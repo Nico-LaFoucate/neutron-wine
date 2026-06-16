@@ -1,0 +1,25 @@
+diff --git a/dlls/windows.web/json_object.c b/dlls/windows.web/json_object.c
+index f80c273e414..db6773c9316 100644
+--- a/dlls/windows.web/json_object.c
++++ b/dlls/windows.web/json_object.c
+@@ -51,6 +51,20 @@ static HRESULT WINAPI json_object_QueryInterface( IJsonObject *iface, REFIID iid
+         return S_OK;
+     }
+ 
++    {
++        static const GUID NEUTRON_IID_home_collection =
++            { 0xc9d9a725, 0x786b, 0x5113, { 0xb4, 0xb7, 0x9b, 0x61, 0x76, 0x4c, 0x22, 0x0b } };
++        if (impl->members && IsEqualGUID( iid, &NEUTRON_IID_home_collection ))
++        {
++            ERR( "NEUTRON-json: returning members map for home-screen IID %s\n", debugstr_guid( iid ) );
++            IMap_HSTRING_IInspectable_AddRef( impl->members );
++            *out = (void *)impl->members;
++            return S_OK;
++        }
++    }
++
++    ERR( "NEUTRON-json: UNHANDLED JsonObject QI for %s\n", debugstr_guid( iid ) );
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;

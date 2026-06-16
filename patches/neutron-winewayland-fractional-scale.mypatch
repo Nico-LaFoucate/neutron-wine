@@ -1,0 +1,237 @@
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index cbc49823cd6..54c3f19012d 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -10,6 +10,7 @@ SOURCES = \
+ 	cursor-shape-v1.xml \
+ 	display.c \
+ 	dllmain.c \
++	fractional-scale-v1.xml \
+ 	opengl.c \
+ 	pointer-constraints-unstable-v1.xml \
+ 	pointer-warp-v1.xml \
+diff --git a/dlls/winewayland.drv/fractional-scale-v1.xml b/dlls/winewayland.drv/fractional-scale-v1.xml
+new file mode 100644
+index 00000000000..350bfc01eaf
+--- /dev/null
++++ b/dlls/winewayland.drv/fractional-scale-v1.xml
+@@ -0,0 +1,102 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="fractional_scale_v1">
++  <copyright>
++    Copyright © 2022 Kenny Levinsen
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="Protocol for requesting fractional surface scales">
++    This protocol allows a compositor to suggest for surfaces to render at
++    fractional scales.
++
++    A client can submit scaled content by utilizing wp_viewport. This is done by
++    creating a wp_viewport object for the surface and setting the destination
++    rectangle to the surface size before the scale factor is applied.
++
++    The buffer size is calculated by multiplying the surface size by the
++    intended scale.
++
++    The wl_surface buffer scale should remain set to 1.
++
++    If a surface has a surface-local size of 100 px by 50 px and wishes to
++    submit buffers with a scale of 1.5, then a buffer of 150px by 75 px should
++    be used and the wp_viewport destination rectangle should be 100 px by 50 px.
++
++    For toplevel surfaces, the size is rounded halfway away from zero. The
++    rounding algorithm for subsurface position and size is not defined.
++  </description>
++
++  <interface name="wp_fractional_scale_manager_v1" version="1">
++    <description summary="fractional surface scale information">
++      A global interface for requesting surfaces to use fractional scales.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="unbind the fractional surface scale interface">
++        Informs the server that the client will not be using this protocol
++        object anymore. This does not affect any other objects,
++        wp_fractional_scale_v1 objects included.
++      </description>
++    </request>
++
++    <enum name="error">
++      <entry name="fractional_scale_exists" value="0"
++        summary="the surface already has a fractional_scale object associated"/>
++    </enum>
++
++    <request name="get_fractional_scale">
++      <description summary="extend surface interface for scale information">
++        Create an add-on object for the the wl_surface to let the compositor
++        request fractional scales. If the given wl_surface already has a
++        wp_fractional_scale_v1 object associated, the fractional_scale_exists
++        protocol error is raised.
++      </description>
++      <arg name="id" type="new_id" interface="wp_fractional_scale_v1"
++           summary="the new surface scale info interface id"/>
++      <arg name="surface" type="object" interface="wl_surface"
++           summary="the surface"/>
++    </request>
++  </interface>
++
++  <interface name="wp_fractional_scale_v1" version="1">
++    <description summary="fractional scale interface to a wl_surface">
++      An additional interface to a wl_surface object which allows the compositor
++      to inform the client of the preferred scale.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="remove surface scale information for surface">
++        Destroy the fractional scale object. When this object is destroyed,
++        preferred_scale events will no longer be sent.
++      </description>
++    </request>
++
++    <event name="preferred_scale">
++      <description summary="notify of new preferred scale">
++        Notification of a new preferred scale for this surface that the
++        compositor suggests that the client should use.
++
++        The sent scale is the numerator of a fraction with a denominator of 120.
++      </description>
++      <arg name="scale" type="uint" summary="the new preferred scale"/>
++    </event>
++  </interface>
++</protocol>
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index b3d6b3c89e7..dc1d37def36 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -158,6 +158,11 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         process_wayland.wp_viewporter =
+             wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
+     }
++    else if (strcmp(interface, "wp_fractional_scale_manager_v1") == 0)
++    {
++        process_wayland.wp_fractional_scale_manager_v1 =
++            wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
++    }
+     else if (strcmp(interface, "wl_subcompositor") == 0)
+     {
+         process_wayland.wl_subcompositor =
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 2f8275ddb52..e8ee6e72a0f 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -143,6 +143,20 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener =
+  *
+  * Creates a role-less wayland surface.
+  */
++static void fractional_scale_handle_preferred(void *data,
++                                              struct wp_fractional_scale_v1 *fs,
++                                              uint32_t scale)
++{
++    struct wayland_surface *surface = data;
++    surface->preferred_scale = scale / 120.0;
++    TRACE("hwnd=%p scale120=%u (%.4f)\n", surface->hwnd, scale, surface->preferred_scale);
++}
++
++static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
++{
++    fractional_scale_handle_preferred,
++};
++
+ struct wayland_surface *wayland_surface_create(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+@@ -174,6 +188,16 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
+         goto err;
+     }
+ 
++    if (process_wayland.wp_fractional_scale_manager_v1)
++    {
++        surface->wp_fractional_scale =
++            wp_fractional_scale_manager_v1_get_fractional_scale(
++                process_wayland.wp_fractional_scale_manager_v1, surface->wl_surface);
++        if (surface->wp_fractional_scale)
++            wp_fractional_scale_v1_add_listener(surface->wp_fractional_scale,
++                                                &fractional_scale_listener, surface);
++    }
++
+     surface->window.scale = 1.0;
+ 
+     return surface;
+@@ -212,6 +236,12 @@ void wayland_surface_destroy(struct wayland_surface *surface)
+ 
+     wayland_surface_clear_role(surface);
+ 
++    if (surface->wp_fractional_scale)
++    {
++        wp_fractional_scale_v1_destroy(surface->wp_fractional_scale);
++        surface->wp_fractional_scale = NULL;
++    }
++
+     if (surface->wp_viewport)
+     {
+         wp_viewport_destroy(surface->wp_viewport);
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 5f4bd6a7cf6..d56a5b56f4b 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -34,6 +34,7 @@
+ #include "relative-pointer-unstable-v1-client-protocol.h"
+ #include "text-input-unstable-v3-client-protocol.h"
+ #include "viewporter-client-protocol.h"
++#include "fractional-scale-v1-client-protocol.h"
+ #include "xdg-output-unstable-v1-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
+@@ -171,6 +172,7 @@ struct wayland
+     struct xdg_wm_base *xdg_wm_base;
+     struct wl_shm *wl_shm;
+     struct wp_viewporter *wp_viewporter;
++    struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
+     struct wl_subcompositor *wl_subcompositor;
+     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
+     struct zwp_relative_pointer_manager_v1 *zwp_relative_pointer_manager_v1;
+@@ -268,6 +270,9 @@ struct wayland_surface
+ 
+     struct wl_surface *wl_surface;
+     struct wp_viewport *wp_viewport;
++    struct wp_fractional_scale_v1 *wp_fractional_scale;
++    /* compositor's preferred fractional scale (0 if none received yet) */
++    double preferred_scale;
+     struct wayland_shm_buffer *small_icon_buffer;
+     struct wayland_shm_buffer *big_icon_buffer;
+ 
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 88eee3421d7..acee6355a4c 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -176,6 +176,11 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+ 
+     conf->state = window_state;
+     conf->scale = NtUserGetSystemDpiForProcess(0) / 96.0;
++    /* NEUTRON: if the compositor advertised a precise fractional scale for this
++     * surface, use it (exact 1.70 vs DPI-derived 1.6979) so the device-resolution
++     * buffer maps 1:1 to the output with no fractional resample. */
++    if (data->wayland_surface && data->wayland_surface->preferred_scale > 0.0)
++        conf->scale = data->wayland_surface->preferred_scale;
+     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
+     conf->managed = data->managed;
+ }

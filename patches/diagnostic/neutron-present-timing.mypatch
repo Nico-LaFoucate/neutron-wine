@@ -1,0 +1,65 @@
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 3e8e229fae6..20983ab3c45 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -26,6 +26,8 @@
+ 
+ #include <stdarg.h>
+ #include <string.h>
++#include <time.h>      /* NEUTRON_PRESENT_TIMING */
++#include <pthread.h>   /* NEUTRON_PRESENT_TIMING */
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -472,6 +474,51 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+                 (unsigned)_uc, (unsigned)_uq, (unsigned)_ue);
+         }
+     }
++    /* NEUTRON_PRESENT_TIMING: per-hwnd present-cadence (frame pacing) measure.
++     * Times the interval between successive on-screen presents per window,
++     * accumulates in-process (NO per-frame I/O, so it doesn't perturb pacing),
++     * and logs a one-line summary every 120 presents. This is the no-HUD
++     * frametime measurement for the non-DX (DS.DisableDirectXDisplay) path. */
++    {
++        static pthread_mutex_t _nt_lock = PTHREAD_MUTEX_INITIALIZER;
++        static struct present_timing { HWND hwnd; int w, h; ULONGLONG last_ns;
++            unsigned long n; double sum, sumsq, mn, mx; } _nt[16];
++        struct timespec _ts;
++        ULONGLONG _now;
++        int _w = surface->rect.right - surface->rect.left;
++        int _h = surface->rect.bottom - surface->rect.top;
++        int _i;
++
++        clock_gettime( CLOCK_MONOTONIC, &_ts );
++        _now = (ULONGLONG)_ts.tv_sec * 1000000000ull + _ts.tv_nsec;
++
++        pthread_mutex_lock( &_nt_lock );
++        for (_i = 0; _i < 16; _i++) if (_nt[_i].hwnd == hwnd) break;
++        if (_i == 16) for (_i = 0; _i < 16; _i++)
++            if (!_nt[_i].hwnd) { _nt[_i].hwnd = hwnd; _nt[_i].mn = 1e30; break; }
++        if (_i < 16)
++        {
++            _nt[_i].w = _w; _nt[_i].h = _h;
++            if (_nt[_i].last_ns)
++            {
++                double _dt = (double)(_now - _nt[_i].last_ns) / 1000.0; /* microseconds */
++                _nt[_i].n++;
++                _nt[_i].sum += _dt; _nt[_i].sumsq += _dt * _dt;
++                if (_dt < _nt[_i].mn) _nt[_i].mn = _dt;
++                if (_dt > _nt[_i].mx) _nt[_i].mx = _dt;
++                if (_nt[_i].n % 120 == 0)
++                {
++                    double _mean = _nt[_i].sum / _nt[_i].n;
++                    double _var = _nt[_i].sumsq / _nt[_i].n - _mean * _mean;
++                    ERR( "NEUTRON_PRESENT_TIMING: hwnd %p %dx%d off %d n %lu mean %.1fus min %.1fus max %.1fus p2p %.1fus var %.0f\n",
++                         hwnd, _w, _h, (int)surface->client.offscreen, _nt[_i].n,
++                         _mean, _nt[_i].mn, _nt[_i].mx, _nt[_i].mx - _nt[_i].mn, _var );
++                }
++            }
++            _nt[_i].last_ns = _now;
++        }
++        pthread_mutex_unlock( &_nt_lock );
++    }
+     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
+     XFlush( gdi_display );

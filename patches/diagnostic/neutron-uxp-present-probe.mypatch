@@ -1,0 +1,27 @@
+diff --git a/dlls/winex11.drv/init.c b/dlls/winex11.drv/init.c
+index 09ef2bf8664..3e8e229fae6 100644
+--- a/dlls/winex11.drv/init.c
++++ b/dlls/winex11.drv/init.c
+@@ -456,6 +456,22 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
+         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
+     if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+ 
++    /* NEUTRON_UXP_PRESENT_PROBE: read hdc_src for big UXP surfaces before the blit */
++    {
++        int _uw = surface->rect.right - surface->rect.left;
++        int _uh = surface->rect.bottom - surface->rect.top;
++        static LONG _uxp_n = 0;
++        if (_uw >= 1900 && _uh >= 900 && InterlockedIncrement(&_uxp_n) <= 12)
++        {
++            COLORREF _uc = NtGdiGetPixel( surface->hdc_src, _uw / 2, _uh / 2 );
++            COLORREF _uq = NtGdiGetPixel( surface->hdc_src, _uw / 4, _uh / 4 );
++            COLORREF _ue = NtGdiGetPixel( surface->hdc_src, _uw - 8, _uh - 8 );
++            ERR("NEUTRON_UXP_PRESENT_PROBE: hwnd %p offscreen %d src %dx%d dst_drawable %lx rect_dst (%ld,%ld)-(%ld,%ld) srcpix_c 0x%08x srcpix_q 0x%08x srcpix_e 0x%08x\n",
++                hwnd, (int)surface->client.offscreen, _uw, _uh,
++                (unsigned long)window, rect_dst.left, rect_dst.top, rect_dst.right, rect_dst.bottom,
++                (unsigned)_uc, (unsigned)_uq, (unsigned)_ue);
++        }
++    }
+     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+                      surface->hdc_src, 0, 0, surface->rect.right, surface->rect.bottom, SRCCOPY, 0 );
+     XFlush( gdi_display );

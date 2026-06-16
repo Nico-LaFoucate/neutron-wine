@@ -1,0 +1,15 @@
+# build workspace (cloned wine-tkg + built wine tree)
+_work/
+*-build/
+
+# build artifacts
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.pkg.tar.*
+
+# OS / editor
+.DS_Store
+*.swp

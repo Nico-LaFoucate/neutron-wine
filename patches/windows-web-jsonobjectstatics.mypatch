@@ -1,0 +1,120 @@
+diff --git a/include/windows.data.json.idl b/include/windows.data.json.idl
+--- a/include/windows.data.json.idl
++++ b/include/windows.data.json.idl
+@@ -129,6 +129,17 @@ namespace Windows.Data.Json {
+         HRESULT CreateStringValue([in] HSTRING input, [out, retval] Windows.Data.Json.JsonValue **value);
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Data.Json.JsonObject),
++        uuid(2289f159-54de-45d8-abcc-22603fa066a0)
++    ]
++    interface IJsonObjectStatics : IInspectable
++    {
++        HRESULT Parse([in] HSTRING input, [out, retval] Windows.Data.Json.JsonObject **result);
++        HRESULT TryParse([in] HSTRING input, [out] Windows.Data.Json.JsonObject **result, [out, retval] boolean *succeeded);
++    }
++
+     [
+         activatable(Windows.Foundation.UniversalApiContract, 1.0),
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+@@ -152,7 +163,7 @@ namespace Windows.Data.Json {
+         activatable(Windows.Foundation.UniversalApiContract, 1.0),
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         marshaling_behavior(agile),
+-        /* static(Windows.Data.Json.IJsonObjectStatics, Windows.Foundation.UniversalApiContract, 1.0), */
++        static(Windows.Data.Json.IJsonObjectStatics, Windows.Foundation.UniversalApiContract, 1.0),
+         threading(both)
+     ]
+     runtimeclass JsonObject
+--- a/dlls/windows.web/json_object.c	2026-06-01 19:33:40.496523061 +0000
++++ b/dlls/windows.web/json_object.c	2026-06-01 19:34:11.915134683 +0000
+@@ -240,6 +240,7 @@
+ struct json_object_statics
+ {
+     IActivationFactory IActivationFactory_iface;
++    IJsonObjectStatics IJsonObjectStatics_iface;
+     LONG ref;
+ };
+ 
+@@ -264,6 +265,13 @@
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID( iid, &IID_IJsonObjectStatics ))
++    {
++        *out = &impl->IJsonObjectStatics_iface;
++        IInspectable_AddRef( *out );
++        return S_OK;
++    }
++
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+@@ -348,9 +356,65 @@
+     factory_ActivateInstance,
+ };
+ 
++DEFINE_IINSPECTABLE( json_object_statics, IJsonObjectStatics, struct json_object_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI json_object_statics_Parse( IJsonObjectStatics *iface, HSTRING input, IJsonObject **result )
++{
++    IJsonValueStatics *value_statics;
++    JsonValueType value_type;
++    IJsonValue *value;
++    HRESULT hr;
++
++    TRACE( "iface %p, input %s, result %p\n", iface, debugstr_hstring( input ), result );
++
++    if (!result) return E_POINTER;
++    *result = NULL;
++    if (!input) return WEB_E_INVALID_JSON_STRING;
++
++    if (FAILED(hr = IActivationFactory_QueryInterface( json_value_factory, &IID_IJsonValueStatics, (void **)&value_statics )))
++        return hr;
++    hr = IJsonValueStatics_Parse( value_statics, input, &value );
++    IJsonValueStatics_Release( value_statics );
++    if (FAILED(hr)) return hr;
++
++    if (SUCCEEDED(hr = IJsonValue_get_ValueType( value, &value_type )) && value_type != JsonValueType_Object)
++        hr = WEB_E_INVALID_JSON_STRING;
++    if (SUCCEEDED(hr)) hr = IJsonValue_GetObject( value, result );
++    IJsonValue_Release( value );
++    return hr;
++}
++
++static HRESULT WINAPI json_object_statics_TryParse( IJsonObjectStatics *iface, HSTRING input, IJsonObject **result, boolean *succeeded )
++{
++    HRESULT hr;
++
++    TRACE( "iface %p, input %s, result %p, succeeded %p\n", iface, debugstr_hstring( input ), result, succeeded );
++
++    if (!result || !succeeded) return E_POINTER;
++    hr = json_object_statics_Parse( iface, input, result );
++    *succeeded = SUCCEEDED(hr);
++    return S_OK;
++}
++
++static const struct IJsonObjectStaticsVtbl json_object_statics_vtbl =
++{
++    json_object_statics_QueryInterface,
++    json_object_statics_AddRef,
++    json_object_statics_Release,
++    /* IInspectable methods */
++    json_object_statics_GetIids,
++    json_object_statics_GetRuntimeClassName,
++    json_object_statics_GetTrustLevel,
++    /* IJsonObjectStatics methods */
++    json_object_statics_Parse,
++    json_object_statics_TryParse,
++};
++
++
+ static struct json_object_statics json_object_statics =
+ {
+     {&factory_vtbl},
++    {&json_object_statics_vtbl},
+     1,
+ };
+ 
