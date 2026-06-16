@@ -28,6 +28,7 @@ description of each. Production patches live in `patches/`; env-gated diagnostic
 | Patch | Purpose |
 | --- | --- |
 | `neutron-winewayland-fractional-scale` | Crisp HiDPI UI under `winewayland.drv` via `wp_fractional_scale_v1` (1:1 buffer→output). |
+| `neutron-winewayland-xdg-popup` | Menu-bar dropdowns as `xdg_popup` (not `wl_subsurface`) so KWin stops clipping their bottom. |
 | `neutron-present-pacer` | X11 software frame pacer in `winex11.drv` (kills program-monitor playback judder). |
 | `neutron-dcomp-bridge` | DirectComposition device impl + DXVK/vkd3d swapchain→window present bridge. |
 | `neutron-jsonobject-homescreen` | UXP home-screen locale/i18n fix. |

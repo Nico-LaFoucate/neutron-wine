@@ -3,7 +3,10 @@
 Patches are applied on top of the upstream Wine base (see `../build/WINE_BASE`) by `../build/build.sh`,
 which drops them into `wine-tkg-git/wine-tkg-userpatches/` (wine-tkg applies every `*.mypatch` there).
 
-Order is not significant — each patch touches distinct files/regions.
+Order is mostly insignificant — patches touch distinct files/regions — with one exception:
+`neutron-winewayland-xdg-popup` applies on top of `neutron-winewayland-fractional-scale` (same
+`winewayland.drv` files). wine-tkg applies `*.mypatch` alphabetically, which already orders
+`fractional-scale` before `xdg-popup`, so no manual ordering is needed.
 
 ## Production (`patches/`)
 
@@ -13,6 +16,20 @@ fractional-scaled output (e.g. 4K @ 1.7×) instead of being compositor-upscaled 
 manager, listens for `preferred_scale`, and uses that exact scale for `conf->scale`. Pairs with the
 engine setting `LogPixels = round(96 × scale)` so System-DPI-aware Adobe apps render at device resolution.
 Touches: `Makefile.in`, `fractional-scale-v1.xml`, `wayland.c`, `wayland_surface.c`, `waylanddrv.h`,
+`window.c`.
+
+### `neutron-winewayland-xdg-popup.mypatch`
+Renders Premiere's menu-bar dropdowns as **`xdg_popup`** surfaces instead of `wl_subsurface`s. KWin
+clips the bottom of a desync subsurface popup even when it is fully painted, correctly sized and on
+screen (proven: byte-identical menu shows fully under X11; clip persists at scale 1.0); `xdg_popup` lets
+the compositor position, constrain and display it. Only lightweight SHM menus take the popup path —
+GPU/client-surface windows (the splash) and windows already realized as subsurfaces keep the classic
+subsurface-of-owner path, avoiding role churn / ghost frames. Bumps the `xdg_wm_base` bind from v2 to
+**v3** (needed for `xdg_positioner.set_offset` + `xdg_popup.reposition`); must not exceed v3 or KWin emits
+`xdg_toplevel` v4/v5 events the 2-entry listener can't dispatch (aborts libwayland). Also reparents a
+client subsurface when its toplevel's `wl_surface` is recreated by a role change (fixes a torn splash).
+Backport/adaptation of Proton-EM / proton-cachyos 11.0-20260601 (@Etaash-mathamsetty). Applies on top of
+`neutron-winewayland-fractional-scale`. Touches: `wayland.c`, `wayland_surface.c`, `waylanddrv.h`,
 `window.c`.
 
 ### `neutron-present-pacer.mypatch`
