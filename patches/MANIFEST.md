@@ -32,6 +32,18 @@ Backport/adaptation of Proton-EM / proton-cachyos 11.0-20260601 (@Etaash-mathams
 `neutron-winewayland-fractional-scale`. Touches: `wayland.c`, `wayland_surface.c`, `waylanddrv.h`,
 `window.c`.
 
+### `neutron-winewayland-decoration.mypatch`
+Optional **server-side** (`xdg-decoration`) window decorations, **off by default**. Neutron uses
+**client-side** decorations — Wine draws its own NC, themed dark via the prefix's Control Panel colors
+(`neutron-decoration/neutron-premiere-dark.reg`) — so the title bar is part of the window surface:
+self-contained in the prefix, never overflows onto a second monitor, independent of the compositor's
+global decoration theme (KWin has no per-app decoration). `WAYLANDDRV_SSD=1` opts into compositor-drawn
+frames. When enabled, implements `zxdg_decoration_manager_v1` + the `pGetWindowStyleMasks` hook (v2, or
+v1 gated to KDE). Premiere fights compositor resize/maximize and overflows on multi-monitor under SSD,
+hence CSD is the default. Applies on top of `neutron-winewayland-xdg-popup`. Touches: `Makefile.in`,
+`xdg-decoration-unstable-v1.xml`, `wayland.c`, `waylanddrv.h`, `waylanddrv_main.c`, `window.c`,
+`wayland_surface.c`.
+
 ### `neutron-present-pacer.mypatch`
 X11 software frame pacer in `winex11.drv : X11DRV_client_surface_present`. Sleeps to the next refresh
 tick (real per-monitor rate via xcb-randr) before the `StretchBlt`, gated to active program-monitor
