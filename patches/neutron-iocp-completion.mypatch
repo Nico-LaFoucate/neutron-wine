@@ -1,0 +1,46 @@
+# neutron-iocp-completion
+#
+# Wineserver fix: async I/O completion for fd-bound completion ports with NO APC context.
+# Premiere's UXP layer (libuv) drives file reads off its IOCP without an APC context;
+# stock wine only queues the IOCP packet when there's an APC context or via the APC path,
+# so libuv's loop never gets the completion and blocks forever -> blank UXP home screen.
+# This adds the missing branch in async_set_result(): when the async has no APC and no APC
+# context but its fd is bound to a completion port, queue the packet via add_async_completion
+# (which no-ops if the fd has no port), honoring FILE_SKIP_COMPLETION_PORT_ON_SUCCESS.
+#
+# A debug trace in this branch is gated behind NEUTRON_IOCP_DEBUG (off by default): the branch
+# runs on every libuv/IOCP file-read completion, so an unconditional fprintf there spams stderr
+# and drags playback under heavy decode I/O.
+#
+# This was previously deployed as a manual wineserver build (not a patch); capturing it here so
+# a clean package rebuild includes it. Touches: server/async.c.
+
+diff --git a/server/async.c b/server/async.c
+index d7f665ba10b..91097f18d37 100644
+--- a/server/async.c
++++ b/server/async.c
+@@ -622,6 +622,24 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
+             {
+                 add_async_completion( async, async->data.apc_context, status, total );
+             }
++            /* NEUTRON FIX: async I/O with no APC context whose fd is bound to a completion port
++             * still needs an IOCP packet (Windows delivers it via the port association, not an
++             * APC). libuv drives file reads off its IOCP with no APC context; without this the
++             * packet is never queued and libuv's loop blocks forever (blank UXP home screen).
++             * Reuses add_async_completion() (no-ops if the fd has no completion port). Honors
++             * FILE_SKIP_COMPLETION_PORT_ON_SUCCESS like the path above. cvalue 0. */
++            else if (!async->data.apc && !async->data.apc_context && async->fd &&
++                     (async->pending || !(async->comp_flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)))
++            {
++                /* NEUTRON: debug trace OFF by default — this branch runs on every libuv/IOCP
++                 * file-read completion, so an unconditional fprintf here spams stderr and drags
++                 * playback (heavy decode I/O). Gate behind NEUTRON_IOCP_DEBUG (cached once). */
++                static int neutron_iocp_dbg = -1;
++                if (neutron_iocp_dbg < 0) neutron_iocp_dbg = getenv( "NEUTRON_IOCP_DEBUG" ) ? 1 : 0;
++                if (neutron_iocp_dbg)
++                    fprintf( stderr, "NEUTRON FIX v3: branchC fd=%p comp_key=%08x%08x iosb=%08x%08x user=%08x%08x apcctx=%08x%08x status=%08x total=%lx\n", async->fd, (unsigned int)((unsigned long long)async->comp_key >> 32), (unsigned int)(unsigned long long)async->comp_key, (unsigned int)((unsigned long long)async->data.iosb >> 32), (unsigned int)(unsigned long long)async->data.iosb, (unsigned int)((unsigned long long)async->data.user >> 32), (unsigned int)(unsigned long long)async->data.user, (unsigned int)((unsigned long long)async->data.apc_context >> 32), (unsigned int)(unsigned long long)async->data.apc_context, status, (unsigned long)total );
++                add_async_completion( async, 0, status, total );
++            }
+ 
+             if (async->event) set_event( async->event );
+             else if (async->fd && !async->is_system) set_fd_signaled( async->fd, 1 );

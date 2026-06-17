@@ -86,6 +86,16 @@ UXP home-screen locale/i18n fix (storage-based loader) so the Premiere home scre
 ### `windows-web-jsonobjectstatics.mypatch`
 Supporting JSONObject statics fix (pairs with the home-screen fix).
 
+### `neutron-iocp-completion.mypatch`
+Wineserver fix in `async_set_result()` (`server/async.c`): queue an IOCP completion packet for
+async I/O on an fd bound to a completion port that has **no APC context**. Premiere's UXP layer
+(libuv) drives file reads off its IOCP without an APC context; stock wine never queues the packet,
+so libuv's loop blocks forever → **blank UXP home screen**. Reuses `add_async_completion` (no-ops
+without a port), honors `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`. A per-completion debug trace is gated
+behind `NEUTRON_IOCP_DEBUG` (off by default — it spams stderr and drags playback otherwise). Was
+previously a manual wineserver build; captured here so package rebuilds include it. Load-bearing.
+Touches: `server/async.c`.
+
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
 ### `neutron-present-timing.mypatch`
