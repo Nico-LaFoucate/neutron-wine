@@ -1,39 +1,254 @@
 # neutron-caption-buttons
 #
-# Flat, dark caption buttons for Wine's client-side window decorations (win32u
-# non-client painting), so the _ [] X buttons match modern Adobe/Windows chrome
-# instead of the classic raised 3D bevel. Pairs with neutron-winewayland-decoration
-# (CSD) and the prefix's dark Control Panel colors (neutron-decoration/
-# neutron-premiere-dark.reg).
+# Flat, dark caption buttons for Wine's client-side window decorations, rendered via
+# the NtUserDrawNonClientButton user-mode callback (the same path uxtheme / MDI menu
+# buttons use). The _ [] X buttons match modern Adobe/Windows chrome instead of the
+# classic raised 3D bevel: a released, non-hot button is filled with COLOR_ACTIVECAPTION
+# (blends into the title bar, glyph only); the close button turns Windows-red on
+# hover/press with a forced-white glyph; minimize/maximize get a subtle
+# COLOR_BTNHIGHLIGHT hover shade; pressed non-close buttons darken via COLOR_BTNSHADOW.
 #
-# Changes in dlls/win32u/defwnd.c:
-#  - draw_frame_caption(): replace the raised push-button bevel (draw_push_button ->
-#    draw_rect_edge EDGE_RAISED) with a flat fill. A released, non-hot button is
-#    filled with COLOR_ACTIVECAPTION so it blends into the title bar (only the
-#    Marlett glyph shows); the close button turns Windows-red on hover/press with a
-#    forced-white glyph; minimize/maximize get a subtle COLOR_BTNHIGHLIGHT shade on
-#    hover; pressed non-close buttons darken via COLOR_BTNSHADOW.
-#  - Hover tracking: a (hwnd, hittest) "hot button" pair, fed by handle_nc_mouse_move
-#    (arming NtUserTrackMouseEvent TME_NONCLIENT|TME_LEAVE) and cleared by
-#    handle_nc_mouse_leave; draw_{close,max,min}_button add DFCS_HOT accordingly, and
-#    set_nc_hot_button()/redraw_nc_button() repaint only the affected button (no full
-#    bar repaint), matching the existing press-tracking redraw path.
-#  - Removes the now-unused draw_push_button() and draw_checked_rect() helpers
-#    (get_55aa_brush is still used elsewhere).
+# Drawing the caption buttons in user-mode (user32) rather than inline in win32u is what
+# lets a later step swap in custom button icons, which need user-mode imaging (WIC/GDI+
+# PNG/ICO loading + AlphaBlend). win32u just hit-tests, tracks hover, and packs
+# (type, down, grayed, hot) for the callback.
 #
-# Self-contained win32u change; does not depend on the winewayland.drv patches.
-# Touches: dlls/win32u/defwnd.c.
+# Pieces:
+#  - winuser.h: CAPTION_{CLOSE,MIN,MAX,RESTORE}_BUTTON added to enum NONCLIENT_BUTTON_TYPE;
+#    the pNonClientButtonDraw hook gains a trailing BOOL `hot` (hover state).
+#  - ntuser.h: draw_non_client_button_params gains BOOL hot.
+#  - win32u/defwnd.c: draw_{close,max,min}_button route through a new draw_caption_button
+#    (KeUserModeCallback NtUserDrawNonClientButton) instead of the old inline renderer;
+#    hover via a (hwnd, hittest) hot-button pair fed by handle_nc_mouse_move (arming
+#    NtUserTrackMouseEvent TME_NONCLIENT|TME_LEAVE) + handle_nc_mouse_leave;
+#    set_nc_hot_button/redraw_nc_button repaint only the affected button.
+#  - user32/nonclient.c: USER_NonClientButtonDraw gains `hot` and a CAPTION_* branch ->
+#    user_draw_caption_button (the flat fill + Marlett-glyph renderer, relocated here).
+#  - user32/{user_main.c,user_private.h}: thread `hot` through the callback unpacker/proto.
+#  - uxtheme/{window.c,uxthemedll.h}: thread `hot`; route CAPTION_* to the default (user32)
+#    drawer so the flat Neutron buttons survive an active visual style.
+#
+# Pairs with neutron-winewayland-decoration (CSD) + the prefix's dark Control Panel colors.
+# Touches: include/winuser.h, include/ntuser.h, dlls/win32u/defwnd.c,
+# dlls/user32/{nonclient.c,user_main.c,user_private.h}, dlls/uxtheme/{window.c,uxthemedll.h}.
 
+diff --git a/dlls/user32/nonclient.c b/dlls/user32/nonclient.c
+index d65e7c9864c..be250181362 100644
+--- a/dlls/user32/nonclient.c
++++ b/dlls/user32/nonclient.c
+@@ -132,8 +132,91 @@ static void user_draw_mdi_button( HDC hdc, enum NONCLIENT_BUTTON_TYPE type, RECT
+     DrawFrameControl( hdc, &rect, DFC_CAPTION, flags );
+ }
+ 
++/* Neutron: flat caption button (the main window's _ [] X). Relocated from win32u's
++ * draw_frame_caption so custom-icon rendering (which needs user-mode imaging) can
++ * hook here later. No classic 3D bevel: a released, non-hot button is filled with
++ * the active-caption color so it blends into the title bar (only the Marlett glyph
++ * shows); the close button uses a Windows-style red highlight on hover/press with a
++ * forced-white glyph; minimize/maximize get a subtle lighter shade on hover; pressed
++ * non-close buttons darken. Must stay visually identical to the old win32u renderer. */
++static void user_draw_caption_button( HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
++                                      RECT rect, BOOL down, BOOL grayed, BOOL hot )
++{
++    static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
++    BOOL is_close = (type == CAPTION_CLOSE_BUTTON);
++    int w = rect.right - rect.left, h = rect.bottom - rect.top;
++    int small_diam = w < h ? w : h;
++    RECT sq = rect;
++    COLORREF bg, text_color, prev_color;
++    HBRUSH brush;
++    HFONT font, prev_font;
++    LOGFONTW lf = { 0 };
++    WCHAR str[2] = { 0, 0 };
++    SIZE size;
++    UINT prev_align;
++    INT prev_bk, xc, yc;
++
++    switch (type)
++    {
++    case CAPTION_CLOSE_BUTTON:   str[0] = 0x72; break;
++    case CAPTION_MIN_BUTTON:     str[0] = 0x30; break;
++    case CAPTION_MAX_BUTTON:     str[0] = 0x31; break;
++    case CAPTION_RESTORE_BUTTON: str[0] = 0x32; break;
++    default: return;
++    }
++
++    /* flat background */
++    if (is_close && (hot || down))
++        bg = down ? RGB( 176, 30, 32 ) : RGB( 232, 17, 35 );
++    else if (down)
++        bg = GetSysColor( COLOR_BTNSHADOW );
++    else if (hot)
++        bg = GetSysColor( COLOR_BTNHIGHLIGHT );
++    else
++        bg = GetSysColor( COLOR_ACTIVECAPTION );
++    brush = CreateSolidBrush( bg );
++    FillRect( hdc, &rect, brush );
++    DeleteObject( brush );
++
++    /* center the glyph in a square box (mirrors win32u make_square_rect) */
++    if (w > h)      { sq.left += (w - h) / 2; sq.right  = sq.left + small_diam; }
++    else if (h > w) { sq.top  += (h - w) / 2; sq.bottom = sq.top  + small_diam; }
++    xc = (sq.left + sq.right) / 2;
++    yc = (sq.top + sq.bottom) / 2;
++
++    if (grayed)                       text_color = GetSysColor( COLOR_BTNSHADOW );
++    else if (is_close && (hot || down)) text_color = RGB( 255, 255, 255 );
++    else                              text_color = GetSysColor( COLOR_BTNTEXT );
++
++    lf.lfHeight = -(small_diam - 2);
++    lf.lfWeight = FW_NORMAL;
++    lf.lfCharSet = SYMBOL_CHARSET;
++    lf.lfPitchAndFamily = FIXED_PITCH | FF_DONTCARE;
++    lstrcpyW( lf.lfFaceName, marlettW );
++    font = CreateFontIndirectW( &lf );
++    prev_align = SetTextAlign( hdc, TA_TOP | TA_LEFT );
++    prev_bk = SetBkMode( hdc, TRANSPARENT );
++    prev_color = GetTextColor( hdc );
++    prev_font = SelectObject( hdc, font );
++    GetTextExtentPoint32W( hdc, str, 1, &size );
++
++    if (grayed)   /* classic inactive drop-shadow */
++    {
++        SetTextColor( hdc, GetSysColor( COLOR_BTNHIGHLIGHT ) );
++        ExtTextOutW( hdc, xc - size.cx / 2 + 1, yc - size.cy / 2 + 1, 0, NULL, str, 1, NULL );
++    }
++    SetTextColor( hdc, text_color );
++    ExtTextOutW( hdc, xc - size.cx / 2, yc - size.cy / 2, 0, NULL, str, 1, NULL );
++
++    SelectObject( hdc, prev_font );
++    SetTextColor( hdc, prev_color );
++    SetTextAlign( hdc, prev_align );
++    SetBkMode( hdc, prev_bk );
++    DeleteObject( font );
++}
++
+ void WINAPI USER_NonClientButtonDraw( HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
+-                                      RECT rect, BOOL down, BOOL grayed )
++                                      RECT rect, BOOL down, BOOL grayed, BOOL hot )
+ {
+     switch (type)
+     {
+@@ -144,5 +227,11 @@ void WINAPI USER_NonClientButtonDraw( HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_
+     case MENU_HELP_BUTTON:
+         user_draw_mdi_button( hdc, type, rect, down, grayed );
+         return;
++    case CAPTION_CLOSE_BUTTON:
++    case CAPTION_MIN_BUTTON:
++    case CAPTION_MAX_BUTTON:
++    case CAPTION_RESTORE_BUTTON:
++        user_draw_caption_button( hdc, type, rect, down, grayed, hot );
++        return;
+     }
+ }
+diff --git a/dlls/user32/user_main.c b/dlls/user32/user_main.c
+index ebd83737953..b86e7dedaa3 100644
+--- a/dlls/user32/user_main.c
++++ b/dlls/user32/user_main.c
+@@ -46,7 +46,7 @@ static NTSTATUS WINAPI User32DrawNonClientButton( void *args, ULONG size )
+ {
+     const struct draw_non_client_button_params *params = args;
+     user_api->pNonClientButtonDraw( params->hwnd, params->hdc, params->type, params->rect,
+-                                    params->down, params->grayed );
++                                    params->down, params->grayed, params->hot );
+     return STATUS_SUCCESS;
+ }
+ 
+diff --git a/dlls/user32/user_private.h b/dlls/user32/user_private.h
+index abb84b0e880..29101fcff98 100644
+--- a/dlls/user32/user_private.h
++++ b/dlls/user32/user_private.h
+@@ -164,7 +164,7 @@ extern BOOL get_icon_size( HICON handle, SIZE *size );
+ extern struct user_api_hook *user_api;
+ LRESULT WINAPI USER_DefDlgProc(HWND, UINT, WPARAM, LPARAM, BOOL);
+ LRESULT WINAPI USER_ScrollBarProc(HWND, UINT, WPARAM, LPARAM, BOOL);
+-void WINAPI USER_NonClientButtonDraw(HWND, HDC, enum NONCLIENT_BUTTON_TYPE, RECT, BOOL, BOOL);
++void WINAPI USER_NonClientButtonDraw(HWND, HDC, enum NONCLIENT_BUTTON_TYPE, RECT, BOOL, BOOL, BOOL);
+ void WINAPI USER_ScrollBarDraw(HWND, HDC, INT, enum SCROLL_HITTEST,
+                                const struct SCROLL_TRACKING_INFO *, BOOL, BOOL, RECT *, UINT,
+                                INT, INT, INT, BOOL);
+diff --git a/dlls/uxtheme/uxthemedll.h b/dlls/uxtheme/uxthemedll.h
+index aa073cbbb3c..82093d0cc57 100644
+--- a/dlls/uxtheme/uxthemedll.h
++++ b/dlls/uxtheme/uxthemedll.h
+@@ -108,7 +108,7 @@ extern void UXTHEME_UninitSystem(void);
+ extern struct user_api_hook user_api;
+ LRESULT WINAPI UXTHEME_DefDlgProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, BOOL unicode);
+ void WINAPI UXTHEME_NonClientButtonDraw(HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
+-                                        RECT rect, BOOL down, BOOL grayed);
++                                        RECT rect, BOOL down, BOOL grayed, BOOL hot);
+ void WINAPI UXTHEME_ScrollBarDraw(HWND hwnd, HDC dc, INT bar, enum SCROLL_HITTEST hit_test,
+                                   const struct SCROLL_TRACKING_INFO *tracking_info,
+                                   BOOL draw_arrows, BOOL draw_interior, RECT *rect, UINT enable_flags,
+diff --git a/dlls/uxtheme/window.c b/dlls/uxtheme/window.c
+index d059a85b297..361d210d141 100644
+--- a/dlls/uxtheme/window.c
++++ b/dlls/uxtheme/window.c
+@@ -28,7 +28,7 @@
+ #include "vssym32.h"
+ 
+ static void uxtheme_draw_menu_button(HTHEME theme, HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
+-                                     RECT rect, BOOL down, BOOL grayed)
++                                     RECT rect, BOOL down, BOOL grayed, BOOL hot)
+ {
+     int part, state;
+ 
+@@ -48,7 +48,7 @@ static void uxtheme_draw_menu_button(HTHEME theme, HWND hwnd, HDC hdc, enum NONC
+         break;
+     /* There is no WP_MDIMAXBUTTON */
+     default:
+-        user_api.pNonClientButtonDraw(hwnd, hdc, type, rect, down, grayed);
++        user_api.pNonClientButtonDraw(hwnd, hdc, type, rect, down, grayed, hot);
+         return;
+     }
+ 
+@@ -65,14 +65,14 @@ static void uxtheme_draw_menu_button(HTHEME theme, HWND hwnd, HDC hdc, enum NONC
+ }
+ 
+ void WINAPI UXTHEME_NonClientButtonDraw(HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
+-                                        RECT rect, BOOL down, BOOL grayed)
++                                        RECT rect, BOOL down, BOOL grayed, BOOL hot)
+ {
+     HTHEME theme;
+ 
+     theme = OpenThemeDataForDpi(NULL, L"Window", GetDpiForWindow(hwnd));
+     if (!theme)
+     {
+-        user_api.pNonClientButtonDraw(hwnd, hdc, type, rect, down, grayed);
++        user_api.pNonClientButtonDraw(hwnd, hdc, type, rect, down, grayed, hot);
+         return;
+     }
+ 
+@@ -83,7 +83,12 @@ void WINAPI UXTHEME_NonClientButtonDraw(HWND hwnd, HDC hdc, enum NONCLIENT_BUTTO
+     case MENU_MAX_BUTTON:
+     case MENU_RESTORE_BUTTON:
+     case MENU_HELP_BUTTON:
+-        uxtheme_draw_menu_button(theme, hwnd, hdc, type, rect, down, grayed);
++        uxtheme_draw_menu_button(theme, hwnd, hdc, type, rect, down, grayed, hot);
++        break;
++    /* Neutron: the main caption buttons keep their flat Neutron look even when a
++     * visual style is active — render via the default (user32) drawer, not uxtheme. */
++    default:
++        user_api.pNonClientButtonDraw(hwnd, hdc, type, rect, down, grayed, hot);
+         break;
+     }
+ 
 diff --git a/dlls/win32u/defwnd.c b/dlls/win32u/defwnd.c
-index 5951374fc9a..f851dac96af 100644
+index 5951374fc9a..8cb4f586033 100644
 --- a/dlls/win32u/defwnd.c
 +++ b/dlls/win32u/defwnd.c
-@@ -1258,66 +1258,6 @@ static int make_square_rect( RECT *src, RECT *dst )
+@@ -1258,123 +1258,25 @@ static int make_square_rect( RECT *src, RECT *dst )
     return small_diam;
  }
  
 -static void draw_checked_rect( HDC dc, RECT *rect )
--{
++/* Neutron: hand a single caption button to the user-mode NC-button drawer (the same
++ * KeUserModeCallback the MDI menu buttons use). The flat rendering — and, later,
++ * custom-icon blitting which needs user-mode imaging — lives in user32
++ * (user_draw_caption_button). win32u just packs (type, down, grayed, hot). */
++static void draw_caption_button( HWND hwnd, HDC hdc, RECT *r, enum NONCLIENT_BUTTON_TYPE type,
++                                 BOOL down, BOOL grayed, BOOL hot )
+ {
 -    if (get_sys_color( COLOR_BTNHIGHLIGHT ) == RGB( 255, 255, 255 ))
 -    {
 -      HBRUSH prev_brush;
@@ -92,59 +307,86 @@ index 5951374fc9a..f851dac96af 100644
 -    return TRUE;
 -}
 -
- static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
- {
-     RECT rect;
-@@ -1334,7 +1274,37 @@ static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
- 
-     static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
- 
+-static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
+-{
+-    RECT rect;
+-    int small_diam = make_square_rect( r, &rect ) - 2;
+-    HFONT prev_font, font;
+-    int color_idx = flags & DFCS_INACTIVE ? COLOR_BTNSHADOW : COLOR_BTNTEXT;
+-    int xc = (rect.left + rect.right) / 2;
+-    int yc = (rect.top + rect.bottom) / 2;
+-    LOGFONTW lf = { 0 };
+-    WCHAR str[] = {0, 0};
+-    DWORD prev_align, prev_bk;
+-    COLORREF prev_color;
+-    SIZE size;
+-
+-    static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
+-
 -    draw_push_button( dc, r, flags & 0xff00 );
-+    /* Neutron: flat caption buttons (no classic 3D bevel) for a modern, dark chrome.
-+     * The caption bar is already painted behind the buttons during a full NC repaint,
-+     * but the press-tracking path (track_close_button / track_min_max_box) and the
-+     * hover path (handle_nc_mouse_move) redraw an individual button without repainting
-+     * the bar, so the background must be filled here as well. The close button uses a
-+     * Windows-style red highlight on hover/press; the minimize/maximize buttons use a
-+     * subtle lighter shade on hover; pressed (non-close) buttons darken slightly; and a
-+     * released, non-hot button is filled with the active-caption color so it blends
-+     * straight back into the title bar. */
-+    {
-+        BOOL is_close = (flags & 0xf) == DFCS_CAPTIONCLOSE;
-+        COLORREF bg;
-+        HBRUSH brush;
-+
-+        if (is_close && (flags & (DFCS_HOT | DFCS_PUSHED)))
-+            bg = (flags & DFCS_PUSHED) ? RGB( 176, 30, 32 ) : RGB( 232, 17, 35 );
-+        else if (flags & DFCS_PUSHED)
-+            bg = get_sys_color( COLOR_BTNSHADOW );
-+        else if (flags & DFCS_HOT)
-+            bg = get_sys_color( COLOR_BTNHIGHLIGHT );
-+        else
-+            bg = get_sys_color( COLOR_ACTIVECAPTION );
-+
-+        brush = NtGdiCreateSolidBrush( bg, NULL );
-+        fill_rect( dc, r, brush );
-+        NtGdiDeleteObjectApp( brush );
-+
-+        /* keep the glyph crisp on the red close highlight */
-+        if (is_close && (flags & (DFCS_HOT | DFCS_PUSHED)) && !(flags & DFCS_INACTIVE))
-+            color_idx = -1;  /* sentinel: use white below instead of a system color */
-+    }
- 
-     switch (flags & 0xf)
-     {
-@@ -1365,7 +1335,8 @@ static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
-         NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color(COLOR_BTNHIGHLIGHT), NULL );
-         NtGdiExtTextOutW( dc, xc-size.cx/2+1, yc-size.cy/2+1, 0, NULL, str, 1, NULL, 0 );
-     }
+-
+-    switch (flags & 0xf)
+-    {
+-    case DFCS_CAPTIONCLOSE:    str[0] = 0x72; break;
+-    case DFCS_CAPTIONHELP:     str[0] = 0x73; break;
+-    case DFCS_CAPTIONMIN:      str[0] = 0x30; break;
+-    case DFCS_CAPTIONMAX:      str[0] = 0x31; break;
+-    case DFCS_CAPTIONRESTORE:  str[0] = 0x32; break;
+-    default:
+-        WARN( "Invalid caption; flags=0x%04x\n", flags );
+-        return FALSE;
+-    }
+-
+-    lf.lfHeight = -small_diam;
+-    lf.lfWeight = FW_NORMAL;
+-    lf.lfCharSet = SYMBOL_CHARSET;
+-    lf.lfPitchAndFamily = FIXED_PITCH | FF_DONTCARE;
+-    memcpy( lf.lfFaceName, marlettW, sizeof(marlettW) );
+-    font = NtGdiHfontCreate( &lf, sizeof(lf), 0, 0, NULL );
+-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextAlign, TA_TOP | TA_LEFT, &prev_align );
+-    NtGdiGetAndSetDCDword( dc, NtGdiSetBkMode, TRANSPARENT, &prev_bk );
+-    NtGdiGetDCDword( dc, NtGdiGetTextColor, &prev_color );
+-    prev_font = NtGdiSelectFont( dc, font );
+-    NtGdiGetTextExtentExW( dc, str, 1, 0, NULL, NULL, &size, 0 );
+-
+-    if (flags & DFCS_INACTIVE)
+-    {
+-        NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color(COLOR_BTNHIGHLIGHT), NULL );
+-        NtGdiExtTextOutW( dc, xc-size.cx/2+1, yc-size.cy/2+1, 0, NULL, str, 1, NULL, 0 );
+-    }
 -    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color( color_idx ), NULL );
-+    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor,
-+                           color_idx == -1 ? RGB( 255, 255, 255 ) : get_sys_color( color_idx ), NULL );
-     NtGdiExtTextOutW( dc, xc-size.cx/2, yc-size.cy/2, 0, NULL, str, 1, NULL, 0 );
+-    NtGdiExtTextOutW( dc, xc-size.cx/2, yc-size.cy/2, 0, NULL, str, 1, NULL, 0 );
+-
+-    NtGdiSelectFont(dc, prev_font);
+-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, prev_color, NULL );
+-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextAlign, prev_align, NULL );
+-    NtGdiGetAndSetDCDword( dc, NtGdiSetBkMode, prev_bk, NULL );
+-    NtGdiDeleteObjectApp( font );
++    struct draw_non_client_button_params params;
++    void *ret_ptr;
++    ULONG ret_len;
  
-     NtGdiSelectFont(dc, prev_font);
-@@ -1463,6 +1434,12 @@ BOOL draw_frame_menu( HDC dc, RECT *r, UINT flags )
+-    return TRUE;
++    params.hwnd = hwnd;
++    params.hdc = hdc;
++    params.type = type;
++    params.rect = *r;
++    params.down = down;
++    params.grayed = grayed;
++    params.hot = hot;
++    KeUserModeCallback( NtUserDrawNonClientButton, &params, sizeof(params), &ret_ptr, &ret_len );
+ }
+ 
+ void draw_menu_button( HWND hwnd, HDC dc, RECT *r, enum NONCLIENT_BUTTON_TYPE type, BOOL down, BOOL grayed )
+@@ -1389,6 +1291,7 @@ void draw_menu_button( HWND hwnd, HDC dc, RECT *r, enum NONCLIENT_BUTTON_TYPE ty
+     params.rect = *r;
+     params.down = down;
+     params.grayed = grayed;
++    params.hot = FALSE;   /* menu (MDI) buttons have no hover state */
+     KeUserModeCallback( NtUserDrawNonClientButton, &params, sizeof(params), &ret_ptr, &ret_len );
+ }
+ 
+@@ -1463,12 +1366,18 @@ BOOL draw_frame_menu( HDC dc, RECT *r, UINT flags )
      return retval;
  }
  
@@ -157,35 +399,77 @@ index 5951374fc9a..f851dac96af 100644
  static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
  {
      RECT rect;
-@@ -1470,6 +1447,8 @@ static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     DWORD style = get_window_long( hwnd, GWL_STYLE );
      DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
-     UINT flags = DFCS_CAPTIONCLOSE;
+-    UINT flags = DFCS_CAPTIONCLOSE;
++    BOOL hot = hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTCLOSE;
  
-+    if (hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTCLOSE) flags |= DFCS_HOT;
-+
      get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
  
-     /* A tool window has a smaller Close button */
-@@ -1510,6 +1489,7 @@ static void draw_max_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+@@ -1494,22 +1403,21 @@ static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+         rect.right -= 2;
+     }
+ 
+-    if (down) flags |= DFCS_PUSHED;
+-    if (grayed) flags |= DFCS_INACTIVE;
+-    draw_frame_caption( hdc, &rect, flags );
++    draw_caption_button( hwnd, hdc, &rect, CAPTION_CLOSE_BUTTON, down, grayed, hot );
+ }
+ 
+ static void draw_max_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+ {
+     RECT rect;
+-    UINT flags;
++    enum NONCLIENT_BUTTON_TYPE type;
+     DWORD style = get_window_long( hwnd, GWL_STYLE );
+     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
++    BOOL hot = hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTMAXBUTTON;
+ 
+     /* never draw maximize box when window has WS_EX_TOOLWINDOW style */
      if (ex_style & WS_EX_TOOLWINDOW) return;
  
-     flags = (style & WS_MAXIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMAX;
-+    if (hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTMAXBUTTON) flags |= DFCS_HOT;
+-    flags = (style & WS_MAXIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMAX;
++    type = (style & WS_MAXIMIZE) ? CAPTION_RESTORE_BUTTON : CAPTION_MAX_BUTTON;
  
      get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
      if (style & WS_SYSMENU) rect.right -= get_system_metrics( SM_CXSIZE );
-@@ -1533,6 +1513,7 @@ static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+@@ -1517,22 +1425,21 @@ static void draw_max_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     rect.bottom = rect.top + get_system_metrics( SM_CYSIZE ) - 2;
+     rect.top += 2;
+     rect.right -= 2;
+-    if (down) flags |= DFCS_PUSHED;
+-    if (grayed) flags |= DFCS_INACTIVE;
+-    draw_frame_caption( hdc, &rect, flags );
++    draw_caption_button( hwnd, hdc, &rect, type, down, grayed, hot );
+ }
+ 
+ static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+ {
+     RECT rect;
+-    UINT flags;
++    enum NONCLIENT_BUTTON_TYPE type;
+     DWORD style = get_window_long( hwnd, GWL_STYLE );
+     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
++    BOOL hot = hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTMINBUTTON;
+ 
+     /* never draw minimize box when window has WS_EX_TOOLWINDOW style */
      if (ex_style & WS_EX_TOOLWINDOW) return;
  
-     flags = (style & WS_MINIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMIN;
-+    if (hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTMINBUTTON) flags |= DFCS_HOT;
+-    flags = (style & WS_MINIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMIN;
++    type = (style & WS_MINIMIZE) ? CAPTION_RESTORE_BUTTON : CAPTION_MIN_BUTTON;
  
      get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
      if (style & WS_SYSMENU)
-@@ -1548,6 +1529,53 @@ static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
-     draw_frame_caption( hdc, &rect, flags );
- }
- 
+@@ -1543,9 +1450,54 @@ static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     rect.bottom = rect.top + get_system_metrics( SM_CYSIZE ) - 2;
+     rect.top += 2;
+     rect.right -= 2;
+-    if (down) flags |= DFCS_PUSHED;
+-    if (grayed) flags |= DFCS_INACTIVE;
+-    draw_frame_caption( hdc, &rect, flags );
++    draw_caption_button( hwnd, hdc, &rect, type, down, grayed, hot );
++}
++
 +/* Neutron: repaint a single caption button in its current hover/normal state without
 + * repainting the whole caption bar (used by the hover path). The hot-button globals
 + * are consulted by the draw_*_button helpers, so they must be set before calling. */
@@ -231,12 +515,10 @@ index 5951374fc9a..f851dac96af 100644
 +
 +    if (prev_hwnd) redraw_nc_button( prev_hwnd, prev_ht );
 +    if (ht) redraw_nc_button( hwnd, ht );
-+}
-+
+ }
+ 
  static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
-                              DWORD  ex_style, BOOL active )
- {
-@@ -2370,6 +2398,28 @@ static LRESULT handle_nc_mouse_move( HWND hwnd, WPARAM wparam, LPARAM lparam )
+@@ -2370,6 +2322,28 @@ static LRESULT handle_nc_mouse_move( HWND hwnd, WPARAM wparam, LPARAM lparam )
  
      TRACE( "hwnd=%p wparam=%#lx lparam=%#lx\n", hwnd, (long)wparam, lparam );
  
@@ -265,7 +547,7 @@ index 5951374fc9a..f851dac96af 100644
      if (wparam != HTHSCROLL && wparam != HTVSCROLL)
          return 0;
  
-@@ -2391,6 +2441,10 @@ static LRESULT handle_nc_mouse_leave( HWND hwnd )
+@@ -2391,6 +2365,10 @@ static LRESULT handle_nc_mouse_leave( HWND hwnd )
  
      TRACE( "hwnd=%p\n", hwnd );
  
@@ -276,3 +558,38 @@ index 5951374fc9a..f851dac96af 100644
      if (style & WS_HSCROLL)
          handle_scroll_event( hwnd, SB_HORZ, WM_NCMOUSELEAVE, pt );
      if (style & WS_VSCROLL)
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 54d0d626d7b..f7627a92d6a 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -588,6 +588,7 @@ struct draw_non_client_button_params
+     RECT rect;
+     BOOL down;
+     BOOL grayed;
++    BOOL hot;   /* Neutron: hover state, for the flat caption buttons */
+ };
+ 
+ /* NtUserDrawScrollBar params */
+diff --git a/include/winuser.h b/include/winuser.h
+index 32b07b387a1..33fee8ab666 100644
+--- a/include/winuser.h
++++ b/include/winuser.h
+@@ -4861,12 +4861,17 @@ enum NONCLIENT_BUTTON_TYPE
+     MENU_MAX_BUTTON,                 /* Menu max button */
+     MENU_RESTORE_BUTTON,             /* Menu restore button */
+     MENU_HELP_BUTTON,                /* Menu help button */
++    CAPTION_CLOSE_BUTTON,            /* Neutron: main caption close button */
++    CAPTION_MIN_BUTTON,              /* Neutron: main caption minimize button */
++    CAPTION_MAX_BUTTON,              /* Neutron: main caption maximize button */
++    CAPTION_RESTORE_BUTTON,          /* Neutron: main caption restore button */
+ };
+ 
+ struct user_api_hook
+ {
+     LRESULT (WINAPI *pDefDlgProc)(HWND, UINT, WPARAM, LPARAM, BOOL);
+-    void (WINAPI *pNonClientButtonDraw)(HWND, HDC, enum NONCLIENT_BUTTON_TYPE, RECT, BOOL, BOOL);
++    /* Neutron: trailing BOOL is `hot` (hover) — added for the flat caption buttons. */
++    void (WINAPI *pNonClientButtonDraw)(HWND, HDC, enum NONCLIENT_BUTTON_TYPE, RECT, BOOL, BOOL, BOOL);
+     void (WINAPI *pScrollBarDraw)(HWND, HDC, INT, enum SCROLL_HITTEST,
+                                   const struct SCROLL_TRACKING_INFO *, BOOL, BOOL, RECT *, UINT,
+                                   INT, INT, INT, BOOL);
