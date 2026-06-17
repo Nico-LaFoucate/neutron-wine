@@ -53,8 +53,12 @@ button turns Windows-red on hover/press with a forced-white glyph; minimize/maxi
 through the **`NtUserDrawNonClientButton` user-mode callback** (the path uxtheme / MDI menu buttons use)
 rather than inline in win32u — `win32u/defwnd.c`'s `draw_{close,max,min}_button` pack `(type, down,
 grayed, hot)` into a new `draw_caption_button` and the flat renderer lives in `user32`
-(`user_draw_caption_button`); this is what lets a later step swap in custom button icons (which need
-user-mode imaging). Adds `CAPTION_*` to `enum NONCLIENT_BUTTON_TYPE` and a trailing `hot` to the
+(`user_draw_caption_button`). **Optional custom icons** (off by default): when
+`HKCU\Software\Neutron\Caption` `Enabled`=1, `user_draw_caption_button` draws `IconDir\{close,min,max,
+restore}.ico` (optional `_hover`/`_press` variants) over the themed background via `LoadImageW` +
+`NtUserDrawIconEx` (`.ico` only — no WIC/COM in NC paint), falling back to the Marlett glyph when a
+file is missing. Collider writes the keys and ships/normalizes the `.ico` sets. Adds `CAPTION_*` to
+`enum NONCLIENT_BUTTON_TYPE` and a trailing `hot` to the
 `pNonClientButtonDraw` hook + `draw_non_client_button_params`. Hover via a `(hwnd, hittest)` hot-button
 pair driven by `handle_nc_mouse_move` (arming `NtUserTrackMouseEvent` `TME_NONCLIENT|TME_LEAVE`) and
 cleared by `handle_nc_mouse_leave`; `set_nc_hot_button()`/`redraw_nc_button()` repaint only the affected

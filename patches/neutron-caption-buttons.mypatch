@@ -1,45 +1,139 @@
 # neutron-caption-buttons
 #
-# Flat, dark caption buttons for Wine's client-side window decorations, rendered via
-# the NtUserDrawNonClientButton user-mode callback (the same path uxtheme / MDI menu
-# buttons use). The _ [] X buttons match modern Adobe/Windows chrome instead of the
-# classic raised 3D bevel: a released, non-hot button is filled with COLOR_ACTIVECAPTION
-# (blends into the title bar, glyph only); the close button turns Windows-red on
-# hover/press with a forced-white glyph; minimize/maximize get a subtle
-# COLOR_BTNHIGHLIGHT hover shade; pressed non-close buttons darken via COLOR_BTNSHADOW.
+# Flat, dark caption buttons for Wine's client-side window decorations, with optional
+# custom button icons, rendered via the NtUserDrawNonClientButton user-mode callback
+# (the path uxtheme / MDI menu buttons use). The _ [] X buttons match modern
+# Adobe/Windows chrome instead of the classic raised 3D bevel: a released, non-hot
+# button is filled with COLOR_ACTIVECAPTION (blends into the title bar, glyph only); the
+# close button turns Windows-red on hover/press with a forced-white glyph;
+# minimize/maximize get a subtle COLOR_BTNHIGHLIGHT hover shade; pressed non-close
+# buttons darken via COLOR_BTNSHADOW.
 #
-# Drawing the caption buttons in user-mode (user32) rather than inline in win32u is what
-# lets a later step swap in custom button icons, which need user-mode imaging (WIC/GDI+
-# PNG/ICO loading + AlphaBlend). win32u just hit-tests, tracks hover, and packs
-# (type, down, grayed, hot) for the callback.
+# Drawing in user-mode (user32) rather than inline in win32u is what enables custom
+# icons (which need user-mode imaging). win32u hit-tests, tracks hover, and packs
+# (type, down, grayed, hot) for the callback; user32 paints.
+#
+# Custom icons (opt-in, off by default): user_draw_caption_button reads
+#   HKCU\Software\Neutron\Caption : Enabled (REG_DWORD), IconDir (REG_SZ)
+# and, when enabled, draws IconDir\{close,min,max,restore}.ico (with optional
+# _hover/_press state variants) over the themed background, falling back to the Marlett
+# glyph when a file is missing or icons are off. .ico is used so the load path is
+# user32's own LoadImageW + NtUserDrawIconEx — no WIC/COM in NC paint. Collider
+# (Neutron's launcher) writes these keys and ships/normalizes the .ico sets.
 #
 # Pieces:
-#  - winuser.h: CAPTION_{CLOSE,MIN,MAX,RESTORE}_BUTTON added to enum NONCLIENT_BUTTON_TYPE;
-#    the pNonClientButtonDraw hook gains a trailing BOOL `hot` (hover state).
+#  - winuser.h: CAPTION_{CLOSE,MIN,MAX,RESTORE}_BUTTON in enum NONCLIENT_BUTTON_TYPE;
+#    pNonClientButtonDraw hook gains a trailing BOOL hot (hover).
 #  - ntuser.h: draw_non_client_button_params gains BOOL hot.
-#  - win32u/defwnd.c: draw_{close,max,min}_button route through a new draw_caption_button
-#    (KeUserModeCallback NtUserDrawNonClientButton) instead of the old inline renderer;
-#    hover via a (hwnd, hittest) hot-button pair fed by handle_nc_mouse_move (arming
+#  - win32u/defwnd.c: draw_{close,max,min}_button route through draw_caption_button
+#    (KeUserModeCallback NtUserDrawNonClientButton); inline renderer removed; hover via a
+#    (hwnd, hittest) hot-button pair fed by handle_nc_mouse_move (arming
 #    NtUserTrackMouseEvent TME_NONCLIENT|TME_LEAVE) + handle_nc_mouse_leave;
 #    set_nc_hot_button/redraw_nc_button repaint only the affected button.
-#  - user32/nonclient.c: USER_NonClientButtonDraw gains `hot` and a CAPTION_* branch ->
-#    user_draw_caption_button (the flat fill + Marlett-glyph renderer, relocated here).
-#  - user32/{user_main.c,user_private.h}: thread `hot` through the callback unpacker/proto.
-#  - uxtheme/{window.c,uxthemedll.h}: thread `hot`; route CAPTION_* to the default (user32)
-#    drawer so the flat Neutron buttons survive an active visual style.
+#  - user32/nonclient.c: USER_NonClientButtonDraw gains hot + a CAPTION_* branch ->
+#    user_draw_caption_button (flat fill + Marlett glyph, relocated) + the custom-icon
+#    path (neutron_caption_icon_dir / neutron_draw_caption_icon).
+#  - user32/{user_main.c,user_private.h}, uxtheme/{window.c,uxthemedll.h}: thread hot;
+#    uxtheme routes CAPTION_* to the default drawer so flat/custom buttons survive a
+#    visual style.
 #
 # Pairs with neutron-winewayland-decoration (CSD) + the prefix's dark Control Panel colors.
 # Touches: include/winuser.h, include/ntuser.h, dlls/win32u/defwnd.c,
 # dlls/user32/{nonclient.c,user_main.c,user_private.h}, dlls/uxtheme/{window.c,uxthemedll.h}.
 
 diff --git a/dlls/user32/nonclient.c b/dlls/user32/nonclient.c
-index d65e7c9864c..be250181362 100644
+index d65e7c9864c..014849be73a 100644
 --- a/dlls/user32/nonclient.c
 +++ b/dlls/user32/nonclient.c
-@@ -132,8 +132,91 @@ static void user_draw_mdi_button( HDC hdc, enum NONCLIENT_BUTTON_TYPE type, RECT
+@@ -20,6 +20,7 @@
+ 
+ #include "user_private.h"
+ #include "controls.h"
++#include "winreg.h"
+ #include "wine/debug.h"
+ 
+ 
+@@ -132,8 +133,173 @@ static void user_draw_mdi_button( HDC hdc, enum NONCLIENT_BUTTON_TYPE type, RECT
      DrawFrameControl( hdc, &rect, DFC_CAPTION, flags );
  }
  
++/* Neutron: custom caption-button icons. Collider writes
++ *   HKCU\Software\Neutron\Caption : Enabled (REG_DWORD), IconDir (REG_SZ)
++ * and drops per-button .ico files in IconDir: close/min/max/restore.ico, with optional
++ * _hover / _press state variants (e.g. close_hover.ico). .ico is used (not PNG) so we
++ * load with user32's own LoadImageW — no WIC/COM in the NC-paint path; Collider
++ * normalizes any imported art to .ico. Read once per process: a theme change requires a
++ * relaunch (which the Appearance panel already states). */
++static BOOL neutron_caption_icon_dir( WCHAR *dir, DWORD cch )
++{
++    static int enabled = -1;            /* -1 = not yet read, 0 = off, 1 = on */
++    static WCHAR cached[MAX_PATH];
++
++    if (enabled < 0)
++    {
++        HKEY key;
++        enabled = 0;
++        cached[0] = 0;
++        if (!RegOpenKeyExW( HKEY_CURRENT_USER, L"Software\\Neutron\\Caption", 0, KEY_READ, &key ))
++        {
++            DWORD type, val, size = sizeof(val);
++            if (!RegQueryValueExW( key, L"Enabled", NULL, &type, (BYTE *)&val, &size ) &&
++                type == REG_DWORD && val)
++            {
++                size = sizeof(cached);
++                if (!RegQueryValueExW( key, L"IconDir", NULL, &type, (BYTE *)cached, &size ) &&
++                    (type == REG_SZ || type == REG_EXPAND_SZ) && cached[0])
++                    enabled = 1;
++            }
++            RegCloseKey( key );
++        }
++    }
++    if (enabled != 1) return FALSE;
++    lstrcpynW( dir, cached, cch );
++    return TRUE;
++}
++
++/* Draw the custom icon for this button/state into box, over the (already painted) themed
++ * background. Returns FALSE — fall back to the Marlett glyph — when custom icons are off
++ * or no icon file is present for this button. */
++static BOOL neutron_draw_caption_icon( HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
++                                       const RECT *box, BOOL down, BOOL hot )
++{
++    static const struct { enum NONCLIENT_BUTTON_TYPE type; const WCHAR *name; } names[] = {
++        { CAPTION_CLOSE_BUTTON,   L"close" },
++        { CAPTION_MIN_BUTTON,     L"min" },
++        { CAPTION_MAX_BUTTON,     L"max" },
++        { CAPTION_RESTORE_BUTTON, L"restore" },
++    };
++    WCHAR dir[MAX_PATH], path[MAX_PATH];
++    const WCHAR *base = NULL, *suffix;
++    int i, sz, w = box->right - box->left, h = box->bottom - box->top;
++    HICON icon;
++
++    if (!neutron_caption_icon_dir( dir, ARRAY_SIZE(dir) )) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(names); i++)
++        if (names[i].type == type) { base = names[i].name; break; }
++    if (!base) return FALSE;
++
++    sz = (w < h ? w : h) - 4;
++    if (sz < 1) return FALSE;
++
++    /* prefer a state-specific icon (_press / _hover), else the base icon */
++    suffix = down ? L"_press" : hot ? L"_hover" : L"";
++    wsprintfW( path, L"%s\\%s%s.ico", dir, base, suffix );
++    icon = LoadImageW( NULL, path, IMAGE_ICON, sz, sz, LR_LOADFROMFILE );
++    if (!icon && *suffix)
++    {
++        wsprintfW( path, L"%s\\%s.ico", dir, base );
++        icon = LoadImageW( NULL, path, IMAGE_ICON, sz, sz, LR_LOADFROMFILE );
++    }
++    if (!icon) return FALSE;
++
++    NtUserDrawIconEx( hdc, box->left + (w - sz) / 2, box->top + (h - sz) / 2, icon, sz, sz, 0, NULL, DI_NORMAL );
++    DestroyIcon( icon );
++    return TRUE;
++}
++
 +/* Neutron: flat caption button (the main window's _ [] X). Relocated from win32u's
 + * draw_frame_caption so custom-icon rendering (which needs user-mode imaging) can
 + * hook here later. No classic 3D bevel: a released, non-hot button is filled with
@@ -86,6 +180,11 @@ index d65e7c9864c..be250181362 100644
 +    FillRect( hdc, &rect, brush );
 +    DeleteObject( brush );
 +
++    /* a custom icon (if configured for this prefix) replaces the Marlett glyph; the
++     * themed background — including the close-button red on hover/press — is kept. */
++    if (neutron_draw_caption_icon( hdc, type, &rect, down, hot ))
++        return;
++
 +    /* center the glyph in a square box (mirrors win32u make_square_rect) */
 +    if (w > h)      { sq.left += (w - h) / 2; sq.right  = sq.left + small_diam; }
 +    else if (h > w) { sq.top  += (h - w) / 2; sq.bottom = sq.top  + small_diam; }
@@ -129,7 +228,7 @@ index d65e7c9864c..be250181362 100644
  {
      switch (type)
      {
-@@ -144,5 +227,11 @@ void WINAPI USER_NonClientButtonDraw( HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_
+@@ -144,5 +310,11 @@ void WINAPI USER_NonClientButtonDraw( HWND hwnd, HDC hdc, enum NONCLIENT_BUTTON_
      case MENU_HELP_BUTTON:
          user_draw_mdi_button( hdc, type, rect, down, grayed );
          return;
