@@ -1,0 +1,278 @@
+# neutron-caption-buttons
+#
+# Flat, dark caption buttons for Wine's client-side window decorations (win32u
+# non-client painting), so the _ [] X buttons match modern Adobe/Windows chrome
+# instead of the classic raised 3D bevel. Pairs with neutron-winewayland-decoration
+# (CSD) and the prefix's dark Control Panel colors (neutron-decoration/
+# neutron-premiere-dark.reg).
+#
+# Changes in dlls/win32u/defwnd.c:
+#  - draw_frame_caption(): replace the raised push-button bevel (draw_push_button ->
+#    draw_rect_edge EDGE_RAISED) with a flat fill. A released, non-hot button is
+#    filled with COLOR_ACTIVECAPTION so it blends into the title bar (only the
+#    Marlett glyph shows); the close button turns Windows-red on hover/press with a
+#    forced-white glyph; minimize/maximize get a subtle COLOR_BTNHIGHLIGHT shade on
+#    hover; pressed non-close buttons darken via COLOR_BTNSHADOW.
+#  - Hover tracking: a (hwnd, hittest) "hot button" pair, fed by handle_nc_mouse_move
+#    (arming NtUserTrackMouseEvent TME_NONCLIENT|TME_LEAVE) and cleared by
+#    handle_nc_mouse_leave; draw_{close,max,min}_button add DFCS_HOT accordingly, and
+#    set_nc_hot_button()/redraw_nc_button() repaint only the affected button (no full
+#    bar repaint), matching the existing press-tracking redraw path.
+#  - Removes the now-unused draw_push_button() and draw_checked_rect() helpers
+#    (get_55aa_brush is still used elsewhere).
+#
+# Self-contained win32u change; does not depend on the winewayland.drv patches.
+# Touches: dlls/win32u/defwnd.c.
+
+diff --git a/dlls/win32u/defwnd.c b/dlls/win32u/defwnd.c
+index 5951374fc9a..f851dac96af 100644
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -1258,66 +1258,6 @@ static int make_square_rect( RECT *src, RECT *dst )
+    return small_diam;
+ }
+ 
+-static void draw_checked_rect( HDC dc, RECT *rect )
+-{
+-    if (get_sys_color( COLOR_BTNHIGHLIGHT ) == RGB( 255, 255, 255 ))
+-    {
+-      HBRUSH prev_brush;
+-      DWORD prev_bg;
+-
+-      fill_rect( dc, rect, get_sys_color_brush( COLOR_BTNFACE ));
+-      NtGdiGetAndSetDCDword( dc, NtGdiSetBkColor, RGB(255, 255, 255), &prev_bg );
+-      prev_brush = NtGdiSelectBrush( dc, get_55aa_brush() );
+-      NtGdiPatBlt( dc, rect->left, rect->top, rect->right-rect->left,
+-                   rect->bottom-rect->top, 0x00fa0089 );
+-      NtGdiSelectBrush( dc, prev_brush );
+-      NtGdiGetAndSetDCDword( dc, NtGdiSetBkColor, prev_bg, NULL );
+-    }
+-    else
+-    {
+-        fill_rect( dc, rect, get_sys_color_brush( COLOR_BTNHIGHLIGHT ));
+-    }
+-}
+-
+-static BOOL draw_push_button( HDC dc, RECT *r, UINT flags )
+-{
+-    RECT rect = *r;
+-    UINT edge;
+-
+-    if (flags & (DFCS_PUSHED | DFCS_CHECKED | DFCS_FLAT))
+-        edge = EDGE_SUNKEN;
+-    else
+-        edge = EDGE_RAISED;
+-
+-    if (flags & DFCS_CHECKED)
+-    {
+-        if (flags & DFCS_MONO)
+-            draw_rect_edge( dc, &rect, edge, BF_MONO|BF_RECT|BF_ADJUST, 1 );
+-        else
+-            draw_rect_edge( dc, &rect, edge, (flags & DFCS_FLAT)|BF_RECT|BF_SOFT|BF_ADJUST, 1 );
+-        if (!(flags & DFCS_TRANSPARENT)) draw_checked_rect( dc, &rect );
+-    }
+-    else
+-    {
+-        if (flags & DFCS_MONO)
+-        {
+-            draw_rect_edge( dc, &rect, edge, BF_MONO|BF_RECT|BF_ADJUST, 1 );
+-            if (!(flags & DFCS_TRANSPARENT))
+-                fill_rect( dc, &rect, get_sys_color_brush( COLOR_BTNFACE ));
+-        }
+-        else
+-        {
+-            UINT edge_flags = BF_RECT | BF_SOFT | (flags & DFCS_FLAT);
+-            if (!(flags & DFCS_TRANSPARENT)) edge_flags |= BF_MIDDLE;
+-            draw_rect_edge( dc, r, edge, edge_flags, 1 );
+-        }
+-    }
+-
+-    /* Adjust rectangle if asked */
+-    if (flags & DFCS_ADJUSTRECT) InflateRect( r, -2, -2 );
+-    return TRUE;
+-}
+-
+ static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
+ {
+     RECT rect;
+@@ -1334,7 +1274,37 @@ static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
+ 
+     static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
+ 
+-    draw_push_button( dc, r, flags & 0xff00 );
++    /* Neutron: flat caption buttons (no classic 3D bevel) for a modern, dark chrome.
++     * The caption bar is already painted behind the buttons during a full NC repaint,
++     * but the press-tracking path (track_close_button / track_min_max_box) and the
++     * hover path (handle_nc_mouse_move) redraw an individual button without repainting
++     * the bar, so the background must be filled here as well. The close button uses a
++     * Windows-style red highlight on hover/press; the minimize/maximize buttons use a
++     * subtle lighter shade on hover; pressed (non-close) buttons darken slightly; and a
++     * released, non-hot button is filled with the active-caption color so it blends
++     * straight back into the title bar. */
++    {
++        BOOL is_close = (flags & 0xf) == DFCS_CAPTIONCLOSE;
++        COLORREF bg;
++        HBRUSH brush;
++
++        if (is_close && (flags & (DFCS_HOT | DFCS_PUSHED)))
++            bg = (flags & DFCS_PUSHED) ? RGB( 176, 30, 32 ) : RGB( 232, 17, 35 );
++        else if (flags & DFCS_PUSHED)
++            bg = get_sys_color( COLOR_BTNSHADOW );
++        else if (flags & DFCS_HOT)
++            bg = get_sys_color( COLOR_BTNHIGHLIGHT );
++        else
++            bg = get_sys_color( COLOR_ACTIVECAPTION );
++
++        brush = NtGdiCreateSolidBrush( bg, NULL );
++        fill_rect( dc, r, brush );
++        NtGdiDeleteObjectApp( brush );
++
++        /* keep the glyph crisp on the red close highlight */
++        if (is_close && (flags & (DFCS_HOT | DFCS_PUSHED)) && !(flags & DFCS_INACTIVE))
++            color_idx = -1;  /* sentinel: use white below instead of a system color */
++    }
+ 
+     switch (flags & 0xf)
+     {
+@@ -1365,7 +1335,8 @@ static BOOL draw_frame_caption( HDC dc, RECT *r, UINT flags )
+         NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color(COLOR_BTNHIGHLIGHT), NULL );
+         NtGdiExtTextOutW( dc, xc-size.cx/2+1, yc-size.cy/2+1, 0, NULL, str, 1, NULL, 0 );
+     }
+-    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor, get_sys_color( color_idx ), NULL );
++    NtGdiGetAndSetDCDword( dc, NtGdiSetTextColor,
++                           color_idx == -1 ? RGB( 255, 255, 255 ) : get_sys_color( color_idx ), NULL );
+     NtGdiExtTextOutW( dc, xc-size.cx/2, yc-size.cy/2, 0, NULL, str, 1, NULL, 0 );
+ 
+     NtGdiSelectFont(dc, prev_font);
+@@ -1463,6 +1434,12 @@ BOOL draw_frame_menu( HDC dc, RECT *r, UINT flags )
+     return retval;
+ }
+ 
++/* Neutron: the caption button (HTCLOSE / HTMAXBUTTON / HTMINBUTTON) the pointer is
++ * currently hovering, for the flat hover highlight. Only one NC button across all
++ * windows can be hovered at a time, so a single global pair is sufficient. */
++static HWND nc_hot_button_hwnd;
++static UINT nc_hot_button_ht;
++
+ static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+ {
+     RECT rect;
+@@ -1470,6 +1447,8 @@ static void draw_close_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     DWORD ex_style = get_window_long( hwnd, GWL_EXSTYLE );
+     UINT flags = DFCS_CAPTIONCLOSE;
+ 
++    if (hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTCLOSE) flags |= DFCS_HOT;
++
+     get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
+ 
+     /* A tool window has a smaller Close button */
+@@ -1510,6 +1489,7 @@ static void draw_max_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     if (ex_style & WS_EX_TOOLWINDOW) return;
+ 
+     flags = (style & WS_MAXIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMAX;
++    if (hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTMAXBUTTON) flags |= DFCS_HOT;
+ 
+     get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
+     if (style & WS_SYSMENU) rect.right -= get_system_metrics( SM_CXSIZE );
+@@ -1533,6 +1513,7 @@ static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     if (ex_style & WS_EX_TOOLWINDOW) return;
+ 
+     flags = (style & WS_MINIMIZE) ? DFCS_CAPTIONRESTORE : DFCS_CAPTIONMIN;
++    if (hwnd == nc_hot_button_hwnd && nc_hot_button_ht == HTMINBUTTON) flags |= DFCS_HOT;
+ 
+     get_inside_rect( hwnd, COORDS_WINDOW, &rect, style, ex_style );
+     if (style & WS_SYSMENU)
+@@ -1548,6 +1529,53 @@ static void draw_min_button( HWND hwnd, HDC hdc, BOOL down, BOOL grayed )
+     draw_frame_caption( hdc, &rect, flags );
+ }
+ 
++/* Neutron: repaint a single caption button in its current hover/normal state without
++ * repainting the whole caption bar (used by the hover path). The hot-button globals
++ * are consulted by the draw_*_button helpers, so they must be set before calling. */
++static void redraw_nc_button( HWND hwnd, UINT ht )
++{
++    DWORD style = get_window_long( hwnd, GWL_STYLE );
++    HDC hdc;
++
++    if (!(hdc = NtUserGetWindowDC( hwnd ))) return;
++
++    switch (ht)
++    {
++    case HTCLOSE:
++    {
++        HMENU sys_menu = NtUserGetSystemMenu( hwnd, FALSE );
++        UINT state = get_menu_state( sys_menu, SC_CLOSE, MF_BYCOMMAND );
++        draw_close_button( hwnd, hdc, FALSE,
++                           (state & (MF_DISABLED | MF_GRAYED)) || state == 0xffffffff );
++        break;
++    }
++    case HTMAXBUTTON:
++        draw_max_button( hwnd, hdc, FALSE, !(style & WS_MAXIMIZEBOX) );
++        break;
++    case HTMINBUTTON:
++        draw_min_button( hwnd, hdc, FALSE, !(style & WS_MINIMIZEBOX) );
++        break;
++    }
++
++    NtUserReleaseDC( hwnd, hdc );
++}
++
++/* Neutron: move the caption-button hover highlight to (hwnd, ht); ht == 0 clears it.
++ * Repaints the button losing the highlight and the one gaining it. */
++static void set_nc_hot_button( HWND hwnd, UINT ht )
++{
++    HWND prev_hwnd = nc_hot_button_hwnd;
++    UINT prev_ht = nc_hot_button_ht;
++
++    if (prev_hwnd == (ht ? hwnd : NULL) && prev_ht == ht) return;
++
++    nc_hot_button_hwnd = ht ? hwnd : NULL;
++    nc_hot_button_ht = ht;
++
++    if (prev_hwnd) redraw_nc_button( prev_hwnd, prev_ht );
++    if (ht) redraw_nc_button( hwnd, ht );
++}
++
+ static void draw_nc_caption( HDC hdc, RECT *rect, HWND hwnd, DWORD  style,
+                              DWORD  ex_style, BOOL active )
+ {
+@@ -2370,6 +2398,28 @@ static LRESULT handle_nc_mouse_move( HWND hwnd, WPARAM wparam, LPARAM lparam )
+ 
+     TRACE( "hwnd=%p wparam=%#lx lparam=%#lx\n", hwnd, (long)wparam, lparam );
+ 
++    /* Neutron: track hover over the caption buttons for the flat hover highlight. */
++    if (wparam == HTCLOSE || wparam == HTMINBUTTON || wparam == HTMAXBUTTON)
++    {
++        TRACKMOUSEEVENT tme = { sizeof(tme), TME_QUERY };
++
++        set_nc_hot_button( hwnd, wparam );
++
++        /* arm NC mouse-leave so the highlight clears when the pointer leaves the frame */
++        NtUserTrackMouseEvent( &tme );
++        if (((tme.dwFlags & (TME_NONCLIENT | TME_LEAVE)) != (TME_NONCLIENT | TME_LEAVE)) ||
++            tme.hwndTrack != hwnd)
++        {
++            tme.cbSize = sizeof(tme);
++            tme.dwFlags = TME_NONCLIENT | TME_LEAVE;
++            tme.hwndTrack = hwnd;
++            tme.dwHoverTime = 0;
++            NtUserTrackMouseEvent( &tme );
++        }
++    }
++    else if (nc_hot_button_hwnd == hwnd)
++        set_nc_hot_button( hwnd, 0 );
++
+     if (wparam != HTHSCROLL && wparam != HTVSCROLL)
+         return 0;
+ 
+@@ -2391,6 +2441,10 @@ static LRESULT handle_nc_mouse_leave( HWND hwnd )
+ 
+     TRACE( "hwnd=%p\n", hwnd );
+ 
++    /* Neutron: clear the caption-button hover highlight when leaving the frame. */
++    if (nc_hot_button_hwnd == hwnd)
++        set_nc_hot_button( hwnd, 0 );
++
+     if (style & WS_HSCROLL)
+         handle_scroll_event( hwnd, SB_HORZ, WM_NCMOUSELEAVE, pt );
+     if (style & WS_VSCROLL)

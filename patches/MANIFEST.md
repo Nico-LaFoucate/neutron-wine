@@ -44,6 +44,21 @@ hence CSD is the default. Applies on top of `neutron-winewayland-xdg-popup`. Tou
 `xdg-decoration-unstable-v1.xml`, `wayland.c`, `waylanddrv.h`, `waylanddrv_main.c`, `window.c`,
 `wayland_surface.c`.
 
+### `neutron-caption-buttons.mypatch`
+Flat, dark caption buttons for the client-side decorations (win32u NC painting), so the `_ [] X`
+buttons match modern Adobe/Windows chrome instead of the classic raised 3D bevel. In
+`draw_frame_caption()` the raised push-button (`draw_push_button` → `draw_rect_edge EDGE_RAISED`) is
+replaced by a flat fill: a released, non-hot button uses `COLOR_ACTIVECAPTION` so it blends into the
+title bar (only the Marlett glyph shows); the **close** button turns Windows-red on hover/press with a
+forced-white glyph; minimize/maximize get a subtle `COLOR_BTNHIGHLIGHT` hover shade; pressed non-close
+buttons darken via `COLOR_BTNSHADOW`. Adds hover tracking — a `(hwnd, hittest)` hot-button pair driven
+by `handle_nc_mouse_move` (arming `NtUserTrackMouseEvent` `TME_NONCLIENT|TME_LEAVE`) and cleared by
+`handle_nc_mouse_leave`; `set_nc_hot_button()`/`redraw_nc_button()` repaint only the affected button
+(no full bar repaint, matching the press-tracking path). Removes the now-unused `draw_push_button()`
+and `draw_checked_rect()` helpers. Self-contained; does not depend on the winewayland.drv patches.
+Pairs with `neutron-winewayland-decoration` + `neutron-decoration/neutron-premiere-dark.reg`.
+Touches: `dlls/win32u/defwnd.c`.
+
 ### `neutron-present-pacer.mypatch`
 X11 software frame pacer in `winex11.drv : X11DRV_client_surface_present`. Sleeps to the next refresh
 tick (real per-monitor rate via xcb-randr) before the `StretchBlt`, gated to active program-monitor
