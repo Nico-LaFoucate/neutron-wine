@@ -1,0 +1,1396 @@
+# neutron-winewayland
+#
+# Combined winewayland.drv patch: fractional-scale (1:1 buffer mapping on fractional-scaled
+# outputs), xdg_popup menu rendering (Premiere dropdowns), and client-side window decorations
+# (CSD: Wine draws its own dark title bar, themed via the prefix Control Panel colors). These
+# three features were previously separate patches but overlap heavily in the same winewayland.drv
+# files and are interdependent (decoration builds on xdg-popup builds on fractional-scale), so they
+# are maintained together here to apply cleanly on the staging base. Touches:
+# dlls/winewayland.drv/{Makefile.in,fractional-scale-v1.xml,xdg-decoration-unstable-v1.xml,
+# wayland.c,wayland_surface.c,waylanddrv.h,waylanddrv_main.c,window.c}.
+
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index cbc49823cd6..aaa0e97fb4b 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -10,6 +10,7 @@ SOURCES = \
+ 	cursor-shape-v1.xml \
+ 	display.c \
+ 	dllmain.c \
++	fractional-scale-v1.xml \
+ 	opengl.c \
+ 	pointer-constraints-unstable-v1.xml \
+ 	pointer-warp-v1.xml \
+@@ -28,6 +29,7 @@ SOURCES = \
+ 	window.c \
+ 	window_surface.c \
+ 	wlr-data-control-unstable-v1.xml \
++	xdg-decoration-unstable-v1.xml \
+ 	xdg-output-unstable-v1.xml \
+ 	xdg-shell.xml \
+ 	xdg-toplevel-icon-v1.xml
+diff --git a/dlls/winewayland.drv/fractional-scale-v1.xml b/dlls/winewayland.drv/fractional-scale-v1.xml
+new file mode 100644
+index 00000000000..350bfc01eaf
+--- /dev/null
++++ b/dlls/winewayland.drv/fractional-scale-v1.xml
+@@ -0,0 +1,102 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="fractional_scale_v1">
++  <copyright>
++    Copyright © 2022 Kenny Levinsen
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <description summary="Protocol for requesting fractional surface scales">
++    This protocol allows a compositor to suggest for surfaces to render at
++    fractional scales.
++
++    A client can submit scaled content by utilizing wp_viewport. This is done by
++    creating a wp_viewport object for the surface and setting the destination
++    rectangle to the surface size before the scale factor is applied.
++
++    The buffer size is calculated by multiplying the surface size by the
++    intended scale.
++
++    The wl_surface buffer scale should remain set to 1.
++
++    If a surface has a surface-local size of 100 px by 50 px and wishes to
++    submit buffers with a scale of 1.5, then a buffer of 150px by 75 px should
++    be used and the wp_viewport destination rectangle should be 100 px by 50 px.
++
++    For toplevel surfaces, the size is rounded halfway away from zero. The
++    rounding algorithm for subsurface position and size is not defined.
++  </description>
++
++  <interface name="wp_fractional_scale_manager_v1" version="1">
++    <description summary="fractional surface scale information">
++      A global interface for requesting surfaces to use fractional scales.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="unbind the fractional surface scale interface">
++        Informs the server that the client will not be using this protocol
++        object anymore. This does not affect any other objects,
++        wp_fractional_scale_v1 objects included.
++      </description>
++    </request>
++
++    <enum name="error">
++      <entry name="fractional_scale_exists" value="0"
++        summary="the surface already has a fractional_scale object associated"/>
++    </enum>
++
++    <request name="get_fractional_scale">
++      <description summary="extend surface interface for scale information">
++        Create an add-on object for the the wl_surface to let the compositor
++        request fractional scales. If the given wl_surface already has a
++        wp_fractional_scale_v1 object associated, the fractional_scale_exists
++        protocol error is raised.
++      </description>
++      <arg name="id" type="new_id" interface="wp_fractional_scale_v1"
++           summary="the new surface scale info interface id"/>
++      <arg name="surface" type="object" interface="wl_surface"
++           summary="the surface"/>
++    </request>
++  </interface>
++
++  <interface name="wp_fractional_scale_v1" version="1">
++    <description summary="fractional scale interface to a wl_surface">
++      An additional interface to a wl_surface object which allows the compositor
++      to inform the client of the preferred scale.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="remove surface scale information for surface">
++        Destroy the fractional scale object. When this object is destroyed,
++        preferred_scale events will no longer be sent.
++      </description>
++    </request>
++
++    <event name="preferred_scale">
++      <description summary="notify of new preferred scale">
++        Notification of a new preferred scale for this surface that the
++        compositor suggests that the client should use.
++
++        The sent scale is the numerator of a fraction with a denominator of 120.
++      </description>
++      <arg name="scale" type="uint" summary="the new preferred scale"/>
++    </event>
++  </interface>
++</protocol>
+diff --git a/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml b/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+new file mode 100644
+index 00000000000..4426f6cd8e4
+--- /dev/null
++++ b/dlls/winewayland.drv/xdg-decoration-unstable-v1.xml
+@@ -0,0 +1,176 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="xdg_decoration_unstable_v1">
++  <copyright>
++    Copyright © 2018 Simon Ser
++
++    Permission is hereby granted, free of charge, to any person obtaining a
++    copy of this software and associated documentation files (the "Software"),
++    to deal in the Software without restriction, including without limitation
++    the rights to use, copy, modify, merge, publish, distribute, sublicense,
++    and/or sell copies of the Software, and to permit persons to whom the
++    Software is furnished to do so, subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the next
++    paragraph) shall be included in all copies or substantial portions of the
++    Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++    DEALINGS IN THE SOFTWARE.
++  </copyright>
++
++  <interface name="zxdg_decoration_manager_v1" version="2">
++    <description summary="window decoration manager">
++      This interface allows a compositor to announce support for server-side
++      decorations.
++
++      A window decoration is a set of window controls as deemed appropriate by
++      the party managing them, such as user interface components used to move,
++      resize and change a window's state.
++
++      A client can use this protocol to request being decorated by a supporting
++      compositor.
++
++      If compositor and client do not negotiate the use of a server-side
++      decoration using this protocol, clients continue to self-decorate as they
++      see fit.
++
++      Warning! The protocol described in this file is experimental and
++      backward incompatible changes may be made. Backward compatible changes
++      may be added together with the corresponding interface version bump.
++      Backward incompatible changes are done by bumping the version number in
++      the protocol and interface names and resetting the interface version.
++      Once the protocol is to be declared stable, the 'z' prefix and the
++      version number in the protocol and interface names are removed and the
++      interface version number is reset.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the decoration manager object">
++        Destroy the decoration manager. This doesn't destroy objects created
++        with the manager.
++      </description>
++    </request>
++
++    <request name="get_toplevel_decoration">
++      <description summary="create a new toplevel decoration object">
++        Create a new decoration object associated with the given toplevel.
++
++        For objects of version 1, creating an xdg_toplevel_decoration from an
++        xdg_toplevel which has a buffer attached or committed is a client
++        error, and any attempts by a client to attach or manipulate a buffer
++        prior to the first xdg_toplevel_decoration.configure event must also be
++        treated as errors.
++
++        For objects of version 2 or newer, creating an xdg_toplevel_decoration
++        from an xdg_toplevel which has a buffer attached or committed is
++        allowed. The initial decoration mode of the surface if a buffer is
++        already attached depends on whether a xdg_toplevel_decoration object
++        has been associated with the surface or not prior to this request.
++
++        If an xdg_toplevel_decoration was associated with the surface, then
++        destroyed without a surface commit, the previous decoration mode is
++        retained.
++
++        If no xdg_toplevel_decoration was associated with the surface prior to
++        this request, or if a surface commit has been perfomed after a previous
++        xdg_toplevel_decoration object associated with the surface was
++        destroyed, the decoration mode is assumed to be client-side.
++      </description>
++      <arg name="id" type="new_id" interface="zxdg_toplevel_decoration_v1"/>
++      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
++    </request>
++  </interface>
++
++  <interface name="zxdg_toplevel_decoration_v1" version="2">
++    <description summary="decoration object for a toplevel surface">
++      The decoration object allows the compositor to toggle server-side window
++      decorations for a toplevel surface. The client can request to switch to
++      another mode.
++
++      The xdg_toplevel_decoration object must be destroyed before its
++      xdg_toplevel.
++    </description>
++
++    <enum name="error">
++      <entry name="unconfigured_buffer" value="0"
++        summary="xdg_toplevel has a buffer attached before configure"/>
++      <entry name="already_constructed" value="1"
++        summary="xdg_toplevel already has a decoration object"/>
++      <entry name="orphaned" value="2"
++        summary="xdg_toplevel destroyed before the decoration object"/>
++      <entry name="invalid_mode" value="3" summary="invalid mode"/>
++    </enum>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the decoration object">
++        Switch back to a mode without any server-side decorations at the next
++        commit, unless a new xdg_toplevel_decoration is created for the surface
++        first.
++      </description>
++    </request>
++
++    <enum name="mode">
++      <description summary="window decoration modes">
++        These values describe window decoration modes.
++      </description>
++      <entry name="client_side" value="1"
++        summary="no server-side window decoration"/>
++      <entry name="server_side" value="2"
++        summary="server-side window decoration"/>
++    </enum>
++
++    <request name="set_mode">
++      <description summary="set the decoration mode">
++        Set the toplevel surface decoration mode. This informs the compositor
++        that the client prefers the provided decoration mode.
++
++        After requesting a decoration mode, the compositor will respond by
++        emitting an xdg_surface.configure event. The client should then update
++        its content, drawing it without decorations if the received mode is
++        server-side decorations. The client must also acknowledge the configure
++        when committing the new content (see xdg_surface.ack_configure).
++
++        The compositor can decide not to use the client's mode and enforce a
++        different mode instead.
++
++        Clients whose decoration mode depend on the xdg_toplevel state may send
++        a set_mode request in response to an xdg_surface.configure event and wait
++        for the next xdg_surface.configure event to prevent unwanted state.
++        Such clients are responsible for preventing configure loops and must
++        make sure not to send multiple successive set_mode requests with the
++        same decoration mode.
++
++        If an invalid mode is supplied by the client, the invalid_mode protocol
++        error is raised by the compositor.
++      </description>
++      <arg name="mode" type="uint" enum="mode" summary="the decoration mode"/>
++    </request>
++
++    <request name="unset_mode">
++      <description summary="unset the decoration mode">
++        Unset the toplevel surface decoration mode. This informs the compositor
++        that the client doesn't prefer a particular decoration mode.
++
++        This request has the same semantics as set_mode.
++      </description>
++    </request>
++
++    <event name="configure">
++      <description summary="notify a decoration mode change">
++        The configure event configures the effective decoration mode. The
++        configured state should not be applied immediately. Clients must send an
++        ack_configure in response to this event. See xdg_surface.configure and
++        xdg_surface.ack_configure for details.
++
++        A configure event can be sent at any time. The specified mode must be
++        obeyed by the client.
++      </description>
++      <arg name="mode" type="uint" enum="mode" summary="the decoration mode"/>
++    </event>
++  </interface>
++</protocol>
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index b3d6b3c89e7..43c4d1345b4 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -86,6 +86,25 @@ static const struct wl_seat_listener seat_listener =
+     wl_seat_handle_name
+ };
+ 
++/* Server-side (compositor-drawn) decorations are OPT-IN. Neutron defaults to
++ * client-side decorations — Wine draws its own non-client frame — which is
++ * self-contained in the prefix, never overflows the monitor, and doesn't inherit
++ * the compositor's global window-decoration theme. Set WAYLANDDRV_SSD=1 to opt
++ * into compositor-drawn (xdg-decoration) frames instead. */
++static int wayland_disable_ssd(void)
++{
++    static int disabled = -1;
++    const char *env;
++
++    if (disabled == -1)
++    {
++        env = getenv("WAYLANDDRV_SSD");
++        disabled = !(env && !strcmp(env, "1"));
++    }
++
++    return disabled;
++}
++
+ /**********************************************************************
+  *          Registry handling
+  */
+@@ -120,11 +139,16 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+     }
+     else if (strcmp(interface, "xdg_wm_base") == 0)
+     {
+-        /* Bind version 2 so that compositors (e.g., sway) can properly send tiled
+-         * states, instead of falling back to (ab)using the maximized state. */
++        /* Bind version 3: it enables the tiled states (>= v2) plus the
++         * xdg_positioner offset and xdg_popup::reposition requests (v3) we use
++         * for menu popups. We deliberately cap at 3 rather than going higher,
++         * because v4 (configure_bounds) and v5 (wm_capabilities) add xdg_toplevel
++         * events our listener doesn't handle, which would abort libwayland. */
++        if (version < 3)
++            WARN("xdg_wm_base version %u < 3; menu popups may not position correctly\n", version);
+         process_wayland.xdg_wm_base =
+             wl_registry_bind(registry, id, &xdg_wm_base_interface,
+-                             version < 2 ? version : 2);
++                             version < 3 ? version : 3);
+         xdg_wm_base_add_listener(process_wayland.xdg_wm_base, &xdg_wm_base_listener, NULL);
+     }
+     else if (strcmp(interface, "wl_shm") == 0)
+@@ -158,6 +182,28 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         process_wayland.wp_viewporter =
+             wl_registry_bind(registry, id, &wp_viewporter_interface, 1);
+     }
++    else if (strcmp(interface, "wp_fractional_scale_manager_v1") == 0)
++    {
++        process_wayland.wp_fractional_scale_manager_v1 =
++            wl_registry_bind(registry, id, &wp_fractional_scale_manager_v1_interface, 1);
++    }
++    else if (strcmp(interface, "zxdg_decoration_manager_v1") == 0)
++    {
++        /* Server-side decorations: let the compositor draw the title bar with
++         * the desktop theme. Gated to compositors known to honor it well (KDE),
++         * unless the protocol is new enough (v2) to be trusted broadly. */
++        if (wayland_disable_ssd()) return;
++        if (version >= 2)
++        {
++            process_wayland.zxdg_decoration_manager_v1 =
++                wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 2);
++        }
++        else if (WAYLAND_HasWindowManager("KDE"))
++        {
++            process_wayland.zxdg_decoration_manager_v1 =
++                wl_registry_bind(registry, id, &zxdg_decoration_manager_v1_interface, 1);
++        }
++    }
+     else if (strcmp(interface, "wl_subcompositor") == 0)
+     {
+         process_wayland.wl_subcompositor =
+@@ -318,6 +364,9 @@ BOOL wayland_process_init(void)
+     }
+ 
+     /* Check for optional globals. */
++    if (!process_wayland.zxdg_decoration_manager_v1)
++        WARN("Wayland compositor doesn't support optional zxdg_decoration_manager_v1 (server-side decorations won't work)\n");
++
+     if (!process_wayland.zwp_pointer_constraints_v1)
+         ERR("Wayland compositor doesn't support optional zwp_pointer_constraints_v1 (pointer locking/confining won't work)\n");
+ 
+diff --git a/dlls/winewayland.drv/wayland_surface.c b/dlls/winewayland.drv/wayland_surface.c
+index 2f8275ddb52..39c1dfcee96 100644
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -34,6 +34,13 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
++static inline BOOL popup_config_changed(struct wayland_surface_config *c1,
++                                        struct wayland_surface_config *c2)
++{
++    return c1->height != c2->height || c1->width != c2->width ||
++           c1->x != c2->x || c1->y != c2->y;
++}
++
+ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_surface,
+                                          uint32_t serial)
+ {
+@@ -48,8 +55,13 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
+ 
+     /* Handle this event only if wayland_surface is still associated with
+      * the target xdg_surface. */
+-    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
+-        surface->xdg_surface == xdg_surface)
++    if (!(surface = data->wayland_surface) || surface->xdg_surface != xdg_surface)
++    {
++        wayland_win_data_release(data);
++        return;
++    }
++
++    if (wayland_surface_is_toplevel(surface))
+     {
+         /* If we have a previously requested config, we have already sent a
+          * WM_WAYLAND_CONFIGURE which hasn't been handled yet. In that case,
+@@ -57,9 +69,34 @@ static void xdg_surface_handle_configure(void *private, struct xdg_surface *xdg_
+         should_post = surface->requested.serial == 0;
+         initial_configure = surface->current.serial == 0;
+         surface->pending.serial = serial;
++        /* Carry the established decoration mode forward across configures that
++         * don't themselves carry a decoration event (e.g. resizes). */
++        if (!surface->pending.decor && surface->current.decor)
++            surface->pending.decor = surface->current.decor;
++        else if (!surface->pending.decor && surface->requested.decor)
++            surface->pending.decor = surface->requested.decor;
++        /* A decoration mode change must be processed through the message loop. */
++        if (surface->pending.decor &&
++            surface->pending.decor != surface->current.decor)
++        {
++            should_post = TRUE;
++            initial_configure = TRUE;
++        }
+         surface->requested = surface->pending;
+         memset(&surface->pending, 0, sizeof(surface->pending));
+     }
++    else if (wayland_surface_is_popup(surface))
++    {
++        /* Popups don't go through the window message loop; ack directly by
++         * exposing the surface so the (possibly compositor-constrained)
++         * position/size take effect. */
++        initial_configure = surface->current.serial == 0 ||
++                            popup_config_changed(&surface->current, &surface->pending);
++        surface->pending.serial = serial;
++        surface->processing = surface->pending;
++        surface->processing.processed = TRUE;
++        memset(&surface->pending, 0, sizeof(surface->pending));
++    }
+ 
+     wayland_win_data_release(data);
+ 
+@@ -138,11 +175,71 @@ static const struct xdg_toplevel_listener xdg_toplevel_listener =
+     xdg_toplevel_handle_close
+ };
+ 
++static void xdg_popup_handle_configure(void *private, struct xdg_popup *xdg_popup,
++                                       int32_t x, int32_t y, int32_t width, int32_t height)
++{
++    HWND hwnd = private;
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++
++    TRACE("hwnd=%p %d,%d %dx%d\n", hwnd, x, y, width, height);
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++
++    if ((surface = data->wayland_surface) && wayland_surface_is_popup(surface))
++    {
++        surface->pending.x = x;
++        surface->pending.y = y;
++        surface->pending.width = width;
++        surface->pending.height = height;
++        surface->pending.state = 0;
++    }
++
++    wayland_win_data_release(data);
++}
++
++static void xdg_popup_handle_done(void *private, struct xdg_popup *xdg_popup)
++{
++    HWND hwnd = private;
++
++    TRACE("hwnd=%p popup dismissed by compositor\n", hwnd);
++
++    NtUserPostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
++}
++
++static void xdg_popup_handle_reposition(void *private, struct xdg_popup *xdg_popup,
++                                        uint32_t token)
++{
++    /* We get a configure event after a reposition, so nothing to do here. */
++    TRACE("hwnd=%p token=%u\n", private, token);
++}
++
++static const struct xdg_popup_listener xdg_popup_listener =
++{
++    xdg_popup_handle_configure,
++    xdg_popup_handle_done,
++    xdg_popup_handle_reposition,
++};
++
+ /**********************************************************************
+  *          wayland_surface_create
+  *
+  * Creates a role-less wayland surface.
+  */
++static void fractional_scale_handle_preferred(void *data,
++                                              struct wp_fractional_scale_v1 *fs,
++                                              uint32_t scale)
++{
++    struct wayland_surface *surface = data;
++    surface->preferred_scale = scale / 120.0;
++    TRACE("hwnd=%p scale120=%u (%.4f)\n", surface->hwnd, scale, surface->preferred_scale);
++}
++
++static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
++{
++    fractional_scale_handle_preferred,
++};
++
+ struct wayland_surface *wayland_surface_create(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+@@ -174,6 +271,16 @@ struct wayland_surface *wayland_surface_create(HWND hwnd)
+         goto err;
+     }
+ 
++    if (process_wayland.wp_fractional_scale_manager_v1)
++    {
++        surface->wp_fractional_scale =
++            wp_fractional_scale_manager_v1_get_fractional_scale(
++                process_wayland.wp_fractional_scale_manager_v1, surface->wl_surface);
++        if (surface->wp_fractional_scale)
++            wp_fractional_scale_v1_add_listener(surface->wp_fractional_scale,
++                                                &fractional_scale_listener, surface);
++    }
++
+     surface->window.scale = 1.0;
+ 
+     return surface;
+@@ -212,6 +319,12 @@ void wayland_surface_destroy(struct wayland_surface *surface)
+ 
+     wayland_surface_clear_role(surface);
+ 
++    if (surface->wp_fractional_scale)
++    {
++        wp_fractional_scale_v1_destroy(surface->wp_fractional_scale);
++        surface->wp_fractional_scale = NULL;
++    }
++
+     if (surface->wp_viewport)
+     {
+         wp_viewport_destroy(surface->wp_viewport);
+@@ -241,19 +354,86 @@ void wayland_surface_destroy(struct wayland_surface *surface)
+     free(surface);
+ }
+ 
++static void zxdg_toplevel_decoration_v1_configure(void *user_data,
++                                                  struct zxdg_toplevel_decoration_v1 *decoration,
++                                                  uint32_t mode)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++    HWND hwnd = user_data;
++
++    if ((data = wayland_win_data_get(hwnd)))
++    {
++        if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
++        {
++            TRACE("got mode %u for surface %p\n", mode, surface);
++            surface->pending.decor = mode;
++        }
++        wayland_win_data_release(data);
++    }
++}
++
++static const struct zxdg_toplevel_decoration_v1_listener zxdg_toplevel_decoration_listener =
++{
++    zxdg_toplevel_decoration_v1_configure
++};
++
++/* Request server-side decorations: the compositor draws the title bar/frame
++ * with the desktop theme. The compositor then configures the actual mode. */
++static void wayland_surface_init_decoration(struct wayland_surface *surface)
++{
++    TRACE("surface %p\n", surface);
++
++    if (!process_wayland.zxdg_decoration_manager_v1) return;
++
++    surface->current.decor = 0;
++    surface->zxdg_toplevel_decoration_v1 =
++        zxdg_decoration_manager_v1_get_toplevel_decoration(
++            process_wayland.zxdg_decoration_manager_v1, surface->xdg_toplevel);
++    if (!surface->zxdg_toplevel_decoration_v1)
++    {
++        ERR("Failed to create toplevel zxdg_toplevel_decoration_v1\n");
++        return;
++    }
++    zxdg_toplevel_decoration_v1_set_mode(surface->zxdg_toplevel_decoration_v1,
++                                         ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
++    zxdg_toplevel_decoration_v1_add_listener(surface->zxdg_toplevel_decoration_v1,
++                                             &zxdg_toplevel_decoration_listener,
++                                             surface->hwnd);
++}
++
+ /**********************************************************************
+  *          wayland_surface_make_toplevel
+  *
+  * Gives the toplevel role to a plain wayland surface.
+  */
+-void wayland_surface_make_toplevel(struct wayland_surface *surface)
++void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor)
+ {
+     WCHAR text[1024];
+ 
+     TRACE("surface=%p\n", surface);
+ 
+     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL);
+-    if (surface->xdg_surface && surface->xdg_toplevel) return;
++    if (surface->xdg_surface && surface->xdg_toplevel)
++    {
++        /* Already a toplevel: just toggle the decoration to match the window's
++         * current style (a window can gain/lose its caption while mapped). */
++        if (process_wayland.zxdg_decoration_manager_v1)
++        {
++            if (!server_decor && surface->zxdg_toplevel_decoration_v1)
++            {
++                zxdg_toplevel_decoration_v1_destroy(surface->zxdg_toplevel_decoration_v1);
++                surface->zxdg_toplevel_decoration_v1 = NULL;
++                surface->pending.decor = surface->current.decor = 0;
++            }
++            else if (server_decor && !surface->zxdg_toplevel_decoration_v1)
++                wayland_surface_init_decoration(surface);
++
++            wl_surface_commit(surface->wl_surface);
++            wl_display_flush(process_wayland.wl_display);
++        }
++        return;
++    }
+ 
+     wayland_surface_clear_role(surface);
+     surface->role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+@@ -276,6 +456,8 @@ void wayland_surface_make_toplevel(struct wayland_surface *surface)
+ 
+     wayland_surface_assign_icon(surface);
+ 
++    if (server_decor) wayland_surface_init_decoration(surface);
++
+     wl_surface_commit(surface->wl_surface);
+     wl_display_flush(process_wayland.wl_display);
+ 
+@@ -327,6 +509,113 @@ err:
+     ERR("Failed to assign subsurface role to wayland surface\n");
+ }
+ 
++/* Build an xdg_positioner that places the popup at (config->x, config->y)
++ * relative to the owner window's top-left, in surface-local coords. */
++static struct xdg_positioner *popup_create_positioner(struct wayland_surface *owner,
++                                                      struct wayland_surface_config *config)
++{
++    struct xdg_positioner *xdg_positioner =
++        xdg_wm_base_create_positioner(process_wayland.xdg_wm_base);
++
++    if (!xdg_positioner) return NULL;
++
++    xdg_positioner_set_anchor_rect(xdg_positioner, owner->geometry.left,
++                                   owner->geometry.top, 1, 1);
++    xdg_positioner_set_anchor(xdg_positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
++    xdg_positioner_set_gravity(xdg_positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
++    xdg_positioner_set_offset(xdg_positioner, config->x, config->y);
++    xdg_positioner_set_size(xdg_positioner, config->width, config->height);
++    /* Let the compositor slide the popup to keep it on-screen. Slide-only keeps
++     * the size constant so it stays consistent with our fixed menu buffer and
++     * window geometry (flip/resize would change size/orientation). */
++    xdg_positioner_set_constraint_adjustment(xdg_positioner,
++        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
++
++    return xdg_positioner;
++}
++
++/**********************************************************************
++ *          wayland_surface_make_popup
++ *
++ * Gives the popup role to a plain wayland surface, anchored to an owner
++ * (toplevel) surface. The compositor positions and constrains it.
++ */
++void wayland_surface_make_popup(struct wayland_surface *surface,
++                                struct wayland_surface *owner,
++                                const RECT *rect)
++{
++    struct wayland_surface_config config = {0};
++    struct xdg_positioner *xdg_positioner = NULL;
++
++    config.x = rect->left - owner->window.rect.left;
++    config.y = rect->top - owner->window.rect.top;
++    config.width = rect->right - rect->left;
++    config.height = rect->bottom - rect->top;
++
++    assert(owner->xdg_surface);
++    assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_POPUP);
++
++    /* Already a popup of this owner: just reposition if the geometry changed. */
++    if (surface->xdg_popup && surface->owner_hwnd == owner->hwnd)
++    {
++        if (!surface->current.serial) return;
++        wayland_surface_coords_from_window(surface, config.x, config.y,
++                                           &config.x, &config.y);
++        wayland_surface_coords_from_window(surface, config.width, config.height,
++                                           &config.width, &config.height);
++
++        if (popup_config_changed(&surface->current, &config))
++        {
++            if (!(xdg_positioner = popup_create_positioner(owner, &config)))
++            {
++                ERR("Failed to create positioner!\n");
++                return;
++            }
++            xdg_popup_reposition(surface->xdg_popup, xdg_positioner, 0);
++            xdg_positioner_destroy(xdg_positioner);
++            wl_surface_commit(surface->wl_surface);
++            wl_display_flush(process_wayland.wl_display);
++        }
++        return;
++    }
++
++    wayland_surface_clear_role(surface);
++    surface->role = WAYLAND_SURFACE_ROLE_POPUP;
++
++    TRACE("surface=%p owner=%p rect=%s\n", surface, owner, wine_dbgstr_rect(rect));
++
++    surface->xdg_surface = xdg_wm_base_get_xdg_surface(process_wayland.xdg_wm_base,
++                                                       surface->wl_surface);
++    if (!surface->xdg_surface) goto err;
++    xdg_surface_add_listener(surface->xdg_surface, &xdg_surface_listener, surface->hwnd);
++
++    /* Seed the popup scale from the owner so the positioner math is in the
++     * owner's coordinate space. */
++    surface->window.scale = owner->window.scale;
++
++    wayland_surface_coords_from_window(surface, config.x, config.y, &config.x, &config.y);
++    wayland_surface_coords_from_window(surface, config.width, config.height,
++                                       &config.width, &config.height);
++
++    if (!(xdg_positioner = popup_create_positioner(owner, &config))) goto err;
++
++    surface->xdg_popup = xdg_surface_get_popup(surface->xdg_surface, owner->xdg_surface,
++                                               xdg_positioner);
++    xdg_positioner_destroy(xdg_positioner);
++    if (!surface->xdg_popup) goto err;
++    xdg_popup_add_listener(surface->xdg_popup, &xdg_popup_listener, surface->hwnd);
++
++    surface->owner_hwnd = owner->hwnd;
++    wl_surface_commit(surface->wl_surface);
++    wl_display_flush(process_wayland.wl_display);
++
++    return;
++err:
++    wayland_surface_clear_role(surface);
++    ERR("Failed to assign popup role to wayland surface\n");
++}
++
+ /**********************************************************************
+  *          wayland_surface_clear_role
+  *
+@@ -343,6 +632,22 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+     case WAYLAND_SURFACE_ROLE_NONE:
+         break;
+ 
++    case WAYLAND_SURFACE_ROLE_POPUP:
++        if (surface->xdg_popup)
++        {
++            xdg_popup_destroy(surface->xdg_popup);
++            surface->xdg_popup = NULL;
++        }
++
++        if (surface->xdg_surface)
++        {
++            xdg_surface_destroy(surface->xdg_surface);
++            surface->xdg_surface = NULL;
++        }
++
++        surface->owner_hwnd = 0;
++        break;
++
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         if (surface->xdg_toplevel_icon)
+         {
+@@ -353,6 +658,12 @@ void wayland_surface_clear_role(struct wayland_surface *surface)
+             surface->xdg_toplevel_icon = NULL;
+         }
+ 
++        if (surface->zxdg_toplevel_decoration_v1)
++        {
++            zxdg_toplevel_decoration_v1_destroy(surface->zxdg_toplevel_decoration_v1);
++            surface->zxdg_toplevel_decoration_v1 = NULL;
++        }
++
+         if (surface->xdg_toplevel)
+         {
+             xdg_toplevel_destroy(surface->xdg_toplevel);
+@@ -561,6 +872,8 @@ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface
+                                         rect.left, rect.top,
+                                         rect.right - rect.left,
+                                         rect.bottom - rect.top);
++        /* Remember the geometry; popups anchor against their owner's. */
++        surface->geometry = rect;
+     }
+ }
+ 
+@@ -637,7 +950,10 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
+     {
+         surface->current = surface->processing;
+         memset(&surface->processing, 0, sizeof(surface->processing));
+-        xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
++        /* If a decoration change occurred during the initial configure, avoid
++         * a double ack as that would cause a protocol error. */
++        if (surface->processing.serial != surface->current.serial)
++            xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+     }
+     /* If this is the initial configure, and we have a compatible requested
+      * config, use that, in order to draw windows that don't go through the
+@@ -649,6 +965,9 @@ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
+     {
+         surface->current = surface->requested;
+         memset(&surface->requested, 0, sizeof(surface->requested));
++        /* Decoration changes must go through the message loop. */
++        surface->requested.decor = surface->current.decor;
++        surface->current.decor = 0;
+         xdg_surface_ack_configure(surface->xdg_surface, surface->current.serial);
+     }
+     else if (!surface->current.serial ||
+@@ -726,6 +1045,7 @@ BOOL wayland_surface_reconfigure(struct wayland_surface *surface)
+     case WAYLAND_SURFACE_ROLE_NONE:
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
++    case WAYLAND_SURFACE_ROLE_POPUP:
+         if (!surface->xdg_surface) break; /* surface role has been cleared */
+         if (!wayland_surface_reconfigure_xdg(surface, width, height)) return FALSE;
+         break;
+@@ -1163,6 +1483,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         }
+ 
+         client->toplevel = 0;
++        client->toplevel_wl_surface = NULL;
+         return;
+     }
+ 
+@@ -1172,7 +1493,10 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         return;
+     }
+ 
+-    if (client->toplevel != toplevel)
++    /* Reparent if the toplevel changed, or if the toplevel's wl_surface was
++     * recreated (e.g. a role change to/from an unmanaged popup/subsurface left
++     * the client subsurface parented to a now-destroyed wl_surface). */
++    if (client->toplevel != toplevel || client->toplevel_wl_surface != surface->wl_surface)
+     {
+         wayland_client_surface_attach(client, NULL);
+ 
+@@ -1189,6 +1513,7 @@ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND t
+         wl_subsurface_set_desync(client->wl_subsurface);
+ 
+         client->toplevel = toplevel;
++        client->toplevel_wl_surface = surface->wl_surface;
+     }
+ 
+     NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 5f4bd6a7cf6..14599c4e587 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -34,6 +34,8 @@
+ #include "relative-pointer-unstable-v1-client-protocol.h"
+ #include "text-input-unstable-v3-client-protocol.h"
+ #include "viewporter-client-protocol.h"
++#include "fractional-scale-v1-client-protocol.h"
++#include "xdg-decoration-unstable-v1-client-protocol.h"
+ #include "xdg-output-unstable-v1-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
+@@ -83,6 +85,7 @@ enum wayland_surface_role
+     WAYLAND_SURFACE_ROLE_NONE,
+     WAYLAND_SURFACE_ROLE_TOPLEVEL,
+     WAYLAND_SURFACE_ROLE_SUBSURFACE,
++    WAYLAND_SURFACE_ROLE_POPUP,
+ };
+ 
+ struct wayland_keyboard
+@@ -171,6 +174,8 @@ struct wayland
+     struct xdg_wm_base *xdg_wm_base;
+     struct wl_shm *wl_shm;
+     struct wp_viewporter *wp_viewporter;
++    struct wp_fractional_scale_manager_v1 *wp_fractional_scale_manager_v1;
++    struct zxdg_decoration_manager_v1 *zxdg_decoration_manager_v1;
+     struct wl_subcompositor *wl_subcompositor;
+     struct zwp_pointer_constraints_v1 *zwp_pointer_constraints_v1;
+     struct zwp_relative_pointer_manager_v1 *zwp_relative_pointer_manager_v1;
+@@ -222,8 +227,10 @@ struct wayland_output
+ 
+ struct wayland_surface_config
+ {
++    int32_t x, y;
+     int32_t width, height;
+     enum wayland_surface_config_state state;
++    enum zxdg_toplevel_decoration_v1_mode decor;
+     uint32_t serial;
+     BOOL processed;
+ };
+@@ -231,6 +238,9 @@ struct wayland_surface_config
+ struct wayland_window_config
+ {
+     RECT rect;
++    /* The full window rect including the non-client frame; rect excludes any
++     * frame that the compositor draws (server-side decorations). */
++    RECT window_rect;
+     RECT client_rect;
+     enum wayland_surface_config_state state;
+     /* The scale (i.e., normalized dpi) the window is rendering at. */
+@@ -245,6 +255,10 @@ struct wayland_client_surface
+     struct client_surface client;
+     HWND toplevel;
+     struct wl_surface *wl_surface;
++    /* The parent wl_surface the client subsurface is currently attached to.
++     * Tracked so we can reparent when the toplevel's wayland_surface (and thus
++     * its wl_surface) is recreated by a role change, e.g. toplevel->popup. */
++    struct wl_surface *toplevel_wl_surface;
+     struct wl_subsurface *wl_subsurface;
+     struct wp_viewport *wp_viewport;
+ };
+@@ -268,17 +282,29 @@ struct wayland_surface
+ 
+     struct wl_surface *wl_surface;
+     struct wp_viewport *wp_viewport;
++    struct wp_fractional_scale_v1 *wp_fractional_scale;
++    /* compositor's preferred fractional scale (0 if none received yet) */
++    double preferred_scale;
+     struct wayland_shm_buffer *small_icon_buffer;
+     struct wayland_shm_buffer *big_icon_buffer;
+ 
+     enum wayland_surface_role role;
++
++    /* shared by the toplevel and popup roles */
++    struct xdg_surface *xdg_surface;
++
+     union
+     {
+         struct
+         {
+-            struct xdg_surface *xdg_surface;
+             struct xdg_toplevel *xdg_toplevel;
+             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
++            struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1;
++        };
++        struct
++        {
++            struct xdg_popup *xdg_popup;
++            HWND owner_hwnd;
+         };
+         struct
+         {
+@@ -288,6 +314,8 @@ struct wayland_surface
+     };
+ 
+     struct wayland_surface_config pending, requested, processing, current;
++    /* the last xdg_surface window geometry set on this surface */
++    RECT geometry;
+     BOOL resizing;
+     struct wayland_window_config window;
+     int content_width, content_height;
+@@ -314,9 +342,11 @@ void wayland_output_use_xdg_extension(struct wayland_output *output);
+ 
+ struct wayland_surface *wayland_surface_create(HWND hwnd);
+ void wayland_surface_destroy(struct wayland_surface *surface);
+-void wayland_surface_make_toplevel(struct wayland_surface *surface);
++void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor);
+ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+                                      struct wayland_surface *parent);
++void wayland_surface_make_popup(struct wayland_surface *surface,
++                                struct wayland_surface *owner, const RECT *rect);
+ void wayland_surface_clear_role(struct wayland_surface *surface);
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+@@ -343,6 +373,11 @@ static inline BOOL wayland_surface_is_toplevel(struct wayland_surface *surface)
+     return surface->role == WAYLAND_SURFACE_ROLE_TOPLEVEL && surface->xdg_toplevel;
+ }
+ 
++static inline BOOL wayland_surface_is_popup(struct wayland_surface *surface)
++{
++    return surface->role == WAYLAND_SURFACE_ROLE_POPUP && surface->xdg_popup;
++}
++
+ /**********************************************************************
+  *          Wayland SHM buffer
+  */
+@@ -436,6 +471,29 @@ static inline LRESULT send_message(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
+     return NtUserMessageCall(hwnd, msg, wparam, lparam, NULL, NtUserSendMessage, FALSE);
+ }
+ 
++/* Whether a window should get server-side decorations: a captioned window that
++ * isn't a layered (transparent/splash) window.
++ *
++ * NEUTRON divergence from upstream EM: upstream also excludes WS_EX_TOOLWINDOW.
++ * Adobe's Premiere home/Welcome window is a WS_EX_TOOLWINDOW that nonetheless
++ * carries a full WS_CAPTION|WS_SYSMENU|WS_THICKFRAME and is a primary, user-
++ * facing toplevel. Excluding it leaves it with Wine's built-in (Win95) frame
++ * while every other window gets the themed compositor frame. Since the user
++ * opted into themed decorations for all managed windows, allow tool windows
++ * that present a real caption (i.e. have WS_SYSMENU, distinguishing them from
++ * thin-frame tooltip/palette helpers) to get server-side decorations too. */
++static inline BOOL is_decoration_enabled(DWORD style, DWORD ex_style)
++{
++    if (ex_style & WS_EX_LAYERED) return FALSE;
++
++    if ((ex_style & WS_EX_TOOLWINDOW) && !(style & WS_SYSMENU)) return FALSE;
++
++    if ((style & WS_CAPTION) == WS_CAPTION)
++        return TRUE;
++
++    return FALSE;
++}
++
+ RGNDATA *get_region_data(HRGN region);
+ 
+ /**********************************************************************
+@@ -460,6 +518,8 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+                               const struct window_rects *new_rects, struct window_surface *surface);
+ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects);
+ BOOL WAYLAND_CreateWindowSurface(HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface);
++BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask);
++BOOL WAYLAND_HasWindowManager(const char *name);
+ UINT WAYLAND_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
+ UINT WAYLAND_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
+ 
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index b7a8a29be70..da84f67d299 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -53,6 +53,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pWindowPosChanged = WAYLAND_WindowPosChanged,
+     .pWindowPosChanging = WAYLAND_WindowPosChanging,
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
++    .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pVulkanInit = WAYLAND_VulkanInit,
+     .pOpenGLInit = WAYLAND_OpenGLInit,
+ };
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 88eee3421d7..859dd6882c9 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -153,7 +153,10 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+     enum wayland_surface_config_state window_state = 0;
+     DWORD style;
+ 
+-    conf->rect = data->rects.window;
++    /* rect is the surface-backed (visible) area, which excludes any frame the
++     * compositor draws server-side; window_rect is the full Win32 window rect. */
++    conf->rect = data->rects.visible;
++    conf->window_rect = data->rects.window;
+     conf->client_rect = data->rects.client;
+     style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+ 
+@@ -176,6 +179,11 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+ 
+     conf->state = window_state;
+     conf->scale = NtUserGetSystemDpiForProcess(0) / 96.0;
++    /* NEUTRON: if the compositor advertised a precise fractional scale for this
++     * surface, use it (exact 1.70 vs DPI-derived 1.6979) so the device-resolution
++     * buffer maps 1:1 to the output with no fractional resample. */
++    if (data->wayland_surface && data->wayland_surface->preferred_scale > 0.0)
++        conf->scale = data->wayland_surface->preferred_scale;
+     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
+     conf->managed = data->managed;
+ }
+@@ -188,21 +196,25 @@ static void reapply_cursor_clipping(void)
+     NtUserSetThreadDpiAwarenessContext(context);
+ }
+ 
+-static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data, struct wayland_surface *toplevel_surface)
++static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
++                                                    struct wayland_surface *toplevel_surface,
++                                                    struct wayland_surface *owner_surface)
+ {
+     struct wayland_client_surface *client = data->client_surface;
+     struct wayland_surface *surface;
+     enum wayland_surface_role role;
+-    BOOL visible;
++    BOOL visible, server_decor = FALSE;
+     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
++    DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+     struct wl_region *input_region;
+ 
+     TRACE("hwnd=%p\n", data->hwnd);
+ 
+-    visible = ((NtUserGetWindowLongW(data->hwnd, GWL_STYLE) & WS_VISIBLE) == WS_VISIBLE) &&
++    visible = ((style & WS_VISIBLE) == WS_VISIBLE) &&
+                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
++    else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 
+@@ -224,6 +236,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+     wl_surface_set_input_region(surface->wl_surface, input_region);
+     if (input_region) wl_region_destroy(input_region);
+ 
++    /* win32u shrinks the visible (surface-backed) rect below the full window rect
++     * exactly when the driver advertises it manages the frame (GetWindowStyleMasks);
++     * that difference is our cue to ask the compositor for server-side decorations. */
++    if (!EqualRect(&data->rects.visible, &data->rects.window) &&
++        is_decoration_enabled(style, exstyle))
++    {
++        server_decor = TRUE;
++    }
++
+     /* If the window is a visible toplevel make it a wayland
+      * xdg_toplevel. Otherwise keep it role-less to avoid polluting the
+      * compositor with empty xdg_toplevels. */
+@@ -233,11 +254,14 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+         wayland_surface_clear_role(surface);
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+-        wayland_surface_make_toplevel(surface);
++        wayland_surface_make_toplevel(surface, server_decor);
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         wayland_surface_make_subsurface(surface, toplevel_surface);
+         break;
++    case WAYLAND_SURFACE_ROLE_POPUP:
++        wayland_surface_make_popup(surface, owner_surface, &data->rects.window);
++        break;
+     }
+ 
+     if (visible && client) wayland_client_surface_attach(client, data->hwnd);
+@@ -309,6 +333,8 @@ static void wayland_win_data_update_wayland_state(struct wayland_win_data *data)
+     switch (surface->role)
+     {
+     case WAYLAND_SURFACE_ROLE_NONE:
++    /* Popups are positioned by the compositor and have no extra state to set. */
++    case WAYLAND_SURFACE_ROLE_POPUP:
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         if (!surface->xdg_surface) break; /* surface role has been cleared */
+@@ -446,10 +472,10 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
+-    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+-    struct wayland_surface *toplevel_surface;
++    HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL;
++    struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
+     struct wayland_client_surface *client;
+-    struct wayland_win_data *data, *toplevel_data;
++    struct wayland_win_data *data, *toplevel_data, *owner_data;
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+ 
+     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
+@@ -457,11 +483,60 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+-    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) toplevel = owner_hint;
++    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+-    toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
+-    toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
++
++    /* GPU windows (splash screens, GL/Vulkan content) carry a client surface;
++     * they keep the classic subsurface-of-owner behavior. Only lightweight SHM
++     * popups (menus) — which are the ones hit by the compositor subsurface
++     * clipping bug — are promoted to xdg_popup. */
++    if (owner && data->client_surface)
++    {
++        toplevel = owner;
++        owner = NULL;
++    }
++
++    owner_data = owner && owner != hwnd ? wayland_win_data_get_nolock(owner) : NULL;
++    owner_surface = owner_data ? owner_data->wayland_surface : NULL;
++
++    /* Promote an owned, unmanaged window to an xdg_popup only when:
++     *  - its owner is already a mapped xdg_surface (toplevel or popup),
++     *  - it isn't already a subsurface — re-roling a live surface destroys and
++     *    recreates it, leaving a ghost frame; and menus reach this on first show
++     *    anyway since their owner (the main window) is already mapped,
++     *  - the owner relationship isn't circular.
++     * Otherwise fall back to the classic behavior: a subsurface of the owner.
++     * This keeps a popup candidate whose owner isn't ready yet (e.g. a splash
++     * sub-window) as a subsurface of its owner, rather than briefly flashing as
++     * a standalone toplevel (which showed as a ghost second window). */
++    if (owner_surface && owner_surface->xdg_surface &&
++        !(data->wayland_surface &&
++          data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE) &&
++        !((owner_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++           owner_surface->toplevel_hwnd == hwnd) ||
++          (owner_surface->role == WAYLAND_SURFACE_ROLE_POPUP &&
++           owner_surface->owner_hwnd == hwnd)))
++    {
++        /* popup: anchored to its owner, not a subsurface of any toplevel */
++        toplevel_data = NULL;
++        toplevel_surface = NULL;
++    }
++    else
++    {
++        BOOL is_cycle = owner_surface &&
++            ((owner_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++              owner_surface->toplevel_hwnd == hwnd) ||
++             (owner_surface->role == WAYLAND_SURFACE_ROLE_POPUP &&
++              owner_surface->owner_hwnd == hwnd));
++        owner_surface = NULL;
++        owner_data = NULL;
++        /* Become a subsurface of the owner (classic), unless that would form a
++         * cycle, in which case fall back to the root toplevel. */
++        if (owner && !is_cycle) toplevel = owner;
++        toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
++        toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
++    }
+ 
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+@@ -483,7 +558,7 @@ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
+             data->wayland_surface = NULL;
+         }
+     }
+-    else if (wayland_win_data_create_wayland_surface(data, toplevel_surface))
++    else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface))
+     {
+         wayland_win_data_update_wayland_state(data);
+     }
+@@ -495,7 +570,7 @@ static void wayland_configure_window(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+     INT width, height, window_width, window_height;
+-    INT window_surf_width, window_surf_height;
++    INT window_surf_width, window_surf_height, offset_x = 0, offset_y = 0;
+     UINT flags = 0;
+     uint32_t state;
+     DWORD style;
+@@ -521,9 +596,22 @@ static void wayland_configure_window(HWND hwnd)
+ 
+     if (!surface->requested.serial)
+     {
+-        TRACE("requested configure event already handled, returning\n");
+-        wayland_win_data_release(data);
+-        return;
++        /* A decoration-mode change carries no new xdg serial, but still needs to
++         * run through a configure so the frame change is applied. */
++        if (surface->requested.decor && surface->current.serial &&
++            surface->requested.decor != surface->current.decor)
++        {
++            enum zxdg_toplevel_decoration_v1_mode decor = surface->requested.decor;
++            surface->requested = surface->current;
++            surface->requested.decor = decor;
++            surface->requested.processed = FALSE;
++        }
++        else
++        {
++            TRACE("requested configure event already handled, returning\n");
++            wayland_win_data_release(data);
++            return;
++        }
+     }
+ 
+     surface->processing = surface->requested;
+@@ -561,6 +649,11 @@ static void wayland_configure_window(HWND hwnd)
+     {
+         flags |= SWP_FRAMECHANGED;
+     }
++    /* Transitions between decoration modes may entail a frame change. */
++    else if (surface->processing.decor != surface->current.decor)
++    {
++        flags |= SWP_FRAMECHANGED;
++    }
+ 
+     wayland_surface_coords_from_window(surface,
+                                        surface->window.rect.right -
+@@ -584,6 +677,20 @@ static void wayland_configure_window(HWND hwnd)
+     wayland_surface_coords_to_window(surface, width, height,
+                                      &window_width, &window_height);
+ 
++    /* With server-side decorations the compositor reports the visible (content)
++     * size, but the Win32 window rect includes the frame the compositor draws.
++     * Add the frame extents back so the window is sized to include them. */
++    offset_x = (surface->window.rect.left - surface->window.window_rect.left) +
++               (surface->window.window_rect.right - surface->window.rect.right);
++    offset_y = (surface->window.rect.top - surface->window.window_rect.top) +
++               (surface->window.window_rect.bottom - surface->window.rect.bottom);
++    if (window_width && window_height &&
++        surface->processing.decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
++    {
++        window_width += offset_x;
++        window_height += offset_y;
++    }
++
+     /* Detect a restore from an application-initiated minimize: the last
+      * requested config placed the window at the offscreen sentinel position
+      * with WS_MINIMIZE, and the compositor is now sending a configure. Ack
+@@ -808,6 +915,68 @@ LRESULT WAYLAND_SysCommand(HWND hwnd, WPARAM wparam, LPARAM lparam, const POINT
+     return ret;
+ }
+ 
++/***********************************************************************
++ *          WAYLAND_HasWindowManager
++ *
++ * Reports whether the session's desktop matches `name` (XDG_CURRENT_DESKTOP).
++ * Used to gate features (e.g. server-side decorations) to compositors known to
++ * support them well. The special name "waylanddrv" always matches.
++ */
++BOOL WAYLAND_HasWindowManager(const char *name)
++{
++    static int once;
++    const char *env = getenv("XDG_CURRENT_DESKTOP");
++
++    if (!once++) TRACE("DE: %s\n", debugstr_a(env));
++
++    if (!strcmp("waylanddrv", name)) return TRUE;
++    if (env && !strcmp(env, name)) return TRUE;
++
++    return FALSE;
++}
++
++/***********************************************************************
++ *          WAYLAND_GetWindowStyleMasks
++ *
++ * Tells win32u which window-style bits the driver/compositor manages (so win32u
++ * stops drawing that frame itself and shrinks the visible rect accordingly). We
++ * claim the caption/frame styles for managed toplevels that have server-side
++ * decorations available and enabled.
++ */
++BOOL WAYLAND_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask)
++{
++    BOOL ret = TRUE;
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++
++    TRACE("%p %x %x %p %p\n", hwnd, style, ex_style, style_mask, ex_style_mask);
++
++    *style_mask = *ex_style_mask = 0;
++
++    if (!process_wayland.zxdg_decoration_manager_v1) return FALSE;
++
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++
++    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
++    {
++        if (!data->managed) ret = FALSE;
++        else if (surface->current.decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE)
++            ret = FALSE;
++    }
++
++    wayland_win_data_release(data);
++
++    if (ret) ret = is_decoration_enabled(style, ex_style);
++
++    if (ret)
++    {
++        *style_mask |= WS_CAPTION | WS_DLGFRAME | WS_THICKFRAME;
++        *ex_style_mask |= WS_EX_DLGMODALFRAME;
++    }
++
++    return ret;
++}
++
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
+ {
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT);

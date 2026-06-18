@@ -3,46 +3,32 @@
 Patches are applied on top of the upstream Wine base (see `../build/WINE_BASE`) by `../build/build.sh`,
 which drops them into `wine-tkg-git/wine-tkg-userpatches/` (wine-tkg applies every `*.mypatch` there).
 
-Order is mostly insignificant — patches touch distinct files/regions — with one exception:
-`neutron-winewayland-xdg-popup` applies on top of `neutron-winewayland-fractional-scale` (same
-`winewayland.drv` files). wine-tkg applies `*.mypatch` alphabetically, which already orders
-`fractional-scale` before `xdg-popup`, so no manual ordering is needed.
+Order is insignificant — patches touch distinct files/regions, and each is generated against the
+**staging-applied base** (not plain upstream), so every patch applies cleanly on the wine-tkg staging
+tree in any order (verified: the full set reproduces the working source byte-for-byte). wine-tkg applies
+`*.mypatch` alphabetically. The build requires `_user_patches_no_confirm="true"` in `customization.cfg`
+(else userpatches are silently skipped on a non-interactive build).
 
 ## Production (`patches/`)
 
-### `neutron-winewayland-fractional-scale.mypatch`
-Adds `wp_fractional_scale_v1` support to `winewayland.drv` so the UI buffer maps **1:1** to a
-fractional-scaled output (e.g. 4K @ 1.7×) instead of being compositor-upscaled (blurry). Binds the
-manager, listens for `preferred_scale`, and uses that exact scale for `conf->scale`. Pairs with the
-engine setting `LogPixels = round(96 × scale)` so System-DPI-aware Adobe apps render at device resolution.
-Touches: `Makefile.in`, `fractional-scale-v1.xml`, `wayland.c`, `wayland_surface.c`, `waylanddrv.h`,
-`window.c`.
+### `neutron-winewayland.mypatch`
+Combined `winewayland.drv` patch — fractional-scale + xdg_popup menus + client-side decorations. These
+three were originally separate patches but overlap heavily in the same `winewayland.drv` files and are
+interdependent, so they're maintained as one patch that applies cleanly on the staging base.
+- **fractional-scale**: `wp_fractional_scale_v1` so the UI buffer maps **1:1** to a fractional-scaled
+  output (e.g. 4K @ 1.7×) instead of being compositor-upscaled (blurry). Binds the manager, uses
+  `preferred_scale` for `conf->scale`. Pairs with engine `LogPixels = round(96 × scale)`.
+- **xdg_popup menus**: renders Premiere's menu-bar dropdowns as `xdg_popup` (not `wl_subsurface`) so KWin
+  positions/constrains/displays them fully (subsurface popups get bottom-clipped). Lightweight SHM menus
+  only; bumps `xdg_wm_base` to v3 (set_offset/reposition; must not exceed v3). Backport/adaptation of
+  Proton-EM / proton-cachyos 11.0-20260601 (@Etaash-mathamsetty).
+- **CSD decoration**: Wine draws its own non-client frame, themed dark via the prefix Control Panel colors
+  (default; `WAYLANDDRV_SSD=1` opts into compositor-drawn frames). Self-contained in the prefix, no
+  multi-monitor overflow, independent of KWin's global decoration theme. Also implements
+  `zxdg_decoration_manager_v1` + `pGetWindowStyleMasks` for the SSD opt-in.
 
-### `neutron-winewayland-xdg-popup.mypatch`
-Renders Premiere's menu-bar dropdowns as **`xdg_popup`** surfaces instead of `wl_subsurface`s. KWin
-clips the bottom of a desync subsurface popup even when it is fully painted, correctly sized and on
-screen (proven: byte-identical menu shows fully under X11; clip persists at scale 1.0); `xdg_popup` lets
-the compositor position, constrain and display it. Only lightweight SHM menus take the popup path —
-GPU/client-surface windows (the splash) and windows already realized as subsurfaces keep the classic
-subsurface-of-owner path, avoiding role churn / ghost frames. Bumps the `xdg_wm_base` bind from v2 to
-**v3** (needed for `xdg_positioner.set_offset` + `xdg_popup.reposition`); must not exceed v3 or KWin emits
-`xdg_toplevel` v4/v5 events the 2-entry listener can't dispatch (aborts libwayland). Also reparents a
-client subsurface when its toplevel's `wl_surface` is recreated by a role change (fixes a torn splash).
-Backport/adaptation of Proton-EM / proton-cachyos 11.0-20260601 (@Etaash-mathamsetty). Applies on top of
-`neutron-winewayland-fractional-scale`. Touches: `wayland.c`, `wayland_surface.c`, `waylanddrv.h`,
-`window.c`.
-
-### `neutron-winewayland-decoration.mypatch`
-Optional **server-side** (`xdg-decoration`) window decorations, **off by default**. Neutron uses
-**client-side** decorations — Wine draws its own NC, themed dark via the prefix's Control Panel colors
-(`neutron-decoration/neutron-premiere-dark.reg`) — so the title bar is part of the window surface:
-self-contained in the prefix, never overflows onto a second monitor, independent of the compositor's
-global decoration theme (KWin has no per-app decoration). `WAYLANDDRV_SSD=1` opts into compositor-drawn
-frames. When enabled, implements `zxdg_decoration_manager_v1` + the `pGetWindowStyleMasks` hook (v2, or
-v1 gated to KDE). Premiere fights compositor resize/maximize and overflows on multi-monitor under SSD,
-hence CSD is the default. Applies on top of `neutron-winewayland-xdg-popup`. Touches: `Makefile.in`,
-`xdg-decoration-unstable-v1.xml`, `wayland.c`, `waylanddrv.h`, `waylanddrv_main.c`, `window.c`,
-`wayland_surface.c`.
+Touches: `dlls/winewayland.drv/{Makefile.in, fractional-scale-v1.xml, xdg-decoration-unstable-v1.xml,
+wayland.c, wayland_surface.c, waylanddrv.h, waylanddrv_main.c, window.c}`.
 
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern
