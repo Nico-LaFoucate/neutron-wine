@@ -33,6 +33,18 @@ if [ "${INCLUDE_DIAGNOSTIC:-0}" = "1" ]; then
     cp "$REPO"/patches/diagnostic/*.mypatch "$TKGDIR/wine-tkg-userpatches/"
 fi
 
+# 3b. Force non-interactive userpatch application. The default-tkg preset sources BOTH
+# customization.cfg AND wine-tkg-profiles/advanced-customization.cfg, and the latter is
+# sourced LAST and defaults _user_patches_no_confirm="false" — which overrides our
+# customization.cfg and makes wine-tkg hit an interactive prompt that, with no TTY input,
+# silently SKIPS every userpatch (producing a stock wine). Force the setting in every cfg
+# the preset may read so the patches always auto-apply on a non-interactive build.
+for _cfg in "$TKGDIR/customization.cfg" "$TKGDIR/wine-tkg-profiles/advanced-customization.cfg"; do
+    [ -f "$_cfg" ] || continue
+    sed -i 's/^_user_patches=.*/_user_patches="true"/'                       "$_cfg"
+    sed -i 's/^_user_patches_no_confirm=.*/_user_patches_no_confirm="true"/' "$_cfg"
+done
+
 # 4. Build (non-makepkg flow). Output lands in src/<flavor>-build/.
 cd "$TKGDIR"
 ./non-makepkg-build.sh
