@@ -1,0 +1,13 @@
+diff --git a/dlls/msvcrt/except.c b/dlls/msvcrt/except.c
+index 8be9ab7c785..3ebdcdb0bb3 100644
+--- a/dlls/msvcrt/except.c
++++ b/dlls/msvcrt/except.c
+@@ -919,7 +919,7 @@ void CDECL _FindAndUnlinkFrame(frame_info *fi)
+         return;
+     }
+ 
+-    for (; cur->next; cur = cur->next)
++    for (; cur && cur->next; cur = cur->next)
+     {
+         if (cur->next == fi)
+         {

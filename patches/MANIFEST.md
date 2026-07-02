@@ -90,3 +90,15 @@ A-B pacing strategies.
 
 ### `neutron-uxp-present-probe.mypatch`
 Reads UXP surface pixels before the present blit (diagnostic for the home-screen render investigation).
+
+### `neutron-adobe-libxml2-embedded-decl.mypatch`
+Wine's bundled libxml2 rejects `<?xml …?>` declarations embedded inside elements; Adobe's Creative
+Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. Makes
+`xmlParsePITarget`/`xmlParsePI` tolerate embedded XML declarations (as Windows MSXML does). Ported from
+PhialsBasement/wine-adobe-installers (regenerated against our staging base). Required for `--method
+download` (running Adobe's own installer under Neutron).
+
+### `neutron-adobe-msvcrt-findframe-null.mypatch`
+`msvcrt!_FindAndUnlinkFrame` dereferenced NULL when the frame list is empty and the unlinked frame
+isn't the head — hit during the Adobe installer's C++ exception unwinding. One-line guard. Ported from
+PhialsBasement/wine-adobe-installers.
