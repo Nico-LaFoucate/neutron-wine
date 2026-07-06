@@ -40,16 +40,23 @@ description of each. Production patches live in `patches/`; env-gated diagnostic
 
 ```sh
 build/build.sh            # fetch wine-tkg, drop in patches/, apply the pinned config, build
+build/package.sh          # wrap the built tree into a versioned release artifact (see Releases)
 ```
 The result is a complete Wine tree; point Neutron at it with `NEUTRON_WINE=<…>/wine`.
-See the script for prerequisites and detail. (Requires the usual Wine build deps + `wine-tkg-git`'s.)
+See [`build/build.sh`](build/build.sh) for prerequisites and detail. (Requires the usual Wine build
+deps + `wine-tkg-git`'s.)
 
 ## Releases
 
-Users don't build Wine — they download a prebuilt, versioned runtime. `build/package.sh` wraps a
-built tree into a release artifact (`neutron-wine-<ver>.tar.xz` + `.sha256` + `manifest.json`) that
-attaches to a GitHub Release; Neutron's engine resolves and verifies it from the manifest. The
-release version is pinned in [`build/VERSION`](build/VERSION). Full runbook: [`RELEASING.md`](RELEASING.md).
+Users don't build Wine — they download a prebuilt, versioned runtime.
+[`build/package.sh`](build/package.sh) wraps a built tree into a release artifact
+(`neutron-wine-<ver>.tar.xz` + `.sha256` + `manifest.json`) that attaches to a GitHub Release;
+Neutron's engine resolves and verifies it from the manifest (via `neutron runtime install`). The
+release version is pinned in [`build/VERSION`](build/VERSION).
+
+**Full packaging & release runbook:** [`RELEASING.md`](RELEASING.md) — how to cut a release, how the
+engine consumes the manifest, and the patch-set/LGPL provenance notes. Per-patch descriptions live in
+[`patches/MANIFEST.md`](patches/MANIFEST.md).
 
 ## License
 
