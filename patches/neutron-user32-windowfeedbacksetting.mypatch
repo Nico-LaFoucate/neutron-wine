@@ -1,0 +1,60 @@
+diff --git a/dlls/user32/input.c b/dlls/user32/input.c
+index d375a4be782..f80f1ea54ba 100644
+--- a/dlls/user32/input.c
++++ b/dlls/user32/input.c
+@@ -741,6 +741,33 @@ BOOL WINAPI SetGestureConfig( HWND hwnd, DWORD reserved, UINT count,
+     return FALSE;
+ }
+ 
++/**********************************************************************
++ * SetWindowFeedbackSetting (USER32.@)
++ *
++ * No-op touch/pen feedback configuration. Photoshop calls this during
++ * document-window creation; without a real export the wine import stub
++ * raises an unimplemented-function exception and crashes the app.
++ */
++BOOL WINAPI SetWindowFeedbackSetting( HWND hwnd, FEEDBACK_TYPE feedback, DWORD flags,
++                                      UINT32 size, const void *configuration )
++{
++    FIXME( "hwnd %p, feedback %d, flags %#lx, size %u, configuration %p stub!\n",
++           hwnd, feedback, flags, size, configuration );
++    return TRUE;
++}
++
++/**********************************************************************
++ * GetWindowFeedbackSetting (USER32.@)
++ */
++BOOL WINAPI GetWindowFeedbackSetting( HWND hwnd, FEEDBACK_TYPE feedback, DWORD flags,
++                                      UINT32 *size, void *configuration )
++{
++    FIXME( "hwnd %p, feedback %d, flags %#lx, size %p, configuration %p stub!\n",
++           hwnd, feedback, flags, size, configuration );
++    if (size) *size = 0;
++    return FALSE;
++}
++
+ BOOL WINAPI GetPointerDeviceProperties( HANDLE device, UINT32 *count,
+                                         POINTER_DEVICE_PROPERTY *properties)
+ {
+diff --git a/dlls/user32/user32.spec b/dlls/user32/user32.spec
+index fe41f9cb2e7..f3a243b539c 100644
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -704,7 +704,7 @@
+ @ stdcall GetWindowDisplayAffinity(long ptr) NtUserGetWindowDisplayAffinity
+ @ stdcall GetWindowDpiAwarenessContext(long)
+ @ stdcall GetWindowDpiHostingBehavior(long)
+-# @ stub GetWindowFeedbackSetting
++@ stdcall GetWindowFeedbackSetting(long long long ptr ptr)
+ @ stdcall GetWindowInfo(long ptr)
+ @ stdcall GetWindowLongA(long long)
+ @ stdcall -arch=win64 GetWindowLongPtrA(long long)
+@@ -1108,7 +1108,7 @@
+ # @ stub SetWindowCompositionTransition
+ @ stdcall SetWindowContextHelpId(long long) NtUserSetWindowContextHelpId
+ @ stdcall SetWindowDisplayAffinity(long long)
+-# @ stub SetWindowFeedbackSetting
++@ stdcall SetWindowFeedbackSetting(long long long long ptr)
+ @ stdcall SetWindowLongA(long long long)
+ @ stdcall -arch=win64 SetWindowLongPtrA(long long long)
+ @ stdcall -arch=win64 SetWindowLongPtrW(long long long)

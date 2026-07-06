@@ -1,0 +1,48 @@
+# neutron-winewayland-dl-instrument.mypatch — TEMP debug markers (NEUTRON-DL) for the
+# PS win_data_mutex/critsec deadlock. Re-apply to re-instrument; NOT for production.
+--- window.c.neutron-dl.bak	2026-06-18 15:05:02.683359363 -0400
++++ window.c	2026-06-18 15:06:59.095583417 -0400
+@@ -458,6 +458,7 @@
+     struct wayland_win_data *data = wayland_win_data_get(hwnd);
+ 
+     TRACE("hwnd %p, swp_flags %04x, shaped %u, rects %s\n", hwnd, swp_flags, shaped, debugstr_window_rects(rects));
++    ERR("NEUTRON-DL WPChanging-ENTER hwnd=%p\n", hwnd);
+ 
+     if (!data && !(data = wayland_win_data_create(hwnd, rects))) return FALSE;
+ 
+@@ -479,6 +480,7 @@
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+ 
+     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
++    ERR("NEUTRON-DL WPChanged-ENTER hwnd=%p\n", hwnd);
+ 
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+@@ -564,6 +566,7 @@
+     }
+ 
+     wayland_win_data_release(data);
++    ERR("NEUTRON-DL WPChanged-LEAVE hwnd=%p\n", hwnd);
+ }
+ 
+ static void wayland_configure_window(HWND hwnd)
+--- wayland_surface.c.neutron-dl.bak	2026-06-18 15:05:02.683359363 -0400
++++ wayland_surface.c	2026-06-18 15:06:11.418860546 -0400
+@@ -50,6 +50,7 @@
+     HWND hwnd = private;
+ 
+     TRACE("serial=%u\n", serial);
++    ERR("NEUTRON-DL configure-ENTER hwnd=%p serial=%u\n", hwnd, serial);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+@@ -106,7 +107,9 @@
+      * able to flush before due to the lack of the initial configure. */
+     if (initial_configure)
+     {
++        ERR("NEUTRON-DL expose-ENTER hwnd=%p\n", hwnd);
+         NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
++        ERR("NEUTRON-DL expose-LEAVE hwnd=%p\n", hwnd);
+     }
+ }
+ 

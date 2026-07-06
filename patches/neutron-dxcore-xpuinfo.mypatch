@@ -1,0 +1,76 @@
+# neutron-dxcore-xpuinfo.mypatch
+# 2026-06-18 — Implement DXCoreAdapterProperty DedicatedAdapterMemory(7),
+#   DedicatedSystemMemory(8), SharedSystemMemory(9), IsIntegrated(12), IsDetachable(13).
+# WHY: Adobe LibXPUInfo.dll (Photoshop 2025 GPU enumeration) queries props 7 & 12;
+#   upstream Wine dxcore returned DXGI_ERROR_INVALID_CALL -> LibXPUInfo threw an
+#   unhandled C++ exception -> PS aborted at init ('unrecoverable problem').
+# ROLLBACK: restore dlls/dxcore/dxcore.c.neutron-orig.bak, rebuild; or restore the
+#   prefix DLL from neutron-wine/dll-backups/dxcore.dll.prefix-orig
+# ---
+diff --git a/dlls/dxcore/dxcore.c b/dlls/dxcore/dxcore.c
+--- a/dlls/dxcore/dxcore.c
++++ b/dlls/dxcore/dxcore.c
+@@ -110,6 +110,18 @@
+         [DriverVersion] = sizeof(LARGE_INTEGER),
+         [HardwareID] = sizeof(DXCoreHardwareID),
+         [IsHardware] = sizeof(BYTE),
++        /* NEUTRON (2026-06-18): properties required by Adobe LibXPUInfo.dll, used by
++         * Photoshop 2025 (and other CC apps) to enumerate GPU/compute devices at
++         * startup. Upstream Wine left these unimplemented, so get_property_size
++         * returned DXGI_ERROR_INVALID_CALL; LibXPUInfo treated that as fatal, threw
++         * an unhandled C++ exception, and Photoshop aborted at init with
++         * "An unrecoverable problem has occurred. Photoshop will now exit."
++         * Patch + rationale: neutron-wine/patches/neutron-dxcore-xpuinfo.mypatch. */
++        [DedicatedAdapterMemory] = sizeof(UINT64),
++        [DedicatedSystemMemory] = sizeof(UINT64),
++        [SharedSystemMemory] = sizeof(UINT64),
++        [IsIntegrated] = sizeof(BYTE),
++        [IsDetachable] = sizeof(BYTE),
+     };
+ 
+     switch (property)
+@@ -118,6 +130,12 @@
+         case DriverVersion:
+         case HardwareID:
+         case IsHardware:
++        /* NEUTRON: sizes for the LibXPUInfo-required properties (see note above). */
++        case DedicatedAdapterMemory:
++        case DedicatedSystemMemory:
++        case SharedSystemMemory:
++        case IsIntegrated:
++        case IsDetachable:
+             *size = property_sizes[property];
+             return S_OK;
+         case DriverDescription:
+@@ -185,6 +203,31 @@
+             break;
+         }
+ 
++        /* NEUTRON (2026-06-18): values for the Adobe LibXPUInfo-required properties
++         * (see the note in dxcore_adapter_get_property_size). Memory figures come from
++         * the real wined3d adapter identifier; integrated/detachable default to FALSE
++         * (assume a discrete, non-removable adapter — correct for typical desktop GPUs).
++         * DedicatedSystemMemory has no wined3d equivalent, so report 0. */
++        case DedicatedAdapterMemory:
++            *(UINT64 *)buffer = adapter->identifier.video_memory;
++            break;
++
++        case DedicatedSystemMemory:
++            *(UINT64 *)buffer = 0;
++            break;
++
++        case SharedSystemMemory:
++            *(UINT64 *)buffer = adapter->identifier.shared_system_memory;
++            break;
++
++        case IsIntegrated:
++            *(BYTE *)buffer = 0;
++            break;
++
++        case IsDetachable:
++            *(BYTE *)buffer = 0;
++            break;
++
+         default:
+             break;
+     }
