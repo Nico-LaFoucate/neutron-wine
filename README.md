@@ -44,6 +44,13 @@ build/build.sh            # fetch wine-tkg, drop in patches/, apply the pinned c
 The result is a complete Wine tree; point Neutron at it with `NEUTRON_WINE=<…>/wine`.
 See the script for prerequisites and detail. (Requires the usual Wine build deps + `wine-tkg-git`'s.)
 
+## Releases
+
+Users don't build Wine — they download a prebuilt, versioned runtime. `build/package.sh` wraps a
+built tree into a release artifact (`neutron-wine-<ver>.tar.xz` + `.sha256` + `manifest.json`) that
+attaches to a GitHub Release; Neutron's engine resolves and verifies it from the manifest. The
+release version is pinned in [`build/VERSION`](build/VERSION). Full runbook: [`RELEASING.md`](RELEASING.md).
+
 ## License
 
 LGPL-2.1 (Wine's license). See [LICENSE](LICENSE). The patches are derivative works of Wine and are

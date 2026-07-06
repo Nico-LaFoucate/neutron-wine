@@ -82,6 +82,27 @@ behind `NEUTRON_IOCP_DEBUG` (off by default — it spams stderr and drags playba
 previously a manual wineserver build; captured here so package rebuilds include it. Load-bearing.
 Touches: `server/async.c`.
 
+### `neutron-dxcore-xpuinfo.mypatch`
+Implements the `DXCoreAdapterProperty` values Adobe **LibXPUInfo.dll** queries during GPU/compute
+enumeration (`DedicatedAdapterMemory`, `DedicatedSystemMemory`, `SharedSystemMemory`, `IsIntegrated`,
+`IsDetachable`). Upstream Wine left these unimplemented → `get_property_size` returned
+`DXGI_ERROR_INVALID_CALL` → LibXPUInfo threw an unhandled C++ exception → **Photoshop 2025 aborted at
+init** ("An unrecoverable problem has occurred"). Memory figures come from the wined3d adapter
+identifier; integrated/detachable default to FALSE (discrete desktop GPU). Touches: `dlls/dxcore/dxcore.c`.
+
+### `neutron-user32-windowfeedbacksetting.mypatch`
+Adds the missing `SetWindowFeedbackSetting` (USER32) export as a no-op touch/pen feedback stub.
+Photoshop calls it during document-window creation; without a real export the import stub raises an
+unimplemented-function exception and **crashes the app on File → New**. Touches: `dlls/user32/input.c`,
+`dlls/user32/user32.spec`.
+
+### `neutron-win32u-wmpaint-circuitbreaker.mypatch`
+A `WM_PAINT` circuit-breaker in `win32u`. Once Photoshop's home screen shows, OWL's menu bar can storm
+millions of unvalidated `WM_PAINT`s while holding the AdobeOwl critical section, wedging the whole app
+shell so it never finishes loading. Drains the paint after a threshold of unvalidated repaints; a real
+`NtUserBeginPaint` resets the counter so legitimate paint/resize loops never trip it. Touches:
+`dlls/win32u/dce.c`, `dlls/win32u/message.c`.
+
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
 ### `neutron-present-timing.mypatch`
@@ -90,3 +111,20 @@ A-B pacing strategies.
 
 ### `neutron-uxp-present-probe.mypatch`
 Reads UXP surface pixels before the present blit (diagnostic for the home-screen render investigation).
+
+### `neutron-winewayland-dl-instrument.mypatch`
+Temporary `ERR("NEUTRON-DL …")` markers in `winewayland.drv` (`window.c`, `wayland_surface.c`) tracing
+`WindowPosChanging`/`WindowPosChanged` for the Photoshop `win_data_mutex` deadlock investigation.
+Self-labeled **NOT for production** — re-apply only to re-instrument.
+
+### `neutron-adobe-libxml2-embedded-decl.mypatch`
+Wine's bundled libxml2 rejects `<?xml …?>` declarations embedded inside elements; Adobe's Creative
+Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. Makes
+`xmlParsePITarget`/`xmlParsePI` tolerate embedded XML declarations (as Windows MSXML does). Ported from
+PhialsBasement/wine-adobe-installers (regenerated against our staging base). Required for `--method
+download` (running Adobe's own installer under Neutron).
+
+### `neutron-adobe-msvcrt-findframe-null.mypatch`
+`msvcrt!_FindAndUnlinkFrame` dereferenced NULL when the frame list is empty and the unlinked frame
+isn't the head — hit during the Adobe installer's C++ exception unwinding. One-line guard. Ported from
+PhialsBasement/wine-adobe-installers.

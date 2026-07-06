@@ -1,0 +1,58 @@
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index cf641c4ec2b..2470053ef37 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1709,6 +1709,12 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
+     RECT rect;
+     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+ 
++    /* NEUTRON: a real BeginPaint means the app handled the paint -> reset the
++     * WM_PAINT circuit-breaker counter (message.c) so legit paint/resize loops
++     * never trip it. */
++    { extern __thread HWND neutron_break_hwnd; extern __thread unsigned int neutron_break_count;
++      if (hwnd == neutron_break_hwnd) neutron_break_count = 0; }
++
+     NtUserHideCaret( hwnd );
+ 
+     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
+index 1428ff586f4..3b5d640244a 100644
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -4011,6 +4011,13 @@ BOOL WINAPI NtUserPostQuitMessage( INT exit_code )
+     return TRUE;
+ }
+ 
++/* NEUTRON: WM_PAINT-loop circuit-breaker state (per-thread). Reset by a real
++ * BeginPaint in dce.c so healthy paint/resize loops never trip it. Guards against
++ * a single window stuck in an unvalidated WM_PAINT loop (e.g. the AdobeOwl menu
++ * bar under winewayland) monopolizing the message loop and starving the UI. */
++__thread HWND neutron_break_hwnd;
++__thread unsigned int neutron_break_count;
++
+ /**********************************************************************
+  *           NtUserDispatchMessage  (win32u.@)
+  */
+@@ -4044,6 +4051,22 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
+ 
+     if (!msg->hwnd) return 0;
+ 
++    /* NEUTRON: circuit-breaker. If a window is dispatched WM_PAINT many times in a
++     * row with no intervening BeginPaint/validate, drain its update region once so
++     * one stuck window cannot monopolize the message loop. The count is reset by a
++     * real BeginPaint (dce.c), so healthy paint/resize loops never reach the limit. */
++    if (msg->message == WM_PAINT)
++    {
++        if (msg->hwnd == neutron_break_hwnd) neutron_break_count++;
++        else { neutron_break_hwnd = msg->hwnd; neutron_break_count = 1; }
++        if (neutron_break_count >= 2000)
++        {
++            WARN( "NEUTRON: draining stuck WM_PAINT loop on hwnd %p (>=2000 unvalidated)\n", msg->hwnd );
++            NtUserRedrawWindow( msg->hwnd, NULL, 0, RDW_VALIDATE | RDW_NOINTERNALPAINT | RDW_NOCHILDREN );
++            neutron_break_count = 0;
++        }
++    }
++
+     spy_enter_message( SPY_DISPATCHMESSAGE, msg->hwnd, msg->message, msg->wParam, msg->lParam );
+ 
+     if (init_window_call_params( &params, msg->hwnd, msg->message, msg->wParam, msg->lParam,

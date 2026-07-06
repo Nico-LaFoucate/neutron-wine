@@ -13,3 +13,10 @@ _work/
 # OS / editor
 .DS_Store
 *.swp
+
+# release output (tarballs + checksums + manifest)
+dist/
+
+# local debug backups & shader caches — never committed
+dll-backups/
+vkd3d-proton.cache
