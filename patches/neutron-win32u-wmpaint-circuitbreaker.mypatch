@@ -1,55 +1,99 @@
 diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
-index cf641c4ec2b..2470053ef37 100644
+index cf641c4ec2b..95862c4dfd4 100644
 --- a/dlls/win32u/dce.c
 +++ b/dlls/win32u/dce.c
-@@ -1709,6 +1709,12 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
+@@ -1709,6 +1709,11 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
      RECT rect;
      UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
  
-+    /* NEUTRON: a real BeginPaint means the app handled the paint -> reset the
-+     * WM_PAINT circuit-breaker counter (message.c) so legit paint/resize loops
-+     * never trip it. */
-+    { extern __thread HWND neutron_break_hwnd; extern __thread unsigned int neutron_break_count;
-+      if (hwnd == neutron_break_hwnd) neutron_break_count = 0; }
++    /* NEUTRON: a real BeginPaint means the app validated this window's update
++     * region -> clear its WM_PAINT circuit-breaker count (message.c) so legit
++     * paint/resize loops never trip it. */
++    { extern void neutron_break_validate( HWND hwnd ); neutron_break_validate( hwnd ); }
 +
      NtUserHideCaret( hwnd );
  
      if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
 diff --git a/dlls/win32u/message.c b/dlls/win32u/message.c
-index 1428ff586f4..3b5d640244a 100644
+index 1428ff586f4..5a920f191d0 100644
 --- a/dlls/win32u/message.c
 +++ b/dlls/win32u/message.c
-@@ -4011,6 +4011,13 @@ BOOL WINAPI NtUserPostQuitMessage( INT exit_code )
+@@ -4011,6 +4011,55 @@ BOOL WINAPI NtUserPostQuitMessage( INT exit_code )
      return TRUE;
  }
  
-+/* NEUTRON: WM_PAINT-loop circuit-breaker state (per-thread). Reset by a real
-+ * BeginPaint in dce.c so healthy paint/resize loops never trip it. Guards against
-+ * a single window stuck in an unvalidated WM_PAINT loop (e.g. the AdobeOwl menu
-+ * bar under winewayland) monopolizing the message loop and starving the UI. */
-+__thread HWND neutron_break_hwnd;
-+__thread unsigned int neutron_break_count;
++/* NEUTRON: WM_PAINT-loop circuit-breaker state (per-thread, PER-WINDOW). A window
++ * dispatched WM_PAINT many times with NO intervening BeginPaint (validation) is
++ * stuck (e.g. Adobe OWL.MenuBar, whose WM_PAINT handler returns without ever
++ * validating its update region, so WM_PAINT regenerates forever). Reset per-window
++ * by a real BeginPaint in dce.c so healthy paint/resize loops never trip it.
++ *
++ * v1 tracked a SINGLE hwnd+count and was defeated when several stuck windows
++ * interleaved (any hwnd switch reset the counter, so none reached the limit) -
++ * exactly what happens on Photoshop document-open, where the whole OWL toolbar
++ * family storms WM_PAINT together and the open-document worker starves on a lock
++ * the storming main thread holds. v2 keeps a small per-window table so each window
++ * is drained independently regardless of interleaving. */
++#define NEUTRON_BREAK_SLOTS 64
++/* Drain a window after this many WM_PAINT with NO intervening BeginPaint. A healthy
++ * window validates every paint (BeginPaint resets its count), so only a window whose
++ * handler NEVER validates (e.g. Adobe OWL.MenuBar) ever reaches this. 2000 is the
++ * proven freeze-fix value. NOTE: dropping it to 16 to suppress the OWL doc-open storm
++ * was tried - it did suppress the storm but did NOT fix doc-open (the main thread still
++ * holds critsec 14B70FE70 and parks, so the home never dismisses), so it was reverted
++ * to the proven value rather than leave an untested-aggressive threshold in place. */
++#define NEUTRON_BREAK_LIMIT 2000
++__thread HWND neutron_break_hwnds[NEUTRON_BREAK_SLOTS];
++__thread unsigned int neutron_break_counts[NEUTRON_BREAK_SLOTS];
++
++/* Return the table slot tracking hwnd, allocating one (reusing the lowest-count
++ * slot when full - the least-active window is safest to evict) if not present. */
++static int neutron_break_slot( HWND hwnd )
++{
++    int i, min_i = 0;
++    unsigned int min_c = ~0u;
++    for (i = 0; i < NEUTRON_BREAK_SLOTS; i++)
++    {
++        if (neutron_break_hwnds[i] == hwnd) return i;
++        if (neutron_break_counts[i] < min_c) { min_c = neutron_break_counts[i]; min_i = i; }
++    }
++    neutron_break_hwnds[min_i] = hwnd;
++    neutron_break_counts[min_i] = 0;
++    return min_i;
++}
++
++/* NEUTRON: a real BeginPaint validated hwnd -> clear its unvalidated count.
++ * Called from NtUserBeginPaint (dce.c), same thread, so the TLS table is ours. */
++void neutron_break_validate( HWND hwnd )
++{
++    int i;
++    for (i = 0; i < NEUTRON_BREAK_SLOTS; i++)
++        if (neutron_break_hwnds[i] == hwnd) { neutron_break_counts[i] = 0; return; }
++}
 +
  /**********************************************************************
   *           NtUserDispatchMessage  (win32u.@)
   */
-@@ -4044,6 +4051,22 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
+@@ -4044,6 +4093,25 @@ LRESULT WINAPI NtUserDispatchMessage( const MSG *msg )
  
      if (!msg->hwnd) return 0;
  
-+    /* NEUTRON: circuit-breaker. If a window is dispatched WM_PAINT many times in a
-+     * row with no intervening BeginPaint/validate, drain its update region once so
-+     * one stuck window cannot monopolize the message loop. The count is reset by a
-+     * real BeginPaint (dce.c), so healthy paint/resize loops never reach the limit. */
++    /* NEUTRON: per-window circuit-breaker. If a window is dispatched WM_PAINT
++     * NEUTRON_BREAK_LIMIT times with no intervening BeginPaint/validate, drain its
++     * update region so a stuck window (or a set of them, interleaved) cannot
++     * monopolize the message loop. Per-window counts are reset by a real BeginPaint
++     * (dce.c), so healthy paint/resize loops never reach the limit. */
 +    if (msg->message == WM_PAINT)
 +    {
-+        if (msg->hwnd == neutron_break_hwnd) neutron_break_count++;
-+        else { neutron_break_hwnd = msg->hwnd; neutron_break_count = 1; }
-+        if (neutron_break_count >= 2000)
++        int slot = neutron_break_slot( msg->hwnd );
++        unsigned int n = ++neutron_break_counts[slot];
++
++        if (n >= NEUTRON_BREAK_LIMIT)
 +        {
-+            WARN( "NEUTRON: draining stuck WM_PAINT loop on hwnd %p (>=2000 unvalidated)\n", msg->hwnd );
++            ERR( "NEUTRON: draining stuck WM_PAINT loop on hwnd %p (>=%u unvalidated)\n",
++                 msg->hwnd, NEUTRON_BREAK_LIMIT );
 +            NtUserRedrawWindow( msg->hwnd, NULL, 0, RDW_VALIDATE | RDW_NOINTERNALPAINT | RDW_NOCHILDREN );
-+            neutron_break_count = 0;
++            neutron_break_counts[slot] = 0;
 +        }
 +    }
 +
