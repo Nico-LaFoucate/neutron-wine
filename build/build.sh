@@ -52,3 +52,6 @@ cd "$TKGDIR"
 echo
 echo "Built. The Neutron wine is under: $TKGDIR/src/*-build/wine"
 echo "Use it:  NEUTRON_WINE=\"$TKGDIR/src/<flavor>-build/wine\" neutron launch premiere"
+echo
+echo "To cut a release, package the tree into a versioned tarball + manifest:"
+echo "  build/package.sh          # -> dist/  (see RELEASING.md)"
