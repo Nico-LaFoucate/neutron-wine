@@ -1,0 +1,347 @@
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 08a79b5044a..f228005fc48 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -570,6 +570,13 @@ HWND get_parent( HWND hwnd )
+     return retval;
+ }
+ 
++/* NEUTRON: gdb breakpoint target. Fires only when a window is reparented to Owl.Orphanage (the doc
++   "undo" / orphaning). Break here in gdb and `bt` to see the OWL/PE caller doing the orphaning. */
++__attribute__((noinline,used)) void neutron_orphan_marker( HWND hwnd )
++{
++    __asm__ __volatile__( "" : : "r"(hwnd) : "memory" );
++}
++
+ /*****************************************************************
+  *           NtUserSetParent (win32u.@)
+  */
+@@ -609,6 +616,31 @@ HWND WINAPI NtUserSetParent( HWND hwnd, HWND parent )
+         return 0;
+     }
+ 
++    /* NEUTRON diag: log every reparent (doc docking = reparent of the doc/canvas into the app
++       frame). Reveals whether PS issues the final dock-into-frame reparent under winewayland. */
++    {
++        WCHAR cw[64], pw[64];
++        char cb[64], pb[64];
++        UNICODE_STRING cn, pn;
++        int l, i;
++        cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++        pn.Buffer = pw; pn.MaximumLength = sizeof(pw); pn.Length = 0;
++        l = NtUserGetClassName( hwnd, FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++        for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
++        l = NtUserGetClassName( parent, FALSE, &pn ); if (l < 0 || l >= 64) l = 0;
++        for (i = 0; i < l; i++) pb[i] = (char)pw[i]; pb[l] = 0;
++        ERR( "neutron-reparent: hwnd=%p class=%s -> parent=%p class=%s\n", hwnd, cb, parent, pb );
++        {
++            static const char orph[] = "Owl.Orphanage";
++            int k; for (k = 0; orph[k] && pb[k] == orph[k]; k++);
++            if (!orph[k] && !pb[k])
++            {
++                ERR( "neutron-orphan: %s hwnd=%p -> Owl.Orphanage (breakpoint neutron_orphan_marker)\n", cb, hwnd );
++                neutron_orphan_marker( hwnd );
++            }
++        }
++    }
++
+     if (!(full_handle = is_current_thread_window( hwnd )))
+         return UlongToHandle( send_message( hwnd, WM_WINE_SETPARENT, (WPARAM)parent, 0 ));
+ 
+@@ -1385,6 +1417,9 @@ static HWND set_window_owner( HWND hwnd, HWND owner )
+     return ret;
+ }
+ 
++static void neutron_on_window_hidden( HWND hwnd );  /* NEUTRON: defined later, used by hide paths */
++static void neutron_log_shown( HWND hwnd, const char *via );  /* NEUTRON diag: log window shows */
++
+ /* Helper function for SetWindowLong(). */
+ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
+                                           LONG_PTR newval, BOOL ansi, BOOL internal )
+@@ -1562,6 +1597,10 @@ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
+         user_driver->pSetWindowStyle( hwnd, offset, &style );
+         if (made_visible || layered) update_window_state( hwnd );
+         send_message( hwnd, WM_STYLECHANGED, offset, (LPARAM)&style );
++        if (offset == GWL_STYLE && (style.styleOld & WS_VISIBLE) && !(style.styleNew & WS_VISIBLE))
++            neutron_on_window_hidden( hwnd );  /* NEUTRON: window hidden via GWL_STYLE clear */
++        if (offset == GWL_STYLE && !(style.styleOld & WS_VISIBLE) && (style.styleNew & WS_VISIBLE))
++            neutron_log_shown( hwnd, "STYLE" );  /* NEUTRON diag: shown via GWL_STYLE set */
+     }
+ 
+     return retval;
+@@ -2138,7 +2177,16 @@ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOO
+     else monitor_rects = map_window_rects_virt_to_raw( *rects, get_thread_dpi() );
+ 
+     if (!user_driver->pWindowPosChanging( hwnd, swp_flags, shaped, &monitor_rects )) needs_surface = FALSE;
+-    else if (is_child) needs_surface = FALSE;
++    else if (is_child)
++    {
++        /* NEUTRON: CEP/CEF panel hosts (marked with __wine_dcomp_present by dcomp) are normal child
++         * windows: they must NOT get their own window surface. Instead the owner-side consumer blits
++         * the CEF pixels through the child's DC into the TOPLEVEL window_surface, which GDI clips to
++         * the child's visible region and tracks as the dock moves/resizes/gets occluded -- i.e. the
++         * content renders INSIDE the panel, not as an on-top overlay subsurface (the earlier subsurface
++         * approach overhung the frame and didn't clip). So: behave like any child, no own surface. */
++        needs_surface = FALSE;
++    }
+     else if (swp_flags & SWP_HIDEWINDOW) needs_surface = FALSE;
+     else if (swp_flags & SWP_SHOWWINDOW) needs_surface = TRUE;
+     else needs_surface = !!(style & WS_VISIBLE);
+@@ -2230,6 +2278,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
+     is_layered = new_surface && new_surface->alpha_mask;
+     is_child = toplevel && toplevel != hwnd;
+ 
++    if (swp_flags & SWP_HIDEWINDOW) neutron_on_window_hidden( hwnd );  /* NEUTRON: window hidden via SetWindowPos */
++    if (swp_flags & SWP_SHOWWINDOW) neutron_log_shown( hwnd, "SWP" );  /* NEUTRON diag */
++
+     if (is_child) monitor_dpi = get_win_monitor_dpi( toplevel, &raw_dpi );
+     else monitor_dpi = monitor_dpi_from_rect( new_rects->window, dpi, &raw_dpi );
+ 
+@@ -4785,6 +4836,137 @@ void update_window_state( HWND hwnd )
+  *
+  * Implementation of ShowWindow and ShowWindowAsync.
+  */
++/* === NEUTRON: dismiss the OWL home/welcome screen when a document canvas appears. ========
++   Root cause of the Photoshop File->New "wedge": under Wine the UXP home (window class
++   "OWL.WelcomeScreenView") never receives its self-hide signal on doc-create, so its
++   WS_VISIBLE style bit stays set. Photoshop's home-visible check reads exactly
++   that bit (GetWindowLongPtr GWL_STYLE, bit 28), so the home is reported visible forever
++   and the new document never activates/shows. When a sized document canvas (class
++   "PSViewC") becomes visible we clear the welcome's WS_VISIBLE, matching what Windows does
++   internally. Keyed on the OWL class so it is version-proof and a no-op in apps that have
++   no such window (e.g. Premiere). */
++static const WCHAR neutron_welcome_class[] =
++    {'O','W','L','.','W','e','l','c','o','m','e','S','c','r','e','e','n','V','i','e','w',0};
++static const WCHAR neutron_psview_class[] = {'P','S','V','i','e','w','C',0};
++static const WCHAR neutron_docwindow_class[] =
++    {'O','W','L','.','D','o','c','u','m','e','n','t','W','i','n','d','o','w',0};
++static BOOL neutron_class_is( HWND hwnd, const WCHAR *want )
++{
++    WCHAR bufW[64];
++    UNICODE_STRING name;
++    int len;
++    name.Buffer = bufW;
++    name.MaximumLength = sizeof(bufW);
++    name.Length = 0;
++    len = NtUserGetClassName( hwnd, FALSE, &name );
++    if (len <= 0 || len >= 64) return FALSE;
++    bufW[len] = 0;
++    return !wcscmp( bufW, want );
++}
++
++/* NEUTRON diag: log when a substantial window becomes visible, with class/size/root, so we can
++   see per-make whether PS shows the doc canvas early (make-1) or defers it (~make-5). */
++static void neutron_log_shown( HWND hwnd, const char *via )
++{
++    WCHAR bufW[64];
++    char buf[64];
++    UNICODE_STRING name;
++    RECT rc;
++    HWND root;
++    int len, i;
++    rc.left = rc.top = rc.right = rc.bottom = 0;
++    get_client_rect( hwnd, &rc, get_thread_dpi() );
++    if (rc.right - rc.left < 200 || rc.bottom - rc.top < 200) return;  /* skip small controls */
++    name.Buffer = bufW; name.MaximumLength = sizeof(bufW); name.Length = 0;
++    len = NtUserGetClassName( hwnd, FALSE, &name );
++    if (len < 0 || len >= 64) len = 0;
++    for (i = 0; i < len; i++) buf[i] = (char)bufW[i];
++    buf[len] = 0;
++    root = NtUserGetAncestor( hwnd, GA_ROOT );
++    ERR( "neutron-show: %s hwnd=%p class=%s size=%ldx%ld root=%p\n",
++         via, hwnd, buf, (long)(rc.right - rc.left), (long)(rc.bottom - rc.top), root );
++}
++
++/* Walk the window tree under 'parent' for visible OWL.WelcomeScreenView windows. If do_hide,
++   clear their WS_VISIBLE. Returns the count of visible welcomes found. */
++static int neutron_walk_welcomes( HWND parent, int depth, BOOL do_hide )
++{
++    HWND *list;
++    int i, n = 0;
++    if (depth > 12) return 0;
++    if (!(list = list_window_children( parent ))) return 0;
++    for (i = 0; list[i]; i++)
++    {
++        if (neutron_class_is( list[i], neutron_welcome_class )
++            && (get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
++        {
++            if (do_hide)
++            {
++                ERR( "neutron: hiding welcome screen %p\n", list[i] );
++                NtUserShowWindow( list[i], SW_HIDE );
++            }
++            n++;
++        }
++        n += neutron_walk_welcomes( list[i], depth + 1, do_hide );
++    }
++    free( list );
++    return n;
++}
++
++/* THE TRIGGER: on a wedged make the doc canvas is never created/shown, but PS performs the
++   OWL workspace switch by HIDING the start-workspace windows (SWP_HIDEWINDOW / GWL_STYLE
++   clear). When a substantial window is hidden while an OWL.WelcomeScreenView is still visible
++   in the same top-level, the start workspace is going away -> dismiss the welcome too so its
++   WS_VISIBLE clears, which is what makes File->New dock on the first try. */
++static void neutron_on_window_hidden( HWND hwnd )
++{
++    RECT rc;
++    HWND root;
++    if (neutron_class_is( hwnd, neutron_welcome_class )) return;  /* don't recurse on our own hide */
++    rc.left = rc.top = rc.right = rc.bottom = 0;
++    get_client_rect( hwnd, &rc, get_thread_dpi() );
++    ERR( "neutron-diag: HIDE hwnd=%p size=%ldx%ld\n", hwnd,
++         (long)(rc.right - rc.left), (long)(rc.bottom - rc.top) );
++    if (rc.right - rc.left < 400 || rc.bottom - rc.top < 300) return;  /* substantial workspace window */
++    root = NtUserGetAncestor( hwnd, GA_ROOT );
++    if (!root) return;
++    if (neutron_walk_welcomes( root, 0, FALSE ) > 0)
++    {
++        ERR( "neutron: workspace window %p (%ldx%ld) hidden -> dismissing welcome\n", hwnd,
++             (long)(rc.right - rc.left), (long)(rc.bottom - rc.top) );
++        neutron_walk_welcomes( root, 0, TRUE );
++    }
++}
++
++static void neutron_maybe_dismiss_welcome( HWND shown )
++{
++    RECT rc;
++    HWND root;
++    if (!neutron_class_is( shown, neutron_psview_class )) return;
++    rc.left = rc.top = rc.right = rc.bottom = 0;
++    get_client_rect( shown, &rc, get_thread_dpi() );
++    if (rc.right - rc.left < 800 || rc.bottom - rc.top < 600) return;  /* doc canvas, not a panel */
++    root = NtUserGetAncestor( shown, GA_ROOT );
++    if (root) neutron_walk_welcomes( root, 0, TRUE );
++}
++
++/* NEUTRON: THE TRIGGER. An OWL.DocumentWindow is created exactly when a document is created
++   (verified: 0 at startup, 1 per make) -> a doc now exists, so dismiss the welcome/home screen
++   (clear its WS_VISIBLE) and File->New docks on the first try. Search the whole desktop for the
++   welcome because it lives under a different top-level than the new document window. Keyed on the
++   OWL class -> version-proof, and a no-op in apps without it (e.g. Premiere). */
++/* Set when an OWL.DocumentWindow is created; the actual welcome dismiss is DEFERRED to
++   show_window. Doing window ops here (mid-NtUserCreateWindowEx) crashes via re-entrancy. */
++static LONG neutron_dismiss_pending;
++static void neutron_on_window_created( HWND hwnd )
++{
++    if (neutron_class_is( hwnd, neutron_docwindow_class ))
++    {
++        ERR( "neutron: OWL.DocumentWindow %p created -> scheduling welcome dismiss\n", hwnd );
++        InterlockedExchange( &neutron_dismiss_pending, 1 );
++    }
++}
++
+ static BOOL show_window( HWND hwnd, INT cmd )
+ {
+     WND *win;
+@@ -4797,8 +4979,26 @@ static BOOL show_window( HWND hwnd, INT cmd )
+ 
+     TRACE( "hwnd=%p, cmd=%d, was_visible %d\n", hwnd, cmd, was_visible );
+ 
++    {   /* NEUTRON-show: trace shows/hides of the OWL dock hierarchy + doc/float windows via ANY call path
++           (IAT, GetProcAddress, or direct NtUserShowWindow) to find why the doc never docks into OWL.TabGroup. */
++        WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
++        cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++        l = NtUserGetClassName( hwnd, FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++        for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
++        if ((cb[0]=='O'&&cb[1]=='W'&&cb[2]=='L'&&cb[3]=='.') || (cb[0]=='P'&&cb[1]=='S'&&(cb[2]=='F'||cb[2]=='V')))
++            ERR( "neutron-show: hwnd=%p class=%s cmd=%d was_visible=%d style=%08lx\n", hwnd, cb, cmd, was_visible, (unsigned long)style );
++    }
++
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
+ 
++    /* NEUTRON: deferred welcome dismiss. An OWL.DocumentWindow was created (a doc now exists);
++       do the dismiss here in show_window's safe context, not mid-NtUserCreateWindowEx. */
++    if (InterlockedExchange( &neutron_dismiss_pending, 0 ))
++    {
++        ERR( "neutron: deferred welcome dismiss (doc window was created)\n" );
++        neutron_walk_welcomes( 0, 0, TRUE );
++    }
++
+     if ((!(style & (WS_POPUP | WS_CHILD))
+          || ((style & (WS_POPUP | WS_CHILD | WS_CAPTION)) == (WS_POPUP | WS_CAPTION)))
+         && !get_window_relative( hwnd, GW_OWNER )
+@@ -4969,6 +5169,33 @@ static BOOL show_window( HWND hwnd, INT cmd )
+             send_message( hwnd, WM_ACTIVATE, WA_ACTIVE, 0 );
+     }
+ 
++    /* NEUTRON: a window just became visible via a show command -> if it's a sized document
++       canvas, dismiss the OWL home/welcome screen so File->New isn't wedged. Cheap no-op
++       for everything except a large PSViewC (see neutron_maybe_dismiss_welcome). */
++    if (cmd != SW_HIDE && cmd != SW_MINIMIZE && cmd != SW_FORCEMINIMIZE
++        && (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
++    {
++        neutron_log_shown( hwnd, "SHOW" );  /* NEUTRON diag */
++        neutron_maybe_dismiss_welcome( hwnd );
++
++        /* NEUTRON (gated NEUTRON_SHELL_FIX): Wine never emits HSHELL_WINDOWREPLACED (0xd), which OWL's
++           ghost/dock WH_SHELL hook keys on -> PS documents never dock as tabs. Emit it when a top-level
++           window is shown so OWL re-evaluates docking. Broad first cut to test responsiveness. */
++        {
++            static int neutron_shell_fix = -1;
++            if (neutron_shell_fix < 0)
++            {
++                const char *e = getenv( "NEUTRON_SHELL_FIX" );
++                neutron_shell_fix = (e && e[0] == '1') ? 1 : 0;
++            }
++            if (neutron_shell_fix && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD))
++            {
++                ERR( "neutron-shell: EMIT HSHELL_WINDOWREPLACED hwnd=%p\n", hwnd );
++                call_hooks( WH_SHELL, HSHELL_WINDOWREPLACED, (WPARAM)hwnd, 0, 0 );
++            }
++        }
++    }
++
+ done:
+     set_thread_dpi_awareness_context( context );
+     return was_visible;
+@@ -5768,6 +5995,7 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
+                                       cs.hInstance, ansi, style, ex_style )))
+         return 0;
+     hwnd = win->handle;
++    neutron_on_window_created( hwnd );  /* NEUTRON: dismiss welcome when OWL.DocumentWindow is created */
+ 
+     /* Fill the window structure */
+ 
+@@ -6120,6 +6348,28 @@ ULONG_PTR WINAPI NtUserCallHwnd( HWND hwnd, DWORD code )
+     case NtUserCallHwnd_IsWindowVisible:
+         return is_window_visible( hwnd );
+ 
++    case NtUserCallHwnd_NeutronFlushSurface:
++    {
++        /* NEUTRON: commit the toplevel window_surface after the owner-side consumer blitted a CEP
++         * panel's pixels through the child DC into it. The GDI blit already marked the changed region
++         * dirty (surface->bounds), so just flush the existing bounds -- do NOT force the whole
++         * (potentially 4K) toplevel surface dirty, which would recommit the entire window every frame. */
++        WND *win = get_win_ptr( hwnd );
++        struct window_surface *surface;
++        if (win && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++        {
++            if ((surface = win->surface) && surface != &dummy_surface)
++            {
++                window_surface_add_ref( surface );
++                release_win_ptr( win );
++                window_surface_flush( surface );
++                window_surface_release( surface );
++            }
++            else release_win_ptr( win );
++        }
++        return 0;
++    }
++
+     /* temporary exports */
+     case NtUserGetFullWindowHandle:
+         return HandleToUlong( get_full_window_handle( hwnd ));
+diff --git a/include/ntuser.h b/include/ntuser.h
+index 54d0d626d7b..cd550261eae 100644
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -1306,6 +1307,7 @@ enum
+     NtUserGetFullWindowHandle,
+     NtUserIsCurrentProcessWindow,
+     NtUserIsCurrentThreadWindow,
++    NtUserCallHwnd_NeutronFlushSurface, /* NEUTRON: mark hwnd's window surface fully dirty + flush */
+ };
+ 
+ static inline void NtUserActivateOtherWindow( HWND hwnd )

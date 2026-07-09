@@ -27,7 +27,10 @@ TKGDIR="$TKG/wine-tkg-git"
 cp "$REPO/build/customization.cfg" "$TKGDIR/customization.cfg"
 
 # 3. Apply the Neutron patch set (wine-tkg applies every *.mypatch in userpatches).
+# Prune first: a stale *.mypatch left from a previous build (one we've since renamed
+# or dropped) would still be applied and can fail/conflict against the current set.
 mkdir -p "$TKGDIR/wine-tkg-userpatches"
+rm -f "$TKGDIR"/wine-tkg-userpatches/*.mypatch "$TKGDIR"/*.mypatch
 cp "$REPO"/patches/*.mypatch "$TKGDIR/wine-tkg-userpatches/"
 if [ "${INCLUDE_DIAGNOSTIC:-0}" = "1" ]; then
     cp "$REPO"/patches/diagnostic/*.mypatch "$TKGDIR/wine-tkg-userpatches/"

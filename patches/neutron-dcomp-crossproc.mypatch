@@ -1,0 +1,537 @@
+diff --git a/dlls/dcomp/dcomp.spec b/dlls/dcomp/dcomp.spec
+index c51aa087842..28f957d3d06 100644
+--- a/dlls/dcomp/dcomp.spec
++++ b/dlls/dcomp/dcomp.spec
+@@ -27,3 +27,4 @@
+ @ stub SerializeEffectDescription
+ @ cdecl dcomp_register_external(long ptr)
+ @ cdecl dcomp_set_pending_hwnd(long)
++@ cdecl dcomp_get_pending_hwnd()
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index 7115ec29d11..8b340e86753 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -94,44 +94,100 @@ static struct composition_visual *impl_visual_from_IDCompositionVisual2(IDCompos
+ struct presentation
+ {
+     struct list entry;
+-    HWND hwnd;
++    HWND hwnd;         /* the window dcomp was asked to present into (a Chromium-internal child) */
++    HWND present_hwnd; /* where we actually blit: the WC_PLUGPLUG_HTMLEXTENSION panel host if this is
++                        * a CEF/CEP panel, else == hwnd. Only panel hosts are given a subsurface. */
+     IDXGISwapChain *swapchain;
++    HANDLE px_map;     /* NEUTRON: shared px section for cross-process panels (see below) */
++    void  *px_view;
++    BOOL   cross_proc; /* present_hwnd owned by another process (CEF panel) -> use shared px path */
++    UINT   last_present_count; /* NEUTRON perf: skip the staging copy when the swapchain hasn't presented */
++    BOOL   have_present_count;
++    BOOL   t_first_present; /* NEUTRON cold-start timing: first present observed */
++    BOOL   t_first_deliver; /* NEUTRON cold-start timing: first frame delivered to shared mem */
++};
++
++/* NEUTRON: cross-process CEP panel present path.
++ * The panel host window is owned by the Adobe app process, but dcomp/the swapchain live in the CEF
++ * (CEPHtmlEngine) process. Wine's window_surface is per-process, so a cross-process GetDC+StretchDIBits
++ * writes into a detached DC (verified: GetPixel readback = CLR_INVALID) and never reaches the owner's
++ * surface. Instead we hand the pixels to the owner via a named shared section keyed by the host hwnd;
++ * winewayland's consumer thread (running in the owner process) blits them same-process and flushes,
++ * so the subsurface actually commits. */
++#define NEUTRON_PX_MAXW 4096
++#define NEUTRON_PX_MAXH 2304
++struct neutron_px_shbuf
++{
++    LONG  seq;      /* bumped after each fully-written frame */
++    LONG  width;
++    LONG  height;
++    LONG  reserved;
++    BYTE  pixels[1]; /* width*height*4, BGRA top-down */
++};
++#define NEUTRON_PX_BYTES (sizeof(struct neutron_px_shbuf) + (SIZE_T)NEUTRON_PX_MAXW * NEUTRON_PX_MAXH * 4)
++
++#define NEUTRON_REG_MAX 64
++struct neutron_registry
++{
++    LONG  count;
++    DWORD hwnds[NEUTRON_REG_MAX]; /* host hwnds (as DWORD) with a live px section */
+ };
++static const WCHAR neutron_registry_nameW[] =
++    L"__neutron_dcomp_registry";
++
++static void neutron_px_name(HWND hwnd, WCHAR out[64])
++{
++    static const WCHAR fmt[] = L"__neutron_dcomp_px_%08x";
++    wsprintfW(out, fmt, (DWORD)(ULONG_PTR)hwnd);
++}
++
++static void neutron_registry_add(HWND hwnd)
++{
++    HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
++                                  sizeof(struct neutron_registry), neutron_registry_nameW);
++    struct neutron_registry *reg;
++    LONG i;
++    if (!h) return;
++    if ((reg = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, sizeof(*reg))))
++    {
++        for (i = 0; i < reg->count && i < NEUTRON_REG_MAX; i++)
++            if (reg->hwnds[i] == (DWORD)(ULONG_PTR)hwnd) break;
++        if (i == reg->count && reg->count < NEUTRON_REG_MAX)
++        {
++            reg->hwnds[reg->count] = (DWORD)(ULONG_PTR)hwnd;
++            InterlockedIncrement(&reg->count);
++        }
++        UnmapViewOfFile(reg);
++    }
++    /* keep the mapping alive for the process lifetime so the section persists */
++}
++
++/* NEUTRON: walk up from a dcomp present target to the CEP panel host window
++ * (class WC_PLUGPLUG_HTMLEXTENSION_CLASS_NAME). Returns NULL for non-CEF dcomp targets such as the
++ * program-monitor canvas, so we never touch those. */
++static HWND find_cef_panel_host(HWND hwnd)
++{
++    WCHAR cls[128];
++    HWND a;
++    int depth;
++
++    for (a = hwnd, depth = 0; a && depth < 16; a = GetAncestor(a, GA_PARENT), depth++)
++    {
++        if (GetClassNameW(a, cls, 128) > 0 && wcsstr(cls, L"HTMLEXTENSION"))
++            return a;
++    }
++    return NULL;
++}
+ 
+ static struct list presentations = LIST_INIT(presentations);
+ static CRITICAL_SECTION presentations_cs;
+ static INIT_ONCE presentations_once = INIT_ONCE_STATIC_INIT;
+ static HANDLE presentations_thread;
+ 
+-static void dump_bmp(const void *bgra, UINT w, UINT h)
+-{
+-    BITMAPFILEHEADER fh;
+-    BITMAPINFOHEADER ih;
+-    DWORD written;
+-    HANDLE f;
+-
+-    f = CreateFileA("C:\\dcomp_capture.bmp", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+-    if (f == INVALID_HANDLE_VALUE)
+-        return;
+-    memset(&fh, 0, sizeof(fh));
+-    memset(&ih, 0, sizeof(ih));
+-    ih.biSize = sizeof(ih);
+-    ih.biWidth = w;
+-    ih.biHeight = -(LONG)h; /* top-down */
+-    ih.biPlanes = 1;
+-    ih.biBitCount = 32;
+-    ih.biCompression = BI_RGB;
+-    fh.bfType = 0x4D42; /* 'BM' */
+-    fh.bfOffBits = sizeof(fh) + sizeof(ih);
+-    fh.bfSize = fh.bfOffBits + (DWORD)w * 4 * h;
+-    WriteFile(f, &fh, sizeof(fh), &written, NULL);
+-    WriteFile(f, &ih, sizeof(ih), &written, NULL);
+-    WriteFile(f, bgra, (DWORD)w * 4 * h, &written, NULL);
+-    CloseHandle(f);
+-}
+-
+-static void blit_swapchain_to_hwnd(IDXGISwapChain *swapchain, HWND hwnd)
++static void blit_swapchain_to_hwnd(struct presentation *p)
+ {
++    IDXGISwapChain *swapchain = p->swapchain;
++    HWND hwnd = p->present_hwnd;
+     ID3D11Texture2D *backbuffer = NULL, *staging = NULL;
+     ID3D11Device *d3d_device = NULL;
+     ID3D11DeviceContext *ctx = NULL;
+@@ -145,10 +201,26 @@ static void blit_swapchain_to_hwnd(IDXGISwapChain *swapchain, HWND hwnd)
+     UINT y;
+     HRESULT hr;
+     static LONG diag_n;
+-    DWORD center = 0;
+     LONG n;
+     BOOL diag;
+ 
++    if (p->cross_proc)
++    {
++        UINT count = 0;
++        if (SUCCEEDED(IDXGISwapChain_GetLastPresentCount(swapchain, &count)))
++        {
++            if (p->have_present_count && count == p->last_present_count) return;
++            p->last_present_count = count;
++            p->have_present_count = TRUE;
++            if (!p->t_first_present)
++            {
++                p->t_first_present = TRUE;
++                ERR("neutron-time: sc=%p host=%p FIRST-PRESENT tick=%llu presentcount=%u\n",
++                    swapchain, hwnd, GetTickCount64(), count);
++            }
++        }
++    }
++
+     n = InterlockedIncrement(&diag_n);
+     diag = (n % 120 == 1);
+ 
+@@ -172,7 +244,6 @@ static void blit_swapchain_to_hwnd(IDXGISwapChain *swapchain, HWND hwnd)
+     }
+ 
+     ID3D11Texture2D_GetDesc(backbuffer, &desc);
+-    if (diag) ERR("diag: backbuffer %ux%u fmt %d usage %d\n", desc.Width, desc.Height, desc.Format, desc.Usage);
+     desc.Usage = D3D11_USAGE_STAGING;
+     desc.BindFlags = 0;
+     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+@@ -191,9 +262,6 @@ static void blit_swapchain_to_hwnd(IDXGISwapChain *swapchain, HWND hwnd)
+         goto unlock;
+     }
+ 
+-    if (diag && desc.Height && desc.Width)
+-        center = ((DWORD *)((BYTE *)map.pData + (desc.Height / 2) * map.RowPitch))[desc.Width / 2];
+-
+     if ((packed = malloc((SIZE_T)desc.Width * 4 * desc.Height)))
+     {
+         for (y = 0; y < desc.Height; y++)
+@@ -211,20 +279,111 @@ unlock:
+         ID3D10Multithread_Release(mt);
+     }
+ 
+-    if (packed)
++    if (packed && p->cross_proc)
+     {
+-        if (diag)
++        /* NEUTRON cross-process CEP panel: hand the pixels to the owner process via shared memory;
++         * winewayland's consumer thread (owner-side) blits + flushes them. See struct neutron_px_shbuf. */
++        if (desc.Width <= NEUTRON_PX_MAXW && desc.Height <= NEUTRON_PX_MAXH)
+         {
+-            UINT *px = packed;
+-            UINT corner = px[0];
+-            ULONG i, total = (ULONG)desc.Width * desc.Height, diffcount = 0;
+-            for (i = 0; i < total; i++)
+-                if ((px[i] & 0xffffff) != (corner & 0xffffff)) diffcount++;
+-            ERR("diag: corner=%08x pixels-differing-from-corner %lu / %lu; dumping C:\\dcomp_capture.bmp\n",
+-                corner, diffcount, total);
+-            dump_bmp(packed, desc.Width, desc.Height);
++            if (!p->px_view)
++            {
++                WCHAR name[64];
++                neutron_px_name(hwnd, name);
++                p->px_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
++                                               (DWORD)(NEUTRON_PX_BYTES >> 32), (DWORD)NEUTRON_PX_BYTES, name);
++                if (p->px_map)
++                    p->px_view = MapViewOfFile(p->px_map, FILE_MAP_WRITE, 0, 0, NEUTRON_PX_BYTES);
++                if (p->px_view) neutron_registry_add(hwnd);
++            }
++            if (p->px_view)
++            {
++                struct neutron_px_shbuf *sh = p->px_view;
++                /* NEUTRON: the flip-model swapchain alternates GetBuffer(0) between the freshly-rotated
++                 * (blank, solid-color) back buffer and the content buffer, which flashes the panel.
++                 * A real UI frame is never a single flat color; sample a spread of points and if they
++                 * are ALL identical, treat this as a blank rotation and keep the last good frame. */
++                /* The blank flip-rotation has a solid-color BODY (only the shared border chrome
++                 * differs), while a real UI frame's body is varied. Sample a grid strictly inside the
++                 * central region (skip the border) and count distinct colors; too few -> blank -> skip. */
++                const DWORD *px = packed;
++                UINT W = desc.Width, H = desc.Height;
++                UINT x0 = W / 5, x1 = W - W / 5, y0 = H / 5, y1 = H - H / 5;
++                DWORD ref = px[(SIZE_T)((y0 + y1) / 2) * W + (x0 + x1) / 2];
++                int gx, gy, distinct = 0, dd = 0, gx2, gy2;
++                DWORD ref2 = px[0];
++                for (gy = 0; gy < 8; gy++)
++                {
++                    UINT yy = y0 + (y1 - y0) * gy / 8;
++                    for (gx = 0; gx < 8; gx++)
++                    {
++                        UINT xx = x0 + (x1 - x0) * gx / 8;
++                        if (px[(SIZE_T)yy * W + xx] != ref) distinct++;
++                    }
++                }
++                /* DENSE full-frame sample across a 40x40 grid over the WHOLE frame -- a far better
++                 * blank-rotation filter than the central 8x8: the main UI is dark/sparse in the center but
++                 * has plenty of variation top-to-bottom, so the central-distinct gate wrongly rejected it
++                 * and stuck the panel on the last busier frame (the Welcome/Activate screen). */
++                for (gy2 = 0; gy2 < 40; gy2++) for (gx2 = 0; gx2 < 40; gx2++)
++                    if (px[(SIZE_T)(H * gy2 / 40) * W + (W * gx2 / 40)] != ref2) dd++;
++                {
++                    if (diag)
++                        ERR("neutron-src: sc=%p hwnd=%p %ux%u center=%08lx grid8=%d densegrid40=%d -> %s\n",
++                            swapchain, hwnd, desc.Width, desc.Height, px[(SIZE_T)(H / 2) * W + W / 2],
++                            distinct, dd, dd >= 3 ? "HAS-VARIATION" : "TRULY-UNIFORM");
++                    /* Dump EACH distinct swapchain once (keyed by swapchain ptr), + again if it gains
++                     * variation, so we SEE every ForHwnd swapchain's real content. */
++                    {
++                        static struct { void *sc; int best; } seen[16]; static int nseen;
++                        int si, slot = -1;
++                        for (si = 0; si < nseen; si++) if (seen[si].sc == swapchain) { slot = si; break; }
++                        if (slot < 0 && nseen < 16) { slot = nseen++; seen[slot].sc = swapchain; seen[slot].best = -1; }
++                        if (slot >= 0 && dd > seen[slot].best)
++                        {
++                            WCHAR fn[64];
++                            static const WCHAR fmt[] = {'C',':','\\','n','s','c','_','%','0','8','x','_','%','u','x','%','u','.','b','g','r','a',0};
++                            HANDLE fh;
++                            seen[slot].best = dd;
++                            wsprintfW(fn, fmt, (DWORD)(ULONG_PTR)swapchain, desc.Width, desc.Height);
++                            fh = CreateFileW(fn, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
++                            if (fh != INVALID_HANDLE_VALUE)
++                            {
++                                DWORD wr;
++                                WriteFile(fh, packed, desc.Width * desc.Height * 4, &wr, NULL);
++                                CloseHandle(fh);
++                                ERR("neutron-dump: wrote sc=%p %ux%u densegrid40=%d\n", swapchain, desc.Width, desc.Height, dd);
++                            }
++                        }
++                    }
++                }
++                /* Deliver a frame with whole-frame variation (real content), not a solid blank flip
++                 * rotation. The dense 40x40 grid over the WHOLE frame is the right blank filter: the sparse,
++                 * dark main UI (content top-heavy, empty below) is wrongly rejected by a central-only grid,
++                 * which stuck the panel on the busier Welcome frame. dd>=2 = proven working (captions on a
++                 * clip). NOTE: with --disable-direct-composition the ForHwnd swapchain does not do the blank
++                 * flip-rotations the composition path did, so a low threshold is safe here. */
++                if (dd >= 2)
++                {
++                    sh->width = desc.Width;
++                    sh->height = desc.Height;
++                    memcpy(sh->pixels, packed, (SIZE_T)desc.Width * 4 * desc.Height);
++                    InterlockedIncrement(&sh->seq);
++                    if (!p->t_first_deliver)
++                    {
++                        p->t_first_deliver = TRUE;
++                        ERR("neutron-time: sc=%p host=%p FIRST-DELIVER tick=%llu dd=%d\n",
++                            swapchain, hwnd, GetTickCount64(), dd);
++                    }
++                }
++                else if (!p->t_first_deliver && diag)  /* real present but gate rejected it -> hypothesis 2 */
++                    ERR("neutron-time: sc=%p host=%p REJECT dd=%d<2 tick=%llu presentcount=%u\n",
++                        swapchain, hwnd, dd, GetTickCount64(), p->last_present_count);
++            }
+         }
+-
++    }
++    else if (packed)
++    {
++        /* same-process target (e.g. the program-monitor canvas): the classic GDI blit works. */
+         memset(&bmi, 0, sizeof(bmi));
+         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+         bmi.bmiHeader.biWidth = desc.Width;
+@@ -235,19 +394,15 @@ unlock:
+ 
+         if ((hdc = GetDC(hwnd)))
+         {
+-            int sb;
+             GetClientRect(hwnd, &rc);
+             SetStretchBltMode(hdc, COLORONCOLOR);
+-            sb = StretchDIBits(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
++            StretchDIBits(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                           0, 0, desc.Width, desc.Height,
+                           packed, &bmi, DIB_RGB_COLORS, SRCCOPY);
+-            if (diag) ERR("diag: hwnd %p client %ldx%ld center=%08lx StretchDIBits=%d\n",
+-                          hwnd, rc.right - rc.left, rc.bottom - rc.top, center, sb);
+             ReleaseDC(hwnd, hdc);
+         }
+-        else if (diag) ERR("diag: GetDC(%p) returned NULL\n", hwnd);
+-        free(packed);
+     }
++    free(packed);
+ 
+ done:
+     if (staging) ID3D11Texture2D_Release(staging);
+@@ -265,8 +420,8 @@ static DWORD WINAPI presentations_proc(void *arg)
+         EnterCriticalSection(&presentations_cs);
+         LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
+         {
+-            if (p->swapchain && p->hwnd && IsWindow(p->hwnd))
+-                blit_swapchain_to_hwnd(p->swapchain, p->hwnd);
++            if (p->swapchain && p->present_hwnd && IsWindow(p->present_hwnd))
++                blit_swapchain_to_hwnd(p);
+         }
+         LeaveCriticalSection(&presentations_cs);
+         Sleep(16);
+@@ -285,12 +440,61 @@ static void register_presentation(HWND hwnd, IUnknown *content)
+ {
+     IDXGISwapChain *swapchain = NULL;
+     struct presentation *p;
++    HWND host, target;
++    BOOL target_cross_proc = FALSE;
+ 
+     if (!hwnd || !content)
+         return;
+     if (FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain, (void **)&swapchain)))
+         return;
+ 
++    /* NEUTRON: only CEF/CEP panels (which have a WC_PLUGPLUG_HTMLEXTENSION host ancestor) get the
++     * subsurface treatment. We blit into that host and mark IT so win32u gives it its own window
++     * surface -> winewayland maps it as a subsurface ABOVE the parent's GPU (Vulkan/DXVK) client
++     * surface, making our GDI blit visible instead of hidden underneath. Non-CEF dcomp targets (e.g.
++     * the program-monitor canvas) return NULL here and are left completely untouched. */
++    host = find_cef_panel_host(hwnd);
++    target = host ? host : hwnd;
++    {
++        DWORD tpid = 0;
++        GetWindowThreadProcessId(target, &tpid);
++        /* cross-process (CEF panel host owned by the Adobe app) -> shared-memory present path;
++         * same-process (program-monitor canvas) -> classic GDI blit. */
++        target_cross_proc = (tpid && tpid != GetCurrentProcessId());
++    }
++    {
++        /* NEUTRON diag: log the full ancestor chain (class + pid) once per hwnd so we can see whether a
++         * ForHwnd swapchain's CEF child resolves up to the Adobe-owned HTMLEXTENSION host. */
++        static HWND logged[32]; static int nlogged;
++        int li; BOOL seen = FALSE;
++        for (li = 0; li < nlogged; li++) if (logged[li] == hwnd) { seen = TRUE; break; }
++        if (!seen && nlogged < 32)
++        {
++            HWND a; int depth; char chain[512]; int off = 0;
++            logged[nlogged++] = hwnd;
++            for (a = hwnd, depth = 0; a && depth < 16; a = GetAncestor(a, GA_PARENT), depth++)
++            {
++                WCHAR cls[128]; DWORD apid = 0; char cn[128]; int j = 0;
++                if (GetClassNameW(a, cls, 128) <= 0) cls[0] = 0;
++                GetWindowThreadProcessId(a, &apid);
++                while (cls[j] && j < 40) { cn[j] = (char)cls[j]; j++; } cn[j] = 0;
++                off += snprintf(chain + off, sizeof(chain) - off, "%p[%s,pid%lu] <- ", a, cn, apid);
++                if (off > (int)sizeof(chain) - 80) break;
++            }
++            ERR("neutron-time: REGISTER hwnd=%p host=%p target=%p cross_proc=%d tick=%llu chain: %s\n",
++                hwnd, host, target, target_cross_proc, GetTickCount64(), chain);
++        }
++    }
++    if (host && !GetPropW(host, L"__wine_dcomp_present"))
++    {
++        /* ONE-TIME only: propping + SWP_FRAMECHANGED does a cross-process SendMessage to the owner's
++         * GUI thread. Doing it on every re-register (e.g. each swapchain resize) storms that thread and
++         * deadlocks (dcomp worker <-> owner GUI thread). Only grant the surface once. */
++        SetPropW(host, L"__wine_dcomp_present", (HANDLE)(ULONG_PTR)1);
++        SetWindowPos(host, NULL, 0, 0, 0, 0,
++                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_FRAMECHANGED);
++    }
++
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
+     EnterCriticalSection(&presentations_cs);
+@@ -298,6 +502,8 @@ static void register_presentation(HWND hwnd, IUnknown *content)
+     {
+         if (p->hwnd == hwnd)
+         {
++            p->present_hwnd = target;
++            p->cross_proc = target_cross_proc;
+             if (p->swapchain != swapchain)
+             {
+                 if (p->swapchain) IDXGISwapChain_Release(p->swapchain);
+@@ -312,9 +518,11 @@ static void register_presentation(HWND hwnd, IUnknown *content)
+     if ((p = calloc(1, sizeof(*p))))
+     {
+         p->hwnd = hwnd;
++        p->present_hwnd = target;
++        p->cross_proc = target_cross_proc;
+         p->swapchain = swapchain; /* take QI ref */
+         list_add_tail(&presentations, &p->entry);
+-        TRACE("registered presentation hwnd %p swapchain %p.\n", hwnd, swapchain);
++        TRACE("registered presentation hwnd %p (blit target %p) swapchain %p.\n", hwnd, target, swapchain);
+     }
+     else IDXGISwapChain_Release(swapchain);
+     LeaveCriticalSection(&presentations_cs);
+@@ -331,8 +539,14 @@ static void unregister_presentations_for_hwnd(HWND hwnd)
+     {
+         if (p->hwnd == hwnd)
+         {
++            /* NEUTRON: presentation gone -> drop the surface-forcing prop from the panel host
++             * (see register_presentation). Only panel hosts (present_hwnd != hwnd) were propped. */
++            if (p->present_hwnd && p->present_hwnd != hwnd)
++                RemovePropW(p->present_hwnd, L"__wine_dcomp_present");
+             list_remove(&p->entry);
+             if (p->swapchain) IDXGISwapChain_Release(p->swapchain);
++            if (p->px_view) UnmapViewOfFile(p->px_view);
++            if (p->px_map) CloseHandle(p->px_map);
+             free(p);
+         }
+     }
+@@ -372,7 +586,8 @@ static HRESULT WINAPI visual_QueryInterface(IDCompositionVisual2 *iface, REFIID
+         return S_OK;
+     }
+ 
+-    WARN("%s not implemented.\n", debugstr_guid(iid));
++    ERR("neutron-qi: VISUAL refused %s (E_NOINTERFACE) -- if Chromium wanted this, SetContent went here\n",
++        debugstr_guid(iid));
+     *out = NULL;
+     return E_NOINTERFACE;
+ }
+@@ -490,11 +705,38 @@ static HRESULT WINAPI visual_SetContent(IDCompositionVisual2 *iface, IUnknown *c
+         IDXGISwapChain *swapchain;
+         if (SUCCEEDED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain, (void **)&swapchain)))
+         {
+-            TRACE("content %p is an IDXGISwapChain.\n", content);
++            DXGI_SWAP_CHAIN_DESC d = {0};
++            IDXGISwapChain_GetDesc(swapchain, &d);
++            ERR("neutron-setcontent: visual=%p SWAPCHAIN=%p %ux%u fmt=%d buffers=%u swapeffect=%d\n",
++                iface, swapchain, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format,
++                d.BufferCount, d.SwapEffect);
+             IDXGISwapChain_Release(swapchain);
+         }
+         else
+-            FIXME("content %p is not a swapchain - surface content not yet handled.\n", content);
++        {
++            /* If CEF presents the panel via an IDCompositionSurface (not a swapchain) we currently drop
++             * it -> the panel reads white. Log which interfaces this content DOES expose so we know what
++             * to handle. */
++            struct { const char *n; const GUID *iid; } probes[] = {
++                {"IDCompositionSurface",        &IID_IDCompositionSurface},
++                {"IDCompositionVirtualSurface", &IID_IDCompositionVirtualSurface},
++                {"IDXGIResource",               &IID_IDXGIResource},
++                {"ID3D11Texture2D",             &IID_ID3D11Texture2D},
++            };
++            char hit[256] = {0};
++            unsigned k;
++            for (k = 0; k < ARRAY_SIZE(probes); k++)
++            {
++                void *p = NULL;
++                if (SUCCEEDED(IUnknown_QueryInterface(content, probes[k].iid, &p)) && p)
++                {
++                    strcat(hit, probes[k].n); strcat(hit, " ");
++                    IUnknown_Release((IUnknown *)p);
++                }
++            }
++            ERR("neutron-setcontent: visual=%p NON-SWAPCHAIN content=%p exposes: [%s] (surface content NOT handled -> white)\n",
++                iface, content, hit[0] ? hit : "unknown");
++        }
+     }
+     return S_OK;
+ }
+@@ -691,7 +933,8 @@ static HRESULT WINAPI device_QueryInterface(IDCompositionDesktopDevice *iface, R
+         return S_OK;
+     }
+ 
+-    WARN("%s not implemented.\n", debugstr_guid(iid));
++    ERR("neutron-qi: DEVICE refused %s (E_NOINTERFACE) -- e.g. IDCompositionDevice3 Chromium may need\n",
++        debugstr_guid(iid));
+     *out = NULL;
+     return E_NOINTERFACE;
+ }
+@@ -996,11 +1239,13 @@ static HWND pending_hwnd;
+ 
+ void dcomp_set_pending_hwnd(HWND hwnd)
+ {
++    ERR("NEUTRON-DCOMP set(%p)\n", hwnd);
+     pending_hwnd = hwnd;
+ }
+ 
+ HWND dcomp_get_pending_hwnd(void)
+ {
++    ERR("NEUTRON-DCOMP get -> %p\n", pending_hwnd);
+     return pending_hwnd;
+ }
+ 
+@@ -1019,6 +1264,17 @@ void dcomp_register_external(HWND hwnd, IUnknown *swapchain)
+         ERR("gluon-register-fallback: null hwnd -> using pending_hwnd %p for swapchain %p\n",
+             hwnd, swapchain);
+     }
++    {
++        IDXGISwapChain *sc = NULL;
++        DXGI_SWAP_CHAIN_DESC d = {0};
++        if (swapchain && SUCCEEDED(IUnknown_QueryInterface(swapchain, &IID_IDXGISwapChain, (void **)&sc)) && sc)
++        {
++            IDXGISwapChain_GetDesc(sc, &d);
++            IDXGISwapChain_Release(sc);
++        }
++        ERR("neutron-reg-ext: hwnd=%p swapchain=%p %ux%u fmt=%d\n",
++            hwnd, swapchain, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format);
++    }
+     TRACE("%p, %p.\n", hwnd, swapchain);
+     register_presentation(hwnd, swapchain);
+ }

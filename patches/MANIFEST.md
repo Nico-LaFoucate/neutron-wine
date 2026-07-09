@@ -27,8 +27,12 @@ interdependent, so they're maintained as one patch that applies cleanly on the s
   multi-monitor overflow, independent of KWin's global decoration theme. Also implements
   `zxdg_decoration_manager_v1` + `pGetWindowStyleMasks` for the SSD opt-in.
 
-Touches: `dlls/winewayland.drv/{Makefile.in, fractional-scale-v1.xml, xdg-decoration-unstable-v1.xml,
-wayland.c, wayland_surface.c, waylanddrv.h, waylanddrv_main.c, window.c}`.
+Also carries the **owner-process consumer thread** for the cross-process CEF/WebView2 present path
+(`dllmain.c`): it opens each registered host hwnd's shared pixel section and blits it same-process, the
+counterpart to `neutron-dcomp-crossproc`. Plus `wayland_pointer.c` and `window_surface.c` present-path
+updates from the proven dev tree. Touches: `dlls/winewayland.drv/{Makefile.in, fractional-scale-v1.xml,
+xdg-decoration-unstable-v1.xml, wayland.c, wayland_surface.c, waylanddrv.h, waylanddrv_main.c, window.c,
+dllmain.c, wayland_pointer.c, window_surface.c}`.
 
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern
@@ -65,6 +69,40 @@ Touches: `winex11.drv/{neutron_pacer.c,init.c}`, `Makefile.in` (`-lxcb -lxcb-ran
 Working `IDCompositionDevice` implementation (replaces Wine's stub `dlls/dcomp/device.c`) + a present
 bridge that DXVK/vkd3d hand their windowed swapchains to (`dcomp_register_external` /
 `dcomp_set_pending_hwnd`), blitted to the window. Load-bearing for surfaces that bypass DirectComposition.
+
+### `neutron-dcomp-crossproc.mypatch`
+**Cross-process present path for CEF/WebView2 panels — the fix for the BLANK Adobe sign-in.** Applies on
+top of `neutron-dcomp-bridge` (touches the same `dlls/dcomp/device.c`, so it sorts/applies after it).
+Adobe's in-app sign-in (and CEP panels) run their renderer/compositor in a **separate process**
+(`msedgewebview2.exe` / `CEPHtmlEngine`), but the host window belongs to the Adobe app process. Wine's
+`window_surface` is per-process, so a cross-process `GetDC`+`StretchDIBits` writes into a **detached DC**
+(verified: `GetPixel` readback = `CLR_INVALID`) and never reaches the owner's surface → **the sign-in
+paints white**. This patch hands the swapchain pixels to the owner via a named shared section keyed by the
+host hwnd (`__neutron_dcomp_px_<hwnd>` + a shared hwnd registry); the owner-process consumer
+(`neutron-winewayland` `dllmain.c` thread) blits them same-process and flushes so the subsurface commits.
+Adds `dcomp_get_pending_hwnd` to the spec. This present path is present in the proven dev-tree wine but was
+**missing from the v11.10-1 packaged runtime**, which is exactly why the packaged build rendered the
+WebView2 sign-in blank while the dev-tree build rendered it. Pairs with `neutron-cep-child-surface`.
+
+### `neutron-cep-child-surface.mypatch`
+The owner-process half of the cross-process present path: in `win32u/window.c`, CEF/CEP/WebView2 panel-host
+**child** windows are denied their own `window_surface` (`needs_surface = FALSE`) so the consumer blits the
+shared pixels through the child's DC into the **toplevel** surface, which GDI clips to the child's visible
+region and tracks as the panel moves/resizes/occludes — content renders **inside** the panel, not as an
+on-top overlay subsurface. Also carries the OWL welcome-screen dismiss-on-doc-appear logic. Touches:
+`dlls/win32u/window.c`.
+
+### `neutron-mshtml-querycommandsupported.mypatch`
+`mshtml` `IHTMLDocument2::queryCommandSupported` returned `E_NOTIMPL`, which throws an uncaught JS exception
+in pages that feature-detect clipboard support via `document.queryCommandSupported("copy")` (e.g. Adobe's
+`darq` sign-in page), halting their init. Return `VARIANT_FALSE`/`S_OK` ("not supported") so the page's
+fallback path runs. Touches: `dlls/mshtml/htmldoc.c`.
+
+### `neutron-win32k-ntoskrnl-forwards.mypatch`
+Fills in `win32k.sys` exports that were `stub`s (`RtlLookupFunctionEntry`, `RtlVirtualUnwind`,
+`RtlUnwindEx`, `RtlPcToFileHeader`, `__C_specific_handler`, `__chkstk`, `RtlRestoreContext`,
+`RtlCopyMemoryNonTemporal`) as forwards to `ntoskrnl.exe`, arch-gated `-arch=!i386`. Touches:
+`dlls/win32k.sys/win32k.sys.spec`.
 
 ### `neutron-jsonobject-homescreen.mypatch`
 UXP home-screen locale/i18n fix (storage-based loader) so the Premiere home screen loads.
