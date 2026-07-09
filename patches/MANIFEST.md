@@ -133,12 +133,15 @@ Temporary `ERR("NEUTRON-DL …")` markers in `winewayland.drv` (`window.c`, `way
 `WindowPosChanging`/`WindowPosChanged` for the Photoshop `win_data_mutex` deadlock investigation.
 Self-labeled **NOT for production** — re-apply only to re-instrument.
 
-### `neutron-adobe-libxml2-embedded-decl.mypatch`
+### ~~`neutron-adobe-libxml2-embedded-decl.mypatch`~~ (REMOVED — now in wine-staging v11.10)
 Wine's bundled libxml2 rejects `<?xml …?>` declarations embedded inside elements; Adobe's Creative
-Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. Makes
-`xmlParsePITarget`/`xmlParsePI` tolerate embedded XML declarations (as Windows MSXML does). Ported from
-PhialsBasement/wine-adobe-installers (regenerated against our staging base). Required for `--method
-download` (running Adobe's own installer under Neutron).
+Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. The fix
+(tolerate embedded XML declarations in `xmlParsePITarget`/`xmlParsePI`, as Windows MSXML does — from
+PhialsBasement/wine-adobe-installers) **now ships in wine-staging v11.10 itself** as
+`patches/mshtml-adobe/0002-libs-xml2-Tolerate-embedded-XML-declarations-inside-.patch`, which the
+wine-tkg staging pass applies before userpatches — our copy then fails as "previously applied" and
+aborts the build. Removed as redundant; the fix is still in every build via staging. If a future
+`WINE_BASE` bump drops the staging patchset, re-add it from git history.
 
 ### `neutron-adobe-msvcrt-findframe-null.mypatch`
 `msvcrt!_FindAndUnlinkFrame` dereferenced NULL when the frame list is empty and the unlinked frame
