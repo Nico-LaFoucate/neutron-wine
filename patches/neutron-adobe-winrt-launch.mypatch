@@ -1,0 +1,1261 @@
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index b3560f09c12..5467afd5e15 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2923,8 +2923,19 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometryRealization(ID2D1De
+ {
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+     struct d2d_geometry_realization *r = unsafe_impl_from_ID2D1GeometryRealization(realization);
++    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
++    const struct d2d_geometry *geometry_impl;
++
++    TRACE("iface %p, realization %p, brush %p.\n", iface, realization, brush);
++
++    if (FAILED(context->error.code))
++        return;
+ 
+-    FIXME("iface %p, realization %p, brush %p semi-stub!\n", iface, realization, brush);
++    if (context->target.type == D2D_TARGET_UNKNOWN)
++    {
++        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
++        return;
++    }
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+@@ -2939,6 +2950,14 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometryRealization(ID2D1De
+         }
+         return;
+     }
++
++    /* Wine keeps the realization's source geometry rather than baking a separate
++     * mesh, so rendering it is equivalent to Fill/DrawGeometry on that geometry. */
++    geometry_impl = unsafe_impl_from_ID2D1Geometry(r->geometry);
++    if (r->filled)
++        d2d_device_context_fill_geometry(context, geometry_impl, brush_impl, NULL);
++    else
++        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, r->stroke_width);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInk(ID2D1DeviceContext6 *iface,
+diff --git a/dlls/dwmapi/dwmapi_main.c b/dlls/dwmapi/dwmapi_main.c
+index 49e05cd207e..faf006f2811 100644
+--- a/dlls/dwmapi/dwmapi_main.c
++++ b/dlls/dwmapi/dwmapi_main.c
+@@ -195,6 +195,45 @@ HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attrib
+         return E_HANDLE;
+ 
+     switch (attribute) {
++    case DWMWA_CAPTION_BUTTON_BOUNDS:
++    {
++        RECT *rect = (RECT *)pv_attribute;
++        RECT window_rect;
++        LONG style;
++
++        if (!rect)
++            return E_INVALIDARG;
++        if (size < sizeof(*rect))
++            return E_NOT_SUFFICIENT_BUFFER;
++        style = GetWindowLongW(hwnd, GWL_STYLE);
++        if (style & WS_CHILD)
++            return E_HANDLE;
++        if (!GetWindowRect(hwnd, &window_rect))
++            return HRESULT_FROM_WIN32(GetLastError());
++
++        if (style & WS_CAPTION)
++        {
++            /* Bounds of the caption buttons, relative to the window's top-left corner. */
++            int btn_w = GetSystemMetrics(SM_CXSIZE);
++            int btn_h = GetSystemMetrics(SM_CYSIZE);
++            int border_x = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
++            int border_y = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
++            int count = 1; /* close button */
++
++            if (style & WS_MINIMIZEBOX) count++;
++            if (style & WS_MAXIMIZEBOX) count++;
++
++            rect->right = window_rect.right - window_rect.left - border_x;
++            rect->left = rect->right - count * btn_w;
++            rect->top = border_y;
++            rect->bottom = rect->top + btn_h;
++        }
++        else
++            SetRectEmpty(rect);
++
++        hr = S_OK;
++        break;
++    }
+     case DWMWA_EXTENDED_FRAME_BOUNDS:
+     {
+         RECT *rect = (RECT *)pv_attribute;
+diff --git a/dlls/windows.graphics/Makefile.in b/dlls/windows.graphics/Makefile.in
+index ce91ff8f53e..2149240073a 100644
+--- a/dlls/windows.graphics/Makefile.in
++++ b/dlls/windows.graphics/Makefile.in
+@@ -1,6 +1,7 @@
+ MODULE  = windows.graphics.dll
+-IMPORTS = combase
++IMPORTS = combase user32
+ 
+ SOURCES = \
+ 	classes.idl \
+-	main.c
++	main.c \
++	weakref.c
+diff --git a/dlls/windows.graphics/main.c b/dlls/windows.graphics/main.c
+index 25a571975e5..4dfbdd04479 100644
+--- a/dlls/windows.graphics/main.c
++++ b/dlls/windows.graphics/main.c
+@@ -22,10 +22,649 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(display);
+ 
++/* From windows.graphics.display.interop.h (not present in Wine's headers).
++ * Desktop (non-CoreWindow) apps get DisplayInformation through this interop
++ * interface on the activation factory instead of GetForCurrentView(). */
++DEFINE_GUID( IID_IDisplayInformationStaticsInterop, 0x7449121c, 0x382b, 0x4705,
++             0x8d, 0xa7, 0xa7, 0x95, 0xba, 0x48, 0x20, 0x13 );
++
++typedef struct IDisplayInformationStaticsInterop IDisplayInformationStaticsInterop;
++
++struct IDisplayInformationStaticsInteropVtbl
++{
++    /* IUnknown methods */
++    HRESULT (WINAPI *QueryInterface)( IDisplayInformationStaticsInterop *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( IDisplayInformationStaticsInterop *iface );
++    ULONG (WINAPI *Release)( IDisplayInformationStaticsInterop *iface );
++    /* IInspectable methods */
++    HRESULT (WINAPI *GetIids)( IDisplayInformationStaticsInterop *iface, ULONG *iid_count, IID **iids );
++    HRESULT (WINAPI *GetRuntimeClassName)( IDisplayInformationStaticsInterop *iface, HSTRING *class_name );
++    HRESULT (WINAPI *GetTrustLevel)( IDisplayInformationStaticsInterop *iface, TrustLevel *trust_level );
++    /* IDisplayInformationStaticsInterop methods */
++    HRESULT (WINAPI *GetForWindow)( IDisplayInformationStaticsInterop *iface, HWND window, REFIID iid, void **info );
++    HRESULT (WINAPI *GetForMonitor)( IDisplayInformationStaticsInterop *iface, HMONITOR monitor, REFIID iid, void **info );
++};
++
++struct IDisplayInformationStaticsInterop
++{
++    const struct IDisplayInformationStaticsInteropVtbl *lpVtbl;
++};
++
++static LONG64 next_event_token;
++
++static EventRegistrationToken dummy_token(void)
++{
++    EventRegistrationToken token;
++    token.value = InterlockedIncrement64( &next_event_token );
++    return token;
++}
++
++static void get_screen_size( UINT32 *width, UINT32 *height )
++{
++    INT w = GetSystemMetrics( SM_CXSCREEN );
++    INT h = GetSystemMetrics( SM_CYSCREEN );
++    if (w <= 0) w = 1920;
++    if (h <= 0) h = 1080;
++    *width = w;
++    *height = h;
++}
++
++static float get_logical_dpi(void)
++{
++    UINT dpi = GetDpiForSystem();
++    if (!dpi) dpi = 96;
++    return (float)dpi;
++}
++
++/*
++ * AdvancedColorInfo: a standard dynamic range (sRGB / Rec.709) display.
++ */
++struct advanced_color_info
++{
++    IAdvancedColorInfo IAdvancedColorInfo_iface;
++    LONG ref;
++};
++
++static inline struct advanced_color_info *impl_from_IAdvancedColorInfo( IAdvancedColorInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct advanced_color_info, IAdvancedColorInfo_iface );
++}
++
++static HRESULT WINAPI advanced_color_info_QueryInterface( IAdvancedColorInfo *iface, REFIID iid, void **out )
++{
++    struct advanced_color_info *impl = impl_from_IAdvancedColorInfo( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown )
++        || IsEqualGUID( iid, &IID_IInspectable )
++        || IsEqualGUID( iid, &IID_IAgileObject )
++        || IsEqualGUID( iid, &IID_IAdvancedColorInfo ))
++    {
++        *out = &impl->IAdvancedColorInfo_iface;
++        IAdvancedColorInfo_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI advanced_color_info_AddRef( IAdvancedColorInfo *iface )
++{
++    struct advanced_color_info *impl = impl_from_IAdvancedColorInfo( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI advanced_color_info_Release( IAdvancedColorInfo *iface )
++{
++    struct advanced_color_info *impl = impl_from_IAdvancedColorInfo( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI advanced_color_info_GetIids( IAdvancedColorInfo *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI advanced_color_info_GetRuntimeClassName( IAdvancedColorInfo *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Graphics_Display_AdvancedColorInfo,
++                                wcslen( RuntimeClass_Windows_Graphics_Display_AdvancedColorInfo ), class_name );
++}
++
++static HRESULT WINAPI advanced_color_info_GetTrustLevel( IAdvancedColorInfo *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_CurrentAdvancedColorKind( IAdvancedColorInfo *iface,
++        AdvancedColorKind *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = AdvancedColorKind_StandardDynamicRange;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_RedPrimary( IAdvancedColorInfo *iface, Point *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->X = 0.64f;
++    value->Y = 0.33f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_GreenPrimary( IAdvancedColorInfo *iface, Point *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->X = 0.30f;
++    value->Y = 0.60f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_BluePrimary( IAdvancedColorInfo *iface, Point *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->X = 0.15f;
++    value->Y = 0.06f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_WhitePoint( IAdvancedColorInfo *iface, Point *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    value->X = 0.3127f;
++    value->Y = 0.3290f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_MaxLuminanceInNits( IAdvancedColorInfo *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = 350.0f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_MinLuminanceInNits( IAdvancedColorInfo *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = 0.5f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_MaxAverageFullFrameLuminanceInNits( IAdvancedColorInfo *iface,
++        FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = 350.0f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_get_SdrWhiteLevelInNits( IAdvancedColorInfo *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = 80.0f;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_IsHdrMetadataFormatCurrentlySupported( IAdvancedColorInfo *iface,
++        HdrMetadataFormat format, boolean *result )
++{
++    TRACE( "iface %p, format %d, result %p.\n", iface, format, result );
++    *result = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI advanced_color_info_IsAdvancedColorKindAvailable( IAdvancedColorInfo *iface,
++        AdvancedColorKind kind, boolean *result )
++{
++    TRACE( "iface %p, kind %d, result %p.\n", iface, kind, result );
++    *result = (kind == AdvancedColorKind_StandardDynamicRange);
++    return S_OK;
++}
++
++static const struct IAdvancedColorInfoVtbl advanced_color_info_vtbl =
++{
++    advanced_color_info_QueryInterface,
++    advanced_color_info_AddRef,
++    advanced_color_info_Release,
++    /* IInspectable methods */
++    advanced_color_info_GetIids,
++    advanced_color_info_GetRuntimeClassName,
++    advanced_color_info_GetTrustLevel,
++    /* IAdvancedColorInfo methods */
++    advanced_color_info_get_CurrentAdvancedColorKind,
++    advanced_color_info_get_RedPrimary,
++    advanced_color_info_get_GreenPrimary,
++    advanced_color_info_get_BluePrimary,
++    advanced_color_info_get_WhitePoint,
++    advanced_color_info_get_MaxLuminanceInNits,
++    advanced_color_info_get_MinLuminanceInNits,
++    advanced_color_info_get_MaxAverageFullFrameLuminanceInNits,
++    advanced_color_info_get_SdrWhiteLevelInNits,
++    advanced_color_info_IsHdrMetadataFormatCurrentlySupported,
++    advanced_color_info_IsAdvancedColorKindAvailable,
++};
++
++static HRESULT advanced_color_info_create( IAdvancedColorInfo **out )
++{
++    struct advanced_color_info *impl;
++
++    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
++    impl->IAdvancedColorInfo_iface.lpVtbl = &advanced_color_info_vtbl;
++    impl->ref = 1;
++
++    *out = &impl->IAdvancedColorInfo_iface;
++    return S_OK;
++}
++
++/*
++ * DisplayInformation instance object.
++ */
++struct display_information
++{
++    IDisplayInformation IDisplayInformation_iface;
++    IDisplayInformation2 IDisplayInformation2_iface;
++    IDisplayInformation3 IDisplayInformation3_iface;
++    IDisplayInformation4 IDisplayInformation4_iface;
++    IDisplayInformation5 IDisplayInformation5_iface;
++    struct weak_reference_source weak_reference_source;
++};
++
++static inline struct display_information *impl_from_IDisplayInformation( IDisplayInformation *iface )
++{
++    return CONTAINING_RECORD( iface, struct display_information, IDisplayInformation_iface );
++}
++
++static HRESULT WINAPI display_info_QueryInterface( IDisplayInformation *iface, REFIID iid, void **out )
++{
++    struct display_information *impl = impl_from_IDisplayInformation( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown )
++        || IsEqualGUID( iid, &IID_IInspectable )
++        || IsEqualGUID( iid, &IID_IAgileObject )
++        || IsEqualGUID( iid, &IID_IDisplayInformation ))
++    {
++        *out = &impl->IDisplayInformation_iface;
++        IDisplayInformation_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IDisplayInformation2 ))
++    {
++        *out = &impl->IDisplayInformation2_iface;
++        IDisplayInformation2_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IDisplayInformation3 ))
++    {
++        *out = &impl->IDisplayInformation3_iface;
++        IDisplayInformation3_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IDisplayInformation4 ))
++    {
++        *out = &impl->IDisplayInformation4_iface;
++        IDisplayInformation4_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IDisplayInformation5 ))
++    {
++        *out = &impl->IDisplayInformation5_iface;
++        IDisplayInformation5_AddRef( *out );
++        return S_OK;
++    }
++    else if (IsEqualGUID( iid, &IID_IWeakReferenceSource ))
++    {
++        *out = &impl->weak_reference_source.IWeakReferenceSource_iface;
++        IWeakReferenceSource_AddRef( *out );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI display_info_AddRef( IDisplayInformation *iface )
++{
++    struct display_information *impl = impl_from_IDisplayInformation( iface );
++    ULONG ref = weak_reference_strong_add_ref( &impl->weak_reference_source );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI display_info_Release( IDisplayInformation *iface )
++{
++    struct display_information *impl = impl_from_IDisplayInformation( iface );
++    ULONG ref = weak_reference_strong_release( &impl->weak_reference_source );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    if (!ref) free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI display_info_GetIids( IDisplayInformation *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI display_info_GetRuntimeClassName( IDisplayInformation *iface, HSTRING *class_name )
++{
++    TRACE( "iface %p, class_name %p.\n", iface, class_name );
++    return WindowsCreateString( RuntimeClass_Windows_Graphics_Display_DisplayInformation,
++                                wcslen( RuntimeClass_Windows_Graphics_Display_DisplayInformation ), class_name );
++}
++
++static HRESULT WINAPI display_info_GetTrustLevel( IDisplayInformation *iface, TrustLevel *trust_level )
++{
++    TRACE( "iface %p, trust_level %p.\n", iface, trust_level );
++    *trust_level = BaseTrust;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_CurrentOrientation( IDisplayInformation *iface, DisplayOrientations *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = DisplayOrientations_Landscape;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_NativeOrientation( IDisplayInformation *iface, DisplayOrientations *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = DisplayOrientations_Landscape;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_add_OrientationChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    *token = dummy_token();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_remove_OrientationChanged( IDisplayInformation *iface,
++        EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_ResolutionScale( IDisplayInformation *iface, ResolutionScale *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = ResolutionScale_Scale100Percent;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_LogicalDpi( IDisplayInformation *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = get_logical_dpi();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_RawDpiX( IDisplayInformation *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = get_logical_dpi();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_RawDpiY( IDisplayInformation *iface, FLOAT *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = get_logical_dpi();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_add_DpiChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    *token = dummy_token();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_remove_DpiChanged( IDisplayInformation *iface, EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_get_StereoEnabled( IDisplayInformation *iface, boolean *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = FALSE;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_add_StereoEnabledChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    *token = dummy_token();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_remove_StereoEnabledChanged( IDisplayInformation *iface,
++        EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_GetColorProfileAsync( IDisplayInformation *iface,
++        IAsyncOperation_IRandomAccessStream **async_info )
++{
++    FIXME( "iface %p, async_info %p stub!\n", iface, async_info );
++    *async_info = NULL;
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI display_info_add_ColorProfileChanged( IDisplayInformation *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    *token = dummy_token();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info_remove_ColorProfileChanged( IDisplayInformation *iface,
++        EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static const struct IDisplayInformationVtbl display_info_vtbl =
++{
++    display_info_QueryInterface,
++    display_info_AddRef,
++    display_info_Release,
++    /* IInspectable methods */
++    display_info_GetIids,
++    display_info_GetRuntimeClassName,
++    display_info_GetTrustLevel,
++    /* IDisplayInformation methods */
++    display_info_get_CurrentOrientation,
++    display_info_get_NativeOrientation,
++    display_info_add_OrientationChanged,
++    display_info_remove_OrientationChanged,
++    display_info_get_ResolutionScale,
++    display_info_get_LogicalDpi,
++    display_info_get_RawDpiX,
++    display_info_get_RawDpiY,
++    display_info_add_DpiChanged,
++    display_info_remove_DpiChanged,
++    display_info_get_StereoEnabled,
++    display_info_add_StereoEnabledChanged,
++    display_info_remove_StereoEnabledChanged,
++    display_info_GetColorProfileAsync,
++    display_info_add_ColorProfileChanged,
++    display_info_remove_ColorProfileChanged,
++};
++
++DEFINE_IINSPECTABLE( display_info2, IDisplayInformation2, struct display_information, IDisplayInformation_iface )
++
++static HRESULT WINAPI display_info2_get_RawPixelsPerViewPixel( IDisplayInformation2 *iface, DOUBLE *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = get_logical_dpi() / 96.0;
++    return S_OK;
++}
++
++static const struct IDisplayInformation2Vtbl display_info2_vtbl =
++{
++    display_info2_QueryInterface,
++    display_info2_AddRef,
++    display_info2_Release,
++    /* IInspectable methods */
++    display_info2_GetIids,
++    display_info2_GetRuntimeClassName,
++    display_info2_GetTrustLevel,
++    /* IDisplayInformation2 methods */
++    display_info2_get_RawPixelsPerViewPixel,
++};
++
++DEFINE_IINSPECTABLE( display_info3, IDisplayInformation3, struct display_information, IDisplayInformation_iface )
++
++static HRESULT WINAPI display_info3_get_DiagonalSizeInInches( IDisplayInformation3 *iface, IReference_DOUBLE **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = NULL; /* unknown, matches Windows desktops without EDID size info */
++    return S_OK;
++}
++
++static const struct IDisplayInformation3Vtbl display_info3_vtbl =
++{
++    display_info3_QueryInterface,
++    display_info3_AddRef,
++    display_info3_Release,
++    /* IInspectable methods */
++    display_info3_GetIids,
++    display_info3_GetRuntimeClassName,
++    display_info3_GetTrustLevel,
++    /* IDisplayInformation3 methods */
++    display_info3_get_DiagonalSizeInInches,
++};
++
++DEFINE_IINSPECTABLE( display_info4, IDisplayInformation4, struct display_information, IDisplayInformation_iface )
++
++static HRESULT WINAPI display_info4_get_ScreenWidthInRawPixels( IDisplayInformation4 *iface, UINT32 *value )
++{
++    UINT32 width, height;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    get_screen_size( &width, &height );
++    *value = width;
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info4_get_ScreenHeightInRawPixels( IDisplayInformation4 *iface, UINT32 *value )
++{
++    UINT32 width, height;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    get_screen_size( &width, &height );
++    *value = height;
++    return S_OK;
++}
++
++static const struct IDisplayInformation4Vtbl display_info4_vtbl =
++{
++    display_info4_QueryInterface,
++    display_info4_AddRef,
++    display_info4_Release,
++    /* IInspectable methods */
++    display_info4_GetIids,
++    display_info4_GetRuntimeClassName,
++    display_info4_GetTrustLevel,
++    /* IDisplayInformation4 methods */
++    display_info4_get_ScreenWidthInRawPixels,
++    display_info4_get_ScreenHeightInRawPixels,
++};
++
++DEFINE_IINSPECTABLE( display_info5, IDisplayInformation5, struct display_information, IDisplayInformation_iface )
++
++static HRESULT WINAPI display_info5_GetAdvancedColorInfo( IDisplayInformation5 *iface, IAdvancedColorInfo **value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return advanced_color_info_create( value );
++}
++
++static HRESULT WINAPI display_info5_add_AdvancedColorInfoChanged( IDisplayInformation5 *iface,
++        ITypedEventHandler_DisplayInformation_IInspectable *handler, EventRegistrationToken *token )
++{
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    *token = dummy_token();
++    return S_OK;
++}
++
++static HRESULT WINAPI display_info5_remove_AdvancedColorInfoChanged( IDisplayInformation5 *iface,
++        EventRegistrationToken token )
++{
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
++}
++
++static const struct IDisplayInformation5Vtbl display_info5_vtbl =
++{
++    display_info5_QueryInterface,
++    display_info5_AddRef,
++    display_info5_Release,
++    /* IInspectable methods */
++    display_info5_GetIids,
++    display_info5_GetRuntimeClassName,
++    display_info5_GetTrustLevel,
++    /* IDisplayInformation5 methods */
++    display_info5_GetAdvancedColorInfo,
++    display_info5_add_AdvancedColorInfoChanged,
++    display_info5_remove_AdvancedColorInfoChanged,
++};
++
++static HRESULT display_information_create( IDisplayInformation **out )
++{
++    struct display_information *impl;
++    HRESULT hr;
++
++    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
++    impl->IDisplayInformation_iface.lpVtbl = &display_info_vtbl;
++    impl->IDisplayInformation2_iface.lpVtbl = &display_info2_vtbl;
++    impl->IDisplayInformation3_iface.lpVtbl = &display_info3_vtbl;
++    impl->IDisplayInformation4_iface.lpVtbl = &display_info4_vtbl;
++    impl->IDisplayInformation5_iface.lpVtbl = &display_info5_vtbl;
++    if (FAILED(hr = weak_reference_source_init( &impl->weak_reference_source,
++                                                (IUnknown *)&impl->IDisplayInformation_iface )))
++    {
++        free( impl );
++        *out = NULL;
++        return hr;
++    }
++
++    *out = &impl->IDisplayInformation_iface;
++    return S_OK;
++}
++
++/*
++ * DisplayInformation activation factory / statics.
++ */
+ struct display_info_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+     IDisplayInformationStatics IDisplayInformationStatics_iface;
++    IDisplayInformationStaticsInterop IDisplayInformationStaticsInterop_iface;
+     LONG ref;
+ };
+ 
+@@ -42,6 +681,7 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+ 
+     if (IsEqualGUID( iid, &IID_IUnknown )
+         || IsEqualGUID( iid, &IID_IInspectable )
++        || IsEqualGUID( iid, &IID_IAgileObject )
+         || IsEqualGUID( iid, &IID_IActivationFactory ))
+     {
+         *out = &impl->IActivationFactory_iface;
+@@ -54,6 +694,12 @@ static HRESULT WINAPI factory_QueryInterface( IActivationFactory *iface, REFIID
+         IDisplayInformationStatics_AddRef( *out );
+         return S_OK;
+     }
++    else if (IsEqualGUID( iid, &IID_IDisplayInformationStaticsInterop ))
++    {
++        *out = &impl->IDisplayInformationStaticsInterop_iface;
++        IActivationFactory_AddRef( &impl->IActivationFactory_iface );
++        return S_OK;
++    }
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+@@ -96,8 +742,8 @@ static HRESULT WINAPI factory_GetTrustLevel( IActivationFactory *iface, TrustLev
+ 
+ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+-    FIXME( "iface %p, instance %p stub!\n", iface, instance );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++    return display_information_create( (IDisplayInformation **)instance );
+ }
+ 
+ static const struct IActivationFactoryVtbl factory_vtbl =
+@@ -119,36 +765,41 @@ DEFINE_IINSPECTABLE( display_info_statics, IDisplayInformationStatics, struct di
+ static HRESULT WINAPI display_info_statics_GetForCurrentView( IDisplayInformationStatics *iface,
+         IDisplayInformation **current )
+ {
+-    FIXME( "iface %p, current %p stub!\n", iface, current );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, current %p.\n", iface, current );
++    return display_information_create( current );
+ }
+ 
++static DisplayOrientations auto_rotation_preferences = DisplayOrientations_None;
++
+ static HRESULT WINAPI display_info_statics_get_AutoRotationPreferences( IDisplayInformationStatics *iface,
+         DisplayOrientations *value )
+ {
+-    FIXME( "iface %p, value %p stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = auto_rotation_preferences;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI display_info_statics_put_AutoRotationPreferences( IDisplayInformationStatics *iface,
+         DisplayOrientations value )
+ {
+-    FIXME( "iface %p, value %#x stub!\n", iface, value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, value %#x.\n", iface, value );
++    auto_rotation_preferences = value;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI display_info_statics_add_DisplayContentsInvalidated( IDisplayInformationStatics *iface,
+         ITypedEventHandler_DisplayInformation_IInspectable *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, handler %p, token %p.\n", iface, handler, token );
++    *token = dummy_token();
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI display_info_statics_remove_DisplayContentsInvalidated( IDisplayInformationStatics *iface,
+         EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    TRACE( "iface %p, token %I64x.\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static const struct IDisplayInformationStaticsVtbl display_info_statics_vtbl =
+@@ -168,10 +819,56 @@ static const struct IDisplayInformationStaticsVtbl display_info_statics_vtbl =
+     display_info_statics_remove_DisplayContentsInvalidated
+ };
+ 
++DEFINE_IINSPECTABLE( display_info_statics_interop, IDisplayInformationStaticsInterop,
++                     struct display_info_statics, IActivationFactory_iface )
++
++static HRESULT WINAPI display_info_statics_interop_GetForWindow( IDisplayInformationStaticsInterop *iface,
++        HWND window, REFIID iid, void **info )
++{
++    IDisplayInformation *display_info;
++    HRESULT hr;
++
++    TRACE( "iface %p, window %p, iid %s, info %p.\n", iface, window, debugstr_guid( iid ), info );
++
++    if (FAILED(hr = display_information_create( &display_info ))) return hr;
++    hr = IDisplayInformation_QueryInterface( display_info, iid, info );
++    IDisplayInformation_Release( display_info );
++    return hr;
++}
++
++static HRESULT WINAPI display_info_statics_interop_GetForMonitor( IDisplayInformationStaticsInterop *iface,
++        HMONITOR monitor, REFIID iid, void **info )
++{
++    IDisplayInformation *display_info;
++    HRESULT hr;
++
++    TRACE( "iface %p, monitor %p, iid %s, info %p.\n", iface, monitor, debugstr_guid( iid ), info );
++
++    if (FAILED(hr = display_information_create( &display_info ))) return hr;
++    hr = IDisplayInformation_QueryInterface( display_info, iid, info );
++    IDisplayInformation_Release( display_info );
++    return hr;
++}
++
++static const struct IDisplayInformationStaticsInteropVtbl display_info_statics_interop_vtbl =
++{
++    display_info_statics_interop_QueryInterface,
++    display_info_statics_interop_AddRef,
++    display_info_statics_interop_Release,
++    /* IInspectable methods */
++    display_info_statics_interop_GetIids,
++    display_info_statics_interop_GetRuntimeClassName,
++    display_info_statics_interop_GetTrustLevel,
++    /* IDisplayInformationStaticsInterop methods */
++    display_info_statics_interop_GetForWindow,
++    display_info_statics_interop_GetForMonitor,
++};
++
+ static struct display_info_statics display_info_statics =
+ {
+     {&factory_vtbl},
+     {&display_info_statics_vtbl},
++    {&display_info_statics_interop_vtbl},
+     1,
+ };
+ 
+@@ -187,7 +884,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
+ {
+     const WCHAR *name = WindowsGetStringRawBuffer( classid, NULL );
+ 
+-    TRACE( "classid %s, factory %p.\n", debugstr_hstring( classid ), factory );
++    ERR( "NEUTRON-DISPINFO loaded: classid %s, factory %p.\n", debugstr_hstring( classid ), factory );
+ 
+     *factory = NULL;
+ 
+diff --git a/dlls/windows.graphics/private.h b/dlls/windows.graphics/private.h
+index 64e2920bb40..b39f90f0162 100644
+--- a/dlls/windows.graphics/private.h
++++ b/dlls/windows.graphics/private.h
+@@ -19,11 +19,14 @@
+ 
+ #include <stdarg.h>
+ #include <stddef.h>
++#include <stdlib.h>
+ 
+ #define COBJMACROS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winuser.h"
+ #include "winstring.h"
++#include "objidl.h"
+ #include "activation.h"
+ #include "wine/debug.h"
+ 
+@@ -31,6 +34,8 @@
+ #define WIDL_using_Windows_Graphics_Display
+ #include "windows.graphics.display.h"
+ 
++#include "weakref.h"
++
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
+     {                                                                                              \
+diff --git a/dlls/windows.ui/inputpane.c b/dlls/windows.ui/inputpane.c
+index 9a34f041d5c..155c20687b1 100644
+--- a/dlls/windows.ui/inputpane.c
++++ b/dlls/windows.ui/inputpane.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include "private.h"
++#include "weakref.h"
+ #include "initguid.h"
+ #include "inputpaneinterop.h"
+ 
+@@ -29,7 +30,7 @@ struct inputpane
+ {
+     IInputPane IInputPane_iface;
+     IInputPane2 IInputPane2_iface;
+-    LONG ref;
++    struct weak_reference_source weak_reference_source;
+ };
+ 
+ static inline struct inputpane *impl_from_IInputPane( IInputPane *iface )
+@@ -56,6 +57,10 @@ static HRESULT WINAPI inputpane_QueryInterface( IInputPane *iface, REFIID iid, v
+     {
+         *out = &impl->IInputPane2_iface;
+     }
++    else if (IsEqualGUID( iid, &IID_IWeakReferenceSource ))
++    {
++        *out = &impl->weak_reference_source.IWeakReferenceSource_iface;
++    }
+ 
+     if (!*out)
+     {
+@@ -70,7 +75,7 @@ static HRESULT WINAPI inputpane_QueryInterface( IInputPane *iface, REFIID iid, v
+ static ULONG WINAPI inputpane_AddRef( IInputPane *iface )
+ {
+     struct inputpane *impl = impl_from_IInputPane( iface );
+-    ULONG ref = InterlockedIncrement( &impl->ref );
++    ULONG ref = weak_reference_strong_add_ref( &impl->weak_reference_source );
+     TRACE( "iface %p, ref %lu.\n", iface, ref );
+     return ref;
+ }
+@@ -78,7 +83,7 @@ static ULONG WINAPI inputpane_AddRef( IInputPane *iface )
+ static ULONG WINAPI inputpane_Release( IInputPane *iface )
+ {
+     struct inputpane *impl = impl_from_IInputPane( iface );
+-    ULONG ref = InterlockedDecrement( &impl->ref );
++    ULONG ref = weak_reference_strong_release( &impl->weak_reference_source );
+ 
+     TRACE( "iface %p, ref %lu.\n", iface, ref );
+ 
+@@ -106,26 +111,28 @@ static HRESULT WINAPI inputpane_GetTrustLevel( IInputPane *iface, TrustLevel *tr
+ 
+ static HRESULT WINAPI inputpane_add_Showing( IInputPane *iface, ITypedEventHandler_InputPane_InputPaneVisibilityEventArgs *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token);
+-    return E_NOTIMPL;
++    FIXME( "iface %p, handler %p, token %p semi-stub, ignoring handler.\n", iface, handler, token);
++    token->value = 1;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI inputpane_remove_Showing( IInputPane *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, token %#I64x semi-stub.\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI inputpane_add_Hiding( IInputPane *iface, ITypedEventHandler_InputPane_InputPaneVisibilityEventArgs *handler, EventRegistrationToken *token )
+ {
+-    FIXME( "iface %p, handler %p, token %p stub!\n", iface, handler, token);
+-    return E_NOTIMPL;
++    FIXME( "iface %p, handler %p, token %p semi-stub, ignoring handler.\n", iface, handler, token);
++    token->value = 2;
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI inputpane_remove_Hiding( IInputPane *iface, EventRegistrationToken token )
+ {
+-    FIXME( "iface %p, token %#I64x stub!\n", iface, token.value );
+-    return E_NOTIMPL;
++    FIXME( "iface %p, token %#I64x semi-stub.\n", iface, token.value );
++    return S_OK;
+ }
+ 
+ static HRESULT WINAPI inputpane_OccludedRect( IInputPane *iface, Rect *value )
+@@ -283,7 +290,13 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
+ 
+     impl->IInputPane_iface.lpVtbl = &inputpane_vtbl;
+     impl->IInputPane2_iface.lpVtbl = &inputpane2_vtbl;
+-    impl->ref = 1;
++    if (FAILED(weak_reference_source_init( &impl->weak_reference_source,
++                                           (IUnknown *)&impl->IInputPane_iface )))
++    {
++        free( impl );
++        *instance = NULL;
++        return E_OUTOFMEMORY;
++    }
+ 
+     *instance = (IInspectable *)&impl->IInputPane_iface;
+     return S_OK;
+diff --git a/dlls/windows.graphics/weakref.c b/dlls/windows.graphics/weakref.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/windows.graphics/weakref.c
+@@ -0,0 +1,175 @@
++/* WinRT weak reference helpers
++ *
++ * Copyright 2025 Zhiyi Zhang for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define COBJMACROS
++#include "weakref.h"
++
++/* The control block is contained in struct weak_reference so that we don't have to allocate a
++ * separate struct for it */
++struct weak_reference
++{
++    IWeakReference IWeakReference_iface;
++    IUnknown *object;
++    /* control block */
++    LONG ref_strong;
++    LONG ref_weak;
++};
++
++static inline struct weak_reference *impl_from_IWeakReference( IWeakReference *iface )
++{
++    return CONTAINING_RECORD(iface, struct weak_reference, IWeakReference_iface);
++}
++
++static HRESULT WINAPI weak_reference_QueryInterface( IWeakReference *iface, REFIID iid, void **out )
++{
++    struct weak_reference *impl = impl_from_IWeakReference( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) || IsEqualGUID( iid, &IID_IWeakReference ))
++    {
++        *out = &impl->IWeakReference_iface;
++        IWeakReference_AddRef( *out );
++        return S_OK;
++    }
++
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI weak_reference_AddRef( IWeakReference *iface )
++{
++    struct weak_reference *impl = impl_from_IWeakReference( iface );
++    return InterlockedIncrement( &impl->ref_weak );
++}
++
++static ULONG WINAPI weak_reference_Release( IWeakReference *iface )
++{
++    struct weak_reference *impl = impl_from_IWeakReference( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref_weak );
++
++    if (!ref)
++        free( impl );
++    return ref;
++}
++
++static HRESULT WINAPI weak_reference_Resolve( IWeakReference *iface, REFIID iid, IInspectable **out )
++{
++    struct weak_reference *impl = impl_from_IWeakReference( iface );
++    HRESULT hr;
++    LONG ref;
++
++    *out = NULL;
++    do
++    {
++        if (!(ref = ReadNoFence( &impl->ref_strong )))
++            return S_OK;
++    } while (ref != InterlockedCompareExchange( &impl->ref_strong, ref + 1, ref ));
++
++    hr = IUnknown_QueryInterface( impl->object, iid, (void **)out );
++    IUnknown_Release( impl->object );
++    return hr;
++}
++
++static const struct IWeakReferenceVtbl weak_reference_vtbl =
++{
++    weak_reference_QueryInterface,
++    weak_reference_AddRef,
++    weak_reference_Release,
++    weak_reference_Resolve,
++};
++
++static inline struct weak_reference_source *impl_from_IWeakReferenceSource( IWeakReferenceSource *iface )
++{
++    return CONTAINING_RECORD(iface, struct weak_reference_source, IWeakReferenceSource_iface);
++}
++
++static HRESULT WINAPI weak_reference_source_QueryInterface( IWeakReferenceSource *iface, REFIID iid, void **out )
++{
++    struct weak_reference_source *weak_reference_source = impl_from_IWeakReferenceSource( iface );
++    struct weak_reference *weak_reference = impl_from_IWeakReference( weak_reference_source->weak_reference );
++    return IUnknown_QueryInterface( weak_reference->object, iid, out );
++}
++
++static ULONG WINAPI weak_reference_source_AddRef( IWeakReferenceSource *iface )
++{
++    struct weak_reference_source *weak_reference_source = impl_from_IWeakReferenceSource( iface );
++    struct weak_reference *weak_reference = impl_from_IWeakReference( weak_reference_source->weak_reference );
++    return IUnknown_AddRef( weak_reference->object );
++}
++
++static ULONG WINAPI weak_reference_source_Release( IWeakReferenceSource *iface )
++{
++    struct weak_reference_source *weak_reference_source = impl_from_IWeakReferenceSource( iface );
++    struct weak_reference *weak_reference = impl_from_IWeakReference( weak_reference_source->weak_reference );
++    return IUnknown_Release( weak_reference->object );
++}
++
++static HRESULT WINAPI weak_reference_source_GetWeakReference( IWeakReferenceSource *iface,
++                                                              IWeakReference **weak_reference )
++{
++    struct weak_reference_source *impl = impl_from_IWeakReferenceSource( iface );
++
++    *weak_reference = impl->weak_reference;
++    IWeakReference_AddRef( *weak_reference );
++    return S_OK;
++}
++
++static const struct IWeakReferenceSourceVtbl weak_reference_source_vtbl =
++{
++    weak_reference_source_QueryInterface,
++    weak_reference_source_AddRef,
++    weak_reference_source_Release,
++    weak_reference_source_GetWeakReference,
++};
++
++static HRESULT weak_reference_create( IUnknown *object, IWeakReference **out )
++{
++    struct weak_reference *weak_reference;
++
++    if (!(weak_reference = calloc( 1, sizeof(*weak_reference) )))
++        return E_OUTOFMEMORY;
++
++    weak_reference->IWeakReference_iface.lpVtbl = &weak_reference_vtbl;
++    weak_reference->ref_strong = 1;
++    weak_reference->ref_weak = 1;
++    weak_reference->object = object;
++    *out = &weak_reference->IWeakReference_iface;
++    return S_OK;
++}
++
++HRESULT weak_reference_source_init( struct weak_reference_source *source, IUnknown *object )
++{
++    source->IWeakReferenceSource_iface.lpVtbl = &weak_reference_source_vtbl;
++    return weak_reference_create( object, &source->weak_reference );
++}
++
++ULONG weak_reference_strong_add_ref( struct weak_reference_source *source )
++{
++    struct weak_reference *impl = impl_from_IWeakReference( source->weak_reference );
++    return InterlockedIncrement( &impl->ref_strong );
++}
++
++ULONG weak_reference_strong_release( struct weak_reference_source *source )
++{
++    struct weak_reference *impl = impl_from_IWeakReference( source->weak_reference );
++    ULONG ref = InterlockedDecrement( &impl->ref_strong );
++
++    if (!ref)
++        IWeakReference_Release( source->weak_reference );
++    return ref;
++}
+diff --git a/dlls/windows.graphics/weakref.h b/dlls/windows.graphics/weakref.h
+new file mode 100644
+--- /dev/null
++++ b/dlls/windows.graphics/weakref.h
+@@ -0,0 +1,38 @@
++/* WinRT weak reference helpers
++ *
++ * Copyright 2025 Zhiyi Zhang for CodeWeavers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_WEAKREF_H
++#define __WINE_WEAKREF_H
++
++#include "weakreference.h"
++
++struct weak_reference_source
++{
++    IWeakReferenceSource IWeakReferenceSource_iface;
++    IWeakReference *weak_reference;
++};
++
++/* Initialize a IWeakReferenceSource with the object to manage */
++HRESULT weak_reference_source_init( struct weak_reference_source *source, IUnknown *object );
++/* Add a strong reference to the managed object */
++ULONG weak_reference_strong_add_ref( struct weak_reference_source *source );
++/* Release a strong reference to the managed object */
++ULONG weak_reference_strong_release( struct weak_reference_source *source );
++
++#endif /* __WINE_WEAKREF_H */

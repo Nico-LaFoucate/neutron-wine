@@ -96,6 +96,22 @@ Photoshop calls it during document-window creation; without a real export the im
 unimplemented-function exception and **crashes the app on File → New**. Touches: `dlls/user32/input.c`,
 `dlls/user32/user32.spec`.
 
+### `neutron-adobe-winrt-launch.mypatch`
+The WinRT/launch fixes genuine Photoshop 2026 (27.8) needs to reach its licensed home screen
+(snapshot 2026-07-08, converted from `neutron` repo `patches/staging-20260708-adobe-winrt/`):
+- **windows.graphics**: implements the `DisplayInformation` WinRT class (`GetForCurrentView`,
+  DPI/orientation properties) with a `weakref.{c,h}` helper (copied verbatim from upstream
+  `dlls/windows.ui/weakref.{c,h}`). PS queries display info via WinRT at startup.
+- **windows.ui/inputpane.c**: `InputPane` gains `IWeakReferenceSource` (weakref-managed lifetime)
+  so Adobe's touch-keyboard probing doesn't fail QueryInterface.
+- **dwmapi**: `DwmGetWindowAttribute` `DWMWA_CAPTION_BUTTON_BOUNDS` (attr 5) returns real
+  caption-button bounds instead of `E_NOTIMPL`.
+- **d2d1**: `DrawGeometryRealization` implemented (was a semi-stub) — Wine keeps the realization's
+  source geometry, so it renders as Fill/DrawGeometry on that geometry.
+Touches: `dlls/d2d1/device.c`, `dlls/dwmapi/dwmapi_main.c`,
+`dlls/windows.graphics/{Makefile.in,main.c,private.h,weakref.c,weakref.h}`,
+`dlls/windows.ui/inputpane.c`.
+
 ### `neutron-win32u-wmpaint-circuitbreaker.mypatch`
 A `WM_PAINT` circuit-breaker in `win32u`. Once Photoshop's home screen shows, OWL's menu bar can storm
 millions of unvalidated `WM_PAINT`s while holding the AdobeOwl critical section, wedging the whole app
