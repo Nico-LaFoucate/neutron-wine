@@ -96,6 +96,22 @@ Photoshop calls it during document-window creation; without a real export the im
 unimplemented-function exception and **crashes the app on File → New**. Touches: `dlls/user32/input.c`,
 `dlls/user32/user32.spec`.
 
+### `neutron-adobe-winrt-launch.mypatch`
+The WinRT/launch fixes genuine Photoshop 2026 (27.8) needs to reach its licensed home screen
+(snapshot 2026-07-08, converted from `neutron` repo `patches/staging-20260708-adobe-winrt/`):
+- **windows.graphics**: implements the `DisplayInformation` WinRT class (`GetForCurrentView`,
+  DPI/orientation properties) with a `weakref.{c,h}` helper (copied verbatim from upstream
+  `dlls/windows.ui/weakref.{c,h}`). PS queries display info via WinRT at startup.
+- **windows.ui/inputpane.c**: `InputPane` gains `IWeakReferenceSource` (weakref-managed lifetime)
+  so Adobe's touch-keyboard probing doesn't fail QueryInterface.
+- **dwmapi**: `DwmGetWindowAttribute` `DWMWA_CAPTION_BUTTON_BOUNDS` (attr 5) returns real
+  caption-button bounds instead of `E_NOTIMPL`.
+- **d2d1**: `DrawGeometryRealization` implemented (was a semi-stub) — Wine keeps the realization's
+  source geometry, so it renders as Fill/DrawGeometry on that geometry.
+Touches: `dlls/d2d1/device.c`, `dlls/dwmapi/dwmapi_main.c`,
+`dlls/windows.graphics/{Makefile.in,main.c,private.h,weakref.c,weakref.h}`,
+`dlls/windows.ui/inputpane.c`.
+
 ### `neutron-win32u-wmpaint-circuitbreaker.mypatch`
 A `WM_PAINT` circuit-breaker in `win32u`. Once Photoshop's home screen shows, OWL's menu bar can storm
 millions of unvalidated `WM_PAINT`s while holding the AdobeOwl critical section, wedging the whole app
@@ -117,12 +133,15 @@ Temporary `ERR("NEUTRON-DL …")` markers in `winewayland.drv` (`window.c`, `way
 `WindowPosChanging`/`WindowPosChanged` for the Photoshop `win_data_mutex` deadlock investigation.
 Self-labeled **NOT for production** — re-apply only to re-instrument.
 
-### `neutron-adobe-libxml2-embedded-decl.mypatch`
+### ~~`neutron-adobe-libxml2-embedded-decl.mypatch`~~ (REMOVED — now in wine-staging v11.10)
 Wine's bundled libxml2 rejects `<?xml …?>` declarations embedded inside elements; Adobe's Creative
-Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. Makes
-`xmlParsePITarget`/`xmlParsePI` tolerate embedded XML declarations (as Windows MSXML does). Ported from
-PhialsBasement/wine-adobe-installers (regenerated against our staging base). Required for `--method
-download` (running Adobe's own installer under Neutron).
+Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. The fix
+(tolerate embedded XML declarations in `xmlParsePITarget`/`xmlParsePI`, as Windows MSXML does — from
+PhialsBasement/wine-adobe-installers) **now ships in wine-staging v11.10 itself** as
+`patches/mshtml-adobe/0002-libs-xml2-Tolerate-embedded-XML-declarations-inside-.patch`, which the
+wine-tkg staging pass applies before userpatches — our copy then fails as "previously applied" and
+aborts the build. Removed as redundant; the fix is still in every build via staging. If a future
+`WINE_BASE` bump drops the staging patchset, re-add it from git history.
 
 ### `neutron-adobe-msvcrt-findframe-null.mypatch`
 `msvcrt!_FindAndUnlinkFrame` dereferenced NULL when the frame list is empty and the unlinked frame
