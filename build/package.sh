@@ -29,8 +29,14 @@ DIST="$REPO/dist"
 # --- locate the built Wine tree -------------------------------------------------
 TREE="${1:-${NEUTRON_WINE_TREE:-}}"
 if [ -z "$TREE" ]; then
-    # default: what build.sh produces under _work
-    TREE="$(echo "$REPO"/_work/wine-tkg-git/wine-tkg-git/src/*-build/wine | awk '{print $1}')"
+    # default: the COMPLETE installed tree build.sh leaves under _work (bin/ lib/ share/).
+    # Prefer non-makepkg-builds/<flavor> (the `make install` output) over src/*-build/wine
+    # (a raw build dir; the glob there can also match the 32-bit stub build first).
+    TREE="$(echo "$REPO"/_work/wine-tkg-git/wine-tkg-git/non-makepkg-builds/*/bin/wine | awk '{print $1}')"
+    TREE="${TREE%/bin/wine}"
+    if [ ! -x "$TREE/bin/wine" ]; then
+        TREE="$(echo "$REPO"/_work/wine-tkg-git/wine-tkg-git/src/*-build/wine | awk '{print $1}')"
+    fi
 fi
 if [ ! -d "$TREE" ] || { [ ! -x "$TREE/bin/wine" ] && [ ! -x "$TREE/bin/wine64" ]; }; then
     echo "error: no built Wine tree at: ${TREE:-<unset>}" >&2
