@@ -1,0 +1,45 @@
+server: fix scale_dpi() sign for negative coordinates (unsigned promotion wrap).
+
+scale_dpi( int val, unsigned int dpi_from, unsigned int dpi_to ) computes
+"val * dpi_to": int * unsigned promotes val to unsigned, so any NEGATIVE
+coordinate wraps to a huge positive value before the divide. Example (the
+Photoshop 2026 maximized main window, physical origin -5,-5 with the
+fractional-scale LogPixels=163 prefix, read by a 96-dpi client):
+
+    (-5 * 96u - 81) / 163u  =  4294966735u / 163u  =  26349489
+
+so every cross-process GetWindowRect / GetWindowPlacement / ClientToScreen
+of a negative-origin window returns a ~2.6e7 garbage origin (and a
+degenerate left > right rect) whenever the server maps between DPIs.
+Maximized windows ALWAYS have a negative origin (they extend past the
+screen edge by their frame), so under a scaled display every cross-process
+window query of a maximized window was corrupt. The dedicated val<0 branch
+was clearly WRITTEN for signed round-half-away-from-zero; the promotion
+silently defeats it. Do the arithmetic in signed 64-bit (which also removes
+any theoretical int overflow for large coordinates). Upstream Wine bug
+(server/user.h, unchanged since 2018).
+
+Verified: a DPI-unaware probe reading PS 2026's maximized frame goes from
+GetWindowRect=(26349489,26349489,2259,1237) to (-3,-3,2259,1237).
+
+diff --git a/server/user.h b/server/user.h
+index 060e54ec775..7ba565b41dc 100644
+--- a/server/user.h
++++ b/server/user.h
+@@ -233,8 +233,14 @@ static inline int point_in_rect( const struct rectangle *rect, int x, int y )
+ 
+ static inline int scale_dpi( int val, unsigned int dpi_from, unsigned int dpi_to )
+ {
+-    if (val >= 0) return (val * dpi_to + (dpi_from / 2)) / dpi_from;
+-    return (val * dpi_to - (dpi_from / 2)) / dpi_from;
++    /* NEUTRON: do the arithmetic in signed 64-bit. "val * dpi_to" with int *
++     * unsigned promotes val to unsigned, so a negative coordinate (e.g. the
++     * -5,-5 origin of a maximized window) wraps to a huge positive value
++     * (-5 -> 26349489 at 163->96 dpi), corrupting every cross-process
++     * GetWindowRect/placement of a negative-origin window under a scaled
++     * (fractional-scale/LogPixels) display. */
++    if (val >= 0) return ((__int64)val * dpi_to + (dpi_from / 2)) / dpi_from;
++    return ((__int64)val * dpi_to - (dpi_from / 2)) / dpi_from;
+ }
+ 
+ static inline void scale_dpi_rect( struct rectangle *rect, unsigned int dpi_from, unsigned int dpi_to )

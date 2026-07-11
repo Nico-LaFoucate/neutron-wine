@@ -163,6 +163,16 @@ shell so it never finishes loading. Drains the paint after a threshold of unvali
 `NtUserBeginPaint` resets the counter so legitimate paint/resize loops never trip it. Touches:
 `dlls/win32u/dce.c`, `dlls/win32u/message.c`.
 
+### `neutron-server-scale-dpi-sign.mypatch`
+Upstream wineserver bug: `scale_dpi()` computes `val * dpi_to` with `int * unsigned`, promoting a
+NEGATIVE coordinate to unsigned so it wraps to a huge positive value (a maximized window's physical
+origin `-5,-5` scaled 163→96 dpi becomes `26349489` ≈ 2.6e7, and the reported rect goes degenerate,
+`left > right`). Every maximized window has a negative origin (it extends past the screen edge by its
+frame), so under a fractional-scale prefix (`LogPixels`≠96) every cross-process
+`GetWindowRect`/`GetWindowPlacement`/`ClientToScreen` of a maximized window returned a garbage origin
+(this is the "PS 2026 reports a ~2.6e7 corner" measurement). Do the arithmetic in signed 64-bit.
+Touches: `server/user.h`.
+
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
 ### `neutron-present-timing.mypatch`
