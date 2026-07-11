@@ -42,7 +42,7 @@ diff --git a/dlls/dwmapi/dwmapi_main.c b/dlls/dwmapi/dwmapi_main.c
 index 49e05cd207e..faf006f2811 100644
 --- a/dlls/dwmapi/dwmapi_main.c
 +++ b/dlls/dwmapi/dwmapi_main.c
-@@ -195,6 +195,45 @@ HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attrib
+@@ -195,6 +195,59 @@ HRESULT WINAPI DwmGetWindowAttribute(HWND hwnd, DWORD attribute, PVOID pv_attrib
          return E_HANDLE;
  
      switch (attribute) {
@@ -70,11 +70,25 @@ index 49e05cd207e..faf006f2811 100644
 +            int border_x = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
 +            int border_y = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
 +            int count = 1; /* close button */
++            int width = window_rect.right - window_rect.left;
 +
 +            if (style & WS_MINIMIZEBOX) count++;
 +            if (style & WS_MAXIMIZEBOX) count++;
 +
-+            rect->right = window_rect.right - window_rect.left - border_x;
++            /* NEUTRON P2c: the caption-button bounds are window-relative, so only the
++             * window WIDTH matters here. Under winewayland a maximized window can carry a
++             * stale/garbage Win32 origin (Photoshop), making GetWindowRect degenerate
++             * (left > right, negative width) and the bounds land off-window -> the app
++             * paints its caption buttons in the wrong place (black box). Fall back to the
++             * client width, which stays correct, whenever the window width isn't sane. */
++            if (width <= 0)
++            {
++                RECT client_rect;
++                if (GetClientRect(hwnd, &client_rect))
++                    width = client_rect.right - client_rect.left;
++            }
++
++            rect->right = width - border_x;
 +            rect->left = rect->right - count * btn_w;
 +            rect->top = border_y;
 +            rect->bottom = rect->top + btn_h;

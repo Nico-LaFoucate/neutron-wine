@@ -143,7 +143,13 @@ The WinRT/launch fixes genuine Photoshop 2026 (27.8) needs to reach its licensed
 - **windows.ui/inputpane.c**: `InputPane` gains `IWeakReferenceSource` (weakref-managed lifetime)
   so Adobe's touch-keyboard probing doesn't fail QueryInterface.
 - **dwmapi**: `DwmGetWindowAttribute` `DWMWA_CAPTION_BUTTON_BOUNDS` (attr 5) returns real
-  caption-button bounds instead of `E_NOTIMPL`.
+  caption-button bounds instead of `E_NOTIMPL`. Hardened (11.10-3): the bounds are window-relative so
+  only the window WIDTH matters; when `GetWindowRect` is degenerate (negative width — a maximized
+  window can report a stale/garbage Win32 origin under winewayland, e.g. Photoshop 2026's main window
+  reports `left`≈2.6e7) it falls back to the client width so the bounds stay on-window. NOTE: this is
+  a correctness fix for the reported bounds; it does **not** resolve PS 2026's black caption-button
+  box — that is a composition/WSI present-black region (same class as the doc-canvas P1 issue), not a
+  bounds problem (verified: with correct bounds the buttons still render black).
 - **d2d1**: `DrawGeometryRealization` implemented (was a semi-stub) — Wine keeps the realization's
   source geometry, so it renders as Fill/DrawGeometry on that geometry.
 Touches: `dlls/d2d1/device.c`, `dlls/dwmapi/dwmapi_main.c`,
