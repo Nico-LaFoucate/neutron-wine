@@ -1,0 +1,261 @@
+# neutron-dcomp-resize-fixes
+#
+# Resize/maximize robustness for the dcomp GPU-canvas present path (applies on top of
+# neutron-dcomp-bridge + neutron-dcomp-crossproc). Three fixes in blit_swapchain_to_hwnd /
+# presentations_proc: (1) SEH page-fault guard around the swapchain read so a resize/recreate
+# race (maximize/un-maximize) drops the frame instead of crashing in vkd3d d3d12core; (2) pause
+# blits while the target is mid-resize (R3); (3) cache the staging texture, recreate only on size
+# change instead of allocating ~33MB every tick (M1a). Touches: dlls/dcomp/device.c.
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+index 8b340e8..4665950 100644
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -35,6 +35,7 @@
+ #include "dcomp.h"
+ #include "wine/list.h"
+ #include "wine/debug.h"
++#include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+ 
+@@ -105,6 +106,9 @@ struct presentation
+     BOOL   have_present_count;
+     BOOL   t_first_present; /* NEUTRON cold-start timing: first present observed */
+     BOOL   t_first_deliver; /* NEUTRON cold-start timing: first frame delivered to shared mem */
++    ID3D11Texture2D *staging; /* NEUTRON perf: cached staging texture, recreated only on size change */
++    UINT   staging_w, staging_h;
++    LONG   last_client_w, last_client_h; /* NEUTRON: pause blits while the target is mid-resize */
+ };
+ 
+ /* NEUTRON: cross-process CEP panel present path.
+@@ -203,80 +207,125 @@ static void blit_swapchain_to_hwnd(struct presentation *p)
+     static LONG diag_n;
+     LONG n;
+     BOOL diag;
++    /* volatile so their post-__TRY values survive a page fault in the guarded block
++     * (must not skip the mt Leave -> would deadlock the app's resize). */
++    volatile BOOL mt_entered = FALSE, have_pixels = FALSE;
+ 
+-    if (p->cross_proc)
++    n = InterlockedIncrement(&diag_n);
++    diag = (n % 120 == 1);
++
++    /* NEUTRON: the app can resize/recreate this swapchain from another thread on
++     * maximize/un-maximize; our read then races its backbuffer teardown and faults
++     * deep in the D3D/DXGI/vkd3d layer (observed: unhandled AV in d3d12core on
++     * un-maximize). Guard the whole swapchain access with a page-fault handler and
++     * just drop the frame — this async blit is best-effort. The swapchain and device
++     * are ref-held (alive), so leaving the mt lock + releasing the objects afterwards
++     * stays safe; only the backbuffer contents are transiently invalid. */
++    __TRY
+     {
+         UINT count = 0;
+-        if (SUCCEEDED(IDXGISwapChain_GetLastPresentCount(swapchain, &count)))
++        if (p->cross_proc && SUCCEEDED(IDXGISwapChain_GetLastPresentCount(swapchain, &count)) &&
++            p->have_present_count && count == p->last_present_count)
+         {
+-            if (p->have_present_count && count == p->last_present_count) return;
+-            p->last_present_count = count;
+-            p->have_present_count = TRUE;
+-            if (!p->t_first_present)
++            /* No new frame presented since our last blit: skip. */
++        }
++        else
++        {
++            if (p->cross_proc)
+             {
+-                p->t_first_present = TRUE;
+-                ERR("neutron-time: sc=%p host=%p FIRST-PRESENT tick=%llu presentcount=%u\n",
+-                    swapchain, hwnd, GetTickCount64(), count);
++                p->last_present_count = count;
++                p->have_present_count = TRUE;
++                if (!p->t_first_present)
++                {
++                    p->t_first_present = TRUE;
++                    ERR("neutron-time: sc=%p host=%p FIRST-PRESENT tick=%llu presentcount=%u\n",
++                        swapchain, hwnd, GetTickCount64(), count);
++                }
+             }
+-        }
+-    }
+-
+-    n = InterlockedIncrement(&diag_n);
+-    diag = (n % 120 == 1);
+ 
+-    if (FAILED(hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&backbuffer)))
+-    {
+-        if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
+-        return;
+-    }
+-
+-    ID3D11Texture2D_GetDevice(backbuffer, &d3d_device);
+-    if (!d3d_device)
+-        goto done;
+-    ID3D11Device_GetImmediateContext(d3d_device, &ctx);
++            if (FAILED(hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&backbuffer)))
++            {
++                if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
++            }
++            else
++            {
++                ID3D11Texture2D_GetDevice(backbuffer, &d3d_device);
++                if (d3d_device)
++                {
++                    ID3D11Device_GetImmediateContext(d3d_device, &ctx);
+ 
+-    if (FAILED(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D10Multithread, (void **)&mt)))
+-        ID3D11Device_QueryInterface(d3d_device, &IID_ID3D10Multithread, (void **)&mt);
+-    if (mt)
+-    {
+-        ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
+-        ID3D10Multithread_Enter(mt);
+-    }
++                    if (FAILED(ID3D11DeviceContext_QueryInterface(ctx, &IID_ID3D10Multithread, (void **)&mt)))
++                        ID3D11Device_QueryInterface(d3d_device, &IID_ID3D10Multithread, (void **)&mt);
++                    if (mt)
++                    {
++                        ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
++                        ID3D10Multithread_Enter(mt);
++                        mt_entered = TRUE;
++                    }
+ 
+-    ID3D11Texture2D_GetDesc(backbuffer, &desc);
+-    desc.Usage = D3D11_USAGE_STAGING;
+-    desc.BindFlags = 0;
+-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+-    desc.MiscFlags = 0;
+-    if (FAILED(hr = ID3D11Device_CreateTexture2D(d3d_device, &desc, NULL, &staging)))
+-    {
+-        if (diag) ERR("diag: CreateTexture2D(staging) failed hr %#lx\n", hr);
+-        goto unlock;
++                    ID3D11Texture2D_GetDesc(backbuffer, &desc);
++                    desc.Usage = D3D11_USAGE_STAGING;
++                    desc.BindFlags = 0;
++                    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++                    desc.MiscFlags = 0;
++                    /* NEUTRON M1a: reuse a cached staging texture; (re)create only on a size
++                     * change instead of allocating+freeing ~33MB (at 4K) every 16ms tick. The
++                     * cache owns the ref (freed on size change / swapchain change / unregister);
++                     * `staging` here is a borrow and is NOT released in `done`. */
++                    if (!(p->staging && p->staging_w == desc.Width && p->staging_h == desc.Height))
++                    {
++                        if (p->staging) { ID3D11Texture2D_Release(p->staging); p->staging = NULL; }
++                        if (FAILED(hr = ID3D11Device_CreateTexture2D(d3d_device, &desc, NULL, &p->staging)))
++                        {
++                            if (diag) ERR("diag: CreateTexture2D(staging) failed hr %#lx\n", hr);
++                            p->staging = NULL;
++                        }
++                        else { p->staging_w = desc.Width; p->staging_h = desc.Height; }
++                    }
++                    staging = p->staging;
++                    if (staging)
++                    {
++                        ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)backbuffer);
++                        if (FAILED(hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map)))
++                        {
++                            if (diag) ERR("diag: Map failed hr %#lx\n", hr);
++                        }
++                        else
++                        {
++                            if ((packed = malloc((SIZE_T)desc.Width * 4 * desc.Height)))
++                            {
++                                for (y = 0; y < desc.Height; y++)
++                                    memcpy((BYTE *)packed + (SIZE_T)y * desc.Width * 4,
++                                           (BYTE *)map.pData + (SIZE_T)y * map.RowPitch,
++                                           (SIZE_T)desc.Width * 4);
++                            }
++                            ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
++                            have_pixels = TRUE;
++                        }
++                    }
++                }
++            }
++        }
+     }
+-
+-    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)backbuffer);
+-
+-    if (FAILED(hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &map)))
++    __EXCEPT_PAGE_FAULT
+     {
+-        if (diag) ERR("diag: Map failed hr %#lx\n", hr);
+-        goto unlock;
++        static LONG raced_n;
++        if (!(InterlockedIncrement(&raced_n) % 240))
++            WARN("neutron dcomp: blit raced a swapchain resize (n=%ld), dropping frame\n", raced_n);
++        have_pixels = FALSE;
+     }
++    __ENDTRY
+ 
+-    if ((packed = malloc((SIZE_T)desc.Width * 4 * desc.Height)))
++    if (mt_entered)
+     {
+-        for (y = 0; y < desc.Height; y++)
+-            memcpy((BYTE *)packed + (SIZE_T)y * desc.Width * 4,
+-                   (BYTE *)map.pData + (SIZE_T)y * map.RowPitch,
+-                   (SIZE_T)desc.Width * 4);
++        ID3D10Multithread_Leave(mt);
+     }
++    if (mt) ID3D10Multithread_Release(mt);
+ 
+-    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+-
+-unlock:
+-    if (mt)
++    if (!have_pixels)
+     {
+-        ID3D10Multithread_Leave(mt);
+-        ID3D10Multithread_Release(mt);
++        free(packed);
++        goto done;
+     }
+ 
+     if (packed && p->cross_proc)
+@@ -405,7 +454,8 @@ unlock:
+     free(packed);
+ 
+ done:
+-    if (staging) ID3D11Texture2D_Release(staging);
++    /* NEUTRON M1a: `staging` is a borrow of the cached p->staging — do NOT release it here.
++     * The cache is freed on size change (above), swapchain change, and unregister. */
+     if (ctx) ID3D11DeviceContext_Release(ctx);
+     if (d3d_device) ID3D11Device_Release(d3d_device);
+     if (backbuffer) ID3D11Texture2D_Release(backbuffer);
+@@ -421,7 +471,19 @@ static DWORD WINAPI presentations_proc(void *arg)
+         LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
+         {
+             if (p->swapchain && p->present_hwnd && IsWindow(p->present_hwnd))
+-                blit_swapchain_to_hwnd(p);
++            {
++                /* NEUTRON R3 (resize glitch): pause blits while the target is mid-resize.
++                 * Stretching a stale readback into a changing client rect every tick is the
++                 * visible resize artifact; skip while the client size is changing and resume
++                 * once it settles (a frame drop here is already accepted behaviour). */
++                RECT rc = {0};
++                LONG cw = 0, ch = 0;
++                if (GetClientRect(p->present_hwnd, &rc)) { cw = rc.right - rc.left; ch = rc.bottom - rc.top; }
++                if (cw == p->last_client_w && ch == p->last_client_h)
++                    blit_swapchain_to_hwnd(p);
++                p->last_client_w = cw;
++                p->last_client_h = ch;
++            }
+         }
+         LeaveCriticalSection(&presentations_cs);
+         Sleep(16);
+@@ -508,6 +570,8 @@ static void register_presentation(HWND hwnd, IUnknown *content)
+             {
+                 if (p->swapchain) IDXGISwapChain_Release(p->swapchain);
+                 p->swapchain = swapchain; /* take QI ref */
++                /* NEUTRON M1a: swapchain (and possibly its D3D device) changed -> drop the cached staging. */
++                if (p->staging) { ID3D11Texture2D_Release(p->staging); p->staging = NULL; p->staging_w = p->staging_h = 0; }
+             }
+             else IDXGISwapChain_Release(swapchain);
+             LeaveCriticalSection(&presentations_cs);
+@@ -545,6 +609,7 @@ static void unregister_presentations_for_hwnd(HWND hwnd)
+                 RemovePropW(p->present_hwnd, L"__wine_dcomp_present");
+             list_remove(&p->entry);
+             if (p->swapchain) IDXGISwapChain_Release(p->swapchain);
++            if (p->staging) ID3D11Texture2D_Release(p->staging); /* NEUTRON M1a cached staging */
+             if (p->px_view) UnmapViewOfFile(p->px_view);
+             if (p->px_map) CloseHandle(p->px_map);
+             free(p);
