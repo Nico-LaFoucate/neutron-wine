@@ -30,9 +30,30 @@ interdependent, so they're maintained as one patch that applies cleanly on the s
 Also carries the **owner-process consumer thread** for the cross-process CEF/WebView2 present path
 (`dllmain.c`): it opens each registered host hwnd's shared pixel section and blits it same-process, the
 counterpart to `neutron-dcomp-crossproc`. Plus `wayland_pointer.c` and `window_surface.c` present-path
-updates from the proven dev tree. Touches: `dlls/winewayland.drv/{Makefile.in, fractional-scale-v1.xml,
-xdg-decoration-unstable-v1.xml, wayland.c, wayland_surface.c, waylanddrv.h, waylanddrv_main.c, window.c,
-dllmain.c, wayland_pointer.c, window_surface.c}`.
+updates from the proven dev tree.
+
+**Photoshop 2026 layout/present fixes (2026-07-13):**
+- **maximized bottom-strip fix** (`display.c`): reserve the compositor SSD titlebar in `rc_work`
+  (`rc_work.top += round(32×mode/logical)`), so a maximized window's client no longer overhangs the
+  compositor-constrained window and clips the bottom row (Photoshop's new-layer button / status bar).
+- **snap-maximize positioning** (`window.c`): position a *compositor-initiated* maximize (KWin drag-to-top
+  snap) at the target monitor's work-area origin — gated on `MAXIMIZED && !WS_MAXIMIZE` so the win32u
+  maximize-button path (which already positioned it) is untouched and its restore rect isn't corrupted.
+- **flush commit-gate** (`window_surface.c` + `wayland_surface.c` `wayland_surface_can_reconfigure` +
+  `window.c` `wayland_window_can_commit`): skip the SHM buffer copy at the top of the flush when the xdg
+  config isn't commit-compatible yet (the maximize/un-maximize transition), instead of copying tens of MB
+  that get discarded — removes the multi-second maximize-settle lag. Output-neutral (win32u retries).
+- **SHM buffer pool** (`window_surface.c`): pool 3→4 + a bounded non-blocking free-buffer wait (no second
+  fd reader contending with the event thread) — fixes the interactive-resize freeze.
+- **per-monitor DPI step ①** (`display.c`): report each output's real DPI (`round(96×mode/logical)`) to
+  win32u's per-monitor-DPI engine instead of one system DPI (foundation for correct rendering on a
+  mixed-scale multi-monitor desktop; harmless alone — unchanged on the primary).
+- **gated diagnostics** (`window.c`): the `neutron-role`/`neutron-chain`/`neutron-rects`/`neutron-decor`
+  probes are behind `NEUTRON_WL_DIAG=1` (off by default; the syscall-heavy loops no longer run in normal use).
+
+Touches: `dlls/winewayland.drv/{Makefile.in, fractional-scale-v1.xml, xdg-decoration-unstable-v1.xml,
+wayland.c, wayland_surface.c, waylanddrv.h, waylanddrv_main.c, window.c, dllmain.c, wayland_pointer.c,
+window_surface.c, display.c}`.
 
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern
@@ -83,6 +104,16 @@ host hwnd (`__neutron_dcomp_px_<hwnd>` + a shared hwnd registry); the owner-proc
 Adds `dcomp_get_pending_hwnd` to the spec. This present path is present in the proven dev-tree wine but was
 **missing from the v11.10-1 packaged runtime**, which is exactly why the packaged build rendered the
 WebView2 sign-in blank while the dev-tree build rendered it. Pairs with `neutron-cep-child-surface`.
+
+### `neutron-dcomp-resize-fixes.mypatch`
+Resize/maximize robustness for the dcomp GPU-canvas present path — applies on top of `neutron-dcomp-bridge`
++ `neutron-dcomp-crossproc` (same `dlls/dcomp/device.c`; sorts/applies after both). Three fixes in
+`blit_swapchain_to_hwnd` / `presentations_proc`: (1) **SEH page-fault guard** around the swapchain read
+(`GetBuffer`/`CopyResource`/`Map`) so a resize/recreate race on maximize/un-maximize drops the frame instead
+of crashing deep in vkd3d `d3d12core` (the observed AV) — `mt_entered`/`have_pixels` are `volatile` so the
+`ID3D10Multithread` lock is always released; (2) **pause blits while the target is mid-resize** (skip while
+`GetClientRect` is changing) so a stale readback isn't stretched into the resizing window; (3) **cache the
+staging texture**, recreate only on size/swapchain change instead of allocating ~33 MB every 16 ms tick.
 
 ### `neutron-cep-child-surface.mypatch`
 The owner-process half of the cross-process present path: in `win32u/window.c`, CEF/CEP/WebView2 panel-host
@@ -162,6 +193,14 @@ millions of unvalidated `WM_PAINT`s while holding the AdobeOwl critical section,
 shell so it never finishes loading. Drains the paint after a threshold of unvalidated repaints; a real
 `NtUserBeginPaint` resets the counter so legitimate paint/resize loops never trip it. Touches:
 `dlls/win32u/dce.c`, `dlls/win32u/message.c`.
+
+### `neutron-win32u-surface-init-dark.mypatch`
+Initialise a fresh `win32u` `window_surface` to a dark neutral (`0x20`) instead of white (`0xff`) in
+`create_window_surface` (`dce.c`). The content is only visible transiently before a window first paints,
+but `window_surface` recreation during an interactive resize (every 128px bucket) exposes it as a
+full-window flash — white flashes hard against a dark (Adobe) UI, dark grey blends in. Single, isolated
+one-line hunk (line ~573); disjoint from the wmpaint patch's regions so it applies cleanly in either order.
+Touches: `dlls/win32u/dce.c`.
 
 ### `neutron-server-scale-dpi-sign.mypatch`
 Upstream wineserver bug: `scale_dpi()` computes `val * dpi_to` with `int * unsigned`, promoting a

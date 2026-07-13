@@ -1,0 +1,24 @@
+# neutron-win32u-surface-init-dark
+#
+# Initialise a fresh win32u window_surface to a dark neutral (0x20) instead of white (0xff).
+# The content is only visible transiently before a window paints, but window_surface recreation
+# during an interactive resize (every 128px bucket) exposes it as a full-window flash — white
+# flashes hard against a dark Adobe UI, dark grey blends in. Applies on top of the win32u wmpaint
+# patch. Touches: dlls/win32u/dce.c.
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 95862c4..dc8ada3 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -570,7 +570,11 @@ struct window_surface *window_surface_create( UINT size, const struct window_sur
+ 
+     pthread_mutex_init( &surface->mutex, NULL );
+ 
+-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
++    /* NEUTRON: initialise a fresh surface to a dark neutral rather than white. This content is only
++     * visible transiently before the window paints, but window_surface recreation during an interactive
++     * resize (every 128px bucket) exposes it as a full-window flash — white flashes hard against a dark
++     * (Adobe) UI, a dark grey blends in. Harmless elsewhere (also transient). */
++    memset( window_surface_get_color( surface, info ), 0x20, info->bmiHeader.biSizeImage );
+ 
+     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
+     return surface;
