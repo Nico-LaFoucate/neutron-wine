@@ -1,0 +1,97 @@
+# neutron-win32u-monitor-position
+#
+# Preserve each display source's arranged desktop position through win32u's virtual-mode path.
+# In add_modes() the "physical" devmode is taken from a host mode (position (0,0)) and, when
+# per-monitor DPI makes get_virtual_modes() generate scaled modes, `current` is reassigned to a
+# locally-built `virtual` devmode that also carries position (0,0). For a non-primary monitor this
+# DROPS its real arranged position -> every extra monitor collapses onto the origin, monitors
+# overlap, the virtual desktop never extends, and MonitorFromWindow can't tell which monitor a
+# window is on (so per-monitor DPI can never apply). Capture the driver-supplied dmPosition on
+# entry and stamp it back onto `physical` and `virtual`. Position is canonical (EnumDisplaySettings
+# reads it too); no-op for the primary / single-monitor case. Enables correct mixed-DPI multi-mon
+# arrangement (e.g. a 4K@1.7x + 1080p@1.0x side by side). Gated diag via NEUTRON_MON_DIAG=1.
+# Touches: dlls/win32u/sysparams.c.
+diff --git a/dlls/win32u/sysparams.c b/dlls/win32u/sysparams.c
+index d6ae780e3ed..5e70b35d268 100644
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -2168,6 +2168,14 @@ static DEVMODEW *get_virtual_modes( const DEVMODEW *initial, const DEVMODEW *max
+     return modes;
+ }
+ 
++/* NEUTRON: gate for the multi-monitor add_modes position diagnostics (set NEUTRON_MON_DIAG=1). */
++static BOOL neutron_mon_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_MON_DIAG" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
+ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEVMODEW *host_modes, void *param )
+ {
+     struct device_manager_ctx *ctx = param;
+@@ -2175,6 +2183,7 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+     UINT virtual_count, modes_count = host_modes_count;
+     const DEVMODEW *modes = host_modes;
+     struct source *source;
++    POINTL neutron_arranged_pos;
+ 
+     TRACE( "current %s, host_modes_count %u, host_modes %p, param %p\n", debugstr_devmodew( current ),
+            host_modes_count, host_modes, param );
+@@ -2182,6 +2191,20 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+     assert( !list_empty( &sources ) );
+     source = LIST_ENTRY( list_tail( &sources ), struct source, entry );
+ 
++    /* NEUTRON: the arranged desktop position the driver reports for this source. The virtual-mode
++     * path below reassigns `current` to a locally-built `virtual` devmode (and `physical` is taken
++     * from a host mode), both of which carry position (0,0). For a non-primary monitor that drops
++     * its real position, collapsing it onto the origin -> monitors overlap, win32u never sees a
++     * window change monitors, and per-monitor DPI can't apply. Capture the position now and stamp
++     * it back onto `physical`/`virtual` so source->current/physical (and the registry current
++     * settings that feed EnumDisplaySettings) keep the monitor's true desktop position. */
++    neutron_arranged_pos = current->dmPosition;
++    if (neutron_mon_diag())
++        ERR("NEUTRON-MONDIAG-in src=%p driver current pos=(%d,%d) %ux%u host_modes_count=%u fields=%#x\n",
++            source, (int)neutron_arranged_pos.x, (int)neutron_arranged_pos.y,
++            (UINT)current->dmPelsWidth, (UINT)current->dmPelsHeight, host_modes_count,
++            (UINT)current->dmFields);
++
+     if (emulate_modeset)
+     {
+         modes = current;
+@@ -2189,6 +2212,9 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+     }
+ 
+     physical = modes_count == 1 ? *modes : *current;
++    /* NEUTRON: preserve the driver's arranged desktop position (see above) — a single host mode
++     * carries position (0,0). */
++    physical.dmPosition = neutron_arranged_pos;
+     if (ctx->is_primary) ctx->primary = *current;
+ 
+     detached.dmPelsWidth = 0;
+@@ -2209,6 +2235,10 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+         {
+             modes_count = virtual_count;
+             modes = virtual_modes;
++            /* NEUTRON: the virtual devmode (read from the registry current settings, or copied from
++             * physical) carries position (0,0); restore the monitor's real arranged position before
++             * it becomes source->current and the persisted current settings. */
++            virtual.dmPosition = neutron_arranged_pos;
+             current = &virtual;
+ 
+             write_source_mode( source->key, WINE_ENUM_PHYSICAL_SETTINGS, &physical );
+@@ -2226,6 +2256,14 @@ static void add_modes( const DEVMODEW *current, UINT host_modes_count, const DEV
+     source->current = *current;
+     source->physical = physical;
+ 
++    if (neutron_mon_diag())
++        ERR("NEUTRON-MONDIAG-out src=%p dpi=%u modes_count=%u | current pos=(%d,%d) %ux%u | physical pos=(%d,%d) %ux%u\n",
++            source, (UINT)source->dpi, modes_count,
++            (int)source->current.dmPosition.x, (int)source->current.dmPosition.y,
++            (UINT)source->current.dmPelsWidth, (UINT)source->current.dmPelsHeight,
++            (int)source->physical.dmPosition.x, (int)source->physical.dmPosition.y,
++            (UINT)source->physical.dmPelsWidth, (UINT)source->physical.dmPelsHeight);
++
+     free( virtual_modes );
+ }
+ 
