@@ -69,6 +69,25 @@ dpi (within ~1 dpi). Named to sort **after** `neutron-winewayland` in any locale
 and correct *maximize* target on the non-primary monitor need the driver-authoritative override (a
 separate, deferred effort). Touches: `dlls/winewayland.drv/window.c`.
 
+### `neutron-wintab.mypatch`
+Native pen/graphics-tablet (**WinTab**) support for winewayland — pressure-sensitive pen input from a
+Wacom on Wayland, so Photoshop brush pressure works. Binds `zwp_tablet_manager_v2` + tablet-v2 tool
+events (new `wayland_tablet.c`), bridges them to `wintab32` through the win32u `pWintabProc` seam
+(`WAYLAND_WintabProc` + a per-tool packet FIFO in new `wintab.c`), advertises a `WTI_CURSORS` pen cursor
+(apps classify the tool via cursor 0 — without it Photoshop won't build a pen stroke), and injects a
+synthetic system mouse for cursor tracking + stroke arming (untagged, so PS samples it). Vendors
+`tablet-v2.xml`. **Also fixes wintab32 itself** (`dlls/wintab32/wintab32.c`): the internal tablet
+message-window is moved onto a dedicated **pump thread**. It previously lived on whichever app thread
+first called `WTOpen`; an app that busy-polls `WTPacketsGet` inside an hwnd-filtered stroke loop
+(Photoshop) never dispatched the `WT_PACKET` messages, so **zero** packets reached the app mid-stroke
+(down+up only = a straight line). A private always-pumping thread makes delivery asynchronous to the
+app, matching a real Windows WinTab driver. Sorts **after** `neutron-winewayland` (extends
+`waylanddrv.h`/`wayland.c`/`Makefile.in`, removes the obsolete `zwp_tablet_tool_v2_interface` stub).
+Touches: `dlls/winewayland.drv/` (`Makefile.in`, `waylanddrv.h`, `wayland.c`, `waylanddrv_main.c`,
+`wayland_pointer.c`, new `wayland_tablet.c`/`wintab.c`/`tablet-v2.xml`), `dlls/wintab32/wintab32.c`.
+Remaining polish (separate): tilt→orientation + eraser; the angular/laggy *live* stroke is the known
+winewayland canvas present-path lag, not the pen pipeline.
+
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern
 Adobe/Windows chrome instead of the classic raised 3D bevel. A released, non-hot button uses

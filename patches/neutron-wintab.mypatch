@@ -1,0 +1,2871 @@
+# neutron-wintab
+#
+# Native pen/graphics-tablet (WinTab) support for winewayland, so Photoshop (and other
+# Adobe apps) get pressure-sensitive pen input from a Wacom on Wayland. Binds
+# zwp_tablet_manager_v2 + tablet-v2 tool events, bridges them to wintab32 through the
+# win32u pWintabProc seam (WAYLAND_WintabProc), and injects a synthetic system mouse for
+# cursor tracking + stroke arming. Includes a WTI_CURSORS pen-cursor table (apps classify
+# the tool via cursor 0) and a per-tool packet FIFO.
+#
+# Also fixes wintab32 itself: the internal tablet message-window is moved onto a dedicated
+# pump thread. Previously it lived on whichever app thread first called WTOpen; an app that
+# busy-polls WTPacketsGet inside an hwnd-filtered stroke loop (Photoshop) never dispatched
+# the WT_PACKET messages, so ZERO packets reached the app mid-stroke (down+up only = a
+# straight line). A private always-pumping thread makes delivery asynchronous to the app,
+# matching how a real Windows WinTab driver behaves.
+#
+# Depends on: neutron-winewayland (applies after it; extends waylanddrv.h/wayland.c/
+# Makefile.in and removes the now-obsolete zwp_tablet_tool_v2_interface stub).
+diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
+index aaa0e97..81425b8 100644
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -15,6 +15,7 @@ SOURCES = \
+ 	pointer-constraints-unstable-v1.xml \
+ 	pointer-warp-v1.xml \
+ 	relative-pointer-unstable-v1.xml \
++	tablet-v2.xml \
+ 	text-input-unstable-v3.xml \
+ 	viewporter.xml \
+ 	vulkan.c \
+@@ -24,10 +25,12 @@ SOURCES = \
+ 	wayland_output.c \
+ 	wayland_pointer.c \
+ 	wayland_surface.c \
++	wayland_tablet.c \
+ 	wayland_text_input.c \
+ 	waylanddrv_main.c \
+ 	window.c \
+ 	window_surface.c \
++	wintab.c \
+ 	wlr-data-control-unstable-v1.xml \
+ 	xdg-decoration-unstable-v1.xml \
+ 	xdg-output-unstable-v1.xml \
+diff --git a/dlls/winewayland.drv/tablet-v2.xml b/dlls/winewayland.drv/tablet-v2.xml
+new file mode 100644
+index 0000000..58329f7
+--- /dev/null
++++ b/dlls/winewayland.drv/tablet-v2.xml
+@@ -0,0 +1,1178 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="tablet_v2">
++
++  <copyright>
++    Copyright 2014 © Stephen "Lyude" Chandler Paul
++    Copyright 2015-2016 © Red Hat, Inc.
++
++    Permission is hereby granted, free of charge, to any person
++    obtaining a copy of this software and associated documentation files
++    (the "Software"), to deal in the Software without restriction,
++    including without limitation the rights to use, copy, modify, merge,
++    publish, distribute, sublicense, and/or sell copies of the Software,
++    and to permit persons to whom the Software is furnished to do so,
++    subject to the following conditions:
++
++    The above copyright notice and this permission notice (including the
++    next paragraph) shall be included in all copies or substantial
++    portions of the Software.
++
++    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++    NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++    BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++    ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++    SOFTWARE.
++  </copyright>
++
++  <description summary="Wayland protocol for graphics tablets">
++    This description provides a high-level overview of the interplay between
++    the interfaces defined this protocol. For details, see the protocol
++    specification.
++
++    More than one tablet may exist, and device-specifics matter. Tablets are
++    not represented by a single virtual device like wl_pointer. A client
++    binds to the tablet manager object which is just a proxy object. From
++    that, the client requests wp_tablet_manager.get_tablet_seat(wl_seat)
++    and that returns the actual interface that has all the tablets. With
++    this indirection, we can avoid merging wp_tablet into the actual Wayland
++    protocol, a long-term benefit.
++
++    The wp_tablet_seat sends a "tablet added" event for each tablet
++    connected. That event is followed by descriptive events about the
++    hardware; currently that includes events for name, vid/pid and
++    a wp_tablet.path event that describes a local path. This path can be
++    used to uniquely identify a tablet or get more information through
++    libwacom. Emulated or nested tablets can skip any of those, e.g. a
++    virtual tablet may not have a vid/pid. The sequence of descriptive
++    events is terminated by a wp_tablet.done event to signal that a client
++    may now finalize any initialization for that tablet.
++
++    Events from tablets require a tool in proximity. Tools are also managed
++    by the tablet seat; a "tool added" event is sent whenever a tool is new
++    to the compositor. That event is followed by a number of descriptive
++    events about the hardware; currently that includes capabilities,
++    hardware id and serial number, and tool type. Similar to the tablet
++    interface, a wp_tablet_tool.done event is sent to terminate that initial
++    sequence.
++
++    Any event from a tool happens on the wp_tablet_tool interface. When the
++    tool gets into proximity of the tablet, a proximity_in event is sent on
++    the wp_tablet_tool interface, listing the tablet and the surface. That
++    event is followed by a motion event with the coordinates. After that,
++    it's the usual motion, axis, button, etc. events. The protocol's
++    serialisation means events are grouped by wp_tablet_tool.frame events.
++
++    Two special events (that don't exist in X) are down and up. They signal
++    "tip touching the surface". For tablets without real proximity
++    detection, the sequence is: proximity_in, motion, down, frame.
++
++    When the tool leaves proximity, a proximity_out event is sent. If any
++    button is still down, a button release event is sent before this
++    proximity event. These button events are sent in the same frame as the
++    proximity event to signal to the client that the buttons were held when
++    the tool left proximity.
++
++    If the tool moves out of the surface but stays in proximity (i.e.
++    between windows), compositor-specific grab policies apply. This usually
++    means that the proximity-out is delayed until all buttons are released.
++
++    Moving a tool physically from one tablet to the other has no real effect
++    on the protocol, since we already have the tool object from the "tool
++    added" event. All the information is already there and the proximity
++    events on both tablets are all a client needs to reconstruct what
++    happened.
++
++    Some extra axes are normalized, i.e. the client knows the range as
++    specified in the protocol (e.g. [0, 65535]), the granularity however is
++    unknown. The current normalized axes are pressure, distance, and slider.
++
++    Other extra axes are in physical units as specified in the protocol.
++    The current extra axes with physical units are tilt, rotation and
++    wheel rotation.
++
++    Since tablets work independently of the pointer controlled by the mouse,
++    the focus handling is independent too and controlled by proximity.
++    The wp_tablet_tool.set_cursor request sets a tool-specific cursor.
++    This cursor surface may be the same as the mouse cursor, and it may be
++    the same across tools but it is possible to be more fine-grained. For
++    example, a client may set different cursors for the pen and eraser.
++
++    Tools are generally independent of tablets and it is
++    compositor-specific policy when a tool can be removed. Common approaches
++    will likely include some form of removing a tool when all tablets the
++    tool was used on are removed.
++  </description>
++
++  <interface name="zwp_tablet_manager_v2" version="1">
++    <description summary="controller object for graphic tablet devices">
++      An object that provides access to the graphics tablets available on this
++      system. All tablets are associated with a seat, to get access to the
++      actual tablets, use wp_tablet_manager.get_tablet_seat.
++    </description>
++
++    <request name="get_tablet_seat">
++      <description summary="get the tablet seat">
++	Get the wp_tablet_seat object for the given seat. This object
++	provides access to all graphics tablets in this seat.
++      </description>
++      <arg name="tablet_seat" type="new_id" interface="zwp_tablet_seat_v2"/>
++      <arg name="seat" type="object" interface="wl_seat" summary="The wl_seat object to retrieve the tablets for" />
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="release the memory for the tablet manager object">
++	Destroy the wp_tablet_manager object. Objects created from this
++	object are unaffected and should be destroyed separately.
++      </description>
++    </request>
++  </interface>
++
++  <interface name="zwp_tablet_seat_v2" version="1">
++    <description summary="controller object for graphic tablet devices of a seat">
++      An object that provides access to the graphics tablets available on this
++      seat. After binding to this interface, the compositor sends a set of
++      wp_tablet_seat.tablet_added and wp_tablet_seat.tool_added events.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="release the memory for the tablet seat object">
++	Destroy the wp_tablet_seat object. Objects created from this
++	object are unaffected and should be destroyed separately.
++      </description>
++    </request>
++
++    <event name="tablet_added">
++      <description summary="new device notification">
++	This event is sent whenever a new tablet becomes available on this
++	seat. This event only provides the object id of the tablet, any
++	static information about the tablet (device name, vid/pid, etc.) is
++	sent through the wp_tablet interface.
++      </description>
++      <arg name="id" type="new_id" interface="zwp_tablet_v2" summary="the newly added graphics tablet"/>
++    </event>
++
++    <event name="tool_added">
++      <description summary="a new tool has been used with a tablet">
++	This event is sent whenever a tool that has not previously been used
++	with a tablet comes into use. This event only provides the object id
++	of the tool; any static information about the tool (capabilities,
++	type, etc.) is sent through the wp_tablet_tool interface.
++      </description>
++      <arg name="id" type="new_id" interface="zwp_tablet_tool_v2" summary="the newly added tablet tool"/>
++    </event>
++
++    <event name="pad_added">
++      <description summary="new pad notification">
++	This event is sent whenever a new pad is known to the system. Typically,
++	pads are physically attached to tablets and a pad_added event is
++	sent immediately after the wp_tablet_seat.tablet_added.
++	However, some standalone pad devices logically attach to tablets at
++	runtime, and the client must wait for wp_tablet_pad.enter to know
++	the tablet a pad is attached to.
++
++	This event only provides the object id of the pad. All further
++	features (buttons, strips, rings) are sent through the wp_tablet_pad
++	interface.
++      </description>
++      <arg name="id" type="new_id" interface="zwp_tablet_pad_v2" summary="the newly added pad"/>
++    </event>
++  </interface>
++
++  <interface name="zwp_tablet_tool_v2" version="1">
++    <description summary="a physical tablet tool">
++      An object that represents a physical tool that has been, or is
++      currently in use with a tablet in this seat. Each wp_tablet_tool
++      object stays valid until the client destroys it; the compositor
++      reuses the wp_tablet_tool object to indicate that the object's
++      respective physical tool has come into proximity of a tablet again.
++
++      A wp_tablet_tool object's relation to a physical tool depends on the
++      tablet's ability to report serial numbers. If the tablet supports
++      this capability, then the object represents a specific physical tool
++      and can be identified even when used on multiple tablets.
++
++      A tablet tool has a number of static characteristics, e.g. tool type,
++      hardware_serial and capabilities. These capabilities are sent in an
++      event sequence after the wp_tablet_seat.tool_added event before any
++      actual events from this tool. This initial event sequence is
++      terminated by a wp_tablet_tool.done event.
++
++      Tablet tool events are grouped by wp_tablet_tool.frame events.
++      Any events received before a wp_tablet_tool.frame event should be
++      considered part of the same hardware state change.
++    </description>
++
++    <request name="set_cursor">
++      <description summary="set the tablet tool's surface">
++	Sets the surface of the cursor used for this tool on the given
++	tablet. This request only takes effect if the tool is in proximity
++	of one of the requesting client's surfaces or the surface parameter
++	is the current pointer surface. If there was a previous surface set
++	with this request it is replaced. If surface is NULL, the cursor
++	image is hidden.
++
++	The parameters hotspot_x and hotspot_y define the position of the
++	pointer surface relative to the pointer location. Its top-left corner
++	is always at (x, y) - (hotspot_x, hotspot_y), where (x, y) are the
++	coordinates of the pointer location, in surface-local coordinates.
++
++	On surface.attach requests to the pointer surface, hotspot_x and
++	hotspot_y are decremented by the x and y parameters passed to the
++	request. Attach must be confirmed by wl_surface.commit as usual.
++
++	The hotspot can also be updated by passing the currently set pointer
++	surface to this request with new values for hotspot_x and hotspot_y.
++
++	The current and pending input regions of the wl_surface are cleared,
++	and wl_surface.set_input_region is ignored until the wl_surface is no
++	longer used as the cursor. When the use as a cursor ends, the current
++	and pending input regions become undefined, and the wl_surface is
++	unmapped.
++
++	This request gives the surface the role of a wp_tablet_tool cursor. A
++	surface may only ever be used as the cursor surface for one
++	wp_tablet_tool. If the surface already has another role or has
++	previously been used as cursor surface for a different tool, a
++	protocol error is raised.
++      </description>
++      <arg name="serial" type="uint" summary="serial of the proximity_in event"/>
++      <arg name="surface" type="object" interface="wl_surface" allow-null="true"/>
++      <arg name="hotspot_x" type="int" summary="surface-local x coordinate"/>
++      <arg name="hotspot_y" type="int" summary="surface-local y coordinate"/>
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the tool object">
++	This destroys the client's resource for this tool object.
++      </description>
++    </request>
++
++    <enum name="type">
++      <description summary="a physical tool type">
++	Describes the physical type of a tool. The physical type of a tool
++	generally defines its base usage.
++
++	The mouse tool represents a mouse-shaped tool that is not a relative
++	device but bound to the tablet's surface, providing absolute
++	coordinates.
++
++	The lens tool is a mouse-shaped tool with an attached lens to
++	provide precision focus.
++      </description>
++      <entry name="pen" value="0x140" summary="Pen"/>
++      <entry name="eraser" value="0x141" summary="Eraser"/>
++      <entry name="brush" value="0x142" summary="Brush"/>
++      <entry name="pencil" value="0x143" summary="Pencil"/>
++      <entry name="airbrush" value="0x144" summary="Airbrush"/>
++      <entry name="finger" value="0x145" summary="Finger"/>
++      <entry name="mouse" value="0x146" summary="Mouse"/>
++      <entry name="lens" value="0x147" summary="Lens"/>
++    </enum>
++
++    <event name="type">
++      <description summary="tool type">
++	The tool type is the high-level type of the tool and usually decides
++	the interaction expected from this tool.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_tool.done event.
++      </description>
++      <arg name="tool_type" type="uint" enum="type" summary="the physical tool type"/>
++    </event>
++
++    <event name="hardware_serial">
++      <description summary="unique hardware serial number of the tool">
++	If the physical tool can be identified by a unique 64-bit serial
++	number, this event notifies the client of this serial number.
++
++	If multiple tablets are available in the same seat and the tool is
++	uniquely identifiable by the serial number, that tool may move
++	between tablets.
++
++	Otherwise, if the tool has no serial number and this event is
++	missing, the tool is tied to the tablet it first comes into
++	proximity with. Even if the physical tool is used on multiple
++	tablets, separate wp_tablet_tool objects will be created, one per
++	tablet.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_tool.done event.
++      </description>
++      <arg name="hardware_serial_hi" type="uint" summary="the unique serial number of the tool, most significant bits"/>
++      <arg name="hardware_serial_lo" type="uint" summary="the unique serial number of the tool, least significant bits"/>
++    </event>
++
++    <event name="hardware_id_wacom">
++      <description summary="hardware id notification in Wacom's format">
++	This event notifies the client of a hardware id available on this tool.
++
++	The hardware id is a device-specific 64-bit id that provides extra
++	information about the tool in use, beyond the wl_tool.type
++	enumeration. The format of the id is specific to tablets made by
++	Wacom Inc. For example, the hardware id of a Wacom Grip
++	Pen (a stylus) is 0x802.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_tool.done event.
++      </description>
++      <arg name="hardware_id_hi" type="uint" summary="the hardware id, most significant bits"/>
++      <arg name="hardware_id_lo" type="uint" summary="the hardware id, least significant bits"/>
++    </event>
++
++    <enum name="capability">
++      <description summary="capability flags for a tool">
++	Describes extra capabilities on a tablet.
++
++	Any tool must provide x and y values, extra axes are
++	device-specific.
++      </description>
++      <entry name="tilt" value="1" summary="Tilt axes"/>
++      <entry name="pressure" value="2" summary="Pressure axis"/>
++      <entry name="distance" value="3" summary="Distance axis"/>
++      <entry name="rotation" value="4" summary="Z-rotation axis"/>
++      <entry name="slider" value="5" summary="Slider axis"/>
++      <entry name="wheel" value="6" summary="Wheel axis"/>
++    </enum>
++
++    <event name="capability">
++      <description summary="tool capability notification">
++	This event notifies the client of any capabilities of this tool,
++	beyond the main set of x/y axes and tip up/down detection.
++
++	One event is sent for each extra capability available on this tool.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_tool.done event.
++      </description>
++      <arg name="capability" type="uint" enum="capability" summary="the capability"/>
++    </event>
++
++    <event name="done">
++      <description summary="tool description events sequence complete">
++	This event signals the end of the initial burst of descriptive
++	events. A client may consider the static description of the tool to
++	be complete and finalize initialization of the tool.
++      </description>
++    </event>
++
++    <event name="removed">
++      <description summary="tool removed">
++	This event is sent when the tool is removed from the system and will
++	send no further events. Should the physical tool come back into
++	proximity later, a new wp_tablet_tool object will be created.
++
++	It is compositor-dependent when a tool is removed. A compositor may
++	remove a tool on proximity out, tablet removal or any other reason.
++	A compositor may also keep a tool alive until shutdown.
++
++	If the tool is currently in proximity, a proximity_out event will be
++	sent before the removed event. See wp_tablet_tool.proximity_out for
++	the handling of any buttons logically down.
++
++	When this event is received, the client must wp_tablet_tool.destroy
++	the object.
++      </description>
++    </event>
++
++    <event name="proximity_in">
++      <description summary="proximity in event">
++	Notification that this tool is focused on a certain surface.
++
++	This event can be received when the tool has moved from one surface to
++	another, or when the tool has come back into proximity above the
++	surface.
++
++	If any button is logically down when the tool comes into proximity,
++	the respective button event is sent after the proximity_in event but
++	within the same frame as the proximity_in event.
++      </description>
++      <arg name="serial" type="uint"/>
++      <arg name="tablet" type="object" interface="zwp_tablet_v2" summary="The tablet the tool is in proximity of"/>
++      <arg name="surface" type="object" interface="wl_surface" summary="The current surface the tablet tool is over"/>
++    </event>
++
++    <event name="proximity_out">
++      <description summary="proximity out event">
++	Notification that this tool has either left proximity, or is no
++	longer focused on a certain surface.
++
++	When the tablet tool leaves proximity of the tablet, button release
++	events are sent for each button that was held down at the time of
++	leaving proximity. These events are sent before the proximity_out
++	event but within the same wp_tablet.frame.
++
++	If the tool stays within proximity of the tablet, but the focus
++	changes from one surface to another, a button release event may not
++	be sent until the button is actually released or the tool leaves the
++	proximity of the tablet.
++      </description>
++    </event>
++
++    <event name="down">
++      <description summary="tablet tool is making contact">
++	Sent whenever the tablet tool comes in contact with the surface of the
++	tablet.
++
++	If the tool is already in contact with the tablet when entering the
++	input region, the client owning said region will receive a
++	wp_tablet.proximity_in event, followed by a wp_tablet.down
++	event and a wp_tablet.frame event.
++
++	Note that this event describes logical contact, not physical
++	contact. On some devices, a compositor may not consider a tool in
++	logical contact until a minimum physical pressure threshold is
++	exceeded.
++      </description>
++      <arg name="serial" type="uint"/>
++    </event>
++
++    <event name="up">
++      <description summary="tablet tool is no longer making contact">
++	Sent whenever the tablet tool stops making contact with the surface of
++	the tablet, or when the tablet tool moves out of the input region
++	and the compositor grab (if any) is dismissed.
++
++	If the tablet tool moves out of the input region while in contact
++	with the surface of the tablet and the compositor does not have an
++	ongoing grab on the surface, the client owning said region will
++	receive a wp_tablet.up event, followed by a wp_tablet.proximity_out
++	event and a wp_tablet.frame event. If the compositor has an ongoing
++	grab on this device, this event sequence is sent whenever the grab
++	is dismissed in the future.
++
++	Note that this event describes logical contact, not physical
++	contact. On some devices, a compositor may not consider a tool out
++	of logical contact until physical pressure falls below a specific
++	threshold.
++      </description>
++    </event>
++
++    <event name="motion">
++      <description summary="motion event">
++	Sent whenever a tablet tool moves.
++      </description>
++      <arg name="x" type="fixed" summary="surface-local x coordinate"/>
++      <arg name="y" type="fixed" summary="surface-local y coordinate"/>
++    </event>
++
++    <event name="pressure">
++      <description summary="pressure change event">
++	Sent whenever the pressure axis on a tool changes. The value of this
++	event is normalized to a value between 0 and 65535.
++
++	Note that pressure may be nonzero even when a tool is not in logical
++	contact. See the down and up events for more details.
++      </description>
++      <arg name="pressure" type="uint" summary="The current pressure value"/>
++    </event>
++
++    <event name="distance">
++      <description summary="distance change event">
++	Sent whenever the distance axis on a tool changes. The value of this
++	event is normalized to a value between 0 and 65535.
++
++	Note that distance may be nonzero even when a tool is not in logical
++	contact. See the down and up events for more details.
++      </description>
++      <arg name="distance" type="uint" summary="The current distance value"/>
++    </event>
++
++    <event name="tilt">
++      <description summary="tilt change event">
++	Sent whenever one or both of the tilt axes on a tool change. Each tilt
++	value is in degrees, relative to the z-axis of the tablet.
++	The angle is positive when the top of a tool tilts along the
++	positive x or y axis.
++      </description>
++      <arg name="tilt_x" type="fixed" summary="The current value of the X tilt axis"/>
++      <arg name="tilt_y" type="fixed" summary="The current value of the Y tilt axis"/>
++    </event>
++
++    <event name="rotation">
++      <description summary="z-rotation change event">
++	Sent whenever the z-rotation axis on the tool changes. The
++	rotation value is in degrees clockwise from the tool's
++	logical neutral position.
++      </description>
++      <arg name="degrees" type="fixed" summary="The current rotation of the Z axis"/>
++    </event>
++
++    <event name="slider">
++      <description summary="Slider position change event">
++	Sent whenever the slider position on the tool changes. The
++	value is normalized between -65535 and 65535, with 0 as the logical
++	neutral position of the slider.
++
++	The slider is available on e.g. the Wacom Airbrush tool.
++      </description>
++      <arg name="position" type="int" summary="The current position of slider"/>
++    </event>
++
++    <event name="wheel">
++      <description summary="Wheel delta event">
++	Sent whenever the wheel on the tool emits an event. This event
++	contains two values for the same axis change. The degrees value is
++	in the same orientation as the wl_pointer.vertical_scroll axis. The
++	clicks value is in discrete logical clicks of the mouse wheel. This
++	value may be zero if the movement of the wheel was less
++	than one logical click.
++
++	Clients should choose either value and avoid mixing degrees and
++	clicks. The compositor may accumulate values smaller than a logical
++	click and emulate click events when a certain threshold is met.
++	Thus, wl_tablet_tool.wheel events with non-zero clicks values may
++	have different degrees values.
++      </description>
++      <arg name="degrees" type="fixed" summary="The wheel delta in degrees"/>
++      <arg name="clicks" type="int" summary="The wheel delta in discrete clicks"/>
++    </event>
++
++    <enum name="button_state">
++      <description summary="physical button state">
++	Describes the physical state of a button that produced the button event.
++      </description>
++      <entry name="released" value="0" summary="button is not pressed"/>
++      <entry name="pressed" value="1" summary="button is pressed"/>
++    </enum>
++
++    <event name="button">
++      <description summary="button event">
++	Sent whenever a button on the tool is pressed or released.
++
++	If a button is held down when the tool moves in or out of proximity,
++	button events are generated by the compositor. See
++	wp_tablet_tool.proximity_in and wp_tablet_tool.proximity_out for
++	details.
++      </description>
++      <arg name="serial" type="uint"/>
++      <arg name="button" type="uint" summary="The button whose state has changed"/>
++      <arg name="state" type="uint" enum="button_state" summary="Whether the button was pressed or released"/>
++    </event>
++
++    <event name="frame">
++      <description summary="frame event">
++	Marks the end of a series of axis and/or button updates from the
++	tablet. The Wayland protocol requires axis updates to be sent
++	sequentially, however all events within a frame should be considered
++	one hardware event.
++      </description>
++      <arg name="time" type="uint" summary="The time of the event with millisecond granularity"/>
++    </event>
++
++    <enum name="error">
++      <entry name="role" value="0" summary="given wl_surface has another role"/>
++    </enum>
++  </interface>
++
++  <interface name="zwp_tablet_v2" version="1">
++    <description summary="graphics tablet device">
++      The wp_tablet interface represents one graphics tablet device. The
++      tablet interface itself does not generate events; all events are
++      generated by wp_tablet_tool objects when in proximity above a tablet.
++
++      A tablet has a number of static characteristics, e.g. device name and
++      pid/vid. These capabilities are sent in an event sequence after the
++      wp_tablet_seat.tablet_added event. This initial event sequence is
++      terminated by a wp_tablet.done event.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the tablet object">
++	This destroys the client's resource for this tablet object.
++      </description>
++    </request>
++
++    <event name="name">
++      <description summary="tablet device name">
++        A descriptive name for the tablet device.
++
++	If the device has no descriptive name, this event is not sent.
++
++	This event is sent in the initial burst of events before the
++        wp_tablet.done event.
++      </description>
++      <arg name="name" type="string" summary="the device name"/>
++    </event>
++
++    <event name="id">
++      <description summary="tablet device USB vendor/product id">
++	The USB vendor and product IDs for the tablet device.
++
++	If the device has no USB vendor/product ID, this event is not sent.
++	This can happen for virtual devices or non-USB devices, for instance.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet.done event.
++      </description>
++      <arg name="vid" type="uint" summary="USB vendor id"/>
++      <arg name="pid" type="uint" summary="USB product id"/>
++    </event>
++
++    <event name="path">
++      <description summary="path to the device">
++	A system-specific device path that indicates which device is behind
++	this wp_tablet. This information may be used to gather additional
++	information about the device, e.g. through libwacom.
++
++	A device may have more than one device path. If so, multiple
++	wp_tablet.path events are sent. A device may be emulated and not
++	have a device path, and in that case this event will not be sent.
++
++	The format of the path is unspecified, it may be a device node, a
++	sysfs path, or some other identifier. It is up to the client to
++	identify the string provided.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet.done event.
++      </description>
++      <arg name="path" type="string" summary="path to local device"/>
++    </event>
++
++    <event name="done">
++      <description summary="tablet description events sequence complete">
++	This event is sent immediately to signal the end of the initial
++	burst of descriptive events. A client may consider the static
++	description of the tablet to be complete and finalize initialization
++	of the tablet.
++      </description>
++    </event>
++
++    <event name="removed">
++      <description summary="tablet removed event">
++	Sent when the tablet has been removed from the system. When a tablet
++	is removed, some tools may be removed.
++
++	When this event is received, the client must wp_tablet.destroy
++	the object.
++      </description>
++    </event>
++  </interface>
++
++  <interface name="zwp_tablet_pad_ring_v2" version="1">
++    <description summary="pad ring">
++      A circular interaction area, such as the touch ring on the Wacom Intuos
++      Pro series tablets.
++
++      Events on a ring are logically grouped by the wl_tablet_pad_ring.frame
++      event.
++    </description>
++
++    <request name="set_feedback">
++      <description summary="set compositor feedback">
++	Request that the compositor use the provided feedback string
++	associated with this ring. This request should be issued immediately
++	after a wp_tablet_pad_group.mode_switch event from the corresponding
++	group is received, or whenever the ring is mapped to a different
++	action. See wp_tablet_pad_group.mode_switch for more details.
++
++	Clients are encouraged to provide context-aware descriptions for
++	the actions associated with the ring; compositors may use this
++	information to offer visual feedback about the button layout
++	(eg. on-screen displays).
++
++	The provided string 'description' is a UTF-8 encoded string to be
++	associated with this ring, and is considered user-visible; general
++	internationalization rules apply.
++
++	The serial argument will be that of the last
++	wp_tablet_pad_group.mode_switch event received for the group of this
++	ring. Requests providing other serials than the most recent one will be
++	ignored.
++      </description>
++      <arg name="description" type="string" summary="ring description"/>
++      <arg name="serial" type="uint" summary="serial of the mode switch event"/>
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the ring object">
++	This destroys the client's resource for this ring object.
++      </description>
++    </request>
++
++    <enum name="source">
++      <description summary="ring axis source">
++	Describes the source types for ring events. This indicates to the
++	client how a ring event was physically generated; a client may
++	adjust the user interface accordingly. For example, events
++	from a "finger" source may trigger kinetic scrolling.
++      </description>
++      <entry name="finger" value="1" summary="finger"/>
++    </enum>
++
++    <event name="source">
++      <description summary="ring event source">
++	Source information for ring events.
++
++	This event does not occur on its own. It is sent before a
++	wp_tablet_pad_ring.frame event and carries the source information
++	for all events within that frame.
++
++	The source specifies how this event was generated. If the source is
++	wp_tablet_pad_ring.source.finger, a wp_tablet_pad_ring.stop event
++	will be sent when the user lifts the finger off the device.
++
++	This event is optional. If the source is unknown for an interaction,
++	no event is sent.
++      </description>
++      <arg name="source" type="uint" enum="source" summary="the event source"/>
++    </event>
++
++    <event name="angle">
++      <description summary="angle changed">
++	Sent whenever the angle on a ring changes.
++
++	The angle is provided in degrees clockwise from the logical
++	north of the ring in the pad's current rotation.
++      </description>
++      <arg name="degrees" type="fixed" summary="the current angle in degrees"/>
++    </event>
++
++    <event name="stop">
++      <description summary="interaction stopped">
++	Stop notification for ring events.
++
++	For some wp_tablet_pad_ring.source types, a wp_tablet_pad_ring.stop
++	event is sent to notify a client that the interaction with the ring
++	has terminated. This enables the client to implement kinetic scrolling.
++	See the wp_tablet_pad_ring.source documentation for information on
++	when this event may be generated.
++
++	Any wp_tablet_pad_ring.angle events with the same source after this
++	event should be considered as the start of a new interaction.
++      </description>
++    </event>
++
++    <event name="frame">
++      <description summary="end of a ring event sequence">
++	Indicates the end of a set of ring events that logically belong
++	together. A client is expected to accumulate the data in all events
++	within the frame before proceeding.
++
++	All wp_tablet_pad_ring events before a wp_tablet_pad_ring.frame event belong
++	logically together. For example, on termination of a finger interaction
++	on a ring the compositor will send a wp_tablet_pad_ring.source event,
++	a wp_tablet_pad_ring.stop event and a wp_tablet_pad_ring.frame event.
++
++	A wp_tablet_pad_ring.frame event is sent for every logical event
++	group, even if the group only contains a single wp_tablet_pad_ring
++	event. Specifically, a client may get a sequence: angle, frame,
++	angle, frame, etc.
++      </description>
++      <arg name="time" type="uint" summary="timestamp with millisecond granularity"/>
++    </event>
++  </interface>
++
++  <interface name="zwp_tablet_pad_strip_v2" version="1">
++    <description summary="pad strip">
++      A linear interaction area, such as the strips found in Wacom Cintiq
++      models.
++
++      Events on a strip are logically grouped by the wl_tablet_pad_strip.frame
++      event.
++    </description>
++
++    <request name="set_feedback">
++      <description summary="set compositor feedback">
++	Requests the compositor to use the provided feedback string
++	associated with this strip. This request should be issued immediately
++	after a wp_tablet_pad_group.mode_switch event from the corresponding
++	group is received, or whenever the strip is mapped to a different
++	action. See wp_tablet_pad_group.mode_switch for more details.
++
++	Clients are encouraged to provide context-aware descriptions for
++	the actions associated with the strip, and compositors may use this
++	information to offer visual feedback about the button layout
++	(eg. on-screen displays).
++
++	The provided string 'description' is a UTF-8 encoded string to be
++	associated with this ring, and is considered user-visible; general
++	internationalization rules apply.
++
++	The serial argument will be that of the last
++	wp_tablet_pad_group.mode_switch event received for the group of this
++	strip. Requests providing other serials than the most recent one will be
++	ignored.
++      </description>
++      <arg name="description" type="string" summary="strip description"/>
++      <arg name="serial" type="uint" summary="serial of the mode switch event"/>
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the strip object">
++	This destroys the client's resource for this strip object.
++      </description>
++    </request>
++
++    <enum name="source">
++      <description summary="strip axis source">
++	Describes the source types for strip events. This indicates to the
++	client how a strip event was physically generated; a client may
++	adjust the user interface accordingly. For example, events
++	from a "finger" source may trigger kinetic scrolling.
++      </description>
++      <entry name="finger" value="1" summary="finger"/>
++    </enum>
++
++    <event name="source">
++      <description summary="strip event source">
++	Source information for strip events.
++
++	This event does not occur on its own. It is sent before a
++	wp_tablet_pad_strip.frame event and carries the source information
++	for all events within that frame.
++
++	The source specifies how this event was generated. If the source is
++	wp_tablet_pad_strip.source.finger, a wp_tablet_pad_strip.stop event
++	will be sent when the user lifts their finger off the device.
++
++	This event is optional. If the source is unknown for an interaction,
++	no event is sent.
++      </description>
++      <arg name="source" type="uint" enum="source" summary="the event source"/>
++    </event>
++
++    <event name="position">
++      <description summary="position changed">
++	Sent whenever the position on a strip changes.
++
++	The position is normalized to a range of [0, 65535], the 0-value
++	represents the top-most and/or left-most position of the strip in
++	the pad's current rotation.
++      </description>
++      <arg name="position" type="uint" summary="the current position"/>
++    </event>
++
++    <event name="stop">
++      <description summary="interaction stopped">
++	Stop notification for strip events.
++
++	For some wp_tablet_pad_strip.source types, a wp_tablet_pad_strip.stop
++	event is sent to notify a client that the interaction with the strip
++	has terminated. This enables the client to implement kinetic
++	scrolling. See the wp_tablet_pad_strip.source documentation for
++	information on when this event may be generated.
++
++	Any wp_tablet_pad_strip.position events with the same source after this
++	event should be considered as the start of a new interaction.
++      </description>
++    </event>
++
++    <event name="frame">
++      <description summary="end of a strip event sequence">
++	Indicates the end of a set of events that represent one logical
++	hardware strip event. A client is expected to accumulate the data
++	in all events within the frame before proceeding.
++
++	All wp_tablet_pad_strip events before a wp_tablet_pad_strip.frame event belong
++	logically together. For example, on termination of a finger interaction
++	on a strip the compositor will send a wp_tablet_pad_strip.source event,
++	a wp_tablet_pad_strip.stop event and a wp_tablet_pad_strip.frame
++	event.
++
++	A wp_tablet_pad_strip.frame event is sent for every logical event
++	group, even if the group only contains a single wp_tablet_pad_strip
++	event. Specifically, a client may get a sequence: position, frame,
++	position, frame, etc.
++      </description>
++      <arg name="time" type="uint" summary="timestamp with millisecond granularity"/>
++    </event>
++  </interface>
++
++  <interface name="zwp_tablet_pad_group_v2" version="1">
++    <description summary="a set of buttons, rings and strips">
++      A pad group describes a distinct (sub)set of buttons, rings and strips
++      present in the tablet. The criteria of this grouping is usually positional,
++      eg. if a tablet has buttons on the left and right side, 2 groups will be
++      presented. The physical arrangement of groups is undisclosed and may
++      change on the fly.
++
++      Pad groups will announce their features during pad initialization. Between
++      the corresponding wp_tablet_pad.group event and wp_tablet_pad_group.done, the
++      pad group will announce the buttons, rings and strips contained in it,
++      plus the number of supported modes.
++
++      Modes are a mechanism to allow multiple groups of actions for every element
++      in the pad group. The number of groups and available modes in each is
++      persistent across device plugs. The current mode is user-switchable, it
++      will be announced through the wp_tablet_pad_group.mode_switch event both
++      whenever it is switched, and after wp_tablet_pad.enter.
++
++      The current mode logically applies to all elements in the pad group,
++      although it is at clients' discretion whether to actually perform different
++      actions, and/or issue the respective .set_feedback requests to notify the
++      compositor. See the wp_tablet_pad_group.mode_switch event for more details.
++    </description>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the pad object">
++	Destroy the wp_tablet_pad_group object. Objects created from this object
++	are unaffected and should be destroyed separately.
++      </description>
++    </request>
++
++    <event name="buttons">
++      <description summary="buttons announced">
++	Sent on wp_tablet_pad_group initialization to announce the available
++	buttons in the group. Button indices start at 0, a button may only be
++	in one group at a time.
++
++	This event is first sent in the initial burst of events before the
++	wp_tablet_pad_group.done event.
++
++	Some buttons are reserved by the compositor. These buttons may not be
++	assigned to any wp_tablet_pad_group. Compositors may broadcast this
++	event in the case of changes to the mapping of these reserved buttons.
++	If the compositor happens to reserve all buttons in a group, this event
++	will be sent with an empty array.
++      </description>
++      <arg name="buttons" type="array" summary="buttons in this group"/>
++    </event>
++
++    <event name="ring">
++      <description summary="ring announced">
++	Sent on wp_tablet_pad_group initialization to announce available rings.
++	One event is sent for each ring available on this pad group.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_pad_group.done event.
++      </description>
++      <arg name="ring" type="new_id" interface="zwp_tablet_pad_ring_v2"/>
++    </event>
++
++    <event name="strip">
++      <description summary="strip announced">
++	Sent on wp_tablet_pad initialization to announce available strips.
++	One event is sent for each strip available on this pad group.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_pad_group.done event.
++      </description>
++      <arg name="strip" type="new_id" interface="zwp_tablet_pad_strip_v2"/>
++    </event>
++
++    <event name="modes">
++      <description summary="mode-switch ability announced">
++	Sent on wp_tablet_pad_group initialization to announce that the pad
++	group may switch between modes. A client may use a mode to store a
++	specific configuration for buttons, rings and strips and use the
++	wl_tablet_pad_group.mode_switch event to toggle between these
++	configurations. Mode indices start at 0.
++
++	Switching modes is compositor-dependent. See the
++	wp_tablet_pad_group.mode_switch event for more details.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_pad_group.done event. This event is only sent when more than
++	more than one mode is available.
++      </description>
++      <arg name="modes" type="uint" summary="the number of modes"/>
++    </event>
++
++    <event name="done">
++      <description summary="tablet group description events sequence complete">
++	This event is sent immediately to signal the end of the initial
++	burst of descriptive events. A client may consider the static
++	description of the tablet to be complete and finalize initialization
++	of the tablet group.
++      </description>
++    </event>
++
++    <event name="mode_switch">
++      <description summary="mode switch event">
++	Notification that the mode was switched.
++
++	A mode applies to all buttons, rings and strips in a group
++	simultaneously, but a client is not required to assign different actions
++	for each mode. For example, a client may have mode-specific button
++	mappings but map the ring to vertical scrolling in all modes. Mode
++	indices start at 0.
++
++	Switching modes is compositor-dependent. The compositor may provide
++	visual cues to the user about the mode, e.g. by toggling LEDs on
++	the tablet device. Mode-switching may be software-controlled or
++	controlled by one or more physical buttons. For example, on a Wacom
++	Intuos Pro, the button inside the ring may be assigned to switch
++	between modes.
++
++	The compositor will also send this event after wp_tablet_pad.enter on
++	each group in order to notify of the current mode. Groups that only
++	feature one mode will use mode=0 when emitting this event.
++
++	If a button action in the new mode differs from the action in the
++	previous mode, the client should immediately issue a
++	wp_tablet_pad.set_feedback request for each changed button.
++
++	If a ring or strip action in the new mode differs from the action
++	in the previous mode, the client should immediately issue a
++	wp_tablet_ring.set_feedback or wp_tablet_strip.set_feedback request
++	for each changed ring or strip.
++      </description>
++      <arg name="time" type="uint" summary="the time of the event with millisecond granularity"/>
++      <arg name="serial" type="uint"/>
++      <arg name="mode" type="uint" summary="the new mode of the pad"/>
++    </event>
++  </interface>
++
++  <interface name="zwp_tablet_pad_v2" version="1">
++    <description summary="a set of buttons, rings and strips">
++      A pad device is a set of buttons, rings and strips
++      usually physically present on the tablet device itself. Some
++      exceptions exist where the pad device is physically detached, e.g. the
++      Wacom ExpressKey Remote.
++
++      Pad devices have no axes that control the cursor and are generally
++      auxiliary devices to the tool devices used on the tablet surface.
++
++      A pad device has a number of static characteristics, e.g. the number
++      of rings. These capabilities are sent in an event sequence after the
++      wp_tablet_seat.pad_added event before any actual events from this pad.
++      This initial event sequence is terminated by a wp_tablet_pad.done
++      event.
++
++      All pad features (buttons, rings and strips) are logically divided into
++      groups and all pads have at least one group. The available groups are
++      notified through the wp_tablet_pad.group event; the compositor will
++      emit one event per group before emitting wp_tablet_pad.done.
++
++      Groups may have multiple modes. Modes allow clients to map multiple
++      actions to a single pad feature. Only one mode can be active per group,
++      although different groups may have different active modes.
++    </description>
++
++    <request name="set_feedback">
++      <description summary="set compositor feedback">
++	Requests the compositor to use the provided feedback string
++	associated with this button. This request should be issued immediately
++	after a wp_tablet_pad_group.mode_switch event from the corresponding
++	group is received, or whenever a button is mapped to a different
++	action. See wp_tablet_pad_group.mode_switch for more details.
++
++	Clients are encouraged to provide context-aware descriptions for
++	the actions associated with each button, and compositors may use
++	this information to offer visual feedback on the button layout
++	(e.g. on-screen displays).
++
++	Button indices start at 0. Setting the feedback string on a button
++	that is reserved by the compositor (i.e. not belonging to any
++	wp_tablet_pad_group) does not generate an error but the compositor
++	is free to ignore the request.
++
++	The provided string 'description' is a UTF-8 encoded string to be
++	associated with this ring, and is considered user-visible; general
++	internationalization rules apply.
++
++	The serial argument will be that of the last
++	wp_tablet_pad_group.mode_switch event received for the group of this
++	button. Requests providing other serials than the most recent one will
++	be ignored.
++      </description>
++      <arg name="button" type="uint" summary="button index"/>
++      <arg name="description" type="string" summary="button description"/>
++      <arg name="serial" type="uint" summary="serial of the mode switch event"/>
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the pad object">
++	Destroy the wp_tablet_pad object. Objects created from this object
++	are unaffected and should be destroyed separately.
++      </description>
++    </request>
++
++    <event name="group">
++      <description summary="group announced">
++	Sent on wp_tablet_pad initialization to announce available groups.
++	One event is sent for each pad group available.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_pad.done event. At least one group will be announced.
++      </description>
++      <arg name="pad_group" type="new_id" interface="zwp_tablet_pad_group_v2"/>
++    </event>
++
++    <event name="path">
++      <description summary="path to the device">
++	A system-specific device path that indicates which device is behind
++	this wp_tablet_pad. This information may be used to gather additional
++	information about the device, e.g. through libwacom.
++
++	The format of the path is unspecified, it may be a device node, a
++	sysfs path, or some other identifier. It is up to the client to
++	identify the string provided.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_pad.done event.
++      </description>
++      <arg name="path" type="string" summary="path to local device"/>
++    </event>
++
++    <event name="buttons">
++      <description summary="buttons announced">
++	Sent on wp_tablet_pad initialization to announce the available
++	buttons.
++
++	This event is sent in the initial burst of events before the
++	wp_tablet_pad.done event. This event is only sent when at least one
++	button is available.
++      </description>
++      <arg name="buttons" type="uint" summary="the number of buttons"/>
++    </event>
++
++    <event name="done">
++      <description summary="pad description event sequence complete">
++	This event signals the end of the initial burst of descriptive
++	events. A client may consider the static description of the pad to
++	be complete and finalize initialization of the pad.
++      </description>
++    </event>
++
++    <enum name="button_state">
++      <description summary="physical button state">
++	Describes the physical state of a button that caused the button
++	event.
++      </description>
++      <entry name="released" value="0" summary="the button is not pressed"/>
++      <entry name="pressed" value="1" summary="the button is pressed"/>
++    </enum>
++
++    <event name="button">
++      <description summary="physical button state">
++	Sent whenever the physical state of a button changes.
++      </description>
++      <arg name="time" type="uint" summary="the time of the event with millisecond granularity"/>
++      <arg name="button" type="uint" summary="the index of the button that changed state"/>
++      <arg name="state" type="uint" enum="button_state"/>
++    </event>
++
++    <event name="enter">
++      <description summary="enter event">
++	Notification that this pad is focused on the specified surface.
++      </description>
++      <arg name="serial" type="uint" summary="serial number of the enter event"/>
++      <arg name="tablet" type="object" interface="zwp_tablet_v2" summary="the tablet the pad is attached to"/>
++      <arg name="surface" type="object" interface="wl_surface" summary="surface the pad is focused on"/>
++    </event>
++
++    <event name="leave">
++      <description summary="leave event">
++	Notification that this pad is no longer focused on the specified
++	surface.
++      </description>
++      <arg name="serial" type="uint" summary="serial number of the leave event"/>
++      <arg name="surface" type="object" interface="wl_surface" summary="surface the pad is no longer focused on"/>
++    </event>
++
++    <event name="removed">
++      <description summary="pad removed event">
++	Sent when the pad has been removed from the system. When a tablet
++	is removed its pad(s) will be removed too.
++
++	When this event is received, the client must destroy all rings, strips
++	and groups that were offered by this pad, and issue wp_tablet_pad.destroy
++	the pad itself.
++      </description>
++    </event>
++  </interface>
++</protocol>
+diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
+index 43c4d13..a88e611 100644
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -35,6 +35,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ struct wayland process_wayland =
+ {
+     .seat.mutex = PTHREAD_MUTEX_INITIALIZER,
++    .tablet.mutex = PTHREAD_MUTEX_INITIALIZER,   /* NEUTRON: pen/tablet */
+     .keyboard.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .pointer.mutex = PTHREAD_MUTEX_INITIALIZER,
+     .text_input.mutex = PTHREAD_MUTEX_INITIALIZER,
+@@ -170,6 +171,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+         wl_seat_add_listener(seat->wl_seat, &seat_listener, NULL);
+         pthread_mutex_unlock(&seat->mutex);
+         if (process_wayland.zwp_text_input_manager_v3) wayland_text_input_init();
++        /* NEUTRON: bring up the tablet seat now that we have a wl_seat (no-op if the
++         * tablet manager global hasn't arrived yet; the manager branch retries too). */
++        if (process_wayland.tablet.zwp_tablet_manager_v2) wayland_tablet_init();
+         /* Recreate the data device for the new seat. */
+         if (process_wayland.data_device.zwlr_data_control_device_v1 ||
+             process_wayland.data_device.wl_data_device)
+@@ -177,6 +181,15 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
+             wayland_data_device_init();
+         }
+     }
++    else if (strcmp(interface, "zwp_tablet_manager_v2") == 0)
++    {
++        /* NEUTRON: graphics-tablet (pen) manager. Bind v1 of the interface (the
++         * tablet-v2 protocol); wayland_tablet_init() creates the tablet seat once
++         * both this and the wl_seat exist. */
++        process_wayland.tablet.zwp_tablet_manager_v2 =
++            wl_registry_bind(registry, id, &zwp_tablet_manager_v2_interface, 1);
++        if (process_wayland.seat.wl_seat) wayland_tablet_init();
++    }
+     else if (strcmp(interface, "wp_viewporter") == 0)
+     {
+         process_wayland.wp_viewporter =
+diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
+index 921d637..5cb6c94 100644
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -40,10 +40,9 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+-/* The cursor-shape-v1 protocol file references the zwp_tablet_tool_v2
+- * interface object. Since we don't currently use the tablet protocol,
+- * provide a dummy object here to avoid linking errors. */
+-void *zwp_tablet_tool_v2_interface = NULL;
++/* NEUTRON: the real zwp_tablet_tool_v2_interface now comes from the vendored
++ * tablet-v2 protocol (tablet-v2-protocol.c); the former dummy stub here was
++ * removed to avoid a conflicting definition. */
+ 
+ struct system_cursors
+ {
+diff --git a/dlls/winewayland.drv/wayland_tablet.c b/dlls/winewayland.drv/wayland_tablet.c
+new file mode 100644
+index 0000000..04b0b61
+--- /dev/null
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -0,0 +1,475 @@
++/*
++ * Wayland graphics tablets
++ *
++ * Copyright 2024 John Chadwick
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <assert.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++#include "waylanddrv.h"
++#include "wine/debug.h"
++#include "wine/server.h"
++
++
++WINE_DEFAULT_DEBUG_CHANNEL(wintab32);
++
++/**********************************************************************
++ *          zwp_tablet_v2 handlers
++ */
++
++static void wayland_tablet_device_name(void *data, struct zwp_tablet_v2 *zwp_tablet_v2, const char *name)
++{
++    struct wayland_tablet_device *device = (struct wayland_tablet_device *)data;
++    device->name = strdup(name);
++}
++
++static void wayland_tablet_device_id(void *data, struct zwp_tablet_v2 *zwp_tablet_v2, uint32_t vid, uint32_t pid)
++{
++    struct wayland_tablet_device *device = (struct wayland_tablet_device *)data;
++    device->vid = vid;
++    device->pid = pid;
++}
++
++static void wayland_tablet_device_path(void *data, struct zwp_tablet_v2 *zwp_tablet_v2, const char *path)
++{
++    struct wayland_tablet_device *device = (struct wayland_tablet_device *)data;
++    device->path = strdup(path);
++}
++
++static void wayland_tablet_device_done(void *data, struct zwp_tablet_v2 *zwp_tablet_v2)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_device *device = (struct wayland_tablet_device *)data;
++
++    pthread_mutex_lock(&tablet->mutex);
++    list_add_tail(&tablet->devices, &device->entry);
++    pthread_mutex_unlock(&tablet->mutex);
++
++    TRACE("tablet device added: %s (vid=%d, pid=%d)\n",
++          device->name, device->vid, device->pid);
++}
++
++static void wayland_tablet_device_removed(void *data, struct zwp_tablet_v2 *zwp_tablet_v2)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_device *device = (struct wayland_tablet_device *)data;
++
++    if (device->entry.next) {
++        pthread_mutex_lock(&tablet->mutex);
++        list_remove(&device->entry);
++        pthread_mutex_unlock(&tablet->mutex);
++    }
++
++    TRACE("tablet device removed: %s (vid=%d, pid=%d)\n",
++          device->name, device->vid, device->pid);
++
++    zwp_tablet_v2_destroy(zwp_tablet_v2);
++    if (device->name)
++        free(device->name);
++    if (device->path)
++        free(device->path);
++    free(device);
++}
++
++static const struct zwp_tablet_v2_listener zwp_tablet_v2_listener =
++{
++    wayland_tablet_device_name,
++    wayland_tablet_device_id,
++    wayland_tablet_device_path,
++    wayland_tablet_device_done,
++    wayland_tablet_device_removed,
++};
++
++/**********************************************************************
++ *          zwp_tablet_tool_v2 handlers
++ */
++
++static void wayland_tablet_tool_type(void *data, struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                     uint32_t tool_type)
++{
++}
++
++static void wayland_tablet_tool_hardware_serial(void *data,
++                                                struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                                uint32_t hardware_serial_hi,
++                                                uint32_t hardware_serial_lo)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++
++    tool->serial = ((uint64_t)hardware_serial_hi << 32) | (uint64_t) hardware_serial_lo;
++}
++
++static void wayland_tablet_tool_hardware_id_wacom(void *data,
++                                                  struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                                  uint32_t hardware_id_hi,
++                                                  uint32_t hardware_id_lo)
++{
++}
++
++static void wayland_tablet_tool_capability(void *data,
++                                           struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                           uint32_t capability)
++{
++}
++
++static void wayland_tablet_tool_done(void *data,
++                                     struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++
++    pthread_mutex_lock(&tablet->mutex);
++    list_add_tail(&tablet->tools, &tool->entry);
++    pthread_mutex_unlock(&tablet->mutex);
++
++    TRACE("tablet tool added: serial=%llx\n", tool->serial);
++}
++
++static void wayland_tablet_tool_removed(void *data,
++                                        struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++
++    if (tool->entry.next) {
++        pthread_mutex_lock(&tablet->mutex);
++        list_remove(&tool->entry);
++        pthread_mutex_unlock(&tablet->mutex);
++    }
++
++    TRACE("tablet tool removed: serial=%llx\n", tool->serial);
++
++    zwp_tablet_tool_v2_destroy(zwp_tablet_tool_v2);
++    free(tool);
++}
++
++static void wayland_tablet_tool_proximity_in(void *data,
++                                             struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                             uint32_t serial,
++                                             struct zwp_tablet_v2 *tablet,
++                                             struct wl_surface *surface)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    tool->surface = surface;
++    wayland_wintab_proximity_in(tool, serial, tablet, surface);
++}
++
++static void wayland_tablet_tool_proximity_out(void *data,
++                                              struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_proximity_out(tool);
++    tool->surface = NULL;
++}
++
++static void wayland_tablet_tool_down(void *data,
++                                     struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                     uint32_t serial)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    /* NEUTRON: record; the LEFTDOWN is injected in wayland_wintab_frame after the
++     * pen-down packet is published (see the pending_* fields). */
++    tool->pending_buttons = MOUSEEVENTF_LEFTDOWN;
++    wayland_wintab_down(tool, serial);
++}
++
++static void wayland_tablet_tool_up(void *data,
++                                   struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    /* NEUTRON: record; LEFTUP injected in wayland_wintab_frame after the packet. */
++    tool->pending_buttons = MOUSEEVENTF_LEFTUP;
++    wayland_wintab_up(tool);
++}
++
++static void wayland_tablet_tool_motion(void *data,
++                                       struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                       wl_fixed_t x,
++                                       wl_fixed_t y)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    if (tool->surface) {
++        // TODO: Copied directly from wayland_pointer.
++        RECT *window_rect;
++        HWND hwnd = wl_surface_get_user_data(tool->surface);
++        POINT screen;
++        struct wayland_surface *surface;
++        struct wayland_win_data *window_data;
++        if (!(window_data = wayland_win_data_get(hwnd))) return;
++        if (!(surface = window_data->wayland_surface))
++        {
++            wayland_win_data_release(window_data);
++            return;
++        }
++        window_rect = &surface->window.rect;
++        wayland_surface_coords_to_window(surface, wl_fixed_to_double(x), wl_fixed_to_double(y), (int *)&screen.x, (int *)&screen.y);
++        screen.x += window_rect->left;
++        screen.y += window_rect->top;
++        if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
++        else if (screen.x < window_rect->left) screen.x = window_rect->left;
++        if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
++        else if (screen.y < window_rect->top) screen.y = window_rect->top;
++        wayland_win_data_release(window_data);
++        /* NEUTRON: record; the mouse MOVE is injected in wayland_wintab_frame after
++         * the packet, so per-sample mouse+packet stay paired and ordered. */
++        tool->pending_pos = screen;
++        tool->pending_move = TRUE;
++    }
++    wayland_wintab_motion(tool, x, y);
++}
++
++static void wayland_tablet_tool_pressure(void *data,
++                                         struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                         uint32_t pressure)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_pressure(tool, pressure);
++}
++
++static void wayland_tablet_tool_distance(void *data,
++                                         struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                         uint32_t distance)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_distance(tool, distance);
++}
++
++static void wayland_tablet_tool_tilt(void *data,
++                                     struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                     wl_fixed_t tilt_x,
++                                     wl_fixed_t tilt_y)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_tilt(tool, tilt_x, tilt_y);
++}
++
++static void wayland_tablet_tool_rotation(void *data,
++                                         struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                         wl_fixed_t degrees)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_rotation(tool, degrees);
++}
++
++static void wayland_tablet_tool_slider(void *data,
++                                       struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                       int32_t position)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_slider(tool, position);
++}
++
++static void wayland_tablet_tool_wheel(void *data,
++                                      struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                      wl_fixed_t degrees,
++                                      int32_t clicks)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_wheel(tool, degrees, clicks);
++}
++
++static void wayland_tablet_tool_button(void *data,
++                                       struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                       uint32_t serial,
++                                       uint32_t button,
++                                       uint32_t state)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_button(tool, serial, button, state);
++}
++
++static void wayland_tablet_tool_frame(void *data,
++                                      struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
++                                      uint32_t time)
++{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    wayland_wintab_frame(tool, time);
++}
++
++static const struct zwp_tablet_tool_v2_listener zwp_tablet_tool_v2_listener =
++{
++    wayland_tablet_tool_type,
++    wayland_tablet_tool_hardware_serial,
++    wayland_tablet_tool_hardware_id_wacom,
++    wayland_tablet_tool_capability,
++    wayland_tablet_tool_done,
++    wayland_tablet_tool_removed,
++    wayland_tablet_tool_proximity_in,
++    wayland_tablet_tool_proximity_out,
++    wayland_tablet_tool_down,
++    wayland_tablet_tool_up,
++    wayland_tablet_tool_motion,
++    wayland_tablet_tool_pressure,
++    wayland_tablet_tool_distance,
++    wayland_tablet_tool_tilt,
++    wayland_tablet_tool_rotation,
++    wayland_tablet_tool_slider,
++    wayland_tablet_tool_wheel,
++    wayland_tablet_tool_button,
++    wayland_tablet_tool_frame
++};
++
++/**********************************************************************
++ *          zwp_tablet_pad_v2 handlers
++ */
++
++void wayland_tablet_pad_group(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2,
++                              struct zwp_tablet_pad_group_v2 *pad_group)
++{
++}
++
++void wayland_tablet_pad_path(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2,
++                             const char *path)
++{
++}
++
++void wayland_tablet_pad_buttons(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2,
++                                uint32_t buttons)
++{
++}
++
++void wayland_tablet_pad_done(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_pad *pad = (struct wayland_tablet_pad *)data;
++
++    pthread_mutex_lock(&tablet->mutex);
++    list_add_tail(&tablet->pads, &pad->entry);
++    pthread_mutex_unlock(&tablet->mutex);
++
++    TRACE("tablet pad added: %p\n", pad->zwp_tablet_pad_v2);
++}
++
++void wayland_tablet_pad_button(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2,
++                               uint32_t time, uint32_t button, uint32_t state)
++{
++}
++
++void wayland_tablet_pad_enter(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2,
++                              uint32_t serial, struct zwp_tablet_v2 *tablet,
++                              struct wl_surface *surface)
++{
++}
++
++void wayland_tablet_pad_leave(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2,
++                              uint32_t serial, struct wl_surface *surface)
++{
++}
++
++void wayland_tablet_pad_removed(void *data, struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_pad *pad = (struct wayland_tablet_pad *)data;
++
++    if (pad->entry.next) {
++        pthread_mutex_lock(&tablet->mutex);
++        list_remove(&pad->entry);
++        pthread_mutex_unlock(&tablet->mutex);
++    }
++
++    TRACE("tablet pad removed: %p\n", pad->zwp_tablet_pad_v2);
++
++    zwp_tablet_pad_v2_destroy(zwp_tablet_pad_v2);
++    free(pad);
++}
++
++static const struct zwp_tablet_pad_v2_listener zwp_tablet_pad_v2_listener =
++{
++    wayland_tablet_pad_group,
++    wayland_tablet_pad_path,
++    wayland_tablet_pad_buttons,
++    wayland_tablet_pad_done,
++    wayland_tablet_pad_button,
++    wayland_tablet_pad_enter,
++    wayland_tablet_pad_leave,
++    wayland_tablet_pad_removed,
++};
++
++/**********************************************************************
++ *          zwp_tablet_seat_v2 handlers
++ */
++
++static void wayland_tablet_seat_device_added(void *data,
++                                             struct zwp_tablet_seat_v2 *zwp_tablet_seat_v2,
++                                             struct zwp_tablet_v2 *id)
++{
++    struct wayland_tablet_device *device;
++    device = calloc(1, sizeof(struct wayland_tablet_device));
++    device->zwp_tablet_v2 = id;
++    zwp_tablet_v2_add_listener(id, &zwp_tablet_v2_listener, device);
++}
++
++static void wayland_tablet_seat_tool_added(void *data,
++                                           struct zwp_tablet_seat_v2 *zwp_tablet_seat_v2,
++                                           struct zwp_tablet_tool_v2 *id)
++{
++    struct wayland_tablet_tool *tool;
++    tool = calloc(1, sizeof(struct wayland_tablet_tool));
++    tool->zwp_tablet_tool_v2 = id;
++    zwp_tablet_tool_v2_add_listener(id, &zwp_tablet_tool_v2_listener, tool);
++}
++
++static void wayland_tablet_seat_pad_added(void *data, struct zwp_tablet_seat_v2 *zwp_tablet_seat_v2,
++                                          struct zwp_tablet_pad_v2 *id)
++{
++    struct wayland_tablet_pad *pad;
++    pad = calloc(1, sizeof(struct wayland_tablet_pad));
++    pad->zwp_tablet_pad_v2 = id;
++    zwp_tablet_pad_v2_add_listener(id, &zwp_tablet_pad_v2_listener, pad);
++}
++
++static const struct zwp_tablet_seat_v2_listener zwp_tablet_seat_v2_listener =
++{
++    wayland_tablet_seat_device_added,
++    wayland_tablet_seat_tool_added,
++    wayland_tablet_seat_pad_added,
++};
++
++void wayland_tablet_init()
++{
++    struct wayland_seat *seat = &process_wayland.seat;
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct zwp_tablet_seat_v2 *zwp_tablet_seat_v2;
++
++    if (!tablet->zwp_tablet_manager_v2 || !seat->wl_seat)
++        return;
++
++    if (tablet->zwp_tablet_seat_v2)
++        return;
++
++    zwp_tablet_seat_v2 =
++        zwp_tablet_manager_v2_get_tablet_seat(tablet->zwp_tablet_manager_v2, seat->wl_seat);
++
++    pthread_mutex_lock(&tablet->mutex);
++    tablet->zwp_tablet_seat_v2 = zwp_tablet_seat_v2;
++    list_init(&tablet->devices);
++    list_init(&tablet->tools);
++    list_init(&tablet->pads);
++    pthread_mutex_unlock(&tablet->mutex);
++
++    zwp_tablet_seat_v2_add_listener(tablet->zwp_tablet_seat_v2,
++                                    &zwp_tablet_seat_v2_listener,
++                                    NULL);
++}
+diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
+index 0cda0b9..4d50f08 100644
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -41,6 +41,7 @@
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
+ #include "xdg-toplevel-icon-v1-client-protocol.h"
+ #include "pointer-warp-v1-client-protocol.h"
++#include "tablet-v2-client-protocol.h"
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -143,6 +144,50 @@ struct wayland_seat
+     pthread_mutex_t mutex;
+ };
+ 
++/* NEUTRON: graphics-tablet (pen) support via zwp_tablet_manager_v2. Feeds WinTab
++ * (pressure/tilt) so Photoshop's brush pressure works. Adapted from jchw's WIP
++ * wayland-tablet branch, re-plumbed onto the win32u pWintabProc seam. */
++struct wayland_tablet_device
++{
++    struct list entry;
++    struct zwp_tablet_v2 *zwp_tablet_v2;
++    char *name;
++    char *path;
++    uint32_t vid, pid;
++};
++
++struct wayland_tablet_tool
++{
++    struct list entry;
++    struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2;
++    uint64_t serial;
++    struct wl_surface *surface;   /* surface the tool is currently over (proximity) */
++    void *wintab_data;            /* struct wayland_wintab_tool_data * (private to wintab.c) */
++    /* NEUTRON: pending synthetic-mouse action, injected in wayland_wintab_frame AFTER the
++     * WinTab packet is published — so PS sees the pen-down packet before the mouse LEFTDOWN
++     * it arms the stroke on (Windows/winex11 ordering). down/up/motion only RECORD here. */
++    UINT  pending_buttons;        /* MOUSEEVENTF_LEFTDOWN / LEFTUP, 0 = none */
++    POINT pending_pos;            /* latest clamped absolute screen coords */
++    BOOL  pending_move;
++};
++
++struct wayland_tablet_pad
++{
++    struct list entry;
++    struct zwp_tablet_pad_v2 *zwp_tablet_pad_v2;
++};
++
++struct wayland_tablet
++{
++    struct zwp_tablet_manager_v2 *zwp_tablet_manager_v2;
++    struct zwp_tablet_seat_v2 *zwp_tablet_seat_v2;
++    struct list devices;
++    struct list tools;
++    struct list pads;
++    void *wintab_data;            /* struct wayland_wintab_data * (private to wintab.c) */
++    pthread_mutex_t mutex;
++};
++
+ struct wayland_data_device
+ {
+     union
+@@ -186,6 +231,7 @@ struct wayland
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
+     struct wayland_seat seat;
++    struct wayland_tablet tablet;   /* NEUTRON: pen/graphics-tablet (WinTab) */
+     struct wayland_keyboard keyboard;
+     struct wayland_pointer pointer;
+     struct wayland_text_input text_input;
+@@ -498,9 +544,30 @@ static inline BOOL is_decoration_enabled(DWORD style, DWORD ex_style)
+ 
+ RGNDATA *get_region_data(HRGN region);
+ 
++/**********************************************************************
++ *          Tablet (pen / WinTab)
++ */
++void wayland_tablet_init(void);
++void wayland_wintab_proximity_in(struct wayland_tablet_tool *tool, uint32_t serial,
++                                 struct zwp_tablet_v2 *tablet, struct wl_surface *surface);
++void wayland_wintab_proximity_out(struct wayland_tablet_tool *tool);
++void wayland_wintab_down(struct wayland_tablet_tool *tool, uint32_t serial);
++void wayland_wintab_up(struct wayland_tablet_tool *tool);
++void wayland_wintab_motion(struct wayland_tablet_tool *tool, wl_fixed_t x, wl_fixed_t y);
++void wayland_wintab_pressure(struct wayland_tablet_tool *tool, uint32_t pressure);
++void wayland_wintab_distance(struct wayland_tablet_tool *tool, uint32_t distance);
++void wayland_wintab_tilt(struct wayland_tablet_tool *tool, wl_fixed_t tilt_x, wl_fixed_t tilt_y);
++void wayland_wintab_rotation(struct wayland_tablet_tool *tool, wl_fixed_t degrees);
++void wayland_wintab_slider(struct wayland_tablet_tool *tool, int32_t position);
++void wayland_wintab_wheel(struct wayland_tablet_tool *tool, wl_fixed_t degrees, int32_t clicks);
++void wayland_wintab_button(struct wayland_tablet_tool *tool, uint32_t serial, uint32_t button,
++                           uint32_t state);
++void wayland_wintab_frame(struct wayland_tablet_tool *tool, uint32_t time);
++
+ /**********************************************************************
+  *          USER driver functions
+  */
++LRESULT WAYLAND_WintabProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer);
+ 
+ LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+ BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
+diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
+index da84f67..677c0ca 100644
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -52,6 +52,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
+     .pWindowMessage = WAYLAND_WindowMessage,
+     .pWindowPosChanged = WAYLAND_WindowPosChanged,
+     .pWindowPosChanging = WAYLAND_WindowPosChanging,
++    .pWintabProc = WAYLAND_WintabProc,   /* NEUTRON: pen/tablet (WinTab) */
+     .pCreateWindowSurface = WAYLAND_CreateWindowSurface,
+     .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
+     .pVulkanInit = WAYLAND_VulkanInit,
+diff --git a/dlls/winewayland.drv/wintab.c b/dlls/winewayland.drv/wintab.c
+new file mode 100644
+index 0000000..0eebb85
+--- /dev/null
++++ b/dlls/winewayland.drv/wintab.c
+@@ -0,0 +1,920 @@
++/*
++ * Wayland wintab support
++ *
++ * Copyright 2024 John Chadwick
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <assert.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++#include "waylanddrv.h"
++#include "wine/debug.h"
++#include "wine/server.h"
++#include "wintab.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wintab32);
++
++// TODO: This is copied from winex11 while in development, but these
++// structs/defs probably don't belong in the driver.
++//
++#define WT_MAX_NAME_LEN 256
++
++/* NEUTRON: Windows tags pen-generated mouse input with this signature in dwExtraInfo
++ * (win32u checks (info & 0xffffff00)==0xff515700, message.c). Marking our injected
++ * mouse lets PS recognize it as the SAME pen device as the WinTab packets, instead of
++ * a second, conflicting pointing device (the documented Windows "two devices -> dots"). */
++#define MI_WP_SIGNATURE 0xFF515700
++
++typedef struct tagWTI_CURSORS_INFO
++{
++    WCHAR NAME[WT_MAX_NAME_LEN];
++    BOOL ACTIVE;
++    WTPKT PKTDATA;
++    BYTE BUTTONS;
++    BYTE BUTTONBITS;
++    DWORD cchBTNNAMES;
++    WCHAR *BTNNAMES;
++    BYTE BUTTONMAP[32];
++    BYTE SYSBTNMAP[32];
++    BYTE NPBUTTON;
++    UINT NPBTNMARKS[2];
++    UINT *NPRESPONSE;
++    BYTE TPBUTTON;
++    UINT TPBTNMARKS[2];
++    UINT *TPRESPONSE;
++    DWORD PHYSID;
++    UINT MODE;
++    UINT MINPKTDATA;
++    UINT MINBUTTONS;
++    UINT CAPABILITIES;
++    UINT TYPE;
++} WTI_CURSORS_INFO, *LPWTI_CURSORS_INFO;
++
++typedef struct tagWTI_DEVICES_INFO
++{
++    WCHAR NAME[WT_MAX_NAME_LEN];
++    UINT HARDWARE;
++    UINT NCSRTYPES;
++    UINT FIRSTCSR;
++    UINT PKTRATE;
++    WTPKT PKTDATA;
++    WTPKT PKTMODE;
++    WTPKT CSRDATA;
++    INT XMARGIN;
++    INT YMARGIN;
++    INT ZMARGIN;
++    AXIS X;
++    AXIS Y;
++    AXIS Z;
++    AXIS NPRESSURE;
++    AXIS TPRESSURE;
++    AXIS ORIENTATION[3];
++    AXIS ROTATION[3];
++    WCHAR PNPID[WT_MAX_NAME_LEN];
++} WTI_DEVICES_INFO, *LPWTI_DEVICES_INFO;
++
++#define CSR_TYPE_PEN        0x822
++#define CSR_TYPE_ERASER     0x82a
++#define CSR_TYPE_MOUSE_2D   0x007
++#define CSR_TYPE_MOUSE_4D   0x094
++#define CSR_TYPE_OTHER      0x000
++
++typedef struct tagWTPACKET {
++    UINT pkContext;
++    UINT pkStatus;
++    LONG pkTime;
++    WTPKT pkChanged;
++    UINT pkSerialNumber;
++    UINT pkCursor;
++    DWORD pkButtons;
++    DWORD pkX;
++    DWORD pkY;
++    DWORD pkZ;
++    UINT pkNormalPressure;
++    UINT pkTangentPressure;
++    ORIENTATION pkOrientation;
++    ROTATION pkRotation;
++} WTPACKET, *LPWTPACKET;
++
++/* NEUTRON: FIFO of packets. Frames are produced on the Wayland event thread and
++ * consumed (via NtUserWintabPacket) on PS's app thread, one packet per posted
++ * WT_PACKET message. A single shared slot lost the motion path (PS saw the pen-down
++ * point then duplicates -> "just a dot"); the ring delivers every sample in order.
++ * head==tail is empty; an empty pop returns last_packet so a stray WT_PROXIMITY pop
++ * can't underflow. Guarded by process_wayland.tablet.mutex. */
++#define WT_PACKET_RING 256
++struct wayland_wintab_data {
++    WTPACKET ring[WT_PACKET_RING];
++    unsigned int ring_head;   /* next index to pop  */
++    unsigned int ring_tail;   /* next index to push */
++    WTPACKET last_packet;     /* most recent pushed packet (empty-pop fallback) */
++};
++
++struct wayland_wintab_tool_data {
++    WTPACKET last_packet;
++    WTPACKET current_packet;
++};
++
++// TODO: I don't think this should be in the driver.
++static HWND hwndTabletDefault;
++static LOGCONTEXTW gSysContext;
++static WTI_DEVICES_INFO gSysDevice;
++static WTI_CURSORS_INFO gSysCursor;   /* NEUTRON: the single pen cursor (WTI_CURSORS slot 0) */
++static INT gSerial;
++
++// TODO: copied from winex11.
++static DWORD get_changed_state(WTPACKET *last_packet, WTPACKET *current_packet)
++{
++    DWORD change = 0;
++
++    if (current_packet->pkX != last_packet->pkX)
++        change |= PK_X;
++    if (current_packet->pkY != last_packet->pkY)
++        change |= PK_Y;
++    if (current_packet->pkZ != last_packet->pkZ)
++        change |= PK_Z;
++    if (current_packet->pkSerialNumber != last_packet->pkSerialNumber)
++        change |= PK_SERIAL_NUMBER;
++    if (current_packet->pkTime != last_packet->pkTime)
++        change |= PK_TIME;
++    if (current_packet->pkNormalPressure != last_packet->pkNormalPressure)
++        change |= PK_NORMAL_PRESSURE;
++    if (current_packet->pkTangentPressure != last_packet->pkTangentPressure)
++        change |= PK_TANGENT_PRESSURE;
++    if (current_packet->pkCursor != last_packet->pkCursor)
++        change |= PK_CURSOR;
++    if (current_packet->pkButtons != last_packet->pkButtons)
++        change |= PK_BUTTONS;
++    if (current_packet->pkOrientation.orAzimuth   != last_packet->pkOrientation.orAzimuth  ||
++         current_packet->pkOrientation.orAltitude != last_packet->pkOrientation.orAltitude ||
++         current_packet->pkOrientation.orTwist    != last_packet->pkOrientation.orTwist)
++        change |= PK_ORIENTATION;
++    if (current_packet->pkRotation.roPitch != last_packet->pkRotation.roPitch ||
++         current_packet->pkRotation.roRoll != last_packet->pkRotation.roRoll  ||
++         current_packet->pkRotation.roYaw  != last_packet->pkRotation.roYaw)
++        change |= PK_ROTATION;
++
++    return change;
++}
++
++static struct wayland_wintab_data *get_wintab_data(void)
++{
++    struct wayland_wintab_data *data = process_wayland.tablet.wintab_data;
++    if (!data) {
++        data = process_wayland.tablet.wintab_data = calloc(1, sizeof(struct wayland_wintab_data));
++    }
++    return data;
++}
++
++static struct wayland_wintab_tool_data *get_wintab_tool_data(struct wayland_tablet_tool *tool)
++{
++    struct wayland_wintab_tool_data *data = tool->wintab_data;
++    if (!data) {
++        data = tool->wintab_data = calloc(1, sizeof(struct wayland_wintab_tool_data));
++    }
++    return data;
++}
++
++/* NEUTRON: push a packet snapshot into the delivery ring (mutex-guarded). Each ring
++ * entry is popped by exactly one NtUserWintabPacket (WT_PACKET or WT_PROXIMITY), so
++ * proximity events must push too — the empty ring now returns 0 (no fabricated dupes). */
++static void wintab_ring_push(const WTPACKET *pkt)
++{
++    pthread_mutex_lock(&process_wayland.tablet.mutex);
++    {
++        struct wayland_wintab_data *wd = get_wintab_data();
++        wd->ring[wd->ring_tail % WT_PACKET_RING] = *pkt;
++        wd->ring_tail++;
++        if (wd->ring_tail - wd->ring_head > WT_PACKET_RING)
++            wd->ring_head = wd->ring_tail - WT_PACKET_RING;
++        wd->last_packet = *pkt;
++    }
++    pthread_mutex_unlock(&process_wayland.tablet.mutex);
++}
++
++void wayland_wintab_proximity_in(struct wayland_tablet_tool *tool, uint32_t serial,
++                                 struct zwp_tablet_v2 *tablet, struct wl_surface *surface)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    HWND hwnd = NULL;
++    if (tool->surface)
++        hwnd = wl_surface_get_user_data(tool->surface);
++    data->current_packet.pkStatus = 0;
++    data->current_packet.pkSerialNumber = gSerial++;
++    wintab_ring_push(&data->current_packet);
++    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(1, 1));
++}
++
++void wayland_wintab_proximity_out(struct wayland_tablet_tool *tool)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    HWND hwnd = NULL;
++    if (tool->surface)
++        hwnd = wl_surface_get_user_data(tool->surface);
++    data->current_packet.pkStatus = TPS_PROXIMITY;
++    data->current_packet.pkSerialNumber = gSerial++;
++    wintab_ring_push(&data->current_packet);
++    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(0, 1));
++}
++
++void wayland_wintab_down(struct wayland_tablet_tool *tool, uint32_t serial)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    data->current_packet.pkButtons = 1;
++    TRACE("neutron-pen: DOWN\n");
++}
++
++void wayland_wintab_up(struct wayland_tablet_tool *tool)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    data->current_packet.pkButtons = 0;
++    TRACE("neutron-pen: UP\n");
++}
++
++// TODO: This copies substantial amounts of logic from wayland_pointer.c
++// Need to refactor.
++void wayland_wintab_motion(struct wayland_tablet_tool *tool, wl_fixed_t x, wl_fixed_t y)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    struct wayland_win_data *window_data;
++    struct wayland_surface *surface;
++    RECT *window_rect;
++    int wx, wy;
++    HWND hwnd;
++
++    if (!tool->surface)
++    {
++        WARN("dropping data, couldn't get surface for tool\n");
++        return;
++    }
++
++    hwnd = wl_surface_get_user_data(tool->surface);
++
++    if (!(window_data = wayland_win_data_get(hwnd)))
++    {
++        WARN("dropping data, couldn't get window data for handle %p\n", hwnd);
++        return;
++    }
++    if (!(surface = window_data->wayland_surface))
++    {
++        wayland_win_data_release(window_data);
++        return;
++    }
++    window_rect = &surface->window.rect;
++
++    /* Map surface-local (wl_fixed) coords to absolute screen pixels exactly like the
++     * pointer/mouse-injection path (wayland_surface_coords_to_window + window origin),
++     * then express in WinTab's 1/256-pixel units (context lcInExtX = SM_CXVIRTUALSCREEN
++     * << 8). jchw's original added the window origin with <<7, halving it relative to
++     * the pkX body (which is already *256), which offset the pen. */
++    wayland_surface_coords_to_window(surface, wl_fixed_to_double(x), wl_fixed_to_double(y), &wx, &wy);
++    data->current_packet.pkX = (wx + window_rect->left) << 8;
++    data->current_packet.pkY = (wy + window_rect->top) << 8;
++
++    wayland_win_data_release(window_data);
++}
++
++void wayland_wintab_pressure(struct wayland_tablet_tool *tool, uint32_t pressure)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    data->current_packet.pkNormalPressure = pressure;
++}
++
++void wayland_wintab_distance(struct wayland_tablet_tool *tool, uint32_t distance)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    data->current_packet.pkZ = distance;
++}
++
++void wayland_wintab_tilt(struct wayland_tablet_tool *tool, wl_fixed_t tilt_x, wl_fixed_t tilt_y)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    data->current_packet.pkRotation.roPitch = tilt_x >> 8;
++    data->current_packet.pkRotation.roRoll = tilt_y >> 8;
++}
++
++void wayland_wintab_rotation(struct wayland_tablet_tool *tool, wl_fixed_t degrees)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    data->current_packet.pkRotation.roYaw = degrees >> 8;
++}
++
++void wayland_wintab_slider(struct wayland_tablet_tool *tool, int32_t position)
++{
++}
++
++void wayland_wintab_wheel(struct wayland_tablet_tool *tool, wl_fixed_t degrees, int32_t clicks)
++{
++}
++
++void wayland_wintab_button(struct wayland_tablet_tool *tool, uint32_t serial, uint32_t button,
++                           uint32_t state)
++{
++}
++
++void wayland_wintab_frame(struct wayland_tablet_tool *tool, uint32_t time)
++{
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    HWND hwnd = NULL;
++
++    data->current_packet.pkStatus = 0; // TODO
++    /* NEUTRON (F3): stamp in the win32 tick domain, NOT the raw compositor clock —
++     * PS may time-pair packets against mouse messages (which the server stamps with
++     * the win32 tick count), and the raw Wayland timestamp is a different epoch. */
++    data->current_packet.pkTime = NtGetTickCount();
++    data->current_packet.pkSerialNumber = gSerial++;
++    data->current_packet.pkCursor = 0;
++    data->current_packet.pkChanged = get_changed_state(&data->last_packet, &data->current_packet);
++    if (tool->surface)
++        hwnd = wl_surface_get_user_data(tool->surface);
++    TRACE("neutron-pen: frame hwnd=%p P=(%u,%u) btn=%u press=%u chg=%#x serial=%u\n",
++        hwnd, data->current_packet.pkX, data->current_packet.pkY,
++        (unsigned)data->current_packet.pkButtons, data->current_packet.pkNormalPressure,
++        (unsigned)data->current_packet.pkChanged, data->current_packet.pkSerialNumber);
++    data->last_packet = data->current_packet;
++    (void)time;
++    pthread_mutex_lock(&process_wayland.tablet.mutex);
++    {
++        struct wayland_wintab_data *wd = get_wintab_data();
++        wd->ring[wd->ring_tail % WT_PACKET_RING] = data->current_packet;
++        wd->ring_tail++;
++        if (wd->ring_tail - wd->ring_head > WT_PACKET_RING)  /* overflow: drop oldest */
++            wd->ring_head = wd->ring_tail - WT_PACKET_RING;
++        wd->last_packet = data->current_packet;
++    }
++    pthread_mutex_unlock(&process_wayland.tablet.mutex);
++    /* Async post (sync send_message from the event thread deadlocked/crashed PS). */
++    NtUserPostMessage(hwndTabletDefault, WT_PACKET, data->current_packet.pkSerialNumber, (LPARAM)hwnd);
++
++    /* NEUTRON (F1): inject the paired system-mouse event AFTER the WinTab packet is
++     * published + posted — mirroring how Windows WinTab drivers enqueue the packet
++     * then SendInput the system mouse. PS arms its brush stroke on the mouse LEFTDOWN
++     * and immediately reads the WinTab queue; publishing the packet first guarantees
++     * the pen-down sample is visible, instead of PS seeing a stale btn=0 hover packet
++     * and collapsing the stroke to a dot. Move first (so a LEFTDOWN lands at the
++     * updated position), then the button transition. */
++    if (hwnd && tool->pending_move)
++    {
++        INPUT in = {0};
++        in.type = INPUT_MOUSE;
++        in.mi.dx = tool->pending_pos.x;
++        in.mi.dy = tool->pending_pos.y;
++        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++        /* NEUTRON: do NOT tag pen-sourced now that the cursor table makes PS recognize
++         * the pen. Tagging made PS ignore the interior moves (MS "ignore pen-generated
++         * mouse" convention) so it drew a 2-point line; PS samples the stroke position
++         * from these moves, so they must look like normal mouse motion. */
++        NtUserSendHardwareInput(hwnd, 0, &in, 0);
++        tool->pending_move = FALSE;
++    }
++    if (hwnd && tool->pending_buttons)
++    {
++        INPUT in = {0};
++        in.type = INPUT_MOUSE;
++        in.mi.dwFlags = tool->pending_buttons;
++        /* NEUTRON: do NOT tag pen-sourced now that the cursor table makes PS recognize
++         * the pen. Tagging made PS ignore the interior moves (MS "ignore pen-generated
++         * mouse" convention) so it drew a 2-point line; PS samples the stroke position
++         * from these moves, so they must look like normal mouse motion. */
++        NtUserSendHardwareInput(hwnd, 0, &in, 0);
++        tool->pending_buttons = 0;
++    }
++}
++
++/***********************************************************************
++ *           load_tablet_info
++ *
++ * Handles NtUserWintabInit: bring up the tablet seat and populate the system
++ * context/device info. hwnd is wintab32's internal default window that WT_PACKET/
++ * WT_PROXIMITY messages are sent to. Returns TRUE if a tablet is available.
++ */
++static LRESULT load_tablet_info(HWND hwnd)
++{
++    static const WCHAR SZ_CONTEXT_NAME[] = {'W','i','n','e',' ','T','a','b','l','e','t',' ','C','o','n','t','e','x','t',0};
++    static const WCHAR SZ_NON_PLUG_N_PLAY[] = {'n','o','n','-','p','l','u','g','-','n','-','p','l','a','y',0};
++
++    if (!process_wayland.tablet.zwp_tablet_manager_v2)
++        return FALSE;
++
++    /* NEUTRON: do NOT call wayland_tablet_init() here. This runs on PS's app thread
++     * (via NtUserWintabInit), but the tablet seat is created + its device/tool lists
++     * mutated on the Wayland EVENT thread (registry handler). Creating Wayland proxies
++     * and touching those lists from two threads corrupted state (duplicate device
++     * enumeration -> heap AV). The seat is already up by the time PS queries WinTab. */
++
++    hwndTabletDefault = hwnd;
++
++    wcscpy(gSysContext.lcName, SZ_CONTEXT_NAME);
++
++    gSysContext.lcOptions = CXO_SYSTEM;
++    gSysContext.lcLocks = CXL_INSIZE | CXL_INASPECT | CXL_MARGIN |
++                          CXL_SENSITIVITY | CXL_SYSOUT;
++    gSysContext.lcMsgBase= WT_DEFBASE;
++    gSysContext.lcDevice = 0;
++    gSysContext.lcPktData =
++        PK_CONTEXT | PK_STATUS | PK_SERIAL_NUMBER| PK_TIME | PK_CURSOR |
++        PK_BUTTONS |  PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
++    gSysContext.lcMoveMask=
++        PK_BUTTONS |  PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
++    gSysContext.lcStatus = CXS_ONTOP;
++    gSysContext.lcPktRate = 100;
++    gSysContext.lcBtnDnMask = 0xffffffff;
++    gSysContext.lcBtnUpMask = 0xffffffff;
++    gSysContext.lcSensX = 65536;
++    gSysContext.lcSensY = 65536;
++    gSysContext.lcSensX = 65536;
++    gSysContext.lcSensZ = 65536;
++    gSysContext.lcSysSensX= 65536;
++    gSysContext.lcSysSensY= 65536;
++    gSysContext.lcSysExtX = NtUserGetSystemMetrics(SM_CXVIRTUALSCREEN);
++    gSysContext.lcSysExtY = NtUserGetSystemMetrics(SM_CYVIRTUALSCREEN);
++    gSysContext.lcInOrgX = 0;
++    gSysContext.lcOutOrgX = 0;
++    gSysContext.lcInExtX = gSysContext.lcSysExtX << 8;
++    gSysContext.lcOutExtX = gSysContext.lcSysExtX << 8;
++    gSysContext.lcInOrgY = 0;
++    gSysContext.lcOutOrgY = 0;
++    gSysContext.lcInExtY = gSysContext.lcSysExtY << 8;
++    gSysContext.lcOutExtY = gSysContext.lcSysExtY << 8;
++
++    gSysDevice.HARDWARE = HWC_HARDPROX|HWC_PHYSID_CURSORS;
++    gSysDevice.FIRSTCSR= 0;
++    gSysDevice.PKTRATE = 100;
++    gSysDevice.PKTDATA =
++        PK_CONTEXT | PK_STATUS | PK_SERIAL_NUMBER| PK_TIME | PK_CURSOR |
++        PK_BUTTONS |  PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
++    gSysDevice.X.axMin = 0;
++    gSysDevice.X.axMax = gSysContext.lcSysExtX << 8;
++    gSysDevice.X.axUnits = TU_INCHES;
++    gSysDevice.X.axResolution = 96 << 8; // TODO
++    gSysDevice.Y.axMin = 0;
++    gSysDevice.Y.axMax = gSysContext.lcSysExtY << 8;
++    gSysDevice.Y.axUnits = TU_INCHES;
++    gSysDevice.Y.axResolution = 96 << 8; // TODO
++    gSysDevice.NPRESSURE.axMin = 0;
++    gSysDevice.NPRESSURE.axMax = 65535;
++    gSysDevice.TPRESSURE.axMin = 0;
++    gSysDevice.TPRESSURE.axMax = 65535;
++    wcscpy(gSysDevice.PNPID, SZ_NON_PLUG_N_PLAY);
++
++    /* NEUTRON: advertise ONE cursor (the pen). Photoshop probes WTI_CURSORS+pkCursor
++     * to classify the tool that generated each packet; our packets carry pkCursor=0,
++     * so the pen lives in slot 0. Without this PS gets 0 for every cursor query and
++     * won't build a brush stroke from the packets (it draws a mouse-only down->up line). */
++    {
++        static const WCHAR SZ_CURSOR_NAME[] =
++            {'W','i','n','e',' ','T','a','b','l','e','t',' ','P','e','n',0};
++        static const WCHAR SZ_DEVICE_NAME[] =
++            {'W','i','n','e',' ','T','a','b','l','e','t',' ','D','e','v','i','c','e',0};
++        wcscpy(gSysDevice.NAME, SZ_DEVICE_NAME);
++        gSysDevice.NCSRTYPES = 1;
++        gSysDevice.FIRSTCSR  = 0;
++
++        memset(&gSysCursor, 0, sizeof(gSysCursor));
++        wcscpy(gSysCursor.NAME, SZ_CURSOR_NAME);
++        gSysCursor.ACTIVE       = TRUE;
++        gSysCursor.PKTDATA      = gSysContext.lcPktData;
++        gSysCursor.BUTTONS      = 1;
++        gSysCursor.BUTTONBITS   = 1;
++        gSysCursor.NPBUTTON     = 1;
++        gSysCursor.NPBTNMARKS[0] = 0;
++        gSysCursor.NPBTNMARKS[1] = 1;
++        gSysCursor.CAPABILITIES = CRC_MULTIMODE;
++        gSysCursor.TYPE         = CSR_TYPE_PEN;
++        gSysCursor.PHYSID       = 1;
++        gSysCursor.SYSBTNMAP[0] = 1;   /* tip -> left mouse button */
++    }
++
++    return TRUE;
++}
++
++static inline int CopyTabletData(LPVOID target, LPCVOID src, INT size)
++{
++    /*
++     * It is valid to call CopyTabletData with NULL.
++     * This handles the WTInfo() case where lpOutput is null.
++     */
++    if(target != NULL)
++        memcpy(target,src,size);
++    return(size);
++}
++
++/***********************************************************************
++ *           get_tablet_info
++ *
++ * Handles NtUserWintabInfo (the WTInfoW driver query). wCategory = WTI_*,
++ * nIndex the sub-field; lpOutput may be NULL (size query). Adapted from winex11.
++ */
++static LRESULT get_tablet_info(UINT wCategory, UINT nIndex, void *lpOutput)
++{
++    int rc = 0;
++    TRACE("(%u, %u, %p)\n", wCategory, nIndex, lpOutput);
++
++    switch(wCategory)
++    {
++        case 0:
++            TRACE("Return proper size\n");
++            rc = 200;
++            break;
++        case WTI_INTERFACE:
++            switch (nIndex)
++            {
++                WORD version;
++                UINT num;
++                case IFC_WINTABID:
++                {
++                    static const WCHAR driver[] = {'W','i','n','e',' ','W','i','n','t','a','b',' ','1','.','1',0};
++                    rc = CopyTabletData(lpOutput, driver, (wcslen(driver) + 1) * sizeof(WCHAR));
++                    break;
++                }
++                case IFC_SPECVERSION:
++                    version = (0x01) | (0x01 << 8);
++                    rc = CopyTabletData(lpOutput, &version,sizeof(WORD));
++                    break;
++                case IFC_IMPLVERSION:
++                    version = (0x00) | (0x01 << 8);
++                    rc = CopyTabletData(lpOutput, &version,sizeof(WORD));
++                    break;
++                case IFC_NDEVICES:
++                    num = 1;
++                    rc = CopyTabletData(lpOutput, &num,sizeof(num));
++                    break;
++                case IFC_NCURSORS:
++                    num = 1;
++                    rc = CopyTabletData(lpOutput, &num,sizeof(num));
++                    break;
++                default:
++                    FIXME("WTI_INTERFACE unhandled index %i\n",nIndex);
++                    rc = 0;
++            }
++            break;
++        case WTI_DEFSYSCTX:
++        case WTI_DDCTXS:
++        case WTI_DEFCONTEXT:
++            switch (nIndex)
++            {
++                case 0:
++                    rc = CopyTabletData(lpOutput, &gSysContext,
++                            sizeof(LOGCONTEXTW));
++                    break;
++                case CTX_NAME:
++                    rc = CopyTabletData(lpOutput, gSysContext.lcName,
++                            (wcslen(gSysContext.lcName)+1) * sizeof(WCHAR));
++                    break;
++                case CTX_OPTIONS:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcOptions,
++                                        sizeof(UINT));
++                    break;
++                case CTX_STATUS:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcStatus,
++                                        sizeof(UINT));
++                    break;
++                case CTX_LOCKS:
++                    rc= CopyTabletData (lpOutput, &gSysContext.lcLocks,
++                                        sizeof(UINT));
++                    break;
++                case CTX_MSGBASE:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcMsgBase,
++                                        sizeof(UINT));
++                    break;
++                case CTX_DEVICE:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcDevice,
++                                        sizeof(UINT));
++                    break;
++                case CTX_PKTRATE:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcPktRate,
++                                        sizeof(UINT));
++                    break;
++                case CTX_PKTDATA:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcPktData,
++                                        sizeof(WTPKT));
++                    break;
++                case CTX_PKTMODE:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcPktMode,
++                                        sizeof(WTPKT));
++                    break;
++                case CTX_MOVEMASK:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcMoveMask,
++                                        sizeof(WTPKT));
++                    break;
++                case CTX_BTNDNMASK:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcBtnDnMask,
++                                        sizeof(DWORD));
++                    break;
++                case CTX_BTNUPMASK:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcBtnUpMask,
++                                        sizeof(DWORD));
++                    break;
++                case CTX_INORGX:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcInOrgX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_INORGY:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcInOrgY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_INORGZ:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcInOrgZ,
++                                        sizeof(LONG));
++                    break;
++                case CTX_INEXTX:
++                    rc = CopyTabletData(lpOutput, &gSysContext.lcInExtX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_INEXTY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcInExtY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_INEXTZ:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcInExtZ,
++                                        sizeof(LONG));
++                    break;
++                case CTX_OUTORGX:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcOutOrgX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_OUTORGY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcOutOrgY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_OUTORGZ:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcOutOrgZ,
++                                        sizeof(LONG));
++                    break;
++                case CTX_OUTEXTX:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcOutExtX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_OUTEXTY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcOutExtY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_OUTEXTZ:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcOutExtZ,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SENSX:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSensX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SENSY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSensY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SENSZ:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSensZ,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSMODE:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysMode,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSORGX:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysOrgX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSORGY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysOrgY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSEXTX:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysExtX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSEXTY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysExtY,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSSENSX:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysSensX,
++                                        sizeof(LONG));
++                    break;
++                case CTX_SYSSENSY:
++                        rc = CopyTabletData(lpOutput, &gSysContext.lcSysSensY,
++                                        sizeof(LONG));
++                    break;
++                default:
++                    FIXME("WTI_DEFSYSCTX unhandled index %i\n",nIndex);
++                    rc = 0;
++            }
++            break;
++        case WTI_CURSORS:   /* NEUTRON: slot 0 = the pen (matches pkCursor=0 in our packets) */
++            if (!gSysCursor.ACTIVE) { rc = 0; break; }
++            switch (nIndex)
++            {
++                case CSR_NAME:
++                    rc = CopyTabletData(lpOutput, gSysCursor.NAME,
++                                        (wcslen(gSysCursor.NAME)+1) * sizeof(WCHAR));
++                    break;
++                case CSR_ACTIVE:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.ACTIVE, sizeof(BOOL));
++                    break;
++                case CSR_PKTDATA:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.PKTDATA, sizeof(WTPKT));
++                    break;
++                case CSR_BUTTONS:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.BUTTONS, sizeof(BYTE));
++                    break;
++                case CSR_BUTTONBITS:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.BUTTONBITS, sizeof(BYTE));
++                    break;
++                case CSR_BUTTONMAP:
++                    rc = CopyTabletData(lpOutput, gSysCursor.BUTTONMAP, sizeof(BYTE)*32);
++                    break;
++                case CSR_SYSBTNMAP:
++                    rc = CopyTabletData(lpOutput, gSysCursor.SYSBTNMAP, sizeof(BYTE)*32);
++                    break;
++                case CSR_NPBUTTON:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.NPBUTTON, sizeof(BYTE));
++                    break;
++                case CSR_NPBTNMARKS:
++                    rc = CopyTabletData(lpOutput, gSysCursor.NPBTNMARKS, sizeof(UINT)*2);
++                    break;
++                case CSR_CAPABILITIES:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.CAPABILITIES, sizeof(UINT));
++                    break;
++                case CSR_TYPE:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.TYPE, sizeof(UINT));
++                    break;
++                case CSR_PHYSID:
++                {
++                    DWORD id = gSysCursor.PHYSID;
++                    rc = CopyTabletData(lpOutput, &id, sizeof(DWORD));
++                    break;
++                }
++                case CSR_MODE:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.MODE, sizeof(UINT));
++                    break;
++                case CSR_MINPKTDATA:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.MINPKTDATA, sizeof(UINT));
++                    break;
++                case CSR_MINBUTTONS:
++                    rc = CopyTabletData(lpOutput, &gSysCursor.MINBUTTONS, sizeof(UINT));
++                    break;
++                default:
++                    FIXME("WTI_CURSORS unhandled index %i\n", nIndex);
++                    rc = 0;
++            }
++            break;
++        case WTI_DEVICES:
++            switch (nIndex)
++            {
++                case DVC_NAME:
++                    rc = CopyTabletData(lpOutput,gSysDevice.NAME,
++                                        (wcslen(gSysDevice.NAME)+1) * sizeof(WCHAR));
++                    break;
++                case DVC_HARDWARE:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.HARDWARE,
++                                        sizeof(UINT));
++                    break;
++                case DVC_NCSRTYPES:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.NCSRTYPES,
++                                        sizeof(UINT));
++                    break;
++                case DVC_FIRSTCSR:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.FIRSTCSR,
++                                        sizeof(UINT));
++                    break;
++                case DVC_PKTRATE:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.PKTRATE,
++                                        sizeof(UINT));
++                    break;
++                case DVC_PKTDATA:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.PKTDATA,
++                                        sizeof(WTPKT));
++                    break;
++                case DVC_PKTMODE:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.PKTMODE,
++                                        sizeof(WTPKT));
++                    break;
++                case DVC_CSRDATA:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.CSRDATA,
++                                        sizeof(WTPKT));
++                    break;
++                case DVC_XMARGIN:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.XMARGIN,
++                                        sizeof(INT));
++                    break;
++                case DVC_YMARGIN:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.YMARGIN,
++                                        sizeof(INT));
++                    break;
++                case DVC_ZMARGIN:
++                    rc = 0; /* unsupported */
++                    /*
++                    rc = CopyTabletData(lpOutput,&gSysDevice.ZMARGIN,
++                                        sizeof(INT));
++                    */
++                    break;
++                case DVC_X:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.X,
++                                        sizeof(AXIS));
++                    break;
++                case DVC_Y:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.Y,
++                                        sizeof(AXIS));
++                    break;
++                case DVC_Z:
++                    rc = 0; /* unsupported */
++                    /*
++                    rc = CopyTabletData(lpOutput,&gSysDevice.Z,
++                                        sizeof(AXIS));
++                    */
++                    break;
++                case DVC_NPRESSURE:
++                    rc = CopyTabletData(lpOutput,&gSysDevice.NPRESSURE,
++                                        sizeof(AXIS));
++                    break;
++                case DVC_TPRESSURE:
++                    rc = 0; /* unsupported */
++                    /*
++                    rc = CopyTabletData(lpOutput,&gSysDevice.TPRESSURE,
++                                        sizeof(AXIS));
++                    */
++                    break;
++                case DVC_ORIENTATION:
++                    rc = CopyTabletData(lpOutput,gSysDevice.ORIENTATION,
++                                        sizeof(AXIS)*3);
++                    break;
++                case DVC_ROTATION:
++                    rc = 0; /* unsupported */
++                    /*
++                    rc = CopyTabletData(lpOutput,&gSysDevice.ROTATION,
++                                        sizeof(AXIS)*3);
++                    */
++                    break;
++                case DVC_PNPID:
++                    rc = CopyTabletData(lpOutput,gSysDevice.PNPID,
++                                        (wcslen(gSysDevice.PNPID)+1)*sizeof(WCHAR));
++                    break;
++                default:
++                    FIXME("WTI_DEVICES unhandled index %i\n",nIndex);
++                    rc = 0;
++            }
++            break;
++    }
++    return rc;
++}
++
++/***********************************************************************
++ *           WAYLAND_WintabProc
++ *
++ * win32u routes wintab32's NtUserWintabDriverCall to the graphics driver's
++ * pWintabProc (dlls/win32u/message.c). Same dispatch shape as X11DRV_WintabProc.
++ *   NtUserWintabInit   (hwnd)                 -> init tablet, TRUE if present
++ *   NtUserWintabInfo   (category, index, buf) -> WTInfoW query
++ *   NtUserWintabAttach (hwnd)                 -> attach a context queue
++ *   NtUserWintabPacket (buf)                  -> copy out the latest packet
++ */
++LRESULT WAYLAND_WintabProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, void *buffer)
++{
++    switch (msg)
++    {
++    case NtUserWintabInit:
++        return load_tablet_info(hwnd);
++    case NtUserWintabInfo:
++        return get_tablet_info((UINT)wparam, (UINT)lparam, buffer);
++    case NtUserWintabAttach:
++        return TRUE;
++    case NtUserWintabPacket:
++        if (!buffer) return 0;
++        pthread_mutex_lock(&process_wayland.tablet.mutex);
++        {
++            struct wayland_wintab_data *wd = get_wintab_data();
++            WTPACKET *out = buffer;
++            if (wd->ring_head == wd->ring_tail)   /* empty: do NOT fabricate a duplicate */
++            {
++                pthread_mutex_unlock(&process_wayland.tablet.mutex);
++                return 0;   /* TABLET_WindowProc then skips AddPacketToContextQueue */
++            }
++            *out = wd->ring[wd->ring_head++ % WT_PACKET_RING];   /* pop oldest */
++            TRACE("neutron-pen: POP P=(%u,%u) btn=%u press=%u depth=%u serial=%u\n",
++                  out->pkX, out->pkY, (unsigned)out->pkButtons, out->pkNormalPressure,
++                  wd->ring_tail - wd->ring_head, out->pkSerialNumber);
++        }
++        pthread_mutex_unlock(&process_wayland.tablet.mutex);
++        return 1;
++    }
++    return 0;
++}
+diff --git a/dlls/wintab32/wintab32.c b/dlls/wintab32/wintab32.c
+index 1f1e720..be849e8 100644
+--- a/dlls/wintab32/wintab32.c
++++ b/dlls/wintab32/wintab32.c
+@@ -66,15 +66,60 @@ static VOID TABLET_Unregister(void)
+     UnregisterClassW(L"WineTabletClass", NULL);
+ }
+ 
+-static BOOL WINAPI create_internal_window(INIT_ONCE *once, void *param, void **context)
++/* NEUTRON: the internal tablet window must run on a DEDICATED thread with its own
++ * message loop, NOT on whichever app thread first calls WTOpen. The driver posts
++ * WT_PACKET/WT_PROXIMITY to this window; TABLET_WindowProc pulls the packet and adds
++ * it to the context queue that WTPacketsGet reads. If the window lives on the app's UI
++ * thread, an app that busy-polls WTPacketsGet inside an hwnd-filtered stroke loop (e.g.
++ * Photoshop) never DispatchMessage's these messages, so packets are never enqueued and
++ * the whole drag delivers zero packets. A private always-pumping thread makes packet
++ * delivery asynchronous to the app — the contract a real Windows WinTab driver provides. */
++static HANDLE tablet_thread_ready;
++
++static DWORD WINAPI tablet_thread_proc(void *arg)
+ {
++    MSG msg;
++
+     TABLET_Register();
+     hwndTablet = CreateWindowW(L"WineTabletClass", L"Tablet", 0,
+                                 0, 0, 0, 0, HWND_MESSAGE, 0, wintab_instance, 0);
+-
+     if (!hwndTablet)
+         ERR("error creating internal window: %lu\n", GetLastError());
+ 
++    /* Ensure the message queue exists, then let the opener proceed. */
++    PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE);
++    SetEvent(tablet_thread_ready);
++
++    if (!hwndTablet) return 0;
++
++    while (GetMessageW(&msg, NULL, 0, 0) > 0)
++    {
++        TranslateMessage(&msg);
++        DispatchMessageW(&msg);
++    }
++    return 0;
++}
++
++static BOOL WINAPI create_internal_window(INIT_ONCE *once, void *param, void **context)
++{
++    HANDLE thread;
++
++    tablet_thread_ready = CreateEventW(NULL, FALSE, FALSE, NULL);
++    if (!tablet_thread_ready)
++    {
++        ERR("failed to create tablet thread ready event\n");
++        return TRUE;
++    }
++    thread = CreateThread(NULL, 0, tablet_thread_proc, NULL, 0, NULL);
++    if (thread)
++    {
++        WaitForSingleObject(tablet_thread_ready, INFINITE);
++        CloseHandle(thread);
++    }
++    else ERR("failed to create tablet pump thread: %lu\n", GetLastError());
++    CloseHandle(tablet_thread_ready);
++    tablet_thread_ready = NULL;
++
+     return TRUE;
+ }
+ 
