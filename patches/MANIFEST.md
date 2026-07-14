@@ -202,6 +202,19 @@ full-window flash — white flashes hard against a dark (Adobe) UI, dark grey bl
 one-line hunk (line ~573); disjoint from the wmpaint patch's regions so it applies cleanly in either order.
 Touches: `dlls/win32u/dce.c`.
 
+### `neutron-win32u-monitor-position.mypatch`
+Preserve each display source's arranged desktop position through `win32u`'s virtual-mode path
+(`sysparams.c` `add_modes`). The `physical` devmode is taken from a host mode (position `(0,0)`) and,
+once per-monitor DPI makes `get_virtual_modes()` generate scaled modes, `current` is reassigned to a
+locally-built `virtual` devmode that also carries `(0,0)` — so a non-primary monitor's real arranged
+position is dropped, every extra monitor collapses onto the origin, the virtual desktop never extends,
+and `MonitorFromWindow` can't disambiguate which monitor a window is on (per-monitor DPI can never
+apply). Capture the driver-supplied `dmPosition` on entry and stamp it back onto `physical`/`virtual`.
+Position is canonical (`EnumDisplaySettings` reads it too); no-op for the primary / single-monitor case.
+Enables correct mixed-DPI multi-monitor arrangement (e.g. 4K@1.7× + 1080p@1.0× side by side) — the
+prerequisite for per-monitor-DPI rendering. Gated diag via `NEUTRON_MON_DIAG=1`.
+Touches: `dlls/win32u/sysparams.c`.
+
 ### `neutron-server-scale-dpi-sign.mypatch`
 Upstream wineserver bug: `scale_dpi()` computes `val * dpi_to` with `int * unsigned`, promoting a
 NEGATIVE coordinate to unsigned so it wraps to a huge positive value (a maximized window's physical
