@@ -1,0 +1,54 @@
+# neutron-wl-permonitor-scale
+#
+# Per-monitor DPI: derive the winewayland presentation scale (conf->scale in wayland_win_data_get_config)
+# from the window's monitor RAW dpi (NtUserGetWinMonitorDpi) — the same dpi win32u renders the driver
+# buffer at — instead of the compositor's preferred_scale. buffer_px / scale is then a dpi-independent
+# LOGICAL size that the compositor maps to physical px per the actual output, so a window is presented at
+# the correct PHYSICAL size on any monitor (e.g. a 4K@1.7x app window dragged to a 1080p@1.0x renders
+# correctly-sized instead of 1.7x too large). The compositor's exact fractional scale is used only when
+# it agrees with win32u's monitor dpi (within ~1 dpi). Applies on top of neutron-winewayland (same file,
+# disjoint region). Touches: dlls/winewayland.drv/window.c.
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 4db3043..4c57267 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -188,12 +188,33 @@ static void wayland_win_data_get_config(struct wayland_win_data *data,
+     }
+ 
+     conf->state = window_state;
+-    conf->scale = NtUserGetSystemDpiForProcess(0) / 96.0;
+-    /* NEUTRON: if the compositor advertised a precise fractional scale for this
+-     * surface, use it (exact 1.70 vs DPI-derived 1.6979) so the device-resolution
+-     * buffer maps 1:1 to the output with no fractional resample. */
+-    if (data->wayland_surface && data->wayland_surface->preferred_scale > 0.0)
+-        conf->scale = data->wayland_surface->preferred_scale;
++    /* NEUTRON per-monitor DPI: derive the presentation scale from the RAW dpi of the window's monitor
++     * (as win32u sees it) — the SAME dpi win32u renders the driver buffer at (create_window_surface
++     * builds the surface at the window's-monitor raw dpi). buffer_px / scale is then a dpi-independent
++     * LOGICAL size, and the compositor maps that logical size to physical px using the actual output's
++     * scale, so the window is presented at the correct PHYSICAL size on whichever monitor the surface
++     * is on — even when win32u's position-derived monitor belief is wrong (blurry, not huge). Using the
++     * compositor's preferred_scale here instead (the OLD behavior) mismatched the buffer's render dpi:
++     * on a 96-dpi 1080p a 163-dpi buffer was shown 1:1 = 1.7x too large. */
++    {
++        UINT raw_dpi = NtUserGetWinMonitorDpi(data->hwnd, MDT_RAW_DPI);
++        if (!raw_dpi) raw_dpi = NtUserGetSystemDpiForProcess(0);
++        conf->scale = raw_dpi / 96.0;
++        /* Only when the compositor's precise fractional scale AGREES with win32u's monitor dpi
++         * (within ~1 dpi) prefer the exact fraction (1.70 vs DPI-derived 1.6979), so a matching-
++         * monitor buffer maps 1:1 with no fractional resample. If they disagree the surface is on a
++         * different-dpi output than win32u believes — trust the render dpi, not the output scale. */
++        if (data->wayland_surface && data->wayland_surface->preferred_scale > 0.0)
++        {
++            double pref_dpi = data->wayland_surface->preferred_scale * 96.0;
++            if (pref_dpi >= raw_dpi - 2.0 && pref_dpi <= raw_dpi + 2.0)
++                conf->scale = data->wayland_surface->preferred_scale;
++        }
++        if (neutron_wl_diag())
++            ERR("neutron-scale: hwnd=%p raw_dpi=%u preferred_scale=%.4f -> conf->scale=%.4f\n",
++                data->hwnd, raw_dpi,
++                data->wayland_surface ? data->wayland_surface->preferred_scale : 0.0, conf->scale);
++    }
+     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
+     conf->managed = data->managed;
+ }

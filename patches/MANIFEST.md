@@ -55,6 +55,20 @@ Touches: `dlls/winewayland.drv/{Makefile.in, fractional-scale-v1.xml, xdg-decora
 wayland.c, wayland_surface.c, waylanddrv.h, waylanddrv_main.c, window.c, dllmain.c, wayland_pointer.c,
 window_surface.c, display.c}`.
 
+### `neutron-wl-permonitor-scale.mypatch`
+Per-monitor DPI, step ②: derive winewayland's presentation scale (`conf->scale` in
+`wayland_win_data_get_config`) from the window's monitor **raw dpi** (`NtUserGetWinMonitorDpi`, which
+reads win32u's now-correct per-monitor model — see `neutron-win32u-monitor-position`) instead of the
+compositor's `preferred_scale`. Because win32u builds the driver buffer at that same monitor raw dpi,
+`buffer_px / scale` is a dpi-independent **logical** size, and the compositor then maps it to physical px
+per the *actual* output — so a window is presented at the correct **physical** size on whichever monitor
+the surface is on (a 4K@1.7× app window dragged to a 1080p@1.0× renders correctly-sized, not 1.7× too
+large). The compositor's exact fractional scale is preferred only when it agrees with win32u's monitor
+dpi (within ~1 dpi). Named to sort **after** `neutron-winewayland` in any locale (same file, disjoint
+`conf->scale` region). Note: this fixes *floating*-window sizing across monitors; crisp native re-render
+and correct *maximize* target on the non-primary monitor need the driver-authoritative override (a
+separate, deferred effort). Touches: `dlls/winewayland.drv/window.c`.
+
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern
 Adobe/Windows chrome instead of the classic raised 3D bevel. A released, non-hot button uses
