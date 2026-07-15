@@ -5,7 +5,9 @@
 # zwp_tablet_manager_v2 + tablet-v2 tool events, bridges them to wintab32 through the
 # win32u pWintabProc seam (WAYLAND_WintabProc), and injects a synthetic system mouse for
 # cursor tracking + stroke arming. Includes a WTI_CURSORS pen-cursor table (apps classify
-# the tool via cursor 0) and a per-tool packet FIFO.
+# the tool via cursor 0) and a per-tool packet FIFO. Tilt maps to pkOrientation
+# (azimuth/altitude) and the eraser end is a second cursor (CSR_TYPE_ERASER, slot 2) so
+# flipping the stylus switches Photoshop to the Eraser tool.
 #
 # Also fixes wintab32 itself: the internal tablet message-window is moved onto a dedicated
 # pump thread. Previously it lived on whichever app thread first called WTOpen; an app that
@@ -14,10 +16,19 @@
 # straight line). A private always-pumping thread makes delivery asynchronous to the app,
 # matching how a real Windows WinTab driver behaves.
 #
+# First-stroke stray-line fix: Photoshop latches a cursor's stroke origin from the position
+# packet that wintab32's WT_PROXIMITY(enter) handler queues via AddPacketToContextQueue, and
+# never updates it from hover — so the first stroke of each tool drew a line from the entry
+# point to the contact point. The enter is now made origin-neutral: TABLET_WindowProc
+# forwards the "pen entered" message (via TABLET_FindContextByOwner) WITHOUT queuing an
+# authoritative packet, so the origin latches at actual contact like every subsequent stroke.
+#
 # Depends on: neutron-winewayland (applies after it; extends waylanddrv.h/wayland.c/
 # Makefile.in and removes the now-obsolete zwp_tablet_tool_v2_interface stub).
 diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
-index aaa0e97..81425b8 100644
+old mode 100644
+new mode 100755
+index aaa0e97fb4b..81425b804f0
 --- a/dlls/winewayland.drv/Makefile.in
 +++ b/dlls/winewayland.drv/Makefile.in
 @@ -15,6 +15,7 @@ SOURCES = \
@@ -42,8 +53,8 @@ index aaa0e97..81425b8 100644
  	xdg-decoration-unstable-v1.xml \
  	xdg-output-unstable-v1.xml \
 diff --git a/dlls/winewayland.drv/tablet-v2.xml b/dlls/winewayland.drv/tablet-v2.xml
-new file mode 100644
-index 0000000..58329f7
+new file mode 100755
+index 00000000000..58329f72da2
 --- /dev/null
 +++ b/dlls/winewayland.drv/tablet-v2.xml
 @@ -0,0 +1,1178 @@
@@ -1226,7 +1237,9 @@ index 0000000..58329f7
 +  </interface>
 +</protocol>
 diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
-index 43c4d13..a88e611 100644
+old mode 100644
+new mode 100755
+index 43c4d1345b4..a88e611730f
 --- a/dlls/winewayland.drv/wayland.c
 +++ b/dlls/winewayland.drv/wayland.c
 @@ -35,6 +35,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
@@ -1264,7 +1277,9 @@ index 43c4d13..a88e611 100644
      {
          process_wayland.wp_viewporter =
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
-index 921d637..5cb6c94 100644
+old mode 100644
+new mode 100755
+index 921d6372e9b..5cb6c94660c
 --- a/dlls/winewayland.drv/wayland_pointer.c
 +++ b/dlls/winewayland.drv/wayland_pointer.c
 @@ -40,10 +40,9 @@
@@ -1282,11 +1297,11 @@ index 921d637..5cb6c94 100644
  struct system_cursors
  {
 diff --git a/dlls/winewayland.drv/wayland_tablet.c b/dlls/winewayland.drv/wayland_tablet.c
-new file mode 100644
-index 0000000..04b0b61
+new file mode 100755
+index 00000000000..f2224e4c5cd
 --- /dev/null
 +++ b/dlls/winewayland.drv/wayland_tablet.c
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,478 @@
 +/*
 + * Wayland graphics tablets
 + *
@@ -1398,6 +1413,9 @@ index 0000000..04b0b61
 +static void wayland_tablet_tool_type(void *data, struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
 +                                     uint32_t tool_type)
 +{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    tool->type = tool_type;   /* pen vs eraser — arrives before .done, so set before any packet */
++    TRACE("tablet tool %p type %#x\n", tool, tool_type);
 +}
 +
 +static void wayland_tablet_tool_hardware_serial(void *data,
@@ -1763,7 +1781,9 @@ index 0000000..04b0b61
 +                                    NULL);
 +}
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 0cda0b9..4d50f08 100644
+old mode 100644
+new mode 100755
+index 0cda0b9bc36..dc5e95784b7
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -41,6 +41,7 @@
@@ -1774,7 +1794,18 @@ index 0cda0b9..4d50f08 100644
  
  #include "windef.h"
  #include "winbase.h"
-@@ -143,6 +144,50 @@ struct wayland_seat
+@@ -70,6 +71,10 @@ enum wayland_window_message
+     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
++    /* NEUTRON: the toplevel surface entered a wl_output (wparam = output global_id); the
++     * window thread repositions the Win32 window onto that output's monitor so per-monitor
++     * DPI applies. */
++    WM_WAYLAND_OUTPUT_CHANGE,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -143,6 +148,51 @@ struct wayland_seat
      pthread_mutex_t mutex;
  };
  
@@ -1795,6 +1826,7 @@ index 0cda0b9..4d50f08 100644
 +    struct list entry;
 +    struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2;
 +    uint64_t serial;
++    uint32_t type;                /* ZWP_TABLET_TOOL_V2_TYPE_* (pen vs eraser) */
 +    struct wl_surface *surface;   /* surface the tool is currently over (proximity) */
 +    void *wintab_data;            /* struct wayland_wintab_tool_data * (private to wintab.c) */
 +    /* NEUTRON: pending synthetic-mouse action, injected in wayland_wintab_frame AFTER the
@@ -1825,7 +1857,7 @@ index 0cda0b9..4d50f08 100644
  struct wayland_data_device
  {
      union
-@@ -186,6 +231,7 @@ struct wayland
+@@ -186,6 +236,7 @@ struct wayland
      struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
      struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
      struct wayland_seat seat;
@@ -1833,7 +1865,27 @@ index 0cda0b9..4d50f08 100644
      struct wayland_keyboard keyboard;
      struct wayland_pointer pointer;
      struct wayland_text_input text_input;
-@@ -498,9 +544,30 @@ static inline BOOL is_decoration_enabled(DWORD style, DWORD ex_style)
+@@ -212,6 +263,11 @@ struct wayland_output_state
+     char *name;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    /* NEUTRON: the output's arranged position in the Win32 physical-pixel desktop space
++     * (device px, matching win32u's monitor rc_monitor origin). Filled by the display-device
++     * update after overlap resolution; used to reposition a window onto this output's monitor
++     * when the surface enters it. */
++    int x, y;
+ };
+ 
+ struct wayland_output
+@@ -335,6 +391,7 @@ BOOL wayland_process_init(void);
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_destroy(struct wayland_output *output);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
++void wayland_output_arrange_positions(void);
+ 
+ /**********************************************************************
+  *          Wayland surface
+@@ -498,9 +555,30 @@ static inline BOOL is_decoration_enabled(DWORD style, DWORD ex_style)
  
  RGNDATA *get_region_data(HRGN region);
  
@@ -1865,7 +1917,9 @@ index 0cda0b9..4d50f08 100644
  LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
  BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
 diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
-index da84f67..677c0ca 100644
+old mode 100644
+new mode 100755
+index da84f67d299..677c0ca57bb
 --- a/dlls/winewayland.drv/waylanddrv_main.c
 +++ b/dlls/winewayland.drv/waylanddrv_main.c
 @@ -52,6 +52,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
@@ -1877,11 +1931,11 @@ index da84f67..677c0ca 100644
      .pGetWindowStyleMasks = WAYLAND_GetWindowStyleMasks,
      .pVulkanInit = WAYLAND_VulkanInit,
 diff --git a/dlls/winewayland.drv/wintab.c b/dlls/winewayland.drv/wintab.c
-new file mode 100644
-index 0000000..0eebb85
+new file mode 100755
+index 00000000000..9e8cc14acea
 --- /dev/null
 +++ b/dlls/winewayland.drv/wintab.c
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,1091 @@
 +/*
 + * Wayland wintab support
 + *
@@ -1909,6 +1963,7 @@ index 0000000..0eebb85
 +#include "config.h"
 +
 +#include <assert.h>
++#include <math.h>
 +#include <stdlib.h>
 +#include <unistd.h>
 +
@@ -1978,6 +2033,19 @@ index 0000000..0eebb85
 +    WCHAR PNPID[WT_MAX_NAME_LEN];
 +} WTI_DEVICES_INFO, *LPWTI_DEVICES_INFO;
 +
++/* NEUTRON (first-stroke stray-line): full pkChanged mask for discontinuity packets
++ * (proximity in/out, cursor switch). The packet that flips wintab32's ActiveCursor —
++ * and therefore triggers the ONE WT_CSRCHANGE PS uses to (re)classify + position the
++ * new cursor — must declare every field VALID. A pkChanged of 0 tells a spec-conforming
++ * stateful decoder "nothing changed since the previous packet of this cursor"; at a
++ * cursor change there IS no previous packet, so PS resolves the position to its
++ * per-cursor initial state (0,0) = bottom-left corner after the context Y-flip, and the
++ * first stroke of each tool draws a stray line from there. (Everything except
++ * PK_CONTEXT/PK_CHANGED themselves; wintab32 masks with the context's lcPktData.) */
++#define WT_PKCHANGED_FULL (PK_STATUS | PK_TIME | PK_SERIAL_NUMBER | PK_CURSOR | \
++                           PK_BUTTONS | PK_X | PK_Y | PK_Z | PK_NORMAL_PRESSURE | \
++                           PK_TANGENT_PRESSURE | PK_ORIENTATION | PK_ROTATION)
++
 +#define CSR_TYPE_PEN        0x822
 +#define CSR_TYPE_ERASER     0x82a
 +#define CSR_TYPE_MOUSE_2D   0x007
@@ -2018,13 +2086,19 @@ index 0000000..0eebb85
 +struct wayland_wintab_tool_data {
 +    WTPACKET last_packet;
 +    WTPACKET current_packet;
++    BOOL prox_pending;        /* NEUTRON: proximity_in seen, its packet deferred to the next frame */
++    BOOL session_contacted;   /* NEUTRON: tool has touched down at least once since proximity_in */
 +};
 +
 +// TODO: I don't think this should be in the driver.
 +static HWND hwndTabletDefault;
 +static LOGCONTEXTW gSysContext;
 +static WTI_DEVICES_INFO gSysDevice;
-+static WTI_CURSORS_INFO gSysCursor;   /* NEUTRON: the single pen cursor (WTI_CURSORS slot 0) */
++/* NEUTRON: WTI_CURSORS slots. Pen stays at slot 0 (proven with PS; PS classifies via
++ * CSR_TYPE, not slot number), eraser at the Wacom-convention slot 2 (pkCursor%3==2 AND
++ * CSR_TYPE_ERASER — satisfies every known detection scheme). Slot 1 stays inactive. */
++enum { WINTAB_CURSOR_PEN = 0, WINTAB_CURSOR_ERASER = 2, WINTAB_NUM_CURSORS = 3 };
++static WTI_CURSORS_INFO gSysCursor[WINTAB_NUM_CURSORS];
 +static INT gSerial;
 +
 +// TODO: copied from winex11.
@@ -2080,6 +2154,18 @@ index 0000000..0eebb85
 +    return data;
 +}
 +
++/* NEUTRON: which WTI_CURSORS slot / pkStatus a tool's packets carry. PS reads pkCursor ->
++ * WTI_CURSORS+slot / CSR_TYPE to pick pen vs eraser (its PktData 0x1ffc has no PK_STATUS,
++ * so TPS_INVERT never reaches it — set it anyway for apps that do request PK_STATUS). */
++static UINT tool_cursor(struct wayland_tablet_tool *tool)
++{
++    return tool->type == ZWP_TABLET_TOOL_V2_TYPE_ERASER ? WINTAB_CURSOR_ERASER : WINTAB_CURSOR_PEN;
++}
++static UINT tool_status(struct wayland_tablet_tool *tool)
++{
++    return tool->type == ZWP_TABLET_TOOL_V2_TYPE_ERASER ? TPS_INVERT : 0;
++}
++
 +/* NEUTRON: push a packet snapshot into the delivery ring (mutex-guarded). Each ring
 + * entry is popped by exactly one NtUserWintabPacket (WT_PACKET or WT_PROXIMITY), so
 + * proximity events must push too — the empty ring now returns 0 (no fabricated dupes). */
@@ -2101,13 +2187,22 @@ index 0000000..0eebb85
 +                                 struct zwp_tablet_v2 *tablet, struct wl_surface *surface)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    HWND hwnd = NULL;
-+    if (tool->surface)
-+        hwnd = wl_surface_get_user_data(tool->surface);
-+    data->current_packet.pkStatus = 0;
-+    data->current_packet.pkSerialNumber = gSerial++;
-+    wintab_ring_push(&data->current_packet);
-+    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(1, 1));
++    /* NEUTRON (first-stroke stray-line): PS latches a cursor's stroke ORIGIN from the ONE
++     * WT_CSRCHANGE it receives per pkCursor value and never re-latches for that cursor. wintab32
++     * fires that CSRCHANGE from the first packet whose pkCursor differs from ActiveCursor (init
++     * -1) — i.e. the first HOVER packet, at the proximity-ENTRY point — so the first stroke of
++     * each tool draws a line from entry to the contact point. PROVEN: the injected mouse-down
++     * lands at the correct contact point, yet the line still starts at entry (PS uses the WinTab
++     * CSRCHANGE anchor, not the mouse); and TPS_PROXIMITY cannot help because PS's context
++     * PktData 0x1ffc excludes PK_STATUS (pkStatus is never delivered). Suppressing hover packets
++     * regressed (PS needs them to arm + classify the tool). The fix is split: (1) wintab32 now
++     * defers the CSRCHANGE/ActiveCursor update to the first CONTACT packet (pkButtons != 0), so
++     * the one-shot latch lands at the pen-DOWN position while hover packets still flow; (2) here
++     * we still defer the proximity packet to a real position and mark the first-contact packet
++     * with full pkChanged (below) so PS reads the contact position unambiguously. */
++    data->prox_pending = TRUE;
++    data->session_contacted = FALSE;
++    (void)serial; (void)tablet; (void)surface;
 +}
 +
 +void wayland_wintab_proximity_out(struct wayland_tablet_tool *tool)
@@ -2116,8 +2211,18 @@ index 0000000..0eebb85
 +    HWND hwnd = NULL;
 +    if (tool->surface)
 +        hwnd = wl_surface_get_user_data(tool->surface);
-+    data->current_packet.pkStatus = TPS_PROXIMITY;
++    /* NEUTRON: proximity-out is a discontinuity (buttons=0) — with the wintab32 CSRCHANGE gate
++     * it will NOT fire a CSRCHANGE, so emitting it can't create a bad hover-position latch. */
++    data->prox_pending = FALSE;
++    data->session_contacted = FALSE;
++    data->current_packet.pkStatus = TPS_PROXIMITY | tool_status(tool);
++    data->current_packet.pkCursor = tool_cursor(tool);
 +    data->current_packet.pkSerialNumber = gSerial++;
++    data->current_packet.pkTime = NtGetTickCount();
++    /* NEUTRON (first-stroke): proximity packets are discontinuities — declare all fields
++     * valid so no consumer inherits stale/zero per-cursor state (see WT_PKCHANGED_FULL). */
++    data->current_packet.pkChanged = WT_PKCHANGED_FULL;
++    data->last_packet = data->current_packet;
 +    wintab_ring_push(&data->current_packet);
 +    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(0, 1));
 +}
@@ -2191,17 +2296,37 @@ index 0000000..0eebb85
 +    data->current_packet.pkZ = distance;
 +}
 +
++/* NEUTRON: tablet-v2 tilt (degrees from vertical, +x/+y = top of tool leans that way) ->
++ * WinTab ORIENTATION (what PS reads: PktData 0x1ffc includes PK_ORIENTATION, not PK_ROTATION).
++ * orAzimuth = compass direction of the lean (tenths of a degree, 0..3600); orAltitude =
++ * angle from the tablet plane (tenths; 900 = perpendicular, dropping as it tilts), negated
++ * for the eraser (winex11 convention). orTwist = barrel rotation (Art Pen), owned below. */
 +void wayland_wintab_tilt(struct wayland_tablet_tool *tool, wl_fixed_t tilt_x, wl_fixed_t tilt_y)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    data->current_packet.pkRotation.roPitch = tilt_x >> 8;
-+    data->current_packet.pkRotation.roRoll = tilt_y >> 8;
++    double tx = wl_fixed_to_double(tilt_x), ty = wl_fixed_to_double(tilt_y);
++    int azimuth = data->current_packet.pkOrientation.orAzimuth;  /* keep last when vertical */
++    int invert = (tool->type == ZWP_TABLET_TOOL_V2_TYPE_ERASER);
++    double alt_deg;
++
++    if (tx != 0.0 || ty != 0.0)
++    {
++        double az = atan2(tx, -ty) * 180.0 / M_PI;   /* 0 = away from user, clockwise */
++        if (az < 0.0) az += 360.0;
++        azimuth = (int)(az * 10.0 + 0.5) % 3600;
++    }
++    alt_deg = 90.0 - atan(hypot(tan(tx * M_PI / 180.0), tan(ty * M_PI / 180.0))) * 180.0 / M_PI;
++    if (alt_deg < 0.0) alt_deg = 0.0;
++
++    data->current_packet.pkOrientation.orAzimuth  = azimuth;
++    data->current_packet.pkOrientation.orAltitude = (int)(alt_deg * 10.0 + 0.5) * (invert ? -1 : 1);
 +}
 +
 +void wayland_wintab_rotation(struct wayland_tablet_tool *tool, wl_fixed_t degrees)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    data->current_packet.pkRotation.roYaw = degrees >> 8;
++    int t = (int)(wl_fixed_to_double(degrees) * 10.0 + 0.5) % 3600;   /* barrel twist -> orTwist */
++    data->current_packet.pkOrientation.orTwist = t < 0 ? t + 3600 : t;
 +}
 +
 +void wayland_wintab_slider(struct wayland_tablet_tool *tool, int32_t position)
@@ -2222,14 +2347,68 @@ index 0000000..0eebb85
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
 +    HWND hwnd = NULL;
 +
-+    data->current_packet.pkStatus = 0; // TODO
++    if (tool->surface)
++        hwnd = wl_surface_get_user_data(tool->surface);
++
++    /* NEUTRON (first-stroke stray-line): emit the WT_PROXIMITY(enter) at the first HOVER frame,
++     * as a real tablet does (pen entered proximity) — so PS arms and can classify the tool before
++     * contact, and so the enter does not "eat" a real stroke (deferring it to contact turned the
++     * first stroke into a dot). The wintab32 WT_PROXIMITY handler now treats an ENTER as
++     * ORIGIN-NEUTRAL: it forwards the message but does NOT queue this packet's position, so PS no
++     * longer latches the entry point as the stroke origin — it live-tracks and takes the origin
++     * from the actual contact. Belt: seed from the system cursor if no position landed yet. */
++    if (data->prox_pending)
++    {
++        WTPACKET prox;
++        if (data->current_packet.pkX == 0 && data->current_packet.pkY == 0)
++        {
++            POINT pt;
++            if (NtUserGetCursorPos(&pt))
++            {
++                data->current_packet.pkX = pt.x << 8;
++                data->current_packet.pkY = pt.y << 8;
++            }
++        }
++        prox = data->current_packet;
++        prox.pkStatus = tool_status(tool);
++        prox.pkCursor = tool_cursor(tool);
++        prox.pkButtons = 0;
++        prox.pkTime = NtGetTickCount();
++        prox.pkSerialNumber = gSerial++;
++        /* NEUTRON (first-stroke stray-line FIX): this packet is the FIRST of its pkCursor,
++         * i.e. the one that fires WT_CSRCHANGE, from which PS derives the new cursor's
++         * position. It must declare ALL fields changed; pkChanged=0 makes PS decode the
++         * position as its per-cursor initial (0,0) -> corner, regardless of pkX/pkY. */
++        prox.pkChanged = WT_PKCHANGED_FULL;
++        data->last_packet = prox;   /* next frame packet diffs against the prox snapshot */
++        TRACE("neutron-pen: PROX emit P=(%u,%u) cursor=%u chg=%#x serial=%u\n",
++              prox.pkX, prox.pkY, prox.pkCursor, (unsigned)prox.pkChanged, prox.pkSerialNumber);
++        wintab_ring_push(&prox);
++        NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(1, 1));
++        data->prox_pending = FALSE;
++    }
++
++    data->current_packet.pkStatus = tool_status(tool);   /* TPS_INVERT for the eraser */
 +    /* NEUTRON (F3): stamp in the win32 tick domain, NOT the raw compositor clock —
 +     * PS may time-pair packets against mouse messages (which the server stamps with
 +     * the win32 tick count), and the raw Wayland timestamp is a different epoch. */
 +    data->current_packet.pkTime = NtGetTickCount();
 +    data->current_packet.pkSerialNumber = gSerial++;
-+    data->current_packet.pkCursor = 0;
++    data->current_packet.pkCursor = tool_cursor(tool);   /* pen slot 0 / eraser slot 2 */
 +    data->current_packet.pkChanged = get_changed_state(&data->last_packet, &data->current_packet);
++    /* NEUTRON (first-stroke stray-line fix): the FIRST contact packet of a proximity session is
++     * the one that trips wintab32's gated one-shot WT_CSRCHANGE (pkButtons != 0), from which PS
++     * latches the stroke origin. Its position often equals the last hover packet's, so
++     * get_changed_state would leave PK_X/PK_Y CLEAR — and PS gates position on pkChanged (the
++     * original corner bug). Force full pkChanged here so PS unambiguously reads the CONTACT
++     * position and anchors the stroke there. */
++    if (!data->session_contacted && data->current_packet.pkButtons != 0)
++    {
++        data->session_contacted = TRUE;
++        data->current_packet.pkChanged = WT_PKCHANGED_FULL;
++        TRACE("neutron-pen: FIRST-CONTACT P=(%u,%u) cursor=%u -> full pkChanged, CSRCHANGE anchors here\n",
++              data->current_packet.pkX, data->current_packet.pkY, data->current_packet.pkCursor);
++    }
 +    if (tool->surface)
 +        hwnd = wl_surface_get_user_data(tool->surface);
 +    TRACE("neutron-pen: frame hwnd=%p P=(%u,%u) btn=%u press=%u chg=%#x serial=%u\n",
@@ -2270,6 +2449,14 @@ index 0000000..0eebb85
 +         * mouse" convention) so it drew a 2-point line; PS samples the stroke position
 +         * from these moves, so they must look like normal mouse motion. */
 +        NtUserSendHardwareInput(hwnd, 0, &in, 0);
++        /* NEUTRON (instrumentation): confirm the absolute-pixel injection semantics —
++         * where did the system cursor actually land vs what we sent? */
++        {
++            POINT lp = {-1, -1};
++            NtUserGetCursorPos(&lp);
++            TRACE("neutron-pen: INJ move dx=%d dy=%d flags=%#x -> cursor=(%d,%d)\n",
++                  (int)in.mi.dx, (int)in.mi.dy, (unsigned)in.mi.dwFlags, (int)lp.x, (int)lp.y);
++        }
 +        tool->pending_move = FALSE;
 +    }
 +    if (hwnd && tool->pending_buttons)
@@ -2282,6 +2469,14 @@ index 0000000..0eebb85
 +         * mouse" convention) so it drew a 2-point line; PS samples the stroke position
 +         * from these moves, so they must look like normal mouse motion. */
 +        NtUserSendHardwareInput(hwnd, 0, &in, 0);
++        /* NEUTRON (instrumentation): log the button transition + the cursor position it
++         * lands at (no MOVE flag -> server uses the current cursor position). */
++        {
++            POINT lp = {-1, -1};
++            NtUserGetCursorPos(&lp);
++            TRACE("neutron-pen: INJ btn flags=%#x at cursor=(%d,%d)\n",
++                  (unsigned)in.mi.dwFlags, (int)lp.x, (int)lp.y);
++        }
 +        tool->pending_buttons = 0;
 +    }
 +}
@@ -2360,34 +2555,59 @@ index 0000000..0eebb85
 +    gSysDevice.NPRESSURE.axMax = 65535;
 +    gSysDevice.TPRESSURE.axMin = 0;
 +    gSysDevice.TPRESSURE.axMax = 65535;
++    /* NEUTRON: tilt/orientation axes (tenths of a degree). azimuth 0..3600, altitude
++     * signed +/-900 (negative = inverted/eraser), twist 0..3600. Apps that gate tilt UI
++     * on WTI_DEVICES/DVC_ORIENTATION with axMax!=0 need these; PK_ORIENTATION already set. */
++    gSysDevice.ORIENTATION[0].axMin = 0;    gSysDevice.ORIENTATION[0].axMax = 3600;
++    gSysDevice.ORIENTATION[1].axMin = -900; gSysDevice.ORIENTATION[1].axMax = 900;
++    gSysDevice.ORIENTATION[2].axMin = 0;    gSysDevice.ORIENTATION[2].axMax = 3600;
++    {
++        int oi;
++        for (oi = 0; oi < 3; oi++)
++        {
++            gSysDevice.ORIENTATION[oi].axUnits = TU_CIRCLE;
++            gSysDevice.ORIENTATION[oi].axResolution = CASTFIX32(3600);
++        }
++    }
 +    wcscpy(gSysDevice.PNPID, SZ_NON_PLUG_N_PLAY);
 +
-+    /* NEUTRON: advertise ONE cursor (the pen). Photoshop probes WTI_CURSORS+pkCursor
-+     * to classify the tool that generated each packet; our packets carry pkCursor=0,
-+     * so the pen lives in slot 0. Without this PS gets 0 for every cursor query and
-+     * won't build a brush stroke from the packets (it draws a mouse-only down->up line). */
++    /* NEUTRON: advertise the pen (slot 0) and the eraser (slot 2). Photoshop probes
++     * WTI_CURSORS+pkCursor to classify the tool that generated each packet: pen packets
++     * carry pkCursor=0 (CSR_TYPE_PEN), eraser packets pkCursor=2 (CSR_TYPE_ERASER) — PS
++     * switches to its Eraser tool off the cursor type. Without a cursor table PS gets 0
++     * for every query and won't build a stroke at all. */
 +    {
-+        static const WCHAR SZ_CURSOR_NAME[] =
++        static const WCHAR SZ_PEN_NAME[] =
 +            {'W','i','n','e',' ','T','a','b','l','e','t',' ','P','e','n',0};
++        static const WCHAR SZ_ERASER_NAME[] =
++            {'W','i','n','e',' ','T','a','b','l','e','t',' ','E','r','a','s','e','r',0};
 +        static const WCHAR SZ_DEVICE_NAME[] =
 +            {'W','i','n','e',' ','T','a','b','l','e','t',' ','D','e','v','i','c','e',0};
++        WTI_CURSORS_INFO *pen = &gSysCursor[WINTAB_CURSOR_PEN];
++        WTI_CURSORS_INFO *era = &gSysCursor[WINTAB_CURSOR_ERASER];
++
 +        wcscpy(gSysDevice.NAME, SZ_DEVICE_NAME);
-+        gSysDevice.NCSRTYPES = 1;
++        gSysDevice.NCSRTYPES = 2;   /* pen + eraser (count of ACTIVE cursors) */
 +        gSysDevice.FIRSTCSR  = 0;
 +
-+        memset(&gSysCursor, 0, sizeof(gSysCursor));
-+        wcscpy(gSysCursor.NAME, SZ_CURSOR_NAME);
-+        gSysCursor.ACTIVE       = TRUE;
-+        gSysCursor.PKTDATA      = gSysContext.lcPktData;
-+        gSysCursor.BUTTONS      = 1;
-+        gSysCursor.BUTTONBITS   = 1;
-+        gSysCursor.NPBUTTON     = 1;
-+        gSysCursor.NPBTNMARKS[0] = 0;
-+        gSysCursor.NPBTNMARKS[1] = 1;
-+        gSysCursor.CAPABILITIES = CRC_MULTIMODE;
-+        gSysCursor.TYPE         = CSR_TYPE_PEN;
-+        gSysCursor.PHYSID       = 1;
-+        gSysCursor.SYSBTNMAP[0] = 1;   /* tip -> left mouse button */
++        memset(gSysCursor, 0, sizeof(gSysCursor));
++        wcscpy(pen->NAME, SZ_PEN_NAME);
++        pen->ACTIVE       = TRUE;
++        pen->PKTDATA      = gSysContext.lcPktData;
++        pen->BUTTONS      = 1;
++        pen->BUTTONBITS   = 1;
++        pen->NPBUTTON     = 1;
++        pen->NPBTNMARKS[0] = 0;
++        pen->NPBTNMARKS[1] = 1;
++        pen->CAPABILITIES = CRC_MULTIMODE;
++        pen->TYPE         = CSR_TYPE_PEN;
++        pen->PHYSID       = 1;
++        pen->SYSBTNMAP[0] = 1;   /* tip -> left mouse button */
++
++        *era = *pen;             /* eraser mirrors the pen, then override identity */
++        wcscpy(era->NAME, SZ_ERASER_NAME);
++        era->TYPE   = CSR_TYPE_ERASER;
++        era->PHYSID = 2;
 +    }
 +
 +    return TRUE;
@@ -2445,7 +2665,7 @@ index 0000000..0eebb85
 +                    rc = CopyTabletData(lpOutput, &num,sizeof(num));
 +                    break;
 +                case IFC_NCURSORS:
-+                    num = 1;
++                    num = 2;   /* pen + eraser */
 +                    rc = CopyTabletData(lpOutput, &num,sizeof(num));
 +                    break;
 +                default:
@@ -2603,64 +2823,69 @@ index 0000000..0eebb85
 +                    rc = 0;
 +            }
 +            break;
-+        case WTI_CURSORS:   /* NEUTRON: slot 0 = the pen (matches pkCursor=0 in our packets) */
-+            if (!gSysCursor.ACTIVE) { rc = 0; break; }
++        case WTI_CURSORS:       /* slot 0 = pen (pkCursor=0) */
++        case WTI_CURSORS + 1:   /* slot 1 = inactive */
++        case WTI_CURSORS + 2:   /* slot 2 = eraser (pkCursor=2) */
++        {
++            WTI_CURSORS_INFO *cur = &gSysCursor[wCategory - WTI_CURSORS];
++            if (!cur->ACTIVE) { rc = 0; break; }   /* apps poll slots; inactive returns 0 */
 +            switch (nIndex)
 +            {
 +                case CSR_NAME:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.NAME,
-+                                        (wcslen(gSysCursor.NAME)+1) * sizeof(WCHAR));
++                    rc = CopyTabletData(lpOutput, cur->NAME,
++                                        (wcslen(cur->NAME)+1) * sizeof(WCHAR));
 +                    break;
 +                case CSR_ACTIVE:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.ACTIVE, sizeof(BOOL));
++                    rc = CopyTabletData(lpOutput, &cur->ACTIVE, sizeof(BOOL));
 +                    break;
 +                case CSR_PKTDATA:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.PKTDATA, sizeof(WTPKT));
++                    rc = CopyTabletData(lpOutput, &cur->PKTDATA, sizeof(WTPKT));
 +                    break;
 +                case CSR_BUTTONS:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.BUTTONS, sizeof(BYTE));
++                    rc = CopyTabletData(lpOutput, &cur->BUTTONS, sizeof(BYTE));
 +                    break;
 +                case CSR_BUTTONBITS:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.BUTTONBITS, sizeof(BYTE));
++                    rc = CopyTabletData(lpOutput, &cur->BUTTONBITS, sizeof(BYTE));
 +                    break;
 +                case CSR_BUTTONMAP:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.BUTTONMAP, sizeof(BYTE)*32);
++                    rc = CopyTabletData(lpOutput, cur->BUTTONMAP, sizeof(BYTE)*32);
 +                    break;
 +                case CSR_SYSBTNMAP:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.SYSBTNMAP, sizeof(BYTE)*32);
++                    rc = CopyTabletData(lpOutput, cur->SYSBTNMAP, sizeof(BYTE)*32);
 +                    break;
 +                case CSR_NPBUTTON:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.NPBUTTON, sizeof(BYTE));
++                    rc = CopyTabletData(lpOutput, &cur->NPBUTTON, sizeof(BYTE));
 +                    break;
 +                case CSR_NPBTNMARKS:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.NPBTNMARKS, sizeof(UINT)*2);
++                    rc = CopyTabletData(lpOutput, cur->NPBTNMARKS, sizeof(UINT)*2);
 +                    break;
 +                case CSR_CAPABILITIES:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.CAPABILITIES, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->CAPABILITIES, sizeof(UINT));
 +                    break;
 +                case CSR_TYPE:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.TYPE, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->TYPE, sizeof(UINT));
 +                    break;
 +                case CSR_PHYSID:
 +                {
-+                    DWORD id = gSysCursor.PHYSID;
++                    DWORD id = cur->PHYSID;
 +                    rc = CopyTabletData(lpOutput, &id, sizeof(DWORD));
 +                    break;
 +                }
 +                case CSR_MODE:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.MODE, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->MODE, sizeof(UINT));
 +                    break;
 +                case CSR_MINPKTDATA:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.MINPKTDATA, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->MINPKTDATA, sizeof(UINT));
 +                    break;
 +                case CSR_MINBUTTONS:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.MINBUTTONS, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->MINBUTTONS, sizeof(UINT));
 +                    break;
 +                default:
 +                    FIXME("WTI_CURSORS unhandled index %i\n", nIndex);
 +                    rc = 0;
 +            }
 +            break;
++        }
 +        case WTI_DEVICES:
 +            switch (nIndex)
 +            {
@@ -2802,8 +3027,64 @@ index 0000000..0eebb85
 +    }
 +    return 0;
 +}
+diff --git a/dlls/wintab32/context.c b/dlls/wintab32/context.c
+old mode 100644
+new mode 100755
+index 3d79d136f85..2ec8d1ecadd
+--- a/dlls/wintab32/context.c
++++ b/dlls/wintab32/context.c
+@@ -143,6 +143,26 @@ static LPOPENCONTEXT TABLET_FindOpenContext(HCTX hCtx)
+     return NULL;
+ }
+ 
++/* NEUTRON: find the first enabled context owned by hwnd, WITHOUT queuing a packet. Used to
++ * deliver an origin-neutral WT_PROXIMITY(enter): PS latches the position of any packet queued
++ * in association with a proximity-enter as the next stroke's origin (stray-line bug), so on
++ * enter we forward the "pen entered" message but do not insert an authoritative position packet
++ * — mirroring the context-match half of AddPacketToContextQueue. */
++LPOPENCONTEXT TABLET_FindContextByOwner(HWND hwnd)
++{
++    LPOPENCONTEXT ptr;
++
++    EnterCriticalSection(&csTablet);
++    ptr = gOpenContexts;
++    while (ptr)
++    {
++        if (ptr->hwndOwner == hwnd && ptr->enabled) break;
++        ptr = ptr->next;
++    }
++    LeaveCriticalSection(&csTablet);
++    return ptr;
++}
++
+ static inline BOOL LoadTablet(void)
+ {
+     static enum {TI_START = 0, TI_OK, TI_FAIL} loaded = TI_START;
+@@ -243,6 +263,11 @@ LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd)
+                 ptr->PacketQueue[tgt] = *packet;
+                 ptr->PacketsQueued++;
+ 
++                /* NEUTRON: WT_CSRCHANGE (cursor change) is NOT the stroke-origin latch — proven
++                 * live: gating it to contact left the stray line anchored at the proximity-entry
++                 * point, which is carried by WT_PROXIMITY, not CSRCHANGE. Fire it on the first
++                 * packet of a new cursor (original behavior) so pen/eraser classify during hover.
++                 * The origin fix lives in the WT_PROXIMITY handler (origin-neutral enter). */
+                 if (ptr->ActiveCursor != packet->pkCursor)
+                 {
+                     ptr->ActiveCursor = packet->pkCursor;
+@@ -415,7 +440,7 @@ static UINT WTInfoT(UINT wCategory, UINT nIndex, LPVOID lpOutput, BOOL bUnicode)
+             DriverInfo(wCategory, nIndex, &buf);
+ 
+             /*  Handle system extents here, as we can use user32.dll code to set them */
+-            if(wCategory == WTI_DEFSYSCTX)
++            if(wCategory == WTI_DEFSYSCTX || wCategory == WTI_DDCTXS)
+             {
+                 buf.lcSysExtX = GetSystemMetrics(SM_CXSCREEN);
+                 buf.lcSysExtY = GetSystemMetrics(SM_CYSCREEN);
 diff --git a/dlls/wintab32/wintab32.c b/dlls/wintab32/wintab32.c
-index 1f1e720..be849e8 100644
+old mode 100644
+new mode 100755
+index 1f1e720c721..8f55c1b4052
 --- a/dlls/wintab32/wintab32.c
 +++ b/dlls/wintab32/wintab32.c
 @@ -66,15 +66,60 @@ static VOID TABLET_Unregister(void)
@@ -2868,4 +3149,42 @@ index 1f1e720..be849e8 100644
 +
      return TRUE;
  }
+ 
+@@ -139,7 +184,22 @@ static LRESULT WINAPI TABLET_WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
+                 LPOPENCONTEXT handler;
+                 if (NtUserMessageCall(hwnd, NtUserWintabPacket, 0, 0, &packet, NtUserWintabDriverCall, FALSE))
+                 {
+-                    handler = AddPacketToContextQueue(&packet,(HWND)wParam);
++                    /* NEUTRON (first-stroke stray-line fix): Photoshop latches the position of the
++                     * packet queued in association with a proximity-ENTER as the NEXT stroke's
++                     * origin, drawing a stray line from there to the real pen-down (proven: origin
++                     * follows the WT_PROXIMITY position, not CSRCHANGE/hover/mouse). On ENTER
++                     * (LOWORD(lParam) != 0 = entering context) forward the "pen entered" message
++                     * so PS arms and the following WT_CSRCHANGE classifies the tool, but do NOT
++                     * queue an authoritative position packet — let PS take the origin from the
++                     * live hover stream and the actual contact, exactly as it does for the 2nd and
++                     * later strokes of a session. On LEAVE keep the original queue-and-post path. */
++                    if (LOWORD(lParam))
++                    {
++                        TRACE("neutron-pen: PROXIMITY enter -> origin-neutral (no queued position)\n");
++                        handler = TABLET_FindContextByOwner((HWND)wParam);
++                    }
++                    else
++                        handler = AddPacketToContextQueue(&packet,(HWND)wParam);
+                     if (handler)
+                         TABLET_PostTabletMessage(handler, WT_PROXIMITY,
+                                                 (WPARAM)handler->handle, lParam, TRUE);
+diff --git a/dlls/wintab32/wintab_internal.h b/dlls/wintab32/wintab_internal.h
+old mode 100644
+new mode 100755
+index e230f0c1389..3c13da48d17
+--- a/dlls/wintab32/wintab_internal.h
++++ b/dlls/wintab32/wintab_internal.h
+@@ -150,6 +150,7 @@ HWND TABLET_GetInternalWindow(void);
+ int TABLET_PostTabletMessage(LPOPENCONTEXT newcontext, UINT msg, WPARAM wParam,
+                              LPARAM lParam, BOOL send_always);
+ LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd);
++LPOPENCONTEXT TABLET_FindContextByOwner(HWND hwnd);
+ 
+ extern CRITICAL_SECTION csTablet;
  
