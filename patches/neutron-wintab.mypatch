@@ -3303,7 +3303,7 @@ index 00000000000..a2230d0621d
 +    return 0;
 +}
 diff --git a/dlls/wintab32/context.c b/dlls/wintab32/context.c
-index 3d79d136f85..757e6c724b3 100644
+index bce9ca0..757e6c7 100644
 --- a/dlls/wintab32/context.c
 +++ b/dlls/wintab32/context.c
 @@ -143,6 +143,25 @@ static LPOPENCONTEXT TABLET_FindOpenContext(HCTX hCtx)
@@ -3393,15 +3393,6 @@ index 3d79d136f85..757e6c724b3 100644
              }
              break;
           }
-@@ -415,7 +447,7 @@ static UINT WTInfoT(UINT wCategory, UINT nIndex, LPVOID lpOutput, BOOL bUnicode)
-             DriverInfo(wCategory, nIndex, &buf);
- 
-             /*  Handle system extents here, as we can use user32.dll code to set them */
--            if(wCategory == WTI_DEFSYSCTX)
-+            if(wCategory == WTI_DEFSYSCTX || wCategory == WTI_DDCTXS)
-             {
-                 buf.lcSysExtX = GetSystemMetrics(SM_CXSCREEN);
-                 buf.lcSysExtY = GetSystemMetrics(SM_CYSCREEN);
 diff --git a/dlls/wintab32/wintab32.c b/dlls/wintab32/wintab32.c
 index 1f1e720c721..d157b415e15 100644
 --- a/dlls/wintab32/wintab32.c
