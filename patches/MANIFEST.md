@@ -84,9 +84,17 @@ first called `WTOpen`; an app that busy-polls `WTPacketsGet` inside an hwnd-filt
 app, matching a real Windows WinTab driver. Sorts **after** `neutron-winewayland` (extends
 `waylanddrv.h`/`wayland.c`/`Makefile.in`, removes the obsolete `zwp_tablet_tool_v2_interface` stub).
 Touches: `dlls/winewayland.drv/` (`Makefile.in`, `waylanddrv.h`, `wayland.c`, `waylanddrv_main.c`,
-`wayland_pointer.c`, new `wayland_tablet.c`/`wintab.c`/`tablet-v2.xml`), `dlls/wintab32/wintab32.c`.
-Remaining polish (separate): tilt→orientation + eraser; the angular/laggy *live* stroke is the known
-winewayland canvas present-path lag, not the pen pipeline.
+`wayland_pointer.c`, new `wayland_tablet.c`/`wintab.c`/`tablet-v2.xml`), `dlls/wintab32/` (`wintab32.c`,
+`context.c`, `wintab_internal.h`).
+**Tilt + eraser** are implemented: tilt→`pkOrientation` (azimuth/altitude); the eraser end is a second
+cursor (`CSR_TYPE_ERASER`, slot 2) so flipping the stylus switches Photoshop to the Eraser tool.
+**First-stroke stray-line fix:** Photoshop latches a cursor's stroke origin from the position packet that
+`wintab32`'s `WT_PROXIMITY(enter)` handler queues (`AddPacketToContextQueue`) and never updates it from
+hover — so the first stroke of each tool drew a line from the entry point to the contact point. The enter
+is now made *origin-neutral* (`TABLET_WindowProc` forwards the enter via new `TABLET_FindContextByOwner`
+without queuing an authoritative packet), so the origin latches at actual contact like every later stroke.
+The angular/laggy *live* stroke that remains is the known winewayland canvas present-path lag, not the pen
+pipeline.
 
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern

@@ -5,7 +5,9 @@
 # zwp_tablet_manager_v2 + tablet-v2 tool events, bridges them to wintab32 through the
 # win32u pWintabProc seam (WAYLAND_WintabProc), and injects a synthetic system mouse for
 # cursor tracking + stroke arming. Includes a WTI_CURSORS pen-cursor table (apps classify
-# the tool via cursor 0) and a per-tool packet FIFO.
+# the tool via cursor 0) and a per-tool packet FIFO. Tilt maps to pkOrientation
+# (azimuth/altitude) and the eraser end is a second cursor (CSR_TYPE_ERASER, slot 2) so
+# flipping the stylus switches Photoshop to the Eraser tool.
 #
 # Also fixes wintab32 itself: the internal tablet message-window is moved onto a dedicated
 # pump thread. Previously it lived on whichever app thread first called WTOpen; an app that
@@ -14,10 +16,20 @@
 # straight line). A private always-pumping thread makes delivery asynchronous to the app,
 # matching how a real Windows WinTab driver behaves.
 #
+# First-stroke stray-line fix (ROOT CAUSE, 2026-07-16, checked against the genuine Wacom driver):
+# the WinTab system context declared lcOutExt in TABLET UNITS (lcSysExt * units-per-px) where a
+# real Wacom driver sets lcOutExt = raw SCREEN PIXELS. That mis-scaled Photoshop's first-stroke
+# WinTab->cursor mapping by the units-per-px factor — before PS calibrates the WinTab stream
+# against the injected system cursor — so the first stroke of each session drew a ray from a
+# mis-mapped origin out along the first in-contact step. Fixed: lcOutExt = lcSysExt (screen px);
+# lcInExt/pkX carry the tablet-native ~50 units/px scale. Verified clean across pen+eraser at
+# multiple scales. (The proximity-enter packet is also kept origin-neutral — pkChanged=0 on
+# entry — so no authoritative position packet can latch a stale stroke anchor.)
+#
 # Depends on: neutron-winewayland (applies after it; extends waylanddrv.h/wayland.c/
 # Makefile.in and removes the now-obsolete zwp_tablet_tool_v2_interface stub).
 diff --git a/dlls/winewayland.drv/Makefile.in b/dlls/winewayland.drv/Makefile.in
-index aaa0e97..81425b8 100644
+index aaa0e97fb4b..81425b804f0 100644
 --- a/dlls/winewayland.drv/Makefile.in
 +++ b/dlls/winewayland.drv/Makefile.in
 @@ -15,6 +15,7 @@ SOURCES = \
@@ -43,7 +55,7 @@ index aaa0e97..81425b8 100644
  	xdg-output-unstable-v1.xml \
 diff --git a/dlls/winewayland.drv/tablet-v2.xml b/dlls/winewayland.drv/tablet-v2.xml
 new file mode 100644
-index 0000000..58329f7
+index 00000000000..58329f72da2
 --- /dev/null
 +++ b/dlls/winewayland.drv/tablet-v2.xml
 @@ -0,0 +1,1178 @@
@@ -1226,7 +1238,7 @@ index 0000000..58329f7
 +  </interface>
 +</protocol>
 diff --git a/dlls/winewayland.drv/wayland.c b/dlls/winewayland.drv/wayland.c
-index 43c4d13..a88e611 100644
+index 43c4d1345b4..a88e611730f 100644
 --- a/dlls/winewayland.drv/wayland.c
 +++ b/dlls/winewayland.drv/wayland.c
 @@ -35,6 +35,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
@@ -1264,7 +1276,7 @@ index 43c4d13..a88e611 100644
      {
          process_wayland.wp_viewporter =
 diff --git a/dlls/winewayland.drv/wayland_pointer.c b/dlls/winewayland.drv/wayland_pointer.c
-index 921d637..5cb6c94 100644
+index 921d6372e9b..5cb6c94660c 100644
 --- a/dlls/winewayland.drv/wayland_pointer.c
 +++ b/dlls/winewayland.drv/wayland_pointer.c
 @@ -40,10 +40,9 @@
@@ -1283,10 +1295,10 @@ index 921d637..5cb6c94 100644
  {
 diff --git a/dlls/winewayland.drv/wayland_tablet.c b/dlls/winewayland.drv/wayland_tablet.c
 new file mode 100644
-index 0000000..04b0b61
+index 00000000000..f2224e4c5cd
 --- /dev/null
 +++ b/dlls/winewayland.drv/wayland_tablet.c
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,478 @@
 +/*
 + * Wayland graphics tablets
 + *
@@ -1398,6 +1410,9 @@ index 0000000..04b0b61
 +static void wayland_tablet_tool_type(void *data, struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2,
 +                                     uint32_t tool_type)
 +{
++    struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
++    tool->type = tool_type;   /* pen vs eraser — arrives before .done, so set before any packet */
++    TRACE("tablet tool %p type %#x\n", tool, tool_type);
 +}
 +
 +static void wayland_tablet_tool_hardware_serial(void *data,
@@ -1763,7 +1778,7 @@ index 0000000..04b0b61
 +                                    NULL);
 +}
 diff --git a/dlls/winewayland.drv/waylanddrv.h b/dlls/winewayland.drv/waylanddrv.h
-index 0cda0b9..4d50f08 100644
+index 0cda0b9bc36..a15160bd0f7 100644
 --- a/dlls/winewayland.drv/waylanddrv.h
 +++ b/dlls/winewayland.drv/waylanddrv.h
 @@ -41,6 +41,7 @@
@@ -1774,7 +1789,18 @@ index 0cda0b9..4d50f08 100644
  
  #include "windef.h"
  #include "winbase.h"
-@@ -143,6 +144,50 @@ struct wayland_seat
+@@ -70,6 +71,10 @@ enum wayland_window_message
+     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
++    /* NEUTRON: the toplevel surface entered a wl_output (wparam = output global_id); the
++     * window thread repositions the Win32 window onto that output's monitor so per-monitor
++     * DPI applies. */
++    WM_WAYLAND_OUTPUT_CHANGE,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -143,6 +148,54 @@ struct wayland_seat
      pthread_mutex_t mutex;
  };
  
@@ -1795,6 +1821,7 @@ index 0cda0b9..4d50f08 100644
 +    struct list entry;
 +    struct zwp_tablet_tool_v2 *zwp_tablet_tool_v2;
 +    uint64_t serial;
++    uint32_t type;                /* ZWP_TABLET_TOOL_V2_TYPE_* (pen vs eraser) */
 +    struct wl_surface *surface;   /* surface the tool is currently over (proximity) */
 +    void *wintab_data;            /* struct wayland_wintab_tool_data * (private to wintab.c) */
 +    /* NEUTRON: pending synthetic-mouse action, injected in wayland_wintab_frame AFTER the
@@ -1802,6 +1829,9 @@ index 0cda0b9..4d50f08 100644
 +     * it arms the stroke on (Windows/winex11 ordering). down/up/motion only RECORD here. */
 +    UINT  pending_buttons;        /* MOUSEEVENTF_LEFTDOWN / LEFTUP, 0 = none */
 +    POINT pending_pos;            /* latest clamped absolute screen coords */
++    POINT last_injected_pos;      /* NEUTRON: last position actually injected, so the mouse
++                                   * channel can be motion-gated like the real Wacom driver
++                                   * (which emits nothing when the pen hasn't moved) */
 +    BOOL  pending_move;
 +};
 +
@@ -1825,7 +1855,7 @@ index 0cda0b9..4d50f08 100644
  struct wayland_data_device
  {
      union
-@@ -186,6 +231,7 @@ struct wayland
+@@ -186,6 +239,7 @@ struct wayland
      struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
      struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
      struct wayland_seat seat;
@@ -1833,7 +1863,27 @@ index 0cda0b9..4d50f08 100644
      struct wayland_keyboard keyboard;
      struct wayland_pointer pointer;
      struct wayland_text_input text_input;
-@@ -498,9 +544,30 @@ static inline BOOL is_decoration_enabled(DWORD style, DWORD ex_style)
+@@ -212,6 +266,11 @@ struct wayland_output_state
+     char *name;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    /* NEUTRON: the output's arranged position in the Win32 physical-pixel desktop space
++     * (device px, matching win32u's monitor rc_monitor origin). Filled by the display-device
++     * update after overlap resolution; used to reposition a window onto this output's monitor
++     * when the surface enters it. */
++    int x, y;
+ };
+ 
+ struct wayland_output
+@@ -335,6 +394,7 @@ BOOL wayland_process_init(void);
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_destroy(struct wayland_output *output);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
++void wayland_output_arrange_positions(void);
+ 
+ /**********************************************************************
+  *          Wayland surface
+@@ -498,9 +558,30 @@ static inline BOOL is_decoration_enabled(DWORD style, DWORD ex_style)
  
  RGNDATA *get_region_data(HRGN region);
  
@@ -1865,7 +1915,7 @@ index 0cda0b9..4d50f08 100644
  LRESULT WAYLAND_ClipboardWindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
  BOOL WAYLAND_ClipCursor(const RECT *clip, BOOL reset);
 diff --git a/dlls/winewayland.drv/waylanddrv_main.c b/dlls/winewayland.drv/waylanddrv_main.c
-index da84f67..677c0ca 100644
+index da84f67d299..677c0ca57bb 100644
 --- a/dlls/winewayland.drv/waylanddrv_main.c
 +++ b/dlls/winewayland.drv/waylanddrv_main.c
 @@ -52,6 +52,7 @@ static const struct user_driver_funcs waylanddrv_funcs =
@@ -1878,10 +1928,10 @@ index da84f67..677c0ca 100644
      .pVulkanInit = WAYLAND_VulkanInit,
 diff --git a/dlls/winewayland.drv/wintab.c b/dlls/winewayland.drv/wintab.c
 new file mode 100644
-index 0000000..0eebb85
+index 00000000000..a2230d0621d
 --- /dev/null
 +++ b/dlls/winewayland.drv/wintab.c
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,1370 @@
 +/*
 + * Wayland wintab support
 + *
@@ -1909,6 +1959,7 @@ index 0000000..0eebb85
 +#include "config.h"
 +
 +#include <assert.h>
++#include <math.h>
 +#include <stdlib.h>
 +#include <unistd.h>
 +
@@ -1978,11 +2029,35 @@ index 0000000..0eebb85
 +    WCHAR PNPID[WT_MAX_NAME_LEN];
 +} WTI_DEVICES_INFO, *LPWTI_DEVICES_INFO;
 +
++/* NEUTRON (first-stroke stray-line, GROUND-TRUTH fix): a real Wacom driver's entry
++ * (proximity) packet reads back via WTPacket() with pkChanged = 0x0000 — in particular
++ * NO PK_X/PK_Y — so it can NEVER set the app's position anchor; PS tracks position
++ * exclusively from the honest incremental pkChanged of the hover WT_PACKET stream, and
++ * pen-down is just the next ordinary packet (pkChanged = TIME|SERIAL|BUTTONS|PRESSURE,
++ * no X/Y unless the pen actually moved that tick). The previous forced-full pkChanged
++ * (0x3ff6) on discontinuity/first-contact packets flagged X/Y-changed at the ENTRY
++ * point, which is what let PS latch the entry position (stray line). See the Windows
++ * reference capture: neutron-wintab-linux-solution-handoff.md §2. */
++
 +#define CSR_TYPE_PEN        0x822
 +#define CSR_TYPE_ERASER     0x82a
 +#define CSR_TYPE_MOUSE_2D   0x007
 +#define CSR_TYPE_MOUSE_4D   0x094
 +#define CSR_TYPE_OTHER      0x000
++
++/* NEUTRON (2026-07-16) — TABLET UNITS PER SCREEN PIXEL. This is the ROOT of the first-stroke
++ * stray. PS builds its internal stroke space as lcOutExt = lcInExt*16 (verified live in PS's
++ * DUMPCONTEXT) and, on the FIRST stroke of a newly-active cursor — before it can correlate
++ * WinTab coords against the injected system cursor — it maps position/velocity purely from the
++ * context-declared scale. We used to publish pkX/pkY and lcInExt at <<8 = 256 units/px, so our
++ * stroke-space magnitude was px*4096. A real Wacom (reference capture line 5: lcInExt=44800 over
++ * a 3840px screen) is ~11.7 units/px -> px*187. Ours was ~22x hotter, so PS's cold predictor
++ * extrapolated the first in-contact step ~22x -> the collinear stray (ray along the first step,
++ * length proportional to approach speed, first-stroke-only, invisible on slow/straight strokes).
++ * 12 matches Wacom's magnitude while keeping 1/12 px sub-pixel resolution (well clear of the
++ * integer-quantization stall that the old <<8 was fighting). lcInExt scales with pkX in lockstep,
++ * so pkX/lcInExt*lcSysExt == screen px is preserved (the system-cursor mapping is unchanged).
++ * The value lives in neutron_tablet_upp() (runtime-overridable NEUTRON_TABLET_UPP, default 12). */
 +
 +typedef struct tagWTPACKET {
 +    UINT pkContext;
@@ -2018,14 +2093,134 @@ index 0000000..0eebb85
 +struct wayland_wintab_tool_data {
 +    WTPACKET last_packet;
 +    WTPACKET current_packet;
++    BOOL prox_pending;        /* NEUTRON: proximity_in seen, its packet deferred to the next frame
++                               * so the entry packet carries the REAL entry position (tablet-v2
++                               * delivers motion within the same frame as proximity_in) */
++    /* NEUTRON (2026-07-16): Wacom-style smoothing filter — a velocity-ADAPTIVE box average over a
++     * per-axis position ring, matching the genuine Wacom driver's pen smoothing.
++     * Runs continuously from proximity-in (NOT reset at tip-down: that
++     * continuity is why there's no cold-start ramp for PS to amplify). Window `eff` slews +2/-1
++     * per sample toward a target that is DEEP when the pen is slow/still and SHALLOW (low-lag)
++     * when moving; output = mean of the newest `eff` samples; the very first sample returns raw.
++     * The ONE filtered position drives BOTH pkX/pkY and the injected cursor (no channel desync
++     * — the flaw that blew up the naive moving-average). Reset only on proximity-leave. */
++    double flt_x[16], flt_y[16];   /* per-axis position ring (sub-pixel screen coords) */
++    unsigned flt_depth, flt_widx;  /* valid sample count (<=16), ring write cursor */
++    double flt_eff_x, flt_eff_y;   /* effective depth per axis (slew-limited window) */
 +};
++
++/* NEUTRON: map the compositor's event clock into the win32 tick domain.
++ *
++ * Both are monotonic milliseconds and were measured IDENTICAL on this system
++ * (wl_time=5227033 / NtGetTickCount()=5227033), but they are not the same clock: wine's
++ * tick count comes from monotonic_counter() which prefers CLOCK_BOOTTIME, while Wayland
++ * stamps CLOCK_MONOTONIC. Those diverge by the suspend duration across a suspend/resume,
++ * which would otherwise hand PS timestamps far in the past. Rebasing keeps the hardware
++ * cadence (deltas are untouched — that is the whole point) while staying in the epoch PS
++ * needs for pairing packets against mouse-message times. Rebased on every proximity
++ * entry, so any drift is bounded to a single hover session and costs one clock read.
++ *
++ * (wintab_mouse_time note) The injected system-mouse events are stamped from this same
++ * clock, and that matters as much as pkTime. INPUT.mi.time==0 tells the server "stamp it
++ * yourself", and it does — server/queue.c queue_mouse_message():
++ *     time = input->mouse.time;
++ *     if (!time) time = desktop_shm->cursor.last_change;   // == get_tick_count() NOW
++ * i.e. every WM_MOUSEMOVE / WM_LBUTTONDOWN PS receives was timestamped at the instant our
++ * event thread happened to inject it, smearing scheduling jitter over a stream the
++ * hardware delivered on a 7.13ms metronome (measured sd=0.50 vs our sd=3.25, range
++ * 0..24ms, ~1% of samples dt=0). PS extrapolates the brush-stroke velocity at stroke
++ * start as dPosition/dTime, so a jittered clock yields velocity errors up to 24x and, on
++ * a dt=0 pair, an infinite one — flinging the first stroke off the canvas. Passing a
++ * non-zero mi.time makes the server use our value verbatim, so PS sees the true cadence.
++ */
++static LONG wintab_time_offset;          /* win32 ticks - wayland ms */
++static BOOL wintab_time_offset_valid;
++
++static LONG wintab_last_time;
++static LONG wintab_win32_time(uint32_t wl_time)
++{
++    LONG t;
++    if (!wintab_time_offset_valid)
++    {
++        wintab_time_offset = (LONG)(NtGetTickCount() - wl_time);
++        wintab_time_offset_valid = TRUE;
++        TRACE("neutron-pen: rebased tablet clock, offset=%d ms\n", (int)wintab_time_offset);
++    }
++    t = (LONG)(wl_time + wintab_time_offset);
++    /* NEUTRON (2026-07-16) F3: a real Wacom's pkTime NEVER repeats (+5ms every packet at
++     * 200Hz, verified across the whole reference capture). Ours had exactly one dt=0 pair
++     * in 1098 -- the PROX packet and the contact packet sharing a timestamp -- which is an
++     * infinite velocity to anything computing dPosition/dTime. Enforce strict monotonicity. */
++    if (t <= wintab_last_time) t = wintab_last_time + 1;
++    wintab_last_time = t;
++    return t;
++}
++
++
++/* NEUTRON (2026-07-16): tablet units per screen pixel — see the NEUTRON_TABLET_UPP note by the
++ * CSR_TYPE defines. Runtime-overridable (NEUTRON_TABLET_UPP=<n>) so the scale can be swept
++ * across relaunches WITHOUT rebuilding, to map whether the residual stray is proportional to
++ * scale (keep reducing) or a scale-independent floor (a second bug). Default 12 = Wacom scale. */
++static double neutron_tablet_upp(void)
++{
++    static double cached = -1.0;
++    if (cached < 0.0)
++    {
++        const char *e = getenv("NEUTRON_TABLET_UPP");
++        double v = (e && *e) ? atof(e) : 0.0;
++        /* Default 50 = the Cintiq's native ~49.8 units/px (best sub-pixel). Now that lcOutExt is
++         * correct (= screen px), the first-stroke stray is gone at ANY scale, so UPP is just a
++         * resolution choice; 50 is Wacom-faithful and works for all tablets. */
++        cached = (v > 0.0) ? v : 50.0;
++    }
++    return cached;
++}
++
++/* NEUTRON (2026-07-16): Wacom-style smoothing filter parameters. All runtime-overridable for sweeping.
++ *  NEUTRON_PEN_SMOOTH : master enable (0/unset = OFF passthrough; 1 = filter on). Default OFF
++ *                       for tree safety (two earlier naive filters backfired) — enable per-run.
++ *  NEUTRON_PEN_FLOOR  : window while MOVING (low lag). Default 3.
++ *  NEUTRON_PEN_DEEP   : window while STILL (jitter band). Default 9 (= floor x a jitter ratio of ~3, >2).
++ *  NEUTRON_PEN_JITTER : jitter threshold in screen px; |per-sample step| <= this => "still".
++ *                       Default 1.5. (Wacom height-interpolates this; we use a fixed value.) */
++static int    neutron_pen_on(void)     { static int c=-1; if(c<0){const char*e=getenv("NEUTRON_PEN_SMOOTH"); c=(e&&atoi(e)>=1)?1:0;} return c; }
++static double neutron_pen_floor(void)  { static double c=-1; if(c<0){const char*e=getenv("NEUTRON_PEN_FLOOR");  double v=e?atof(e):0; c=(v>=1)?v:3.0;}  return c; }
++static double neutron_pen_deep(void)    { static double c=-1; if(c<0){const char*e=getenv("NEUTRON_PEN_DEEP");   double v=e?atof(e):0; c=(v>=1)?v:9.0;}  return c; }
++static double neutron_pen_jitter(void) { static double c=-1; if(c<0){const char*e=getenv("NEUTRON_PEN_JITTER"); double v=e?atof(e):0; c=(v>0)?v:1.5;}  return c; }
++
++/* Apply the velocity-adaptive box filter for one axis. ring/newest updated by the caller.
++ * eff = &per-axis window. Returns filtered value. `moving_far` decides deep vs floor target. */
++static double neutron_flt_axis(const double *ring, unsigned widx, unsigned depth,
++                               double *eff, double target)
++{
++    double d;
++    unsigned N, i; double sum;
++    /* slew eff toward target: +2 if target>eff+4, +1 if target>eff, hold if ==, else -1 */
++    d = target - *eff;
++    if      (d >  4.0) *eff += 2.0;
++    else if (d >  0.5) *eff += 1.0;
++    else if (d < -0.5) *eff -= 1.0;
++    if (*eff < 1.0) *eff = 1.0;
++    if (*eff > (double)depth) *eff = (double)depth;
++    if (*eff > 16.0) *eff = 16.0;
++    N = (unsigned)(*eff + 0.5); if (N < 1) N = 1; if (N > depth) N = depth;
++    sum = 0.0;
++    for (i = 0; i < N; i++) sum += ring[(widx - 1 - i) & 15];
++    return sum / (double)N;
++}
 +
 +// TODO: I don't think this should be in the driver.
 +static HWND hwndTabletDefault;
 +static LOGCONTEXTW gSysContext;
 +static WTI_DEVICES_INFO gSysDevice;
-+static WTI_CURSORS_INFO gSysCursor;   /* NEUTRON: the single pen cursor (WTI_CURSORS slot 0) */
-+static INT gSerial;
++/* NEUTRON: WTI_CURSORS slots. Pen at slot 0, eraser at the Wacom-convention slot 2
++ * (pkCursor%3==2 AND CSR_TYPE_ERASER — satisfies every known detection scheme). Slot 1
++ * stays inactive. PS classifies by CSR_TYPE + observed pkCursor, not by NCSRTYPES. */
++enum { WINTAB_CURSOR_PEN = 0, WINTAB_CURSOR_ERASER = 2, WINTAB_NUM_CURSORS = 3 };
++static WTI_CURSORS_INFO gSysCursor[WINTAB_NUM_CURSORS];
++/* NEUTRON: packet serials start at 1 (reference capture: first packet is serial 1) and
++ * run STRICTLY CONTINUOUS across proximity sessions — never reset per entry (§2a). */
++static INT gSerial = 1;
 +
 +// TODO: copied from winex11.
 +static DWORD get_changed_state(WTPACKET *last_packet, WTPACKET *current_packet)
@@ -2059,6 +2254,10 @@ index 0000000..0eebb85
 +         current_packet->pkRotation.roYaw  != last_packet->pkRotation.roYaw)
 +        change |= PK_ROTATION;
 +
++    /* NEUTRON (2026-07-16): the pkChanged mask (`&= ~(PK_Z|PK_ORIENTATION)`) that briefly
++     * lived here was REVERTED — it made our contact pkChanged byte-match Windows (0x4d4) and
++     * did NOT change the stray, proving contact-packet CONTENT is not the flinger. */
++
 +    return change;
 +}
 +
@@ -2078,6 +2277,18 @@ index 0000000..0eebb85
 +        data = tool->wintab_data = calloc(1, sizeof(struct wayland_wintab_tool_data));
 +    }
 +    return data;
++}
++
++/* NEUTRON: which WTI_CURSORS slot / pkStatus a tool's packets carry. PS reads pkCursor ->
++ * WTI_CURSORS+slot / CSR_TYPE to pick pen vs eraser (its PktData 0x1ffc has no PK_STATUS,
++ * so TPS_INVERT never reaches it — set it anyway for apps that do request PK_STATUS). */
++static UINT tool_cursor(struct wayland_tablet_tool *tool)
++{
++    return tool->type == ZWP_TABLET_TOOL_V2_TYPE_ERASER ? WINTAB_CURSOR_ERASER : WINTAB_CURSOR_PEN;
++}
++static UINT tool_status(struct wayland_tablet_tool *tool)
++{
++    return tool->type == ZWP_TABLET_TOOL_V2_TYPE_ERASER ? TPS_INVERT : 0;
 +}
 +
 +/* NEUTRON: push a packet snapshot into the delivery ring (mutex-guarded). Each ring
@@ -2101,13 +2312,12 @@ index 0000000..0eebb85
 +                                 struct zwp_tablet_v2 *tablet, struct wl_surface *surface)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    HWND hwnd = NULL;
-+    if (tool->surface)
-+        hwnd = wl_surface_get_user_data(tool->surface);
-+    data->current_packet.pkStatus = 0;
-+    data->current_packet.pkSerialNumber = gSerial++;
-+    wintab_ring_push(&data->current_packet);
-+    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(1, 1));
++    /* NEUTRON (ground-truth): defer the entry packet + WT_PROXIMITY to the first frame,
++     * where the same-frame motion events have populated the REAL entry position (a real
++     * driver's entry packet carries the entry x/y, never 0,0 — reference §2a). */
++    data->prox_pending = TRUE;
++    wintab_time_offset_valid = FALSE;   /* NEUTRON: rebase the tablet clock per hover session */
++    (void)serial; (void)tablet; (void)surface;
 +}
 +
 +void wayland_wintab_proximity_out(struct wayland_tablet_tool *tool)
@@ -2116,10 +2326,17 @@ index 0000000..0eebb85
 +    HWND hwnd = NULL;
 +    if (tool->surface)
 +        hwnd = wl_surface_get_user_data(tool->surface);
-+    data->current_packet.pkStatus = TPS_PROXIMITY;
-+    data->current_packet.pkSerialNumber = gSerial++;
-+    wintab_ring_push(&data->current_packet);
-+    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(0, 1));
++    /* NEUTRON (ground-truth, reference §2d): a real driver queues NO packet with the
++     * proximity-leave — the queue is EMPTY at leave time — and posts WT_PROXIMITY with
++     * lParam=0 (ctx and hw proximity both 0). wintab32's WT_PROXIMITY handler forwards
++     * a leave without popping/queueing. Reset transient tool state quietly so a stale
++     * button/pressure can't leak into the next session's entry packet. */
++    data->prox_pending = FALSE;
++    data->current_packet.pkButtons = 0;
++    data->current_packet.pkNormalPressure = 0;
++    /* NEUTRON: reset the position filter on proximity-leave ONLY (never at tip-down). */
++    data->flt_depth = 0; data->flt_widx = 0; data->flt_eff_x = 0.0; data->flt_eff_y = 0.0;
++    NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, 0);
 +}
 +
 +void wayland_wintab_down(struct wayland_tablet_tool *tool, uint32_t serial)
@@ -2167,14 +2384,73 @@ index 0000000..0eebb85
 +    }
 +    window_rect = &surface->window.rect;
 +
-+    /* Map surface-local (wl_fixed) coords to absolute screen pixels exactly like the
-+     * pointer/mouse-injection path (wayland_surface_coords_to_window + window origin),
-+     * then express in WinTab's 1/256-pixel units (context lcInExtX = SM_CXVIRTUALSCREEN
-+     * << 8). jchw's original added the window origin with <<7, halving it relative to
-+     * the pkX body (which is already *256), which offset the pen. */
-+    wayland_surface_coords_to_window(surface, wl_fixed_to_double(x), wl_fixed_to_double(y), &wx, &wy);
-+    data->current_packet.pkX = (wx + window_rect->left) << 8;
-+    data->current_packet.pkY = (wy + window_rect->top) << 8;
++    /* Map surface-local (wl_fixed) coords to absolute screen position, expressed in
++     * WinTab's 1/256-pixel units (context lcInExtX = SM_CXVIRTUALSCREEN << 8).
++     * jchw's original added the window origin with <<7, halving it relative to the pkX
++     * body (which is already *256), which offset the pen.
++     *
++     * NEUTRON (2026-07-15): do NOT route this through wayland_surface_coords_to_window()
++     * — it round()s to a whole int (wayland_surface.c:1448), and shifting that <<8 then
++     * fabricates 1/256 units that are ALWAYS exact multiples of 256. That threw away every
++     * bit of sub-pixel precision the compositor hands us in the wl_fixed (itself 1/256),
++     * so PS saw a tablet whose resolution is ONE SCREEN PIXEL. Ground truth (Windows
++     * capture): a real Wacom reports lcInExt=44800x29600 against a 3840x2160 screen =
++     * ~11.7 tablet units per screen px, and PS then asks for lcOutExt = lcInExt*16, i.e.
++     * it expects ~186 sub-units per pixel. Quantising to 1px turns smooth slow motion
++     * into stalls punctuated by artificial 1px impulses — measured 2026-07-15: a pen
++     * hovering in produced first-contact steps of 0.0000, 0.0000, 0.0000, 0.0000, 1.4142
++     * (it was never stationary; it was moving sub-pixel), and an eraser's first step read
++     * exactly 1.0000. PS extrapolates the stroke-start step, so a quantisation impulse
++     * becomes a ~578x magnified fling. The system cursor stays integer (below, via
++     * pending_pos) exactly as on Windows — only the packet carries the fine position. */
++    {
++        /* NEUTRON (2026-07-16): Wacom-style smoothing filter — velocity-adaptive box average on the
++         * sub-pixel screen position, run continuously (no tip-down reset). Damps the opening
++         * velocity PS's cold predictor over-reacts to, WITHOUT a cold-start ramp (warm from
++         * hover) and WITHOUT desyncing channels (the ONE filtered position drives both pkX/pkY
++         * and the injected cursor via pending_pos). OFF (default) = exact prior raw behavior. */
++        double raw_x = wl_fixed_to_double(x) * surface->window.scale + window_rect->left;
++        double raw_y = wl_fixed_to_double(y) * surface->window.scale + window_rect->top;
++        double fx = raw_x, fy = raw_y;
++        if (neutron_pen_on())
++        {
++            double jit = neutron_pen_jitter(), thr2 = (2.0*jit)*(2.0*jit);
++            double floorw = neutron_pen_floor(), deepw = neutron_pen_deep();
++            double dx = 0.0, dy = 0.0;
++            unsigned w;
++            data->flt_x[data->flt_widx & 15] = raw_x;
++            data->flt_y[data->flt_widx & 15] = raw_y;
++            data->flt_widx++;
++            if (data->flt_depth < 16) data->flt_depth++;
++            w = data->flt_widx;
++            if (data->flt_depth >= 2)
++            {
++                dx = data->flt_x[(w-1) & 15] - data->flt_x[(w-2) & 15];
++                dy = data->flt_y[(w-1) & 15] - data->flt_y[(w-2) & 15];
++            }
++            fx = neutron_flt_axis(data->flt_x, w, data->flt_depth, &data->flt_eff_x,
++                                  (dx*dx <= thr2) ? deepw : floorw);
++            fy = neutron_flt_axis(data->flt_y, w, data->flt_depth, &data->flt_eff_y,
++                                  (dy*dy <= thr2) ? deepw : floorw);
++            /* drive the injected system cursor from the SAME filtered position */
++            {
++                LONG px = (LONG)llround(fx), py = (LONG)llround(fy);
++                if (px >= window_rect->right)  px = window_rect->right - 1;
++                else if (px < window_rect->left) px = window_rect->left;
++                if (py >= window_rect->bottom) py = window_rect->bottom - 1;
++                else if (py < window_rect->top)  py = window_rect->top;
++                tool->pending_pos.x = px;
++                tool->pending_pos.y = py;
++            }
++        }
++        data->current_packet.pkX = (DWORD)llround(fx * neutron_tablet_upp());
++        data->current_packet.pkY = (DWORD)llround(fy * neutron_tablet_upp());
++    }
++    (void)wx; (void)wy;
++
++    TRACE("neutron-pen: MOTION raw=(%.3f,%.3f) -> pk=(%u,%u)\n",
++          wl_fixed_to_double(x), wl_fixed_to_double(y),
++          data->current_packet.pkX, data->current_packet.pkY);
 +
 +    wayland_win_data_release(window_data);
 +}
@@ -2188,20 +2464,45 @@ index 0000000..0eebb85
 +void wayland_wintab_distance(struct wayland_tablet_tool *tool, uint32_t distance)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    data->current_packet.pkZ = distance;
++    /* NEUTRON (2026-07-16): scale into the DECLARED 0..1023 axis (we used to ship the raw
++     * 0..65535 tablet-v2 value against an axis we claimed didn't exist). A real Wacom's z
++     * declines smoothly to 0 BEFORE contact, so its contact packet flags no PK_Z; ours
++     * sat at a constant ~21845 through hover and SNAPPED to 0 at the contact packet,
++     * flagging PK_Z exactly there (our contact chg=0x654/0x1654 vs Windows 0x4D4/0x5D4). */
++    data->current_packet.pkZ = (distance * 1023) / 65535;
 +}
 +
++/* NEUTRON: tablet-v2 tilt (degrees from vertical, +x/+y = top of tool leans that way) ->
++ * WinTab ORIENTATION (what PS reads: PktData 0x1ffc includes PK_ORIENTATION, not PK_ROTATION).
++ * orAzimuth = compass direction of the lean (tenths of a degree, 0..3600); orAltitude =
++ * angle from the tablet plane (tenths; 900 = perpendicular, dropping as it tilts), negated
++ * for the eraser (winex11 convention). orTwist = barrel rotation (Art Pen), owned below. */
 +void wayland_wintab_tilt(struct wayland_tablet_tool *tool, wl_fixed_t tilt_x, wl_fixed_t tilt_y)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    data->current_packet.pkRotation.roPitch = tilt_x >> 8;
-+    data->current_packet.pkRotation.roRoll = tilt_y >> 8;
++    double tx = wl_fixed_to_double(tilt_x), ty = wl_fixed_to_double(tilt_y);
++    int azimuth = data->current_packet.pkOrientation.orAzimuth;  /* keep last when vertical */
++    int invert = (tool->type == ZWP_TABLET_TOOL_V2_TYPE_ERASER);
++    double alt_deg;
++
++    if (tx != 0.0 || ty != 0.0)
++    {
++        double az = atan2(tx, -ty) * 180.0 / M_PI;   /* 0 = away from user, clockwise */
++        if (az < 0.0) az += 360.0;
++        azimuth = (int)(az * 10.0 + 0.5) % 3600;
++    }
++    alt_deg = 90.0 - atan(hypot(tan(tx * M_PI / 180.0), tan(ty * M_PI / 180.0))) * 180.0 / M_PI;
++    if (alt_deg < 0.0) alt_deg = 0.0;
++
++    data->current_packet.pkOrientation.orAzimuth  = azimuth;
++    data->current_packet.pkOrientation.orAltitude = (int)(alt_deg * 10.0 + 0.5) * (invert ? -1 : 1);
 +}
 +
 +void wayland_wintab_rotation(struct wayland_tablet_tool *tool, wl_fixed_t degrees)
 +{
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
-+    data->current_packet.pkRotation.roYaw = degrees >> 8;
++    int t = (int)(wl_fixed_to_double(degrees) * 10.0 + 0.5) % 3600;   /* barrel twist -> orTwist */
++    data->current_packet.pkOrientation.orTwist = t < 0 ? t + 3600 : t;
 +}
 +
 +void wayland_wintab_slider(struct wayland_tablet_tool *tool, int32_t position)
@@ -2222,13 +2523,101 @@ index 0000000..0eebb85
 +    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
 +    HWND hwnd = NULL;
 +
-+    data->current_packet.pkStatus = 0; // TODO
-+    /* NEUTRON (F3): stamp in the win32 tick domain, NOT the raw compositor clock —
-+     * PS may time-pair packets against mouse messages (which the server stamps with
-+     * the win32 tick count), and the raw Wayland timestamp is a different epoch. */
-+    data->current_packet.pkTime = NtGetTickCount();
++    if (tool->surface)
++        hwnd = wl_surface_get_user_data(tool->surface);
++
++    /* NEUTRON (ground-truth, reference §2a): on every proximity-enter (pen AND eraser,
++     * first and re-entries) a real Wacom driver queues EXACTLY ONE packet at the entry
++     * position (btn=0, press=0) and posts WT_PROXIMITY(lParam=0x00010001); wintab32 then
++     * forwards WT_PROXIMITY -> WT_CSRCHANGE(serial) -> WT_PACKET(serial) to the app in
++     * that order. The crux: the entry packet's pkChanged as read via WTPacket() is
++     * 0x0000 — NO PK_X/PK_Y — so it CANNOT set PS's position anchor; PS takes position
++     * only from the honest hover stream. (The old forced-full pkChanged here was the
++     * stray-line bug.) Emit at the first frame so the same-frame motion events have
++     * landed; belt: seed from the system cursor if no position arrived at all. */
++    if (data->prox_pending)
++    {
++        WTPACKET prox;
++        if (data->current_packet.pkX == 0 && data->current_packet.pkY == 0)
++        {
++            POINT pt;
++            if (NtUserGetCursorPos(&pt))
++            {
++                data->current_packet.pkX = (DWORD)llround(pt.x * neutron_tablet_upp());
++                data->current_packet.pkY = (DWORD)llround(pt.y * neutron_tablet_upp());
++            }
++        }
++        prox = data->current_packet;
++        prox.pkStatus = tool_status(tool);
++        prox.pkCursor = tool_cursor(tool);
++        prox.pkButtons = 0;
++        prox.pkTime = wintab_win32_time(time);   /* NEUTRON: hardware event clock, as above */
++        prox.pkSerialNumber = gSerial++;
++        prox.pkChanged = 0;   /* reference §2a: entry packet says NOTHING changed */
++        data->last_packet = prox;   /* next frame packet diffs against the prox snapshot */
++        TRACE("neutron-pen: PROX emit P=(%u,%u) cursor=%u chg=%#x serial=%u\n",
++              prox.pkX, prox.pkY, prox.pkCursor, (unsigned)prox.pkChanged, prox.pkSerialNumber);
++        wintab_ring_push(&prox);
++        NtUserPostMessage(hwndTabletDefault, WT_PROXIMITY, (WPARAM)hwnd, MAKELPARAM(1, 1));
++        data->prox_pending = FALSE;
++        /* NEUTRON (ground-truth, reference §2a): the entry frame queues EXACTLY ONE
++         * packet — the entry packet — and nothing else, so a WTPacketsPeek at
++         * WT_PROXIMITY time shows precisely 1. Return here instead of falling through
++         * to also push this frame's regular hover packet; that earlier double-push left
++         * TWO packets queued at proximity (verified in the client capture), and the
++         * extra early-hover packet carries honest X/Y-changed at the ENTRY position —
++         * so PS draining at CSRCHANGE time could latch the entry point (the stray line).
++         * The first real hover packet is deferred to the next frame (~7 ms), diffing
++         * against the prox snapshot in data->last_packet. */
++        return;
++    }
++
++    /* NEUTRON (2026-07-16): F1 (holding the contact packet at the previous position to
++     * force pkChanged=0x0454) is REVERTED. Its premise was FALSE: it came from round-1's
++     * logger, which is on record as having had a WTPACKET struct bug. Re-parsing the
++     * trusted round-2 capture (mouse-ref-190231.log) shows **16 of 17 contact packets DO
++     * flag PK_X/PK_Y** with small real motion (serial 3039: changed=0x05D4). Windows'
++     * actual contact property is MAGNITUDE (contact step 0.6-1.2x hover cadence), not a
++     * frozen position. F1 also introduced a NEW divergence: it held the packet at the old
++     * position while the same-serial injected LEFTDOWN carried the real one -- 61px apart,
++     * 1ms apart (020028 eraser contact) -- two same-serial pen positions that disagree,
++     * which never happens on Windows. It did not fix the stray. Do not reintroduce. */
++    data->current_packet.pkStatus = tool_status(tool);   /* TPS_INVERT for the eraser */
++    /* NEUTRON (2026-07-16): a synthetic z=0/press=0 "landing" packet on the down transition
++     * (to give PS's cold predictor a zero-velocity anchor, as a real Wacom's 1-6 pre-contact
++     * z=0 hovers do) was tried here and made the stray WORSE at UPP=12 — reverted. Folding the
++     * approach step into one injected packet is not equivalent to the pen physically settling.
++     * The coordinate-scale fix (NEUTRON_TABLET_UPP) stands as the real lever. */
++    /* NEUTRON (first-stroke stray-line FIX, 2026-07-15): stamp the packet with the
++     * COMPOSITOR's event timestamp, not a clock read at frame-processing time.
++     *
++     * PS extrapolates the brush-stroke velocity at stroke start, and it derives that
++     * velocity from pkTime (dPosition/dTime). NtGetTickCount() sampled here records when
++     * OUR THREAD GOT SCHEDULED, not when the pen actually moved, so it smears scheduling
++     * jitter across a stream the hardware delivers on a metronome. Measured over 320
++     * packets of one hover (2026-07-15): the compositor cadence is 7.13ms mean with
++     * sd=0.50 (284/320 exactly 7ms), while our NtGetTickCount deltas had the same 7.13ms
++     * mean but sd=3.25, ranging 0..24ms. Same motion, velocity estimates differing 24x --
++     * and 3 packets (~1%) were stamped dt=0, i.e. an INFINITE velocity, which flung the
++     * first stroke to the canvas edge. Hence: stray only on the first stroke (the only
++     * one carrying hover velocity into the stroke start), length proportional to approach
++     * speed, direction along the pen's motion. All measured and reproduced.
++     *
++     * zwp_tablet_tool_v2::frame's `time` is the hardware event's own millisecond stamp,
++     * which is exactly what a real Wacom driver reports (Windows reference capture: a
++     * clean "+5 per packet" at lcPktRate=200). The earlier F3 note feared this clock was
++     * a different epoch from the win32 tick domain and would break PS's packet/mouse-
++     * message time-pairing -- that is not so: both are CLOCK_MONOTONIC milliseconds and
++     * were measured starting at the identical value (wl_time=5227033, pkTime=5227033),
++     * so no rebasing is needed and the pairing F3 protected still holds. */
++    data->current_packet.pkTime = wintab_win32_time(time);
 +    data->current_packet.pkSerialNumber = gSerial++;
-+    data->current_packet.pkCursor = 0;
++    data->current_packet.pkCursor = tool_cursor(tool);   /* pen slot 0 / eraser slot 2 */
++    /* NEUTRON (ground-truth, reference §2c): pkChanged is HONEST on every packet — the
++     * incremental diff vs the previous packet. Pen-down is deliberately BORING: just the
++     * next packet with pkButtons 0->1 + pressure (TIME|SERIAL|BUTTONS|NORMAL_PRESSURE =
++     * 0x0454), NO PK_X/PK_Y unless the pen actually moved that tick, and no CSRCHANGE /
++     * PROXIMITY / synthetic packet. That is exactly what get_changed_state produces. */
 +    data->current_packet.pkChanged = get_changed_state(&data->last_packet, &data->current_packet);
 +    if (tool->surface)
 +        hwnd = wl_surface_get_user_data(tool->surface);
@@ -2237,7 +2626,6 @@ index 0000000..0eebb85
 +        (unsigned)data->current_packet.pkButtons, data->current_packet.pkNormalPressure,
 +        (unsigned)data->current_packet.pkChanged, data->current_packet.pkSerialNumber);
 +    data->last_packet = data->current_packet;
-+    (void)time;
 +    pthread_mutex_lock(&process_wayland.tablet.mutex);
 +    {
 +        struct wayland_wintab_data *wd = get_wintab_data();
@@ -2258,30 +2646,78 @@ index 0000000..0eebb85
 +     * the pen-down sample is visible, instead of PS seeing a stale btn=0 hover packet
 +     * and collapsing the stroke to a dot. Move first (so a LEFTDOWN lands at the
 +     * updated position), then the button transition. */
-+    if (hwnd && tool->pending_move)
++    /* NEUTRON (2026-07-15) — the injected system-mouse stream now REPRODUCES the real
++     * Wacom driver's contract, captured on Windows 11 + genuine Wacom Professional driver
++     * (~/Downloads/neutron-mouse-stream-linux-solution-handoff.md). Three measured
++     * divergences from what we used to do, all fixed here:
++     *
++     *  (a) dwExtraInfo = the packet's pkSerialNumber. EVERY pen-driven mouse event the
++     *      real driver injects carries its WT_PACKET's serial in dwExtraInfo (verified
++     *      across a 60k-line capture: serial=11942 <-> extra=0x2EA6, serial=15904 <->
++     *      0x3E20, no exceptions), and the PHYSICAL mouse carries extra=0. It is NOT
++     *      MI_WP_SIGNATURE -- there is no 0xFF5157xx anywhere in 8102 captured mouse
++     *      messages (an earlier fix attempt tagged that value; PS ignored it). So an
++     *      untagged move is indistinguishable from a real mouse: PS saw the tablet
++     *      packets PLUS what looked like a second, independent pointing device shadowing
++     *      them, and had to reconcile two devices where Windows has one. The serial is
++     *      the exact mouse<->packet correspondence PS needs to pair/dedupe/ignore them.
++     *      (PS re-reads CSR_TYPE+CSR_PHYSID once per packet -- it runs per-event logic.)
++     *
++     *  (b) Pen-down is ONE atomic event: move-to-contact + LEFTDOWN together, tagged with
++     *      the contact packet's serial. Real capture: a single injected event with
++     *      btnFlags=0x0001 AND a position payload, which Windows delivers as
++     *      WM_MOUSEMOVE(contact) then WM_LBUTTONDOWN(contact) -- same position, same
++     *      serial, inseparable, and never coalesced apart even under a slow drain. The
++     *      server walks the flag bits in order and does exactly this for one INPUT, so
++     *      the button can never land on a position from some earlier hover move.
++     *
++     *  (c) Inject NOTHING when the position has not changed. The real driver's mouse
++     *      channel is motion-gated: a stationary hover and pressure-only changes while
++     *      down produce ZERO mouse events (captured: serials 11951-11960 = 10 packets,
++     *      54ms, no mouse traffic at all). We were emitting duplicate zero-delta moves
++     *      (logged: 5 consecutive identical "INJ move dx=184 dy=408").
++     *
++     * Not applicable to us: the capture's top-ranked suspect was a stale-hover backlog
++     * from missing coalescing, but wine already implements Windows' generate-on-read --
++     * server/queue.c queue_hardware_message() frees a mouse move instead of queuing it
++     * when win == msg->win, and we pass the same visible hwnd the pointer path does. */
++    if (hwnd && tool->pending_move &&
++        tool->pending_pos.x == tool->last_injected_pos.x &&
++        tool->pending_pos.y == tool->last_injected_pos.y &&
++        !tool->pending_buttons)
 +    {
-+        INPUT in = {0};
-+        in.type = INPUT_MOUSE;
-+        in.mi.dx = tool->pending_pos.x;
-+        in.mi.dy = tool->pending_pos.y;
-+        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-+        /* NEUTRON: do NOT tag pen-sourced now that the cursor table makes PS recognize
-+         * the pen. Tagging made PS ignore the interior moves (MS "ignore pen-generated
-+         * mouse" convention) so it drew a 2-point line; PS samples the stroke position
-+         * from these moves, so they must look like normal mouse motion. */
-+        NtUserSendHardwareInput(hwnd, 0, &in, 0);
++        /* (c) motion-gated: the position did not actually change. */
 +        tool->pending_move = FALSE;
 +    }
-+    if (hwnd && tool->pending_buttons)
++    if (hwnd && (tool->pending_move || tool->pending_buttons))
 +    {
 +        INPUT in = {0};
 +        in.type = INPUT_MOUSE;
-+        in.mi.dwFlags = tool->pending_buttons;
-+        /* NEUTRON: do NOT tag pen-sourced now that the cursor table makes PS recognize
-+         * the pen. Tagging made PS ignore the interior moves (MS "ignore pen-generated
-+         * mouse" convention) so it drew a 2-point line; PS samples the stroke position
-+         * from these moves, so they must look like normal mouse motion. */
++        in.mi.time = wintab_win32_time(time);
++        /* (a) tag every pen-driven mouse event with its packet's serial. */
++        in.mi.dwExtraInfo = data->current_packet.pkSerialNumber;
++
++        /* (b) fold the move and the button into ONE event, so the button is inseparable
++         * from the contact position. On a down frame we always carry the position, even
++         * if no fresh motion arrived, so LEFTDOWN can never inherit a stale cursor. */
++        if (tool->pending_move || (tool->pending_buttons & MOUSEEVENTF_LEFTDOWN))
++        {
++            in.mi.dx = tool->pending_pos.x;
++            in.mi.dy = tool->pending_pos.y;
++            in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++            tool->last_injected_pos = tool->pending_pos;
++        }
++        in.mi.dwFlags |= tool->pending_buttons;
++
 +        NtUserSendHardwareInput(hwnd, 0, &in, 0);
++        {
++            POINT lp = {-1, -1};
++            NtUserGetCursorPos(&lp);
++            TRACE("neutron-pen: INJ flags=%#x pos=(%d,%d) serial=%u -> cursor=(%d,%d)\n",
++                  (unsigned)in.mi.dwFlags, (int)in.mi.dx, (int)in.mi.dy,
++                  (unsigned)in.mi.dwExtraInfo, (int)lp.x, (int)lp.y);
++        }
++        tool->pending_move = FALSE;
 +        tool->pending_buttons = 0;
 +    }
 +}
@@ -2322,7 +2758,7 @@ index 0000000..0eebb85
 +    gSysContext.lcMoveMask=
 +        PK_BUTTONS |  PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
 +    gSysContext.lcStatus = CXS_ONTOP;
-+    gSysContext.lcPktRate = 100;
++    gSysContext.lcPktRate = 143;   /* NEUTRON F2: report what we DELIVER (Cintiq 22HD digitizer = ~143Hz, measured 7.001ms median at the kernel). The old 100 was a guess; the reference's rule is report-truthfully (a real Wacom says 200 and delivers 200). 200 is the INTUOS PRO reference tablet's rate, not ours. */
 +    gSysContext.lcBtnDnMask = 0xffffffff;
 +    gSysContext.lcBtnUpMask = 0xffffffff;
 +    gSysContext.lcSensX = 65536;
@@ -2335,59 +2771,117 @@ index 0000000..0eebb85
 +    gSysContext.lcSysExtY = NtUserGetSystemMetrics(SM_CYVIRTUALSCREEN);
 +    gSysContext.lcInOrgX = 0;
 +    gSysContext.lcOutOrgX = 0;
-+    gSysContext.lcInExtX = gSysContext.lcSysExtX << 8;
-+    gSysContext.lcOutExtX = gSysContext.lcSysExtX << 8;
++    /* NEUTRON: lcInExt at Wacom scale (NEUTRON_TABLET_UPP units/px), in lockstep with pkX.
++     * lcOutExt = SysExt = raw SCREEN PIXELS (what the genuine Wacom driver reports for a
++     * SYSTEM context — screen px, NOT tablet units). We WRONGLY had
++     * lcOutExt = lcSysExt*upp, which makes the context map pkX -> screen*upp instead of screen:
++     * a factor-of-upp error in PS's first-stroke WinTab->cursor mapping (before PS calibrates
++     * against the injected cursor) — exactly the ∝UPP, first-stroke, along-motion stray. */
++    gSysContext.lcInExtX = (LONG)(gSysContext.lcSysExtX * neutron_tablet_upp());
++    gSysContext.lcOutExtX = gSysContext.lcSysExtX;
 +    gSysContext.lcInOrgY = 0;
 +    gSysContext.lcOutOrgY = 0;
-+    gSysContext.lcInExtY = gSysContext.lcSysExtY << 8;
-+    gSysContext.lcOutExtY = gSysContext.lcSysExtY << 8;
++    gSysContext.lcInExtY = (LONG)(gSysContext.lcSysExtY * neutron_tablet_upp());
++    gSysContext.lcOutExtY = gSysContext.lcSysExtY;
 +
 +    gSysDevice.HARDWARE = HWC_HARDPROX|HWC_PHYSID_CURSORS;
 +    gSysDevice.FIRSTCSR= 0;
-+    gSysDevice.PKTRATE = 100;
++    gSysDevice.PKTRATE = 143;   /* NEUTRON F2: see lcPktRate */
 +    gSysDevice.PKTDATA =
 +        PK_CONTEXT | PK_STATUS | PK_SERIAL_NUMBER| PK_TIME | PK_CURSOR |
 +        PK_BUTTONS |  PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
 +    gSysDevice.X.axMin = 0;
-+    gSysDevice.X.axMax = gSysContext.lcSysExtX << 8;
++    gSysDevice.X.axMax = (LONG)(gSysContext.lcSysExtX * neutron_tablet_upp());
 +    gSysDevice.X.axUnits = TU_INCHES;
-+    gSysDevice.X.axResolution = 96 << 8; // TODO
++    /* NEUTRON (2026-07-16): axResolution is a **FIX32** (wintab.h: CASTFIX32(x)=x*65536).
++     * `96 << 8` = 24576 RAW, which PS reads as 24576/65536 = **0.375 lines per inch** with
++     * axUnits=TU_INCHES — i.e. we described a tablet ~13,500x LESS DENSE than a real Wacom
++     * (~5080 lpi), so anything converting packets to physical units sees velocities
++     * inflated by that factor. (The ORIENTATION axes 20 lines below already use CASTFIX32
++     * correctly — X/Y were left `// TODO`.) The intended NUMBER was right: our pkX/pkY are
++     * 1/256 of a virtual-screen pixel, so at wine's nominal 96dpi the true density is
++     * 256*96 = 24576 lines/inch — it just has to be expressed as FIX32. Wacom's own
++     * straight-line artifacts on Windows are blamed on physical-unit features
++     * (double-click-distance suppression, flick thresholds), which is exactly the class of
++     * PS code this metadata feeds. */
++    gSysDevice.X.axResolution = CASTFIX32(96 * 256);
 +    gSysDevice.Y.axMin = 0;
-+    gSysDevice.Y.axMax = gSysContext.lcSysExtY << 8;
++    gSysDevice.Y.axMax = (LONG)(gSysContext.lcSysExtY * neutron_tablet_upp());
 +    gSysDevice.Y.axUnits = TU_INCHES;
-+    gSysDevice.Y.axResolution = 96 << 8; // TODO
++    gSysDevice.Y.axResolution = CASTFIX32(96 * 256);   /* NEUTRON: FIX32, see X above */
 +    gSysDevice.NPRESSURE.axMin = 0;
++    /* NEUTRON (2026-07-16): Z = pen height above the tablet, declared 0..1023 like a real
++     * Wacom (which also DECLINES z to 0 BEFORE contact: 445->341->208->52->0, 17/17). */
++    gSysDevice.Z.axMin = 0;
++    gSysDevice.Z.axMax = 1023;
++    gSysDevice.Z.axUnits = TU_INCHES;
++    gSysDevice.Z.axResolution = CASTFIX32(1024);
 +    gSysDevice.NPRESSURE.axMax = 65535;
 +    gSysDevice.TPRESSURE.axMin = 0;
 +    gSysDevice.TPRESSURE.axMax = 65535;
++    /* NEUTRON: tilt/orientation axes (tenths of a degree). azimuth 0..3600, altitude
++     * signed +/-900 (negative = inverted/eraser), twist 0..3600. Apps that gate tilt UI
++     * on WTI_DEVICES/DVC_ORIENTATION with axMax!=0 need these; PK_ORIENTATION already set. */
++    gSysDevice.ORIENTATION[0].axMin = 0;    gSysDevice.ORIENTATION[0].axMax = 3600;
++    gSysDevice.ORIENTATION[1].axMin = -900; gSysDevice.ORIENTATION[1].axMax = 900;
++    gSysDevice.ORIENTATION[2].axMin = 0;    gSysDevice.ORIENTATION[2].axMax = 3600;
++    {
++        int oi;
++        for (oi = 0; oi < 3; oi++)
++        {
++            gSysDevice.ORIENTATION[oi].axUnits = TU_CIRCLE;
++            gSysDevice.ORIENTATION[oi].axResolution = CASTFIX32(3600);
++        }
++    }
 +    wcscpy(gSysDevice.PNPID, SZ_NON_PLUG_N_PLAY);
 +
-+    /* NEUTRON: advertise ONE cursor (the pen). Photoshop probes WTI_CURSORS+pkCursor
-+     * to classify the tool that generated each packet; our packets carry pkCursor=0,
-+     * so the pen lives in slot 0. Without this PS gets 0 for every cursor query and
-+     * won't build a brush stroke from the packets (it draws a mouse-only down->up line). */
++    /* NEUTRON: advertise the pen (slot 0) and the eraser (slot 2). Photoshop probes
++     * WTI_CURSORS+pkCursor to classify the tool that generated each packet: pen packets
++     * carry pkCursor=0 (CSR_TYPE_PEN), eraser packets pkCursor=2 (CSR_TYPE_ERASER) — PS
++     * switches to its Eraser tool off the cursor type. Without a cursor table PS gets 0
++     * for every query and won't build a stroke at all. */
 +    {
-+        static const WCHAR SZ_CURSOR_NAME[] =
++        static const WCHAR SZ_PEN_NAME[] =
 +            {'W','i','n','e',' ','T','a','b','l','e','t',' ','P','e','n',0};
++        static const WCHAR SZ_ERASER_NAME[] =
++            {'W','i','n','e',' ','T','a','b','l','e','t',' ','E','r','a','s','e','r',0};
 +        static const WCHAR SZ_DEVICE_NAME[] =
 +            {'W','i','n','e',' ','T','a','b','l','e','t',' ','D','e','v','i','c','e',0};
++        WTI_CURSORS_INFO *pen = &gSysCursor[WINTAB_CURSOR_PEN];
++        WTI_CURSORS_INFO *era = &gSysCursor[WINTAB_CURSOR_ERASER];
++
 +        wcscpy(gSysDevice.NAME, SZ_DEVICE_NAME);
-+        gSysDevice.NCSRTYPES = 1;
++        /* NEUTRON (2026-07-16): NCSRTYPES is the SLOT SPAN from FIRSTCSR, not a count of
++         * active cursors. The eraser lives at the Wacom-convention slot 2 (see the
++         * WINTAB_CURSOR_* enum) with slot 1 deliberately inactive, so the span is 3.
++         * Declaring 2 told PS the cursors are [0,1] and the eraser at slot 2 was NEVER
++         * ENUMERATED: PS initialised cursor 0 (the pen) when it opened the context ->
++         * pen warm -> pen never strays, while the eraser stayed unknown until its first
++         * pkCursor=2 packet arrived at the first flip. That exactly matches the surviving
++         * bug: pen clean, eraser strays on its first use only, every run. Wacom's own
++         * layout is slot 0 puck / 1 pen / 2 eraser = NCSRTYPES 3 with inactive slots
++         * allowed, which is why ACTIVE exists per slot. */
++        gSysDevice.NCSRTYPES = WINTAB_NUM_CURSORS;   /* slot SPAN: 0..2 (slot 1 inactive) */
 +        gSysDevice.FIRSTCSR  = 0;
 +
-+        memset(&gSysCursor, 0, sizeof(gSysCursor));
-+        wcscpy(gSysCursor.NAME, SZ_CURSOR_NAME);
-+        gSysCursor.ACTIVE       = TRUE;
-+        gSysCursor.PKTDATA      = gSysContext.lcPktData;
-+        gSysCursor.BUTTONS      = 1;
-+        gSysCursor.BUTTONBITS   = 1;
-+        gSysCursor.NPBUTTON     = 1;
-+        gSysCursor.NPBTNMARKS[0] = 0;
-+        gSysCursor.NPBTNMARKS[1] = 1;
-+        gSysCursor.CAPABILITIES = CRC_MULTIMODE;
-+        gSysCursor.TYPE         = CSR_TYPE_PEN;
-+        gSysCursor.PHYSID       = 1;
-+        gSysCursor.SYSBTNMAP[0] = 1;   /* tip -> left mouse button */
++        memset(gSysCursor, 0, sizeof(gSysCursor));
++        wcscpy(pen->NAME, SZ_PEN_NAME);
++        pen->ACTIVE       = TRUE;
++        pen->PKTDATA      = gSysContext.lcPktData;
++        pen->BUTTONS      = 1;
++        pen->BUTTONBITS   = 1;
++        pen->NPBUTTON     = 1;
++        pen->NPBTNMARKS[0] = 0;
++        pen->NPBTNMARKS[1] = 1;
++        pen->CAPABILITIES = CRC_MULTIMODE;
++        pen->TYPE         = CSR_TYPE_PEN;
++        pen->PHYSID       = 1;
++        pen->SYSBTNMAP[0] = 1;   /* tip -> left mouse button */
++
++        *era = *pen;             /* eraser mirrors the pen, then override identity */
++        wcscpy(era->NAME, SZ_ERASER_NAME);
++        era->TYPE   = CSR_TYPE_ERASER;
++        era->PHYSID = 2;
 +    }
 +
 +    return TRUE;
@@ -2445,7 +2939,7 @@ index 0000000..0eebb85
 +                    rc = CopyTabletData(lpOutput, &num,sizeof(num));
 +                    break;
 +                case IFC_NCURSORS:
-+                    num = 1;
++                    num = WINTAB_NUM_CURSORS;   /* slot span 0..2; slot 1 inactive (see NCSRTYPES) */
 +                    rc = CopyTabletData(lpOutput, &num,sizeof(num));
 +                    break;
 +                default:
@@ -2603,64 +3097,69 @@ index 0000000..0eebb85
 +                    rc = 0;
 +            }
 +            break;
-+        case WTI_CURSORS:   /* NEUTRON: slot 0 = the pen (matches pkCursor=0 in our packets) */
-+            if (!gSysCursor.ACTIVE) { rc = 0; break; }
++        case WTI_CURSORS:       /* slot 0 = pen (pkCursor=0) */
++        case WTI_CURSORS + 1:   /* slot 1 = inactive */
++        case WTI_CURSORS + 2:   /* slot 2 = eraser (pkCursor=2) */
++        {
++            WTI_CURSORS_INFO *cur = &gSysCursor[wCategory - WTI_CURSORS];
++            if (!cur->ACTIVE) { rc = 0; break; }   /* apps poll slots; inactive returns 0 */
 +            switch (nIndex)
 +            {
 +                case CSR_NAME:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.NAME,
-+                                        (wcslen(gSysCursor.NAME)+1) * sizeof(WCHAR));
++                    rc = CopyTabletData(lpOutput, cur->NAME,
++                                        (wcslen(cur->NAME)+1) * sizeof(WCHAR));
 +                    break;
 +                case CSR_ACTIVE:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.ACTIVE, sizeof(BOOL));
++                    rc = CopyTabletData(lpOutput, &cur->ACTIVE, sizeof(BOOL));
 +                    break;
 +                case CSR_PKTDATA:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.PKTDATA, sizeof(WTPKT));
++                    rc = CopyTabletData(lpOutput, &cur->PKTDATA, sizeof(WTPKT));
 +                    break;
 +                case CSR_BUTTONS:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.BUTTONS, sizeof(BYTE));
++                    rc = CopyTabletData(lpOutput, &cur->BUTTONS, sizeof(BYTE));
 +                    break;
 +                case CSR_BUTTONBITS:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.BUTTONBITS, sizeof(BYTE));
++                    rc = CopyTabletData(lpOutput, &cur->BUTTONBITS, sizeof(BYTE));
 +                    break;
 +                case CSR_BUTTONMAP:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.BUTTONMAP, sizeof(BYTE)*32);
++                    rc = CopyTabletData(lpOutput, cur->BUTTONMAP, sizeof(BYTE)*32);
 +                    break;
 +                case CSR_SYSBTNMAP:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.SYSBTNMAP, sizeof(BYTE)*32);
++                    rc = CopyTabletData(lpOutput, cur->SYSBTNMAP, sizeof(BYTE)*32);
 +                    break;
 +                case CSR_NPBUTTON:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.NPBUTTON, sizeof(BYTE));
++                    rc = CopyTabletData(lpOutput, &cur->NPBUTTON, sizeof(BYTE));
 +                    break;
 +                case CSR_NPBTNMARKS:
-+                    rc = CopyTabletData(lpOutput, gSysCursor.NPBTNMARKS, sizeof(UINT)*2);
++                    rc = CopyTabletData(lpOutput, cur->NPBTNMARKS, sizeof(UINT)*2);
 +                    break;
 +                case CSR_CAPABILITIES:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.CAPABILITIES, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->CAPABILITIES, sizeof(UINT));
 +                    break;
 +                case CSR_TYPE:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.TYPE, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->TYPE, sizeof(UINT));
 +                    break;
 +                case CSR_PHYSID:
 +                {
-+                    DWORD id = gSysCursor.PHYSID;
++                    DWORD id = cur->PHYSID;
 +                    rc = CopyTabletData(lpOutput, &id, sizeof(DWORD));
 +                    break;
 +                }
 +                case CSR_MODE:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.MODE, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->MODE, sizeof(UINT));
 +                    break;
 +                case CSR_MINPKTDATA:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.MINPKTDATA, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->MINPKTDATA, sizeof(UINT));
 +                    break;
 +                case CSR_MINBUTTONS:
-+                    rc = CopyTabletData(lpOutput, &gSysCursor.MINBUTTONS, sizeof(UINT));
++                    rc = CopyTabletData(lpOutput, &cur->MINBUTTONS, sizeof(UINT));
 +                    break;
 +                default:
 +                    FIXME("WTI_CURSORS unhandled index %i\n", nIndex);
 +                    rc = 0;
 +            }
 +            break;
++        }
 +        case WTI_DEVICES:
 +            switch (nIndex)
 +            {
@@ -2720,11 +3219,12 @@ index 0000000..0eebb85
 +                                        sizeof(AXIS));
 +                    break;
 +                case DVC_Z:
-+                    rc = 0; /* unsupported */
-+                    /*
++                    /* NEUTRON (2026-07-16): we STREAM pkZ (PS's lcPktData 0x1FFC INCLUDES
++                     * PK_Z) but used to answer "no such axis" here — so any PS code
++                     * calibrating z against the declared axis range divided by a zero
++                     * extent. Declare it, matching the real Wacom's 0..1023. */
 +                    rc = CopyTabletData(lpOutput,&gSysDevice.Z,
 +                                        sizeof(AXIS));
-+                    */
 +                    break;
 +                case DVC_NPRESSURE:
 +                    rc = CopyTabletData(lpOutput,&gSysDevice.NPRESSURE,
@@ -2802,8 +3302,99 @@ index 0000000..0eebb85
 +    }
 +    return 0;
 +}
+diff --git a/dlls/wintab32/context.c b/dlls/wintab32/context.c
+index bce9ca0..757e6c7 100644
+--- a/dlls/wintab32/context.c
++++ b/dlls/wintab32/context.c
+@@ -143,6 +143,25 @@ static LPOPENCONTEXT TABLET_FindOpenContext(HCTX hCtx)
+     return NULL;
+ }
+ 
++/* NEUTRON: find the first enabled context owned by hwnd, WITHOUT queuing a packet. Used for
++ * proximity-LEAVE delivery: a real driver queues no packet with the leave (the queue is empty
++ * at leave time, reference §2d), so we only need the context-match half of
++ * AddPacketToContextQueue to forward WT_PROXIMITY(lParam=0). */
++LPOPENCONTEXT TABLET_FindContextByOwner(HWND hwnd)
++{
++    LPOPENCONTEXT ptr;
++
++    EnterCriticalSection(&csTablet);
++    ptr = gOpenContexts;
++    while (ptr)
++    {
++        if (ptr->hwndOwner == hwnd && ptr->enabled) break;
++        ptr = ptr->next;
++    }
++    LeaveCriticalSection(&csTablet);
++    return ptr;
++}
++
+ static inline BOOL LoadTablet(void)
+ {
+     static enum {TI_START = 0, TI_OK, TI_FAIL} loaded = TI_START;
+@@ -185,7 +204,7 @@ static inline DWORD ScaleForContext(DWORD In, LONG InOrg, LONG InExt, LONG OutOr
+         return MulDiv(abs(InExt) - (In - InOrg), abs(OutExt), abs(InExt)) + OutOrg;
+ }
+ 
+-LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd)
++LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd, BOOL post_csrchange)
+ {
+     LPOPENCONTEXT ptr=NULL;
+ 
+@@ -234,23 +253,36 @@ LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd)
+ 
+             if (tgt == ptr->QueueSize)
+             {
+-                TRACE("Queue Overflow %p\n",ptr->handle);
+-                ptr->PacketQueue[tgt-1].pkStatus |= TPS_QUEUE_ERR;
++                /* NEUTRON (ground-truth, reference §4-#3): on overflow drop the OLDEST
++                 * packet, never the newest. The old drop-newest let a STALE entry-point
++                 * packet survive at the head while fresh contact packets were discarded,
++                 * so a slow drainer read the proximity-entry position at pen-down time
++                 * (the drain-rate-dependent stray line). Flag the queue error on the
++                 * newest surviving packet as before. */
++                TRACE("Queue Overflow %p - dropping oldest\n",ptr->handle);
++                memmove(ptr->PacketQueue, &ptr->PacketQueue[1],
++                        (ptr->QueueSize - 1) * sizeof(WTPACKET));
++                tgt = ptr->QueueSize - 1;
++                ptr->PacketsQueued = tgt;
++                packet->pkStatus |= TPS_QUEUE_ERR;
+             }
+-            else
++
++            TRACE("Placed in queue %p index %i\n",ptr->handle,tgt);
++            ptr->PacketQueue[tgt] = *packet;
++            ptr->PacketsQueued++;
++
++            /* NEUTRON (ground-truth): mid-stream cursor change still fires CSRCHANGE
++             * here; the proximity-ENTER path passes post_csrchange=FALSE and posts its
++             * own CSRCHANGE on EVERY entry (reference §2a: CSRCHANGE is an entry event,
++             * not merely a tool-change event), in the real driver's message order
++             * WT_PROXIMITY -> WT_CSRCHANGE -> WT_PACKET. */
++            if (ptr->ActiveCursor != packet->pkCursor)
+             {
+-                TRACE("Placed in queue %p index %i\n",ptr->handle,tgt);
+-                ptr->PacketQueue[tgt] = *packet;
+-                ptr->PacketsQueued++;
+-
+-                if (ptr->ActiveCursor != packet->pkCursor)
+-                {
+-                    ptr->ActiveCursor = packet->pkCursor;
+-                    if (ptr->context.lcOptions & CXO_CSRMESSAGES)
+-                        TABLET_PostTabletMessage(ptr, _WT_CSRCHANGE(ptr->context.lcMsgBase),
+-                          (WPARAM)packet->pkSerialNumber, (LPARAM)ptr->handle,
+-                            FALSE);
+-                }
++                ptr->ActiveCursor = packet->pkCursor;
++                if (post_csrchange && (ptr->context.lcOptions & CXO_CSRMESSAGES))
++                    TABLET_PostTabletMessage(ptr, _WT_CSRCHANGE(ptr->context.lcMsgBase),
++                      (WPARAM)packet->pkSerialNumber, (LPARAM)ptr->handle,
++                        FALSE);
+             }
+             break;
+          }
 diff --git a/dlls/wintab32/wintab32.c b/dlls/wintab32/wintab32.c
-index 1f1e720..be849e8 100644
+index 1f1e720c721..d157b415e15 100644
 --- a/dlls/wintab32/wintab32.c
 +++ b/dlls/wintab32/wintab32.c
 @@ -66,15 +66,60 @@ static VOID TABLET_Unregister(void)
@@ -2868,4 +3459,89 @@ index 1f1e720..be849e8 100644
 +
      return TRUE;
  }
+ 
+@@ -125,7 +170,7 @@ static LRESULT WINAPI TABLET_WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
+                 LPOPENCONTEXT handler;
+                 if (NtUserMessageCall(hwnd, NtUserWintabPacket, 0, 0, &packet, NtUserWintabDriverCall, FALSE))
+                 {
+-                    handler = AddPacketToContextQueue(&packet,(HWND)lParam);
++                    handler = AddPacketToContextQueue(&packet,(HWND)lParam, TRUE);
+                     if (handler && handler->context.lcOptions & CXO_MESSAGES)
+                        TABLET_PostTabletMessage(handler, _WT_PACKET(handler->context.lcMsgBase),
+                                    (WPARAM)packet.pkSerialNumber,
+@@ -135,14 +180,53 @@ static LRESULT WINAPI TABLET_WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
+             }
+         case WT_PROXIMITY:
+             {
++                /* NEUTRON (ground-truth fix, reference §2a/§2d): reproduce the real Wacom
++                 * driver's proximity contract exactly.
++                 * ENTER (LOWORD(lParam) != 0): the driver queued EXACTLY ONE entry packet
++                 * (real entry x/y, btn=0, pkChanged=0 so it can never set the app's
++                 * position anchor). Pop it, queue it, then post to the app IN ORDER:
++                 * WT_PROXIMITY(lParam=0x00010001) -> WT_CSRCHANGE(entry serial, on EVERY
++                 * enter — it is an entry event, not just a tool change) -> WT_PACKET(same
++                 * serial; if the app consumed the packet in its CSRCHANGE handler, its
++                 * WTPacket() call simply returns FALSE, as on Windows).
++                 * LEAVE: the driver queued NOTHING (queue empty at leave, §2d); just
++                 * forward WT_PROXIMITY with lParam=0. */
+                 WTPACKET packet;
+                 LPOPENCONTEXT handler;
+-                if (NtUserMessageCall(hwnd, NtUserWintabPacket, 0, 0, &packet, NtUserWintabDriverCall, FALSE))
++                if (LOWORD(lParam))
+                 {
+-                    handler = AddPacketToContextQueue(&packet,(HWND)wParam);
+-                    if (handler)
++                    if (NtUserMessageCall(hwnd, NtUserWintabPacket, 0, 0, &packet, NtUserWintabDriverCall, FALSE))
++                    {
++                        handler = AddPacketToContextQueue(&packet, (HWND)wParam, FALSE);
++                        if (handler)
++                        {
++                            TRACE("neutron-pen: PROXIMITY enter serial=%u cur=%u chg=%#lx\n",
++                                  packet.pkSerialNumber, packet.pkCursor, packet.pkChanged);
++                            TABLET_PostTabletMessage(handler, WT_PROXIMITY,
++                                                     (WPARAM)handler->handle, lParam, TRUE);
++                            if (handler->context.lcOptions & CXO_CSRMESSAGES)
++                                TABLET_PostTabletMessage(handler, _WT_CSRCHANGE(handler->context.lcMsgBase),
++                                                         (WPARAM)packet.pkSerialNumber,
++                                                         (LPARAM)handler->handle, FALSE);
++                            if (handler->context.lcOptions & CXO_MESSAGES)
++                                TABLET_PostTabletMessage(handler, _WT_PACKET(handler->context.lcMsgBase),
++                                                         (WPARAM)packet.pkSerialNumber,
++                                                         (LPARAM)handler->handle, FALSE);
++                        }
++                    }
++                    else if ((handler = TABLET_FindContextByOwner((HWND)wParam)))
++                    {
++                        /* No entry packet available (should not happen) — still arm the app. */
++                        WARN("proximity enter without a queued entry packet\n");
+                         TABLET_PostTabletMessage(handler, WT_PROXIMITY,
+-                                                (WPARAM)handler->handle, lParam, TRUE);
++                                                 (WPARAM)handler->handle, lParam, TRUE);
++                    }
++                }
++                else if ((handler = TABLET_FindContextByOwner((HWND)wParam)))
++                {
++                    TRACE("neutron-pen: PROXIMITY leave\n");
++                    TABLET_PostTabletMessage(handler, WT_PROXIMITY,
++                                             (WPARAM)handler->handle, lParam, TRUE);
+                 }
+                 return 0;
+             }
+diff --git a/dlls/wintab32/wintab_internal.h b/dlls/wintab32/wintab_internal.h
+index e230f0c1389..7156ad1b52b 100644
+--- a/dlls/wintab32/wintab_internal.h
++++ b/dlls/wintab32/wintab_internal.h
+@@ -149,7 +149,12 @@ typedef struct tagOPENCONTEXT
+ HWND TABLET_GetInternalWindow(void);
+ int TABLET_PostTabletMessage(LPOPENCONTEXT newcontext, UINT msg, WPARAM wParam,
+                              LPARAM lParam, BOOL send_always);
+-LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd);
++/* post_csrchange: TRUE = post WT_CSRCHANGE when the packet's cursor differs from
++ * ActiveCursor (normal WT_PACKET path). FALSE = update ActiveCursor silently; the
++ * caller posts the CSRCHANGE itself (proximity-ENTER path, which must fire it on
++ * EVERY entry in the order PROXIMITY -> CSRCHANGE -> PACKET, reference §2a). */
++LPOPENCONTEXT AddPacketToContextQueue(LPWTPACKET packet, HWND hwnd, BOOL post_csrchange);
++LPOPENCONTEXT TABLET_FindContextByOwner(HWND hwnd);
+ 
+ extern CRITICAL_SECTION csTablet;
  
