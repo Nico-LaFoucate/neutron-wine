@@ -289,6 +289,22 @@ DetachStream/DetachBuffer/FlushAsync). Fresh prefixes auto-register the new clas
 Validated end-to-end through the real WinML binary and confirmed live: LrC AI Denoise runs, "code 1"
 gone. Upstreamable. Touches: `dlls/windows.storage/*`, `dlls/wintypes/storage.c`.
 
+### `neutron-win32u-setwindowplacement-noclamp.mypatch`
+Lets `SetWindowPlacement` honor full 32-bit rects, fixing scroll-content windows wider/taller than
+32,767 px. Win32's `SetWindowPos` clamps coordinates to signed 16-bit — on Windows too — so apps that
+need larger extents use `SetWindowPlacement` as the documented 32-bit escape hatch. Adobe's
+scroll views (Lightroom's filmstrip, large grid views) size a scroll-content **child** window to the
+full content extent this way (a 1113-photo filmstrip ≈ 131k px), then read `GetWindowRect` back to
+compute the scrollbar. Wine's `NtUserSetWindowPlacement` forwards into `NtUserSetWindowPos`, which
+clamped to 32,767 (in `set_window_pos` + `fixup_swp_flags`) — defeating Adobe's workaround and capping
+the filmstrip at ~photo 278/1113. Fix: a private `SWP_NEUTRON_NOCLAMP` flag set only on the
+`SetWindowPlacement` path skips the 16-bit clamp (leaving `SetWindowPos`'s clamp intact = matches
+Windows) and is masked off before the app/server see `winpos->flags`; also skips the child-coord
+`make_rect_onscreen` snap for `WS_CHILD`. Root cause traced to Lightroom's scroll views sizing a
+child window through `SetWindowPlacement`; confirmed live — all 1113 filmstrip photos scroll. Upstreamable.
+Touches: `dlls/win32u/window.c`. (Applies after `neutron-cep-child-surface` which also touches this
+file; order-safe.)
+
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
 ### `neutron-present-timing.mypatch`
