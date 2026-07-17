@@ -266,6 +266,29 @@ frame), so under a fractional-scale prefix (`LogPixels`≠96) every cross-proces
 (this is the "PS 2026 reports a ~2.6e7 corner" measurement). Do the arithmetic in signed 64-bit.
 Touches: `server/user.h`.
 
+### `neutron-winrt-memstream.mypatch`
+Implements the WinRT in-memory stream stack that Adobe Camera Raw's `WML_LoadFromData` (AI Denoise,
+Select Subject/Sky masks — and likely PS neural filters) builds on. Adobe's path: activate
+`Windows.Storage.Streams.InMemoryRandomAccessStream` → wrap with a `DataWriter` → `WriteBytes(model)`
+→ `StoreAsync` → `RandomAccessStreamReference.CreateFromStream` → `LearningModel.LoadFromStream(ref)`;
+the real `Microsoft.AI.MachineLearning.dll` then `OpenReadAsync()`s the ref and reads the model bytes.
+Upstream Wine had none of the producer half — `InMemoryRandomAccessStream` unregistered, `CreateFromStream`
+an `E_NOTIMPL` stub, and wintypes `DataWriter` a pure `IActivationFactory` skeleton with **no**
+`IDataWriterFactory` (so `RoGetActivationFactory(DataWriter, IDataWriterFactory)` → `E_NOINTERFACE`) —
+so `WML_LoadFromData` failed with Adobe "code 1" on every attempt. Everything downstream (DirectML on
+vkd3d-proton, D3D12 compute-queue device via the native `ILearningModelDeviceFactoryNative` route,
+session, Evaluate) already worked. Adds `dlls/windows.storage/memstream.c` (the `InMemoryRandomAccessStream`
+object over shared refcounted bytes — IRandomAccessStream + IInputStream/IOutputStream + IClosable +
+IContentTypeProvider + IRandomAccessStreamWithContentType; the stream reference; `CreateFromStream`; and
+four **born-completed** async operations that invoke the completion handler inline so C++/WinRT `.get()`
+returns), wires it in `main.c`/`streams.c`/`private.h`/`classes.idl`/`Makefile.in`, and rewrites
+`dlls/wintypes/storage.c` into a functional `DataWriter` (`CreateDataWriter` + WriteByte/Bytes/Buffer/
+numeric/String buffering + `StoreAsync` flushing to the stream's `WriteAsync` via a wintypes `Buffer` +
+DetachStream/DetachBuffer/FlushAsync). Fresh prefixes auto-register the new class via `classes.idl`
+(`#pragma makedep register`) at wineboot; existing prefixes need the `ActivatableClassId` key added.
+Validated end-to-end through the real WinML binary and confirmed live: LrC AI Denoise runs, "code 1"
+gone. Upstreamable. Touches: `dlls/windows.storage/*`, `dlls/wintypes/storage.c`.
+
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
 ### `neutron-present-timing.mypatch`

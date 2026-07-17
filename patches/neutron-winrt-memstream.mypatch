@@ -1,0 +1,2314 @@
+diff --git a/dlls/windows.storage/memstream.c b/dlls/windows.storage/memstream.c
+new file mode 100644
+--- /dev/null
++++ b/dlls/windows.storage/memstream.c
+@@ -0,0 +1,1451 @@
++/* WinRT Windows.Storage.Streams.InMemoryRandomAccessStream Implementation
++ *
++ * Copyright (C) 2026 Neutron
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "private.h"
++
++#include "initguid.h"
++#include "robuffer.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(storage);
++
++/* ===================================================================
++ * Shared, refcounted byte storage backing a family of memory streams.
++ * A stream reference and every clone/view share the same bytes; each
++ * stream object keeps its own cursor position.
++ * =================================================================== */
++struct stream_data
++{
++    LONG ref;
++    BYTE *bytes;
++    UINT64 size;
++    UINT64 capacity;
++};
++
++static struct stream_data *stream_data_create( void )
++{
++    struct stream_data *data;
++    if (!(data = calloc( 1, sizeof(*data) ))) return NULL;
++    data->ref = 1;
++    return data;
++}
++
++static struct stream_data *stream_data_addref( struct stream_data *data )
++{
++    InterlockedIncrement( &data->ref );
++    return data;
++}
++
++static void stream_data_release( struct stream_data *data )
++{
++    if (!InterlockedDecrement( &data->ref ))
++    {
++        free( data->bytes );
++        free( data );
++    }
++}
++
++static HRESULT stream_data_reserve( struct stream_data *data, UINT64 needed )
++{
++    UINT64 capacity = data->capacity ? data->capacity : 256;
++    BYTE *bytes;
++
++    if (needed <= data->capacity) return S_OK;
++    while (capacity < needed) capacity *= 2;
++    if (!(bytes = realloc( data->bytes, capacity ))) return E_OUTOFMEMORY;
++    data->bytes = bytes;
++    data->capacity = capacity;
++    return S_OK;
++}
++
++/* Shared IAsyncInfo tail for our born-completed async operations. All of
++ * ours complete synchronously with S_OK, so the info surface is constant. */
++#define DEFINE_COMPLETED_ASYNC_INFO( pfx, container, info_member, main_member )                     \
++    static inline struct container *info_impl_from_##pfx( IAsyncInfo *iface )                       \
++    {                                                                                              \
++        return CONTAINING_RECORD( iface, struct container, info_member );                           \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )    \
++    {                                                                                              \
++        struct container *impl = info_impl_from_##pfx( iface );                                     \
++        return IInspectable_QueryInterface( (IInspectable *)&impl->main_member, iid, out );         \
++    }                                                                                              \
++    static ULONG WINAPI pfx##_info_AddRef( IAsyncInfo *iface )                                      \
++    {                                                                                              \
++        struct container *impl = info_impl_from_##pfx( iface );                                     \
++        return IInspectable_AddRef( (IInspectable *)&impl->main_member );                           \
++    }                                                                                              \
++    static ULONG WINAPI pfx##_info_Release( IAsyncInfo *iface )                                     \
++    {                                                                                              \
++        struct container *impl = info_impl_from_##pfx( iface );                                     \
++        return IInspectable_Release( (IInspectable *)&impl->main_member );                          \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids )         \
++    {                                                                                              \
++        FIXME( "iface %p stub!\n", iface );                                                         \
++        return E_NOTIMPL;                                                                           \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name )        \
++    {                                                                                              \
++        FIXME( "iface %p stub!\n", iface );                                                         \
++        return E_NOTIMPL;                                                                           \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )          \
++    {                                                                                              \
++        *level = BaseTrust;                                                                         \
++        return S_OK;                                                                                \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_get_Id( IAsyncInfo *iface, UINT32 *id )                        \
++    {                                                                                              \
++        *id = 1;                                                                                    \
++        return S_OK;                                                                                \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )           \
++    {                                                                                              \
++        *status = Completed;                                                                        \
++        return S_OK;                                                                                \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error )             \
++    {                                                                                              \
++        *error = S_OK;                                                                              \
++        return S_OK;                                                                                \
++    }                                                                                              \
++    static HRESULT WINAPI pfx##_info_Cancel( IAsyncInfo *iface ) { return S_OK; }                   \
++    static HRESULT WINAPI pfx##_info_Close( IAsyncInfo *iface ) { return S_OK; }                    \
++    static const struct IAsyncInfoVtbl pfx##_info_vtbl =                                            \
++    {                                                                                              \
++        pfx##_info_QueryInterface, pfx##_info_AddRef, pfx##_info_Release,                           \
++        pfx##_info_GetIids, pfx##_info_GetRuntimeClassName, pfx##_info_GetTrustLevel,               \
++        pfx##_info_get_Id, pfx##_info_get_Status, pfx##_info_get_ErrorCode,                         \
++        pfx##_info_Cancel, pfx##_info_Close,                                                        \
++    };
++
++/* ===================================================================
++ * IAsyncOperationWithProgress<IBuffer*, UINT32> — result of ReadAsync.
++ * =================================================================== */
++struct async_read
++{
++    IAsyncOperationWithProgress_IBuffer_UINT32 IAsyncOperationWithProgress_IBuffer_UINT32_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    IBuffer *result;
++    IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32 *handler;
++};
++
++DEFINE_COMPLETED_ASYNC_INFO( async_read, async_read, IAsyncInfo_iface,
++                             IAsyncOperationWithProgress_IBuffer_UINT32_iface )
++
++static inline struct async_read *impl_from_async_read( IAsyncOperationWithProgress_IBuffer_UINT32 *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_read, IAsyncOperationWithProgress_IBuffer_UINT32_iface );
++}
++
++static HRESULT WINAPI async_read_QueryInterface( IAsyncOperationWithProgress_IBuffer_UINT32 *iface, REFIID iid, void **out )
++{
++    struct async_read *impl = impl_from_async_read( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperationWithProgress_IBuffer_UINT32 ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperationWithProgress_IBuffer_UINT32_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI async_read_AddRef( IAsyncOperationWithProgress_IBuffer_UINT32 *iface )
++{
++    struct async_read *impl = impl_from_async_read( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI async_read_Release( IAsyncOperationWithProgress_IBuffer_UINT32 *iface )
++{
++    struct async_read *impl = impl_from_async_read( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32_Release( impl->handler );
++        if (impl->result) IBuffer_Release( impl->result );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI async_read_GetIids( IAsyncOperationWithProgress_IBuffer_UINT32 *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_read_GetRuntimeClassName( IAsyncOperationWithProgress_IBuffer_UINT32 *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_read_GetTrustLevel( IAsyncOperationWithProgress_IBuffer_UINT32 *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI async_read_put_Progress( IAsyncOperationWithProgress_IBuffer_UINT32 *iface,
++        IAsyncOperationProgressHandler_IBuffer_UINT32 *handler )
++{
++    return S_OK;
++}
++static HRESULT WINAPI async_read_get_Progress( IAsyncOperationWithProgress_IBuffer_UINT32 *iface,
++        IAsyncOperationProgressHandler_IBuffer_UINT32 **handler )
++{
++    *handler = NULL;
++    return S_OK;
++}
++static HRESULT WINAPI async_read_put_Completed( IAsyncOperationWithProgress_IBuffer_UINT32 *iface,
++        IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32 *handler )
++{
++    struct async_read *impl = impl_from_async_read( iface );
++
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if ((impl->handler = handler))
++    {
++        IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32_AddRef( handler );
++        IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32_Invoke( handler, iface, Completed );
++    }
++    return S_OK;
++}
++static HRESULT WINAPI async_read_get_Completed( IAsyncOperationWithProgress_IBuffer_UINT32 *iface,
++        IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32 **handler )
++{
++    struct async_read *impl = impl_from_async_read( iface );
++    if ((*handler = impl->handler)) IAsyncOperationWithProgressCompletedHandler_IBuffer_UINT32_AddRef( *handler );
++    return S_OK;
++}
++static HRESULT WINAPI async_read_GetResults( IAsyncOperationWithProgress_IBuffer_UINT32 *iface, IBuffer **results )
++{
++    struct async_read *impl = impl_from_async_read( iface );
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    if ((*results = impl->result)) IBuffer_AddRef( impl->result );
++    return S_OK;
++}
++
++static const struct IAsyncOperationWithProgress_IBuffer_UINT32Vtbl async_read_vtbl =
++{
++    async_read_QueryInterface,
++    async_read_AddRef,
++    async_read_Release,
++    async_read_GetIids,
++    async_read_GetRuntimeClassName,
++    async_read_GetTrustLevel,
++    async_read_put_Progress,
++    async_read_get_Progress,
++    async_read_put_Completed,
++    async_read_get_Completed,
++    async_read_GetResults,
++};
++
++static HRESULT async_read_create( IBuffer *result, IAsyncOperationWithProgress_IBuffer_UINT32 **out )
++{
++    struct async_read *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperationWithProgress_IBuffer_UINT32_iface.lpVtbl = &async_read_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_read_info_vtbl;
++    impl->ref = 1;
++    if ((impl->result = result)) IBuffer_AddRef( result );
++
++    *out = &impl->IAsyncOperationWithProgress_IBuffer_UINT32_iface;
++    return S_OK;
++}
++
++/* ===================================================================
++ * IAsyncOperationWithProgress<UINT32, UINT32> — result of WriteAsync.
++ * =================================================================== */
++struct async_write
++{
++    IAsyncOperationWithProgress_UINT32_UINT32 IAsyncOperationWithProgress_UINT32_UINT32_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    UINT32 result;
++    IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32 *handler;
++};
++
++DEFINE_COMPLETED_ASYNC_INFO( async_write, async_write, IAsyncInfo_iface,
++                             IAsyncOperationWithProgress_UINT32_UINT32_iface )
++
++static inline struct async_write *impl_from_async_write( IAsyncOperationWithProgress_UINT32_UINT32 *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_write, IAsyncOperationWithProgress_UINT32_UINT32_iface );
++}
++
++static HRESULT WINAPI async_write_QueryInterface( IAsyncOperationWithProgress_UINT32_UINT32 *iface, REFIID iid, void **out )
++{
++    struct async_write *impl = impl_from_async_write( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperationWithProgress_UINT32_UINT32 ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperationWithProgress_UINT32_UINT32_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI async_write_AddRef( IAsyncOperationWithProgress_UINT32_UINT32 *iface )
++{
++    struct async_write *impl = impl_from_async_write( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI async_write_Release( IAsyncOperationWithProgress_UINT32_UINT32 *iface )
++{
++    struct async_write *impl = impl_from_async_write( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI async_write_GetIids( IAsyncOperationWithProgress_UINT32_UINT32 *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_write_GetRuntimeClassName( IAsyncOperationWithProgress_UINT32_UINT32 *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_write_GetTrustLevel( IAsyncOperationWithProgress_UINT32_UINT32 *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI async_write_put_Progress( IAsyncOperationWithProgress_UINT32_UINT32 *iface,
++        IAsyncOperationProgressHandler_UINT32_UINT32 *handler )
++{
++    return S_OK;
++}
++static HRESULT WINAPI async_write_get_Progress( IAsyncOperationWithProgress_UINT32_UINT32 *iface,
++        IAsyncOperationProgressHandler_UINT32_UINT32 **handler )
++{
++    *handler = NULL;
++    return S_OK;
++}
++static HRESULT WINAPI async_write_put_Completed( IAsyncOperationWithProgress_UINT32_UINT32 *iface,
++        IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32 *handler )
++{
++    struct async_write *impl = impl_from_async_write( iface );
++
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if ((impl->handler = handler))
++    {
++        IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32_AddRef( handler );
++        IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32_Invoke( handler, iface, Completed );
++    }
++    return S_OK;
++}
++static HRESULT WINAPI async_write_get_Completed( IAsyncOperationWithProgress_UINT32_UINT32 *iface,
++        IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32 **handler )
++{
++    struct async_write *impl = impl_from_async_write( iface );
++    if ((*handler = impl->handler)) IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32_AddRef( *handler );
++    return S_OK;
++}
++static HRESULT WINAPI async_write_GetResults( IAsyncOperationWithProgress_UINT32_UINT32 *iface, UINT32 *results )
++{
++    struct async_write *impl = impl_from_async_write( iface );
++    *results = impl->result;
++    return S_OK;
++}
++
++static const struct IAsyncOperationWithProgress_UINT32_UINT32Vtbl async_write_vtbl =
++{
++    async_write_QueryInterface,
++    async_write_AddRef,
++    async_write_Release,
++    async_write_GetIids,
++    async_write_GetRuntimeClassName,
++    async_write_GetTrustLevel,
++    async_write_put_Progress,
++    async_write_get_Progress,
++    async_write_put_Completed,
++    async_write_get_Completed,
++    async_write_GetResults,
++};
++
++static HRESULT async_write_create( UINT32 result, IAsyncOperationWithProgress_UINT32_UINT32 **out )
++{
++    struct async_write *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperationWithProgress_UINT32_UINT32_iface.lpVtbl = &async_write_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_write_info_vtbl;
++    impl->ref = 1;
++    impl->result = result;
++
++    *out = &impl->IAsyncOperationWithProgress_UINT32_UINT32_iface;
++    return S_OK;
++}
++
++/* ===================================================================
++ * IAsyncOperation<boolean> — result of FlushAsync.
++ * =================================================================== */
++struct async_bool
++{
++    IAsyncOperation_boolean IAsyncOperation_boolean_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    boolean result;
++    IAsyncOperationCompletedHandler_boolean *handler;
++};
++
++DEFINE_COMPLETED_ASYNC_INFO( async_bool, async_bool, IAsyncInfo_iface, IAsyncOperation_boolean_iface )
++
++static inline struct async_bool *impl_from_async_bool( IAsyncOperation_boolean *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_bool, IAsyncOperation_boolean_iface );
++}
++
++static HRESULT WINAPI async_bool_QueryInterface( IAsyncOperation_boolean *iface, REFIID iid, void **out )
++{
++    struct async_bool *impl = impl_from_async_bool( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperation_boolean ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperation_boolean_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI async_bool_AddRef( IAsyncOperation_boolean *iface )
++{
++    struct async_bool *impl = impl_from_async_bool( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG WINAPI async_bool_Release( IAsyncOperation_boolean *iface )
++{
++    struct async_bool *impl = impl_from_async_bool( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_boolean_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++
++static HRESULT WINAPI async_bool_GetIids( IAsyncOperation_boolean *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_bool_GetRuntimeClassName( IAsyncOperation_boolean *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_bool_GetTrustLevel( IAsyncOperation_boolean *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI async_bool_put_Completed( IAsyncOperation_boolean *iface, IAsyncOperationCompletedHandler_boolean *handler )
++{
++    struct async_bool *impl = impl_from_async_bool( iface );
++
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if ((impl->handler = handler))
++    {
++        IAsyncOperationCompletedHandler_boolean_AddRef( handler );
++        IAsyncOperationCompletedHandler_boolean_Invoke( handler, iface, Completed );
++    }
++    return S_OK;
++}
++static HRESULT WINAPI async_bool_get_Completed( IAsyncOperation_boolean *iface, IAsyncOperationCompletedHandler_boolean **handler )
++{
++    struct async_bool *impl = impl_from_async_bool( iface );
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_boolean_AddRef( *handler );
++    return S_OK;
++}
++static HRESULT WINAPI async_bool_GetResults( IAsyncOperation_boolean *iface, boolean *results )
++{
++    struct async_bool *impl = impl_from_async_bool( iface );
++    *results = impl->result;
++    return S_OK;
++}
++
++static const struct IAsyncOperation_booleanVtbl async_bool_vtbl =
++{
++    async_bool_QueryInterface,
++    async_bool_AddRef,
++    async_bool_Release,
++    async_bool_GetIids,
++    async_bool_GetRuntimeClassName,
++    async_bool_GetTrustLevel,
++    async_bool_put_Completed,
++    async_bool_get_Completed,
++    async_bool_GetResults,
++};
++
++static HRESULT async_bool_create( boolean result, IAsyncOperation_boolean **out )
++{
++    struct async_bool *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_boolean_iface.lpVtbl = &async_bool_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_bool_info_vtbl;
++    impl->ref = 1;
++    impl->result = result;
++
++    *out = &impl->IAsyncOperation_boolean_iface;
++    return S_OK;
++}
++
++/* ===================================================================
++ * The memory stream object itself. One shared byte buffer, per-object
++ * cursor. Exposes the full IRandomAccessStream contract plus the
++ * IRandomAccessStreamWithContentType facet that OpenReadAsync yields.
++ * =================================================================== */
++struct memory_stream
++{
++    IRandomAccessStreamWithContentType IRandomAccessStreamWithContentType_iface;
++    IRandomAccessStream IRandomAccessStream_iface;
++    IInputStream IInputStream_iface;
++    IOutputStream IOutputStream_iface;
++    IClosable IClosable_iface;
++    IContentTypeProvider IContentTypeProvider_iface;
++    LONG ref;
++
++    struct stream_data *data;
++    UINT64 position;
++    boolean can_write;
++};
++
++static const struct IRandomAccessStreamVtbl memory_stream_random_access_vtbl;
++
++static struct memory_stream *memory_stream_alloc( struct stream_data *data, UINT64 position, boolean can_write );
++
++static inline struct memory_stream *impl_from_IRandomAccessStream( IRandomAccessStream *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_stream, IRandomAccessStream_iface );
++}
++
++/* central QueryInterface shared by all facets */
++static HRESULT memory_stream_query_interface( struct memory_stream *impl, REFIID iid, void **out )
++{
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IRandomAccessStream ))
++    {
++        IInspectable_AddRef( (*out = &impl->IRandomAccessStream_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IRandomAccessStreamWithContentType ))
++    {
++        IInspectable_AddRef( (*out = &impl->IRandomAccessStreamWithContentType_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IInputStream ))
++    {
++        IInspectable_AddRef( (*out = &impl->IInputStream_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IOutputStream ))
++    {
++        IInspectable_AddRef( (*out = &impl->IOutputStream_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IClosable ))
++    {
++        IInspectable_AddRef( (*out = &impl->IClosable_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IContentTypeProvider ))
++    {
++        IInspectable_AddRef( (*out = &impl->IContentTypeProvider_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG memory_stream_addref( struct memory_stream *impl )
++{
++    return InterlockedIncrement( &impl->ref );
++}
++
++static ULONG memory_stream_release( struct memory_stream *impl )
++{
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        stream_data_release( impl->data );
++        free( impl );
++    }
++    return ref;
++}
++
++/* ---- IRandomAccessStream ---- */
++static HRESULT WINAPI random_access_QueryInterface( IRandomAccessStream *iface, REFIID iid, void **out )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++    return memory_stream_query_interface( impl, iid, out );
++}
++static ULONG WINAPI random_access_AddRef( IRandomAccessStream *iface )
++{
++    return memory_stream_addref( impl_from_IRandomAccessStream( iface ) );
++}
++static ULONG WINAPI random_access_Release( IRandomAccessStream *iface )
++{
++    return memory_stream_release( impl_from_IRandomAccessStream( iface ) );
++}
++static HRESULT WINAPI random_access_GetIids( IRandomAccessStream *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI random_access_GetRuntimeClassName( IRandomAccessStream *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Storage.Streams.InMemoryRandomAccessStream",
++                                ARRAY_SIZE(L"Windows.Storage.Streams.InMemoryRandomAccessStream") - 1, name );
++}
++static HRESULT WINAPI random_access_GetTrustLevel( IRandomAccessStream *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_get_Size( IRandomAccessStream *iface, UINT64 *value )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    TRACE( "iface %p, value %p.\n", iface, value );
++    *value = impl->data->size;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_put_Size( IRandomAccessStream *iface, UINT64 value )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    HRESULT hr;
++
++    TRACE( "iface %p, value %I64u.\n", iface, value );
++
++    if (FAILED(hr = stream_data_reserve( impl->data, value ))) return hr;
++    if (value > impl->data->size)
++        memset( impl->data->bytes + impl->data->size, 0, value - impl->data->size );
++    impl->data->size = value;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_GetInputStreamAt( IRandomAccessStream *iface, UINT64 position, IInputStream **stream )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    struct memory_stream *view;
++
++    TRACE( "iface %p, position %I64u, stream %p.\n", iface, position, stream );
++
++    if (!(view = memory_stream_alloc( stream_data_addref( impl->data ), position, impl->can_write )))
++    {
++        stream_data_release( impl->data );
++        return E_OUTOFMEMORY;
++    }
++    *stream = &view->IInputStream_iface;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_GetOutputStreamAt( IRandomAccessStream *iface, UINT64 position, IOutputStream **stream )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    struct memory_stream *view;
++
++    TRACE( "iface %p, position %I64u, stream %p.\n", iface, position, stream );
++
++    if (!(view = memory_stream_alloc( stream_data_addref( impl->data ), position, TRUE )))
++    {
++        stream_data_release( impl->data );
++        return E_OUTOFMEMORY;
++    }
++    *stream = &view->IOutputStream_iface;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_get_Position( IRandomAccessStream *iface, UINT64 *value )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    *value = impl->position;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_Seek( IRandomAccessStream *iface, UINT64 position )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    TRACE( "iface %p, position %I64u.\n", iface, position );
++    impl->position = position;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_CloneStream( IRandomAccessStream *iface, IRandomAccessStream **stream )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    struct memory_stream *view;
++
++    TRACE( "iface %p, stream %p.\n", iface, stream );
++
++    if (!(view = memory_stream_alloc( stream_data_addref( impl->data ), impl->position, impl->can_write )))
++    {
++        stream_data_release( impl->data );
++        return E_OUTOFMEMORY;
++    }
++    *stream = &view->IRandomAccessStream_iface;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_get_CanRead( IRandomAccessStream *iface, boolean *value )
++{
++    *value = TRUE;
++    return S_OK;
++}
++static HRESULT WINAPI random_access_get_CanWrite( IRandomAccessStream *iface, boolean *value )
++{
++    struct memory_stream *impl = impl_from_IRandomAccessStream( iface );
++    *value = impl->can_write;
++    return S_OK;
++}
++
++static const struct IRandomAccessStreamVtbl memory_stream_random_access_vtbl =
++{
++    random_access_QueryInterface,
++    random_access_AddRef,
++    random_access_Release,
++    random_access_GetIids,
++    random_access_GetRuntimeClassName,
++    random_access_GetTrustLevel,
++    random_access_get_Size,
++    random_access_put_Size,
++    random_access_GetInputStreamAt,
++    random_access_GetOutputStreamAt,
++    random_access_get_Position,
++    random_access_Seek,
++    random_access_CloneStream,
++    random_access_get_CanRead,
++    random_access_get_CanWrite,
++};
++
++/* ---- IRandomAccessStreamWithContentType (marker; IInspectable only) ---- */
++static inline struct memory_stream *impl_from_IRandomAccessStreamWithContentType( IRandomAccessStreamWithContentType *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_stream, IRandomAccessStreamWithContentType_iface );
++}
++static HRESULT WINAPI with_content_type_QueryInterface( IRandomAccessStreamWithContentType *iface, REFIID iid, void **out )
++{
++    return memory_stream_query_interface( impl_from_IRandomAccessStreamWithContentType( iface ), iid, out );
++}
++static ULONG WINAPI with_content_type_AddRef( IRandomAccessStreamWithContentType *iface )
++{
++    return memory_stream_addref( impl_from_IRandomAccessStreamWithContentType( iface ) );
++}
++static ULONG WINAPI with_content_type_Release( IRandomAccessStreamWithContentType *iface )
++{
++    return memory_stream_release( impl_from_IRandomAccessStreamWithContentType( iface ) );
++}
++static HRESULT WINAPI with_content_type_GetIids( IRandomAccessStreamWithContentType *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI with_content_type_GetRuntimeClassName( IRandomAccessStreamWithContentType *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI with_content_type_GetTrustLevel( IRandomAccessStreamWithContentType *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static const struct IRandomAccessStreamWithContentTypeVtbl memory_stream_with_content_type_vtbl =
++{
++    with_content_type_QueryInterface,
++    with_content_type_AddRef,
++    with_content_type_Release,
++    with_content_type_GetIids,
++    with_content_type_GetRuntimeClassName,
++    with_content_type_GetTrustLevel,
++};
++
++/* ---- IInputStream ---- */
++static inline struct memory_stream *impl_from_IInputStream( IInputStream *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_stream, IInputStream_iface );
++}
++static HRESULT WINAPI input_QueryInterface( IInputStream *iface, REFIID iid, void **out )
++{
++    return memory_stream_query_interface( impl_from_IInputStream( iface ), iid, out );
++}
++static ULONG WINAPI input_AddRef( IInputStream *iface )
++{
++    return memory_stream_addref( impl_from_IInputStream( iface ) );
++}
++static ULONG WINAPI input_Release( IInputStream *iface )
++{
++    return memory_stream_release( impl_from_IInputStream( iface ) );
++}
++static HRESULT WINAPI input_GetIids( IInputStream *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI input_GetRuntimeClassName( IInputStream *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI input_GetTrustLevel( IInputStream *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI input_ReadAsync( IInputStream *iface, IBuffer *buffer, UINT32 count,
++        InputStreamOptions options, IAsyncOperationWithProgress_IBuffer_UINT32 **operation )
++{
++    struct memory_stream *impl = impl_from_IInputStream( iface );
++    IBufferByteAccess *byte_access;
++    UINT32 capacity, to_read;
++    UINT64 available;
++    BYTE *dst;
++    HRESULT hr;
++
++    TRACE( "iface %p, buffer %p, count %u, options %#x, operation %p.\n", iface, buffer, count, options, operation );
++
++    *operation = NULL;
++    if (!buffer) return E_POINTER;
++    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&byte_access ))) return hr;
++    hr = IBufferByteAccess_Buffer( byte_access, &dst );
++    IBufferByteAccess_Release( byte_access );
++    if (FAILED(hr)) return hr;
++
++    if (FAILED(hr = IBuffer_get_Capacity( buffer, &capacity ))) return hr;
++    if (count > capacity) count = capacity;
++
++    available = impl->position < impl->data->size ? impl->data->size - impl->position : 0;
++    to_read = available < count ? (UINT32)available : count;
++    if (to_read) memcpy( dst, impl->data->bytes + impl->position, to_read );
++    impl->position += to_read;
++
++    if (FAILED(hr = IBuffer_put_Length( buffer, to_read ))) return hr;
++
++    return async_read_create( buffer, operation );
++}
++static const struct IInputStreamVtbl memory_stream_input_vtbl =
++{
++    input_QueryInterface,
++    input_AddRef,
++    input_Release,
++    input_GetIids,
++    input_GetRuntimeClassName,
++    input_GetTrustLevel,
++    input_ReadAsync,
++};
++
++/* ---- IOutputStream ---- */
++static inline struct memory_stream *impl_from_IOutputStream( IOutputStream *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_stream, IOutputStream_iface );
++}
++static HRESULT WINAPI output_QueryInterface( IOutputStream *iface, REFIID iid, void **out )
++{
++    return memory_stream_query_interface( impl_from_IOutputStream( iface ), iid, out );
++}
++static ULONG WINAPI output_AddRef( IOutputStream *iface )
++{
++    return memory_stream_addref( impl_from_IOutputStream( iface ) );
++}
++static ULONG WINAPI output_Release( IOutputStream *iface )
++{
++    return memory_stream_release( impl_from_IOutputStream( iface ) );
++}
++static HRESULT WINAPI output_GetIids( IOutputStream *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI output_GetRuntimeClassName( IOutputStream *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI output_GetTrustLevel( IOutputStream *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI output_WriteAsync( IOutputStream *iface, IBuffer *buffer,
++        IAsyncOperationWithProgress_UINT32_UINT32 **operation )
++{
++    struct memory_stream *impl = impl_from_IOutputStream( iface );
++    IBufferByteAccess *byte_access;
++    UINT32 length;
++    BYTE *src;
++    HRESULT hr;
++
++    TRACE( "iface %p, buffer %p, operation %p.\n", iface, buffer, operation );
++
++    *operation = NULL;
++    if (!buffer) return E_POINTER;
++    if (FAILED(hr = IBuffer_get_Length( buffer, &length ))) return hr;
++    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&byte_access ))) return hr;
++    hr = IBufferByteAccess_Buffer( byte_access, &src );
++    IBufferByteAccess_Release( byte_access );
++    if (FAILED(hr)) return hr;
++
++    if (length)
++    {
++        if (FAILED(hr = stream_data_reserve( impl->data, impl->position + length ))) return hr;
++        memcpy( impl->data->bytes + impl->position, src, length );
++        impl->position += length;
++        if (impl->position > impl->data->size) impl->data->size = impl->position;
++    }
++
++    return async_write_create( length, operation );
++}
++static HRESULT WINAPI output_FlushAsync( IOutputStream *iface, IAsyncOperation_boolean **operation )
++{
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++    return async_bool_create( TRUE, operation );
++}
++static const struct IOutputStreamVtbl memory_stream_output_vtbl =
++{
++    output_QueryInterface,
++    output_AddRef,
++    output_Release,
++    output_GetIids,
++    output_GetRuntimeClassName,
++    output_GetTrustLevel,
++    output_WriteAsync,
++    output_FlushAsync,
++};
++
++/* ---- IClosable ---- */
++static inline struct memory_stream *impl_from_IClosable( IClosable *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_stream, IClosable_iface );
++}
++static HRESULT WINAPI closable_QueryInterface( IClosable *iface, REFIID iid, void **out )
++{
++    return memory_stream_query_interface( impl_from_IClosable( iface ), iid, out );
++}
++static ULONG WINAPI closable_AddRef( IClosable *iface )
++{
++    return memory_stream_addref( impl_from_IClosable( iface ) );
++}
++static ULONG WINAPI closable_Release( IClosable *iface )
++{
++    return memory_stream_release( impl_from_IClosable( iface ) );
++}
++static HRESULT WINAPI closable_GetIids( IClosable *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI closable_GetRuntimeClassName( IClosable *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI closable_GetTrustLevel( IClosable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI closable_Close( IClosable *iface )
++{
++    TRACE( "iface %p.\n", iface );
++    return S_OK;
++}
++static const struct IClosableVtbl memory_stream_closable_vtbl =
++{
++    closable_QueryInterface,
++    closable_AddRef,
++    closable_Release,
++    closable_GetIids,
++    closable_GetRuntimeClassName,
++    closable_GetTrustLevel,
++    closable_Close,
++};
++
++/* ---- IContentTypeProvider ---- */
++static inline struct memory_stream *impl_from_IContentTypeProvider( IContentTypeProvider *iface )
++{
++    return CONTAINING_RECORD( iface, struct memory_stream, IContentTypeProvider_iface );
++}
++static HRESULT WINAPI content_type_QueryInterface( IContentTypeProvider *iface, REFIID iid, void **out )
++{
++    return memory_stream_query_interface( impl_from_IContentTypeProvider( iface ), iid, out );
++}
++static ULONG WINAPI content_type_AddRef( IContentTypeProvider *iface )
++{
++    return memory_stream_addref( impl_from_IContentTypeProvider( iface ) );
++}
++static ULONG WINAPI content_type_Release( IContentTypeProvider *iface )
++{
++    return memory_stream_release( impl_from_IContentTypeProvider( iface ) );
++}
++static HRESULT WINAPI content_type_GetIids( IContentTypeProvider *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI content_type_GetRuntimeClassName( IContentTypeProvider *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI content_type_GetTrustLevel( IContentTypeProvider *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI content_type_get_ContentType( IContentTypeProvider *iface, HSTRING *value )
++{
++    TRACE( "iface %p, value %p.\n", iface, value );
++    return WindowsCreateString( L"", 0, value );
++}
++static const struct IContentTypeProviderVtbl memory_stream_content_type_vtbl =
++{
++    content_type_QueryInterface,
++    content_type_AddRef,
++    content_type_Release,
++    content_type_GetIids,
++    content_type_GetRuntimeClassName,
++    content_type_GetTrustLevel,
++    content_type_get_ContentType,
++};
++
++static struct memory_stream *memory_stream_alloc( struct stream_data *data, UINT64 position, boolean can_write )
++{
++    struct memory_stream *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) )))
++        return NULL;
++    impl->IRandomAccessStreamWithContentType_iface.lpVtbl = &memory_stream_with_content_type_vtbl;
++    impl->IRandomAccessStream_iface.lpVtbl = &memory_stream_random_access_vtbl;
++    impl->IInputStream_iface.lpVtbl = &memory_stream_input_vtbl;
++    impl->IOutputStream_iface.lpVtbl = &memory_stream_output_vtbl;
++    impl->IClosable_iface.lpVtbl = &memory_stream_closable_vtbl;
++    impl->IContentTypeProvider_iface.lpVtbl = &memory_stream_content_type_vtbl;
++    impl->ref = 1;
++    impl->data = data;
++    impl->position = position;
++    impl->can_write = can_write;
++    return impl;
++}
++
++/* If iface is one of ours, return its shared data (not addref'd), else NULL. */
++static struct stream_data *memory_stream_data_from( IRandomAccessStream *iface )
++{
++    if (!iface || iface->lpVtbl != &memory_stream_random_access_vtbl) return NULL;
++    return impl_from_IRandomAccessStream( iface )->data;
++}
++
++static HRESULT async_stream_create( IRandomAccessStreamWithContentType *result,
++        IAsyncOperation_IRandomAccessStreamWithContentType **out );
++
++/* ===================================================================
++ * RandomAccessStreamReference produced by CreateFromStream. Holds the
++ * shared bytes; OpenReadAsync hands back a fresh read view.
++ * =================================================================== */
++struct stream_reference
++{
++    IRandomAccessStreamReference IRandomAccessStreamReference_iface;
++    LONG ref;
++    struct stream_data *data;
++};
++
++static inline struct stream_reference *impl_from_IRandomAccessStreamReference( IRandomAccessStreamReference *iface )
++{
++    return CONTAINING_RECORD( iface, struct stream_reference, IRandomAccessStreamReference_iface );
++}
++
++static HRESULT WINAPI stream_reference_QueryInterface( IRandomAccessStreamReference *iface, REFIID iid, void **out )
++{
++    struct stream_reference *impl = impl_from_IRandomAccessStreamReference( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IRandomAccessStreamReference ))
++    {
++        IInspectable_AddRef( (*out = &impl->IRandomAccessStreamReference_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI stream_reference_AddRef( IRandomAccessStreamReference *iface )
++{
++    struct stream_reference *impl = impl_from_IRandomAccessStreamReference( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI stream_reference_Release( IRandomAccessStreamReference *iface )
++{
++    struct stream_reference *impl = impl_from_IRandomAccessStreamReference( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        stream_data_release( impl->data );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI stream_reference_GetIids( IRandomAccessStreamReference *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI stream_reference_GetRuntimeClassName( IRandomAccessStreamReference *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Storage.Streams.RandomAccessStreamReference",
++                                ARRAY_SIZE(L"Windows.Storage.Streams.RandomAccessStreamReference") - 1, name );
++}
++static HRESULT WINAPI stream_reference_GetTrustLevel( IRandomAccessStreamReference *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI stream_reference_OpenReadAsync( IRandomAccessStreamReference *iface,
++        IAsyncOperation_IRandomAccessStreamWithContentType **operation )
++{
++    struct stream_reference *impl = impl_from_IRandomAccessStreamReference( iface );
++    struct memory_stream *view;
++    HRESULT hr;
++
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++
++    *operation = NULL;
++    if (!(view = memory_stream_alloc( stream_data_addref( impl->data ), 0, FALSE )))
++    {
++        stream_data_release( impl->data );
++        return E_OUTOFMEMORY;
++    }
++    hr = async_stream_create( &view->IRandomAccessStreamWithContentType_iface, operation );
++    IRandomAccessStreamWithContentType_Release( &view->IRandomAccessStreamWithContentType_iface );
++    return hr;
++}
++
++static const struct IRandomAccessStreamReferenceVtbl stream_reference_vtbl =
++{
++    stream_reference_QueryInterface,
++    stream_reference_AddRef,
++    stream_reference_Release,
++    stream_reference_GetIids,
++    stream_reference_GetRuntimeClassName,
++    stream_reference_GetTrustLevel,
++    stream_reference_OpenReadAsync,
++};
++
++/* ===================================================================
++ * IAsyncOperation<IRandomAccessStreamWithContentType*> — OpenReadAsync.
++ * (Defined after the stream so it can hold the concrete result type.)
++ * =================================================================== */
++struct async_stream
++{
++    IAsyncOperation_IRandomAccessStreamWithContentType IAsyncOperation_IRandomAccessStreamWithContentType_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    IRandomAccessStreamWithContentType *result;
++    IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType *handler;
++};
++
++DEFINE_COMPLETED_ASYNC_INFO( async_stream, async_stream, IAsyncInfo_iface,
++                             IAsyncOperation_IRandomAccessStreamWithContentType_iface )
++
++static inline struct async_stream *impl_from_async_stream( IAsyncOperation_IRandomAccessStreamWithContentType *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_stream, IAsyncOperation_IRandomAccessStreamWithContentType_iface );
++}
++static HRESULT WINAPI async_stream_QueryInterface( IAsyncOperation_IRandomAccessStreamWithContentType *iface, REFIID iid, void **out )
++{
++    struct async_stream *impl = impl_from_async_stream( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperation_IRandomAccessStreamWithContentType ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperation_IRandomAccessStreamWithContentType_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI async_stream_AddRef( IAsyncOperation_IRandomAccessStreamWithContentType *iface )
++{
++    struct async_stream *impl = impl_from_async_stream( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI async_stream_Release( IAsyncOperation_IRandomAccessStreamWithContentType *iface )
++{
++    struct async_stream *impl = impl_from_async_stream( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType_Release( impl->handler );
++        if (impl->result) IRandomAccessStreamWithContentType_Release( impl->result );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI async_stream_GetIids( IAsyncOperation_IRandomAccessStreamWithContentType *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_stream_GetRuntimeClassName( IAsyncOperation_IRandomAccessStreamWithContentType *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI async_stream_GetTrustLevel( IAsyncOperation_IRandomAccessStreamWithContentType *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI async_stream_put_Completed( IAsyncOperation_IRandomAccessStreamWithContentType *iface,
++        IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType *handler )
++{
++    struct async_stream *impl = impl_from_async_stream( iface );
++
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if ((impl->handler = handler))
++    {
++        IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType_AddRef( handler );
++        IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType_Invoke( handler, iface, Completed );
++    }
++    return S_OK;
++}
++static HRESULT WINAPI async_stream_get_Completed( IAsyncOperation_IRandomAccessStreamWithContentType *iface,
++        IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType **handler )
++{
++    struct async_stream *impl = impl_from_async_stream( iface );
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_IRandomAccessStreamWithContentType_AddRef( *handler );
++    return S_OK;
++}
++static HRESULT WINAPI async_stream_GetResults( IAsyncOperation_IRandomAccessStreamWithContentType *iface,
++        IRandomAccessStreamWithContentType **results )
++{
++    struct async_stream *impl = impl_from_async_stream( iface );
++    if ((*results = impl->result)) IRandomAccessStreamWithContentType_AddRef( impl->result );
++    return S_OK;
++}
++static const struct IAsyncOperation_IRandomAccessStreamWithContentTypeVtbl async_stream_vtbl =
++{
++    async_stream_QueryInterface,
++    async_stream_AddRef,
++    async_stream_Release,
++    async_stream_GetIids,
++    async_stream_GetRuntimeClassName,
++    async_stream_GetTrustLevel,
++    async_stream_put_Completed,
++    async_stream_get_Completed,
++    async_stream_GetResults,
++};
++
++static HRESULT async_stream_create( IRandomAccessStreamWithContentType *result,
++        IAsyncOperation_IRandomAccessStreamWithContentType **out )
++{
++    struct async_stream *impl;
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_IRandomAccessStreamWithContentType_iface.lpVtbl = &async_stream_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &async_stream_info_vtbl;
++    impl->ref = 1;
++    if ((impl->result = result)) IRandomAccessStreamWithContentType_AddRef( result );
++
++    *out = &impl->IAsyncOperation_IRandomAccessStreamWithContentType_iface;
++    return S_OK;
++}
++
++/* ===================================================================
++ * Entry points consumed by streams.c / main.c.
++ * =================================================================== */
++
++/* RandomAccessStreamReference.CreateFromStream */
++HRESULT memory_stream_reference_create( IRandomAccessStream *stream, IRandomAccessStreamReference **out )
++{
++    struct stream_reference *impl;
++    struct stream_data *data;
++
++    *out = NULL;
++    if (!stream) return E_POINTER;
++
++    if (!(data = memory_stream_data_from( stream )))
++    {
++        FIXME( "CreateFromStream over a foreign IRandomAccessStream %p is not supported yet.\n", stream );
++        return E_NOTIMPL;
++    }
++
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IRandomAccessStreamReference_iface.lpVtbl = &stream_reference_vtbl;
++    impl->ref = 1;
++    impl->data = stream_data_addref( data );
++
++    *out = &impl->IRandomAccessStreamReference_iface;
++    return S_OK;
++}
++
++/* ===================================================================
++ * InMemoryRandomAccessStream activation factory.
++ * =================================================================== */
++struct in_memory_stream_factory
++{
++    IActivationFactory IActivationFactory_iface;
++    LONG ref;
++};
++
++static inline struct in_memory_stream_factory *impl_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct in_memory_stream_factory, IActivationFactory_iface );
++}
++
++static HRESULT WINAPI in_memory_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct in_memory_stream_factory *impl = impl_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IInspectable_AddRef( (*out = &impl->IActivationFactory_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI in_memory_factory_AddRef( IActivationFactory *iface )
++{
++    struct in_memory_stream_factory *impl = impl_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG WINAPI in_memory_factory_Release( IActivationFactory *iface )
++{
++    struct in_memory_stream_factory *impl = impl_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++static HRESULT WINAPI in_memory_factory_GetIids( IActivationFactory *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI in_memory_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI in_memory_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *level )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI in_memory_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    struct memory_stream *impl;
++    struct stream_data *data;
++
++    TRACE( "iface %p, instance %p.\n", iface, instance );
++
++    *instance = NULL;
++    if (!(data = stream_data_create())) return E_OUTOFMEMORY;
++    if (!(impl = memory_stream_alloc( data, 0, TRUE )))
++    {
++        stream_data_release( data );
++        return E_OUTOFMEMORY;
++    }
++    *instance = (IInspectable *)&impl->IRandomAccessStream_iface;
++    return S_OK;
++}
++
++static const struct IActivationFactoryVtbl in_memory_factory_vtbl =
++{
++    in_memory_factory_QueryInterface,
++    in_memory_factory_AddRef,
++    in_memory_factory_Release,
++    in_memory_factory_GetIids,
++    in_memory_factory_GetRuntimeClassName,
++    in_memory_factory_GetTrustLevel,
++    in_memory_factory_ActivateInstance,
++};
++
++static struct in_memory_stream_factory in_memory_stream_factory =
++{
++    {&in_memory_factory_vtbl},
++    1,
++};
++
++IActivationFactory *in_memory_random_access_stream_factory = &in_memory_stream_factory.IActivationFactory_iface;
+diff --git a/dlls/windows.storage/streams.c b/dlls/windows.storage/streams.c
+--- a/dlls/windows.storage/streams.c
++++ b/dlls/windows.storage/streams.c
+@@ -133,12 +133,9 @@
+ static HRESULT WINAPI random_access_stream_reference_statics_CreateFromStream( IRandomAccessStreamReferenceStatics *iface, IRandomAccessStream *stream,
+                                                                                IRandomAccessStreamReference **stream_reference )
+ {
+-    FIXME( "iface %p, stream %p, stream_reference %p stub!\n", iface, stream, stream_reference );
++    TRACE( "iface %p, stream %p, stream_reference %p.\n", iface, stream, stream_reference );
+ 
+-    *stream_reference = NULL;
+-
+-    if (!stream) return E_POINTER;
+-    return E_NOTIMPL;
++    return memory_stream_reference_create( stream, stream_reference );
+ }
+ 
+ static const struct IRandomAccessStreamReferenceStaticsVtbl random_access_stream_reference_statics_vtbl =
+diff --git a/dlls/wintypes/storage.c b/dlls/wintypes/storage.c
+--- a/dlls/wintypes/storage.c
++++ b/dlls/wintypes/storage.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright 2022-2024 Zhiyi Zhang for CodeWeavers
+  * Copyright 2025 Jactry Zeng for CodeWeavers
++ * Copyright 2026 Neutron  (functional DataWriter implementation)
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -18,82 +19,665 @@
+  */
+ 
+ #include "private.h"
++#include "robuffer.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wintypes);
+ 
++/* ===================================================================
++ * IAsyncOperation<UINT32> — result of DataWriter.StoreAsync
++ * (born completed; data is committed synchronously).
++ * =================================================================== */
++struct store_async
++{
++    IAsyncOperation_UINT32 IAsyncOperation_UINT32_iface;
++    IAsyncInfo IAsyncInfo_iface;
++    LONG ref;
++    UINT32 result;
++    IAsyncOperationCompletedHandler_UINT32 *handler;
++};
++
++static inline struct store_async *impl_from_IAsyncOperation_UINT32( IAsyncOperation_UINT32 *iface )
++{
++    return CONTAINING_RECORD( iface, struct store_async, IAsyncOperation_UINT32_iface );
++}
++static inline struct store_async *impl_store_async_from_IAsyncInfo( IAsyncInfo *iface )
++{
++    return CONTAINING_RECORD( iface, struct store_async, IAsyncInfo_iface );
++}
++
++static HRESULT WINAPI store_async_QueryInterface( IAsyncOperation_UINT32 *iface, REFIID iid, void **out )
++{
++    struct store_async *impl = impl_from_IAsyncOperation_UINT32( iface );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IAsyncOperation_UINT32 ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperation_UINT32_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncInfo_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI store_async_AddRef( IAsyncOperation_UINT32 *iface )
++{
++    return InterlockedIncrement( &impl_from_IAsyncOperation_UINT32( iface )->ref );
++}
++static ULONG WINAPI store_async_Release( IAsyncOperation_UINT32 *iface )
++{
++    struct store_async *impl = impl_from_IAsyncOperation_UINT32( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->handler) IAsyncOperationCompletedHandler_UINT32_Release( impl->handler );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI store_async_GetIids( IAsyncOperation_UINT32 *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI store_async_GetRuntimeClassName( IAsyncOperation_UINT32 *iface, HSTRING *name )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI store_async_GetTrustLevel( IAsyncOperation_UINT32 *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI store_async_put_Completed( IAsyncOperation_UINT32 *iface, IAsyncOperationCompletedHandler_UINT32 *handler )
++{
++    struct store_async *impl = impl_from_IAsyncOperation_UINT32( iface );
++
++    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
++    if ((impl->handler = handler))
++    {
++        IAsyncOperationCompletedHandler_UINT32_AddRef( handler );
++        IAsyncOperationCompletedHandler_UINT32_Invoke( handler, iface, Completed );
++    }
++    return S_OK;
++}
++static HRESULT WINAPI store_async_get_Completed( IAsyncOperation_UINT32 *iface, IAsyncOperationCompletedHandler_UINT32 **handler )
++{
++    struct store_async *impl = impl_from_IAsyncOperation_UINT32( iface );
++    if ((*handler = impl->handler)) IAsyncOperationCompletedHandler_UINT32_AddRef( *handler );
++    return S_OK;
++}
++static HRESULT WINAPI store_async_GetResults( IAsyncOperation_UINT32 *iface, UINT32 *results )
++{
++    struct store_async *impl = impl_from_IAsyncOperation_UINT32( iface );
++    *results = impl->result;
++    return S_OK;
++}
++static const struct IAsyncOperation_UINT32Vtbl store_async_vtbl =
++{
++    store_async_QueryInterface,
++    store_async_AddRef,
++    store_async_Release,
++    store_async_GetIids,
++    store_async_GetRuntimeClassName,
++    store_async_GetTrustLevel,
++    store_async_put_Completed,
++    store_async_get_Completed,
++    store_async_GetResults,
++};
++
++static HRESULT WINAPI store_info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
++{
++    struct store_async *impl = impl_store_async_from_IAsyncInfo( iface );
++    return IInspectable_QueryInterface( (IInspectable *)&impl->IAsyncOperation_UINT32_iface, iid, out );
++}
++static ULONG WINAPI store_info_AddRef( IAsyncInfo *iface )
++{
++    struct store_async *impl = impl_store_async_from_IAsyncInfo( iface );
++    return IInspectable_AddRef( (IInspectable *)&impl->IAsyncOperation_UINT32_iface );
++}
++static ULONG WINAPI store_info_Release( IAsyncInfo *iface )
++{
++    struct store_async *impl = impl_store_async_from_IAsyncInfo( iface );
++    return IInspectable_Release( (IInspectable *)&impl->IAsyncOperation_UINT32_iface );
++}
++static HRESULT WINAPI store_info_GetIids( IAsyncInfo *iface, ULONG *count, IID **iids ) { return E_NOTIMPL; }
++static HRESULT WINAPI store_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *name ) { return E_NOTIMPL; }
++static HRESULT WINAPI store_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level ) { *level = BaseTrust; return S_OK; }
++static HRESULT WINAPI store_info_get_Id( IAsyncInfo *iface, UINT32 *id ) { *id = 1; return S_OK; }
++static HRESULT WINAPI store_info_get_Status( IAsyncInfo *iface, AsyncStatus *status ) { *status = Completed; return S_OK; }
++static HRESULT WINAPI store_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error ) { *error = S_OK; return S_OK; }
++static HRESULT WINAPI store_info_Cancel( IAsyncInfo *iface ) { return S_OK; }
++static HRESULT WINAPI store_info_Close( IAsyncInfo *iface ) { return S_OK; }
++static const struct IAsyncInfoVtbl store_info_vtbl =
++{
++    store_info_QueryInterface, store_info_AddRef, store_info_Release,
++    store_info_GetIids, store_info_GetRuntimeClassName, store_info_GetTrustLevel,
++    store_info_get_Id, store_info_get_Status, store_info_get_ErrorCode,
++    store_info_Cancel, store_info_Close,
++};
++
++static HRESULT store_async_create( UINT32 result, IAsyncOperation_UINT32 **out )
++{
++    struct store_async *impl;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_UINT32_iface.lpVtbl = &store_async_vtbl;
++    impl->IAsyncInfo_iface.lpVtbl = &store_info_vtbl;
++    impl->ref = 1;
++    impl->result = result;
++    *out = &impl->IAsyncOperation_UINT32_iface;
++    return S_OK;
++}
++
++/* ===================================================================
++ * The DataWriter object: buffers writes, flushes to a bound
++ * IOutputStream on StoreAsync.
++ * =================================================================== */
++struct data_writer_instance
++{
++    IDataWriter IDataWriter_iface;
++    IClosable IClosable_iface;
++    LONG ref;
++
++    IOutputStream *stream;
++    BYTE *buf;
++    UINT32 len;
++    UINT32 cap;
++    ByteOrder byte_order;
++    UnicodeEncoding encoding;
++};
++
++static inline struct data_writer_instance *impl_from_IDataWriter( IDataWriter *iface )
++{
++    return CONTAINING_RECORD( iface, struct data_writer_instance, IDataWriter_iface );
++}
++static inline struct data_writer_instance *impl_from_IClosable( IClosable *iface )
++{
++    return CONTAINING_RECORD( iface, struct data_writer_instance, IClosable_iface );
++}
++
++static HRESULT data_writer_append( struct data_writer_instance *impl, const BYTE *bytes, UINT32 count )
++{
++    if (impl->len + count > impl->cap)
++    {
++        UINT32 cap = impl->cap ? impl->cap : 256;
++        BYTE *p;
++        while (cap < impl->len + count) cap *= 2;
++        if (!(p = realloc( impl->buf, cap ))) return E_OUTOFMEMORY;
++        impl->buf = p;
++        impl->cap = cap;
++    }
++    memcpy( impl->buf + impl->len, bytes, count );
++    impl->len += count;
++    return S_OK;
++}
++
++/* append a fixed-width value honouring the configured byte order (default BE) */
++static HRESULT data_writer_append_value( struct data_writer_instance *impl, const void *value, UINT32 size )
++{
++    const BYTE *src = value;
++    BYTE tmp[8];
++    UINT32 i;
++
++    if (impl->byte_order == ByteOrder_BigEndian)
++    {
++        for (i = 0; i < size; i++) tmp[i] = src[size - 1 - i];
++        return data_writer_append( impl, tmp, size );
++    }
++    return data_writer_append( impl, src, size );
++}
++
++static HRESULT WINAPI data_writer_QueryInterface( IDataWriter *iface, REFIID iid, void **out )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IDataWriter ))
++    {
++        IInspectable_AddRef( (*out = &impl->IDataWriter_iface) );
++        return S_OK;
++    }
++    if (IsEqualGUID( iid, &IID_IClosable ))
++    {
++        IInspectable_AddRef( (*out = &impl->IClosable_iface) );
++        return S_OK;
++    }
++
++    FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++static ULONG WINAPI data_writer_AddRef( IDataWriter *iface )
++{
++    return InterlockedIncrement( &impl_from_IDataWriter( iface )->ref );
++}
++static ULONG WINAPI data_writer_Release( IDataWriter *iface )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    if (!ref)
++    {
++        if (impl->stream) IOutputStream_Release( impl->stream );
++        free( impl->buf );
++        free( impl );
++    }
++    return ref;
++}
++static HRESULT WINAPI data_writer_GetIids( IDataWriter *iface, ULONG *count, IID **iids )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI data_writer_GetRuntimeClassName( IDataWriter *iface, HSTRING *name )
++{
++    return WindowsCreateString( L"Windows.Storage.Streams.DataWriter",
++                                ARRAY_SIZE(L"Windows.Storage.Streams.DataWriter") - 1, name );
++}
++static HRESULT WINAPI data_writer_GetTrustLevel( IDataWriter *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_get_UnstoredBufferLength( IDataWriter *iface, UINT32 *value )
++{
++    *value = impl_from_IDataWriter( iface )->len;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_get_UnicodeEncoding( IDataWriter *iface, UnicodeEncoding *value )
++{
++    *value = impl_from_IDataWriter( iface )->encoding;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_put_UnicodeEncoding( IDataWriter *iface, UnicodeEncoding value )
++{
++    impl_from_IDataWriter( iface )->encoding = value;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_get_ByteOrder( IDataWriter *iface, ByteOrder *value )
++{
++    *value = impl_from_IDataWriter( iface )->byte_order;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_put_ByteOrder( IDataWriter *iface, ByteOrder value )
++{
++    impl_from_IDataWriter( iface )->byte_order = value;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_WriteByte( IDataWriter *iface, BYTE value )
++{
++    return data_writer_append( impl_from_IDataWriter( iface ), &value, 1 );
++}
++static HRESULT WINAPI data_writer_WriteBytes( IDataWriter *iface, UINT32 value_size, BYTE *value )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    TRACE( "iface %p, value_size %u, value %p.\n", iface, value_size, value );
++    return data_writer_append( impl, value, value_size );
++}
++static HRESULT WINAPI data_writer_WriteBuffer( IDataWriter *iface, IBuffer *buffer )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    IBufferByteAccess *bba;
++    UINT32 length;
++    BYTE *bytes;
++    HRESULT hr;
++
++    if (!buffer) return E_POINTER;
++    if (FAILED(hr = IBuffer_get_Length( buffer, &length ))) return hr;
++    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&bba ))) return hr;
++    hr = IBufferByteAccess_Buffer( bba, &bytes );
++    IBufferByteAccess_Release( bba );
++    if (FAILED(hr)) return hr;
++    return data_writer_append( impl, bytes, length );
++}
++static HRESULT WINAPI data_writer_WriteBufferRange( IDataWriter *iface, IBuffer *buffer, UINT32 start, UINT32 count )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    IBufferByteAccess *bba;
++    UINT32 length;
++    BYTE *bytes;
++    HRESULT hr;
++
++    if (!buffer) return E_POINTER;
++    if (FAILED(hr = IBuffer_get_Length( buffer, &length ))) return hr;
++    if (start > length || count > length - start) return E_INVALIDARG;
++    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&bba ))) return hr;
++    hr = IBufferByteAccess_Buffer( bba, &bytes );
++    IBufferByteAccess_Release( bba );
++    if (FAILED(hr)) return hr;
++    return data_writer_append( impl, bytes + start, count );
++}
++static HRESULT WINAPI data_writer_WriteBoolean( IDataWriter *iface, boolean value )
++{
++    BYTE b = value ? 1 : 0;
++    return data_writer_append( impl_from_IDataWriter( iface ), &b, 1 );
++}
++static HRESULT WINAPI data_writer_WriteGuid( IDataWriter *iface, GUID value )
++{
++    FIXME( "iface %p stub!\n", iface );
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI data_writer_WriteInt16( IDataWriter *iface, INT16 value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteInt32( IDataWriter *iface, INT32 value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteInt64( IDataWriter *iface, INT64 value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteUInt16( IDataWriter *iface, UINT16 value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteUInt32( IDataWriter *iface, UINT32 value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteUInt64( IDataWriter *iface, UINT64 value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteSingle( IDataWriter *iface, FLOAT value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteDouble( IDataWriter *iface, DOUBLE value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value, sizeof(value) );
++}
++static HRESULT WINAPI data_writer_WriteDateTime( IDataWriter *iface, DateTime value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value.UniversalTime, sizeof(value.UniversalTime) );
++}
++static HRESULT WINAPI data_writer_WriteTimeSpan( IDataWriter *iface, TimeSpan value )
++{
++    return data_writer_append_value( impl_from_IDataWriter( iface ), &value.Duration, sizeof(value.Duration) );
++}
++static HRESULT WINAPI data_writer_WriteString( IDataWriter *iface, HSTRING value, UINT32 *code_unit_count )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    const WCHAR *str;
++    UINT32 str_len, utf8_len;
++    char *utf8;
++    HRESULT hr;
++
++    str = WindowsGetStringRawBuffer( value, &str_len );
++    utf8_len = WideCharToMultiByte( CP_UTF8, 0, str, str_len, NULL, 0, NULL, NULL );
++    if (!(utf8 = malloc( utf8_len ? utf8_len : 1 ))) return E_OUTOFMEMORY;
++    WideCharToMultiByte( CP_UTF8, 0, str, str_len, utf8, utf8_len, NULL, NULL );
++    hr = data_writer_append( impl, (BYTE *)utf8, utf8_len );
++    free( utf8 );
++    if (SUCCEEDED(hr) && code_unit_count) *code_unit_count = utf8_len;
++    return hr;
++}
++static HRESULT WINAPI data_writer_MeasureString( IDataWriter *iface, HSTRING value, UINT32 *code_unit_count )
++{
++    const WCHAR *str;
++    UINT32 str_len;
++    str = WindowsGetStringRawBuffer( value, &str_len );
++    *code_unit_count = WideCharToMultiByte( CP_UTF8, 0, str, str_len, NULL, 0, NULL, NULL );
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_StoreAsync( IDataWriter *iface, IAsyncOperation_UINT32 **operation )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    IActivationFactory *buffer_factory = buffer_activation_factory;
++    IBufferFactory *ibuf_factory = NULL;
++    IBufferByteAccess *bba = NULL;
++    IBuffer *buffer = NULL;
++    IAsyncOperationWithProgress_UINT32_UINT32 *write_op = NULL;
++    UINT32 stored = impl->len, written = 0;
++    BYTE *dst;
++    HRESULT hr;
++
++    TRACE( "iface %p, operation %p (len %u).\n", iface, operation, impl->len );
++
++    *operation = NULL;
++    if (!impl->stream) return E_UNEXPECTED;
++
++    if (!impl->len) return store_async_create( 0, operation );
++
++    if (FAILED(hr = IActivationFactory_QueryInterface( buffer_factory, &IID_IBufferFactory, (void **)&ibuf_factory )))
++        return hr;
++    if (FAILED(hr = IBufferFactory_Create( ibuf_factory, impl->len, &buffer ))) goto done;
++    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&bba ))) goto done;
++    if (FAILED(hr = IBufferByteAccess_Buffer( bba, &dst ))) goto done;
++    memcpy( dst, impl->buf, impl->len );
++    if (FAILED(hr = IBuffer_put_Length( buffer, impl->len ))) goto done;
++
++    if (FAILED(hr = IOutputStream_WriteAsync( impl->stream, buffer, &write_op ))) goto done;
++    IAsyncOperationWithProgress_UINT32_UINT32_GetResults( write_op, &written );
++
++    impl->len = 0; /* bytes have been committed to the stream */
++    hr = store_async_create( stored, operation );
++
++done:
++    if (write_op) IAsyncOperationWithProgress_UINT32_UINT32_Release( write_op );
++    if (bba) IBufferByteAccess_Release( bba );
++    if (buffer) IBuffer_Release( buffer );
++    if (ibuf_factory) IBufferFactory_Release( ibuf_factory );
++    return hr;
++}
++static HRESULT WINAPI data_writer_FlushAsync( IDataWriter *iface, IAsyncOperation_boolean **operation )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    IAsyncOperation_boolean *flush = NULL;
++    HRESULT hr = S_OK;
++
++    TRACE( "iface %p, operation %p.\n", iface, operation );
++
++    *operation = NULL;
++    if (impl->stream) hr = IOutputStream_FlushAsync( impl->stream, &flush );
++    if (SUCCEEDED(hr)) *operation = flush;
++    return hr;
++}
++static HRESULT WINAPI data_writer_DetachBuffer( IDataWriter *iface, IBuffer **buffer )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++    IBufferFactory *ibuf_factory = NULL;
++    IBufferByteAccess *bba = NULL;
++    BYTE *dst;
++    HRESULT hr;
++
++    TRACE( "iface %p, buffer %p.\n", iface, buffer );
++
++    *buffer = NULL;
++    if (FAILED(hr = IActivationFactory_QueryInterface( buffer_activation_factory, &IID_IBufferFactory, (void **)&ibuf_factory )))
++        return hr;
++    if (FAILED(hr = IBufferFactory_Create( ibuf_factory, impl->len, buffer ))) goto done;
++    if (impl->len)
++    {
++        if (FAILED(hr = IBuffer_QueryInterface( *buffer, &IID_IBufferByteAccess, (void **)&bba ))) goto done;
++        if (SUCCEEDED(hr = IBufferByteAccess_Buffer( bba, &dst )))
++        {
++            memcpy( dst, impl->buf, impl->len );
++            hr = IBuffer_put_Length( *buffer, impl->len );
++        }
++    }
++    if (SUCCEEDED(hr)) impl->len = 0;
++
++done:
++    if (bba) IBufferByteAccess_Release( bba );
++    if (ibuf_factory) IBufferFactory_Release( ibuf_factory );
++    if (FAILED(hr) && *buffer) { IBuffer_Release( *buffer ); *buffer = NULL; }
++    return hr;
++}
++static HRESULT WINAPI data_writer_DetachStream( IDataWriter *iface, IOutputStream **output_stream )
++{
++    struct data_writer_instance *impl = impl_from_IDataWriter( iface );
++
++    TRACE( "iface %p, output_stream %p.\n", iface, output_stream );
++
++    if ((*output_stream = impl->stream))
++    {
++        IOutputStream_AddRef( impl->stream );
++        IOutputStream_Release( impl->stream );
++        impl->stream = NULL;
++    }
++    return S_OK;
++}
++static const struct IDataWriterVtbl data_writer_instance_vtbl =
++{
++    data_writer_QueryInterface,
++    data_writer_AddRef,
++    data_writer_Release,
++    data_writer_GetIids,
++    data_writer_GetRuntimeClassName,
++    data_writer_GetTrustLevel,
++    data_writer_get_UnstoredBufferLength,
++    data_writer_get_UnicodeEncoding,
++    data_writer_put_UnicodeEncoding,
++    data_writer_get_ByteOrder,
++    data_writer_put_ByteOrder,
++    data_writer_WriteByte,
++    data_writer_WriteBytes,
++    data_writer_WriteBuffer,
++    data_writer_WriteBufferRange,
++    data_writer_WriteBoolean,
++    data_writer_WriteGuid,
++    data_writer_WriteInt16,
++    data_writer_WriteInt32,
++    data_writer_WriteInt64,
++    data_writer_WriteUInt16,
++    data_writer_WriteUInt32,
++    data_writer_WriteUInt64,
++    data_writer_WriteSingle,
++    data_writer_WriteDouble,
++    data_writer_WriteDateTime,
++    data_writer_WriteTimeSpan,
++    data_writer_WriteString,
++    data_writer_MeasureString,
++    data_writer_StoreAsync,
++    data_writer_FlushAsync,
++    data_writer_DetachBuffer,
++    data_writer_DetachStream,
++};
++
++/* IClosable facet */
++static HRESULT WINAPI data_writer_closable_QueryInterface( IClosable *iface, REFIID iid, void **out )
++{
++    return data_writer_QueryInterface( &impl_from_IClosable( iface )->IDataWriter_iface, iid, out );
++}
++static ULONG WINAPI data_writer_closable_AddRef( IClosable *iface )
++{
++    return data_writer_AddRef( &impl_from_IClosable( iface )->IDataWriter_iface );
++}
++static ULONG WINAPI data_writer_closable_Release( IClosable *iface )
++{
++    return data_writer_Release( &impl_from_IClosable( iface )->IDataWriter_iface );
++}
++static HRESULT WINAPI data_writer_closable_GetIids( IClosable *iface, ULONG *count, IID **iids )
++{
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI data_writer_closable_GetRuntimeClassName( IClosable *iface, HSTRING *name )
++{
++    return E_NOTIMPL;
++}
++static HRESULT WINAPI data_writer_closable_GetTrustLevel( IClosable *iface, TrustLevel *level )
++{
++    *level = BaseTrust;
++    return S_OK;
++}
++static HRESULT WINAPI data_writer_closable_Close( IClosable *iface )
++{
++    return S_OK;
++}
++static const struct IClosableVtbl data_writer_closable_vtbl =
++{
++    data_writer_closable_QueryInterface,
++    data_writer_closable_AddRef,
++    data_writer_closable_Release,
++    data_writer_closable_GetIids,
++    data_writer_closable_GetRuntimeClassName,
++    data_writer_closable_GetTrustLevel,
++    data_writer_closable_Close,
++};
++
++/* ===================================================================
++ * The activation factory: IActivationFactory + IDataWriterFactory.
++ * =================================================================== */
+ struct data_writer
+ {
+     IActivationFactory IActivationFactory_iface;
++    IDataWriterFactory IDataWriterFactory_iface;
+     LONG ref;
+ };
+ 
+-static inline struct data_writer *impl_data_writer_from_IActivationFactory(IActivationFactory *iface)
+-{
+-    return CONTAINING_RECORD(iface, struct data_writer, IActivationFactory_iface);
+-}
+-
+-static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_QueryInterface(IActivationFactory *iface, REFIID iid,
+-        void **out)
+-{
+-    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
+-
+-    if (IsEqualGUID(iid, &IID_IUnknown)
+-            || IsEqualGUID(iid, &IID_IInspectable)
+-            || IsEqualGUID(iid, &IID_IAgileObject)
+-            || IsEqualGUID(iid, &IID_IActivationFactory))
+-    {
+-        IUnknown_AddRef(iface);
++static inline struct data_writer *impl_data_writer_from_IActivationFactory( IActivationFactory *iface )
++{
++    return CONTAINING_RECORD( iface, struct data_writer, IActivationFactory_iface );
++}
++
++static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_QueryInterface( IActivationFactory *iface, REFIID iid, void **out )
++{
++    struct data_writer *impl = impl_data_writer_from_IActivationFactory( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, &IID_IActivationFactory ))
++    {
++        IUnknown_AddRef( iface );
+         *out = iface;
+         return S_OK;
+     }
+-
+-    WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    if (IsEqualGUID( iid, &IID_IDataWriterFactory ))
++    {
++        IInspectable_AddRef( (*out = &impl->IDataWriterFactory_iface) );
++        return S_OK;
++    }
++
++    WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( iid ) );
+     *out = NULL;
+     return E_NOINTERFACE;
+ }
+-
+-static ULONG STDMETHODCALLTYPE data_writer_activation_factory_AddRef(IActivationFactory *iface)
+-{
+-    struct data_writer *impl = impl_data_writer_from_IActivationFactory(iface);
+-    ULONG ref = InterlockedIncrement(&impl->ref);
+-    TRACE("iface %p, ref %lu.\n", iface, ref);
+-    return ref;
+-}
+-
+-static ULONG STDMETHODCALLTYPE data_writer_activation_factory_Release(IActivationFactory *iface)
+-{
+-    struct data_writer *impl = impl_data_writer_from_IActivationFactory(iface);
+-    ULONG ref = InterlockedDecrement(&impl->ref);
+-    TRACE("iface %p, ref %lu.\n", iface, ref);
+-    return ref;
+-}
+-
+-static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_GetIids(IActivationFactory *iface, ULONG *iid_count,
+-        IID **iids)
+-{
+-    FIXME("iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_GetRuntimeClassName(IActivationFactory *iface,
+-        HSTRING *class_name)
+-{
+-    FIXME("iface %p, class_name %p stub!\n", iface, class_name);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_GetTrustLevel(IActivationFactory *iface,
+-        TrustLevel *trust_level)
+-{
+-    FIXME("iface %p, trust_level %p stub!\n", iface, trust_level);
+-    return E_NOTIMPL;
+-}
+-
+-static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_ActivateInstance(IActivationFactory *iface,
+-        IInspectable **instance)
+-{
+-    FIXME("iface %p, instance %p stub!\n", iface, instance);
+-    return S_OK;
++static ULONG STDMETHODCALLTYPE data_writer_activation_factory_AddRef( IActivationFactory *iface )
++{
++    struct data_writer *impl = impl_data_writer_from_IActivationFactory( iface );
++    return InterlockedIncrement( &impl->ref );
++}
++static ULONG STDMETHODCALLTYPE data_writer_activation_factory_Release( IActivationFactory *iface )
++{
++    struct data_writer *impl = impl_data_writer_from_IActivationFactory( iface );
++    return InterlockedDecrement( &impl->ref );
++}
++static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_GetIids( IActivationFactory *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_GetRuntimeClassName( IActivationFactory *iface, HSTRING *class_name )
++{
++    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
++    return E_NOTIMPL;
++}
++static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_GetTrustLevel( IActivationFactory *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++static HRESULT STDMETHODCALLTYPE data_writer_activation_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
++{
++    FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    return E_NOTIMPL;
+ }
+ 
+ static const struct IActivationFactoryVtbl data_writer_activation_factory_vtbl =
+@@ -101,18 +685,53 @@
+     data_writer_activation_factory_QueryInterface,
+     data_writer_activation_factory_AddRef,
+     data_writer_activation_factory_Release,
+-    /* IInspectable methods */
+     data_writer_activation_factory_GetIids,
+     data_writer_activation_factory_GetRuntimeClassName,
+     data_writer_activation_factory_GetTrustLevel,
+-    /* IActivationFactory methods */
+     data_writer_activation_factory_ActivateInstance,
+ };
+ 
++DEFINE_IINSPECTABLE( data_writer_factory, IDataWriterFactory, struct data_writer, IActivationFactory_iface )
++
++static HRESULT WINAPI data_writer_factory_CreateDataWriter( IDataWriterFactory *iface,
++        IOutputStream *output_stream, IDataWriter **data_writer )
++{
++    struct data_writer_instance *impl;
++
++    TRACE( "iface %p, output_stream %p, data_writer %p.\n", iface, output_stream, data_writer );
++
++    *data_writer = NULL;
++    if (!output_stream) return E_POINTER;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++
++    impl->IDataWriter_iface.lpVtbl = &data_writer_instance_vtbl;
++    impl->IClosable_iface.lpVtbl = &data_writer_closable_vtbl;
++    impl->ref = 1;
++    impl->stream = output_stream;
++    IOutputStream_AddRef( output_stream );
++    impl->byte_order = ByteOrder_BigEndian;
++    impl->encoding = UnicodeEncoding_Utf8;
++
++    *data_writer = &impl->IDataWriter_iface;
++    return S_OK;
++}
++
++static const struct IDataWriterFactoryVtbl data_writer_factory_vtbl =
++{
++    data_writer_factory_QueryInterface,
++    data_writer_factory_AddRef,
++    data_writer_factory_Release,
++    data_writer_factory_GetIids,
++    data_writer_factory_GetRuntimeClassName,
++    data_writer_factory_GetTrustLevel,
++    data_writer_factory_CreateDataWriter,
++};
++
+ struct data_writer data_writer =
+ {
+     {&data_writer_activation_factory_vtbl},
+-    1
++    {&data_writer_factory_vtbl},
++    1,
+ };
+ 
+ IActivationFactory *data_writer_activation_factory = &data_writer.IActivationFactory_iface;
+diff --git a/dlls/windows.storage/main.c b/dlls/windows.storage/main.c
+--- a/dlls/windows.storage/main.c
++++ b/dlls/windows.storage/main.c
+@@ -42,6 +42,9 @@
+     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_RandomAccessStreamReference ))
+         IActivationFactory_QueryInterface( random_access_stream_reference_factory, &IID_IActivationFactory, (void **)factory );
+ 
++    if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_InMemoryRandomAccessStream ))
++        IActivationFactory_QueryInterface( in_memory_random_access_stream_factory, &IID_IActivationFactory, (void **)factory );
++
+     if (*factory) return S_OK;
+     return CLASS_E_CLASSNOTAVAILABLE;
+ }
+diff --git a/dlls/windows.storage/classes.idl b/dlls/windows.storage/classes.idl
+--- a/dlls/windows.storage/classes.idl
++++ b/dlls/windows.storage/classes.idl
+@@ -35,4 +35,5 @@
+ 
+ namespace Windows.Storage.Streams {
+     runtimeclass RandomAccessStreamReference;
++    runtimeclass InMemoryRandomAccessStream;
+ }
+diff --git a/dlls/windows.storage/Makefile.in b/dlls/windows.storage/Makefile.in
+--- a/dlls/windows.storage/Makefile.in
++++ b/dlls/windows.storage/Makefile.in
+@@ -4,5 +4,6 @@
+ SOURCES = \
+ 	classes.idl \
+ 	main.c \
++	memstream.c \
+ 	storagefile.c \
+ 	streams.c
+diff --git a/dlls/windows.storage/private.h b/dlls/windows.storage/private.h
+--- a/dlls/windows.storage/private.h
++++ b/dlls/windows.storage/private.h
+@@ -41,6 +41,9 @@
+ 
+ extern IActivationFactory *storagefile_factory;
+ extern IActivationFactory *random_access_stream_reference_factory;
++extern IActivationFactory *in_memory_random_access_stream_factory;
++
++HRESULT memory_stream_reference_create( IRandomAccessStream *stream, IRandomAccessStreamReference **out );
+ 
+ #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
+     static inline impl_type *impl_from( iface_type *iface )                                        \
