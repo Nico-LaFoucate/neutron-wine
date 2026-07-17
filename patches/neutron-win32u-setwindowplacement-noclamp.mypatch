@@ -1,0 +1,142 @@
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -47,6 +47,16 @@
+     (SWP_AGG_NOPOSCHANGE | SWP_FRAMECHANGED | SWP_HIDEWINDOW | SWP_SHOWWINDOW)
+ #define SWP_AGG_NOCLIENTCHANGE \
+         (SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE)
++
++/* NEUTRON: private SWP flag — bypass the legacy signed-16-bit coordinate clamp on the
++ * SetWindowPlacement path ONLY. Windows' SetWindowPos clamps to 16 bits (kept as-is, it
++ * matches Windows), but SetWindowPlacement honors full 32-bit rcNormalPosition. Adobe apps
++ * exploit this: Lightroom's scroll views size a scroll-content CHILD window to the
++ * full content extent (a 1113-photo filmstrip is ~131k px wide) via SetWindowPlacement, then
++ * read GetWindowRect back to compute the scrollbar. Wine's 32767 clamp truncated that to
++ * ~278 photos. Set only by set_window_placement; honored in set_window_pos + fixup_swp_flags;
++ * masked off before the app/server observe winpos->flags. */
++#define SWP_NEUTRON_NOCLAMP	0x00010000
+ 
+ #define PLACE_MIN		0x0001
+ #define PLACE_MAX		0x0002
+@@ -3210,10 +3220,15 @@
+     WND *win = get_win_ptr( hwnd );
+     WINDOWPLACEMENT wp = *wndpl;
+     DWORD style;
++    /* NEUTRON: a child window's normal rect is in parent-client coords, not screen coords,
++     * so the work-area snap below is meaningless (and would corrupt a scroll-content rect
++     * larger than the screen). */
++    BOOL is_child = win && win != WND_OTHER_PROCESS && win != WND_DESKTOP &&
++                    (win->dwStyle & WS_CHILD);
+ 
+     if (flags & PLACE_MIN) make_point_onscreen( &wp.ptMinPosition );
+     if (flags & PLACE_MAX) make_point_onscreen( &wp.ptMaxPosition );
+-    if (flags & PLACE_RECT) make_rect_onscreen( &wp.rcNormalPosition );
++    if ((flags & PLACE_RECT) && !is_child) make_rect_onscreen( &wp.rcNormalPosition );
+ 
+     TRACE( "%p: setting min %d,%d max %d,%d normal %s flags %x adjusted to min %d,%d max %d,%d normal %s\n",
+            hwnd, wndpl->ptMinPosition.x, wndpl->ptMinPosition.y,
+@@ -3242,20 +3257,20 @@
+         if (flags & PLACE_MIN)
+         {
+             NtUserSetWindowPos( hwnd, 0, wp.ptMinPosition.x, wp.ptMinPosition.y, 0, 0,
+-                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
++                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NEUTRON_NOCLAMP );
+         }
+     }
+     else if (style & WS_MAXIMIZE)
+     {
+         if (flags & PLACE_MAX)
+             NtUserSetWindowPos( hwnd, 0, wp.ptMaxPosition.x, wp.ptMaxPosition.y, 0, 0,
+-                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
++                                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NEUTRON_NOCLAMP );
+     }
+     else if (flags & PLACE_RECT)
+         NtUserSetWindowPos( hwnd, 0, wp.rcNormalPosition.left, wp.rcNormalPosition.top,
+                             wp.rcNormalPosition.right - wp.rcNormalPosition.left,
+                             wp.rcNormalPosition.bottom - wp.rcNormalPosition.top,
+-                            SWP_NOZORDER | SWP_NOACTIVATE );
++                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NEUTRON_NOCLAMP );
+ 
+     NtUserShowWindow( hwnd, wndpl->showCmd );
+ 
+@@ -3898,15 +3913,25 @@
+     winpos->hwnd = win->handle;  /* make it a full handle */
+ 
+     /* Finally make sure that all coordinates are valid */
+-    if (winpos->x < -32768) winpos->x = -32768;
+-    else if (winpos->x > 32767) winpos->x = 32767;
+-    if (winpos->y < -32768) winpos->y = -32768;
+-    else if (winpos->y > 32767) winpos->y = 32767;
+-
+-    if (winpos->cx < 0) winpos->cx = 0;
+-    else if (winpos->cx > 32767) winpos->cx = 32767;
+-    if (winpos->cy < 0) winpos->cy = 0;
+-    else if (winpos->cy > 32767) winpos->cy = 32767;
++    if (!(winpos->flags & SWP_NEUTRON_NOCLAMP))
++    {
++        if (winpos->x < -32768) winpos->x = -32768;
++        else if (winpos->x > 32767) winpos->x = 32767;
++        if (winpos->y < -32768) winpos->y = -32768;
++        else if (winpos->y > 32767) winpos->y = 32767;
++
++        if (winpos->cx < 0) winpos->cx = 0;
++        else if (winpos->cx > 32767) winpos->cx = 32767;
++        if (winpos->cy < 0) winpos->cy = 0;
++        else if (winpos->cy > 32767) winpos->cy = 32767;
++    }
++    else
++    {
++        /* NEUTRON: SetWindowPlacement path — allow full 32-bit rects, only guard against
++         * negative sizes. */
++        if (winpos->cx < 0) winpos->cx = 0;
++        if (winpos->cy < 0) winpos->cy = 0;
++    }
+ 
+     if (win->dwStyle & WS_CHILD)
+     {
+@@ -4093,19 +4118,32 @@
+     }
+ 
+     /* Make sure that coordinates are valid for WM_WINDOWPOSCHANGING */
+-    if (!(winpos->flags & SWP_NOMOVE))
+-    {
+-        if (winpos->x < -32768) winpos->x = -32768;
+-        else if (winpos->x > 32767) winpos->x = 32767;
+-        if (winpos->y < -32768) winpos->y = -32768;
+-        else if (winpos->y > 32767) winpos->y = 32767;
+-    }
+-    if (!(winpos->flags & SWP_NOSIZE))
+-    {
+-        if (winpos->cx < 0) winpos->cx = 0;
+-        else if (winpos->cx > 32767) winpos->cx = 32767;
+-        if (winpos->cy < 0) winpos->cy = 0;
+-        else if (winpos->cy > 32767) winpos->cy = 32767;
++    if (winpos->flags & SWP_NEUTRON_NOCLAMP)
++    {
++        /* NEUTRON: SetWindowPlacement honors full 32-bit rects (Lightroom scroll content
++         * past 32767px); keep sizes non-negative but skip the legacy 16-bit clamp. */
++        if (!(winpos->flags & SWP_NOSIZE))
++        {
++            if (winpos->cx < 0) winpos->cx = 0;
++            if (winpos->cy < 0) winpos->cy = 0;
++        }
++    }
++    else
++    {
++        if (!(winpos->flags & SWP_NOMOVE))
++        {
++            if (winpos->x < -32768) winpos->x = -32768;
++            else if (winpos->x > 32767) winpos->x = 32767;
++            if (winpos->y < -32768) winpos->y = -32768;
++            else if (winpos->y > 32767) winpos->y = 32767;
++        }
++        if (!(winpos->flags & SWP_NOSIZE))
++        {
++            if (winpos->cx < 0) winpos->cx = 0;
++            else if (winpos->cx > 32767) winpos->cx = 32767;
++            if (winpos->cy < 0) winpos->cy = 0;
++            else if (winpos->cy > 32767) winpos->cy = 32767;
++        }
+     }
+ 
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( winpos->hwnd ));
