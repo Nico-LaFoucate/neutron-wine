@@ -1,0 +1,62 @@
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -587,6 +587,11 @@
+     __asm__ __volatile__( "" : : "r"(hwnd) : "memory" );
+ }
+ 
++/* NEUTRON (PS 2025 universal dock): armed from NtUserSetParent when OWL inserts a doc-host TabPane
++   into the frame dock that holds the visible home screen -- the universal pre-decision hook covering
++   all doc-open paths (File>New/Open/recovery), both PS versions. Defined near neutron_on_window_created. */
++static void neutron_predecision_on_reparent( HWND child, HWND parent );
++
+ /*****************************************************************
+  *           NtUserSetParent (win32u.@)
+  */
+@@ -713,6 +718,8 @@
+ 
+     if (was_visible) NtUserShowWindow( hwnd, SW_SHOW );
+ 
++    neutron_predecision_on_reparent( hwnd, parent );  /* NEUTRON: universal PS-dock pre-decision hook */
++
+     set_thread_dpi_awareness_context( context );
+     return old_parent;
+ }
+@@ -5255,6 +5262,8 @@
+ {
+     RECT rc;
+     HWND root;
++    /* Post-decision safety net (gated on an actual doc canvas, so no Cancel wart): the pre-decision
++       hide is handled universally by neutron_predecision_on_reparent (TabPane->Dock insert). */
+     if (!neutron_class_is( shown, neutron_psview_class )) return;
+     rc.left = rc.top = rc.right = rc.bottom = 0;
+     get_client_rect( shown, &rc, get_thread_dpi() );
+@@ -5298,6 +5307,29 @@
+     }
+ }
+ 
++/* NEUTRON (PS 2025 universal dock): every doc-open -- File>New, File>Open, AND recovered-doc-on-
++   launch, in BOTH PS 2025 (OWL.DocumentWindow) and PS 2026 (OWL.Document) -- is immediately preceded
++   by OWL reparenting a fresh OWL.TabPane into the frame's OWL.Dock; when the home is up, that Dock is
++   the welcome's own parent. This insert fires exactly once per doc-open-while-home-is-visible and
++   NEVER at pure startup (all startup TabPane inserts complete before the welcome first shows), so it
++   is the universal pre-decision signal that the PSFloatC New-Doc-dialog trigger (dialog paths only)
++   missed. Arm the existing deferred welcome dismiss -- consumed at the top of show_window by PS's own
++   imminent ShowWindow calls, still several window-ops before the OWL.Document* float-vs-dock decision.
++   Re-entrancy safe: reads class names + walks the tree + sets a flag; performs NO window ops here. */
++static void neutron_predecision_on_reparent( HWND child, HWND parent )
++{
++    char cb[64], pb[64];
++    neutron_class_ascii( child, cb );
++    if (!neutron_ascii_has( cb, "OWL.TabPane" )) return;
++    neutron_class_ascii( parent, pb );
++    if (!neutron_ascii_has( pb, "OWL.Dock" )) return;
++    if (neutron_walk_welcomes( parent, 0, FALSE ) > 0)   /* a VISIBLE welcome in this dock = home is up */
++    {
++        ERR( "neutron: arming pre-decision dismiss (OWL.TabPane -> home's OWL.Dock)\n" );
++        InterlockedExchange( &neutron_dismiss_pending, 1 );
++    }
++}
++
+ static BOOL show_window( HWND hwnd, INT cmd )
+ {
+     WND *win;
