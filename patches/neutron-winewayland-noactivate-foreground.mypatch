@@ -1,0 +1,44 @@
+# neutron-winewayland-noactivate-foreground
+#
+# Don't foreground a WS_EX_NOACTIVATE window when the compositor gives it keyboard focus.
+#
+# keyboard_handle_enter() posts WM_WAYLAND_SET_FOREGROUND (-> NtUserSetForegroundWindowInternal)
+# for ANY managed surface that receives wl_keyboard.enter. KWin sends wl_keyboard.enter to every
+# xdg_toplevel when it maps, so a non-activating tool popup (WS_EX_NOACTIVATE) gets force-activated
+# on every map — directly against the app's activation intent.
+#
+# Repro (Adobe Lightroom Classic, Develop module): creating a 2nd mask opens two floating mask-tool
+# popups (a NonActivateWindow type-picker + an Afx panel, both WS_EX_NOACTIVATE). Each map made
+# winewayland foreground/activate the popup; the app immediately yanked foreground back to its
+# AgWinMainFrame; the two ping-ponged activation ~500x/sec, driving an unbounded relayout storm
+# (canvas recreated, mask list grown, panels sawtoothing) that hung the app until it self-resolved.
+# Measured: 310 winewayland foreground posts (150 + 136 on the two popups) vs 343 app re-grabs.
+#
+# Fix: skip the SetForegroundWindow post for WS_EX_NOACTIVATE windows. A WS_EX_NOACTIVATE window
+# must never become the active/foreground window (documented Win32 semantics); compositor keyboard
+# focus alone is harmless. Conformance-correct, not a per-app hack. The upstream TODO just above this
+# code already flags the foreground path here as incomplete.
+#
+diff --git a/dlls/winewayland.drv/wayland_keyboard.c b/dlls/winewayland.drv/wayland_keyboard.c
+index 0a6eea2fa73..41cd82ebd62 100644
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -815,7 +815,17 @@ static void keyboard_handle_enter(void *private, struct wl_keyboard *wl_keyboard
+          * directly once it's updated to not explicitly deactivate the old
+          * foreground window when both the old and new foreground windows
+          * are in the same non-current thread. */
+-        if (surface->window.managed)
++        /* NEUTRON: KWin sends wl_keyboard.enter to a surface whenever it maps (every
++         * xdg_toplevel gets keyboard focus on map). Translating that unconditionally
++         * into NtUserSetForegroundWindow fights the app's activation intent for
++         * non-activating tool popups (WS_EX_NOACTIVATE): LrC's mask-tool flyouts get
++         * force-activated on every map, the app immediately yanks foreground back to
++         * its main frame, and the two ping-pong ~500x/sec — the Develop "mask storm"
++         * that hangs the app. A WS_EX_NOACTIVATE window must never be foregrounded, so
++         * skip the SetForegroundWindow post for it (compositor keyboard focus alone is
++         * harmless — the app just never wanted this popup to become the active window). */
++        DWORD ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++        if (surface->window.managed && !(ex_style & WS_EX_NOACTIVATE))
+             NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+     }
+ 

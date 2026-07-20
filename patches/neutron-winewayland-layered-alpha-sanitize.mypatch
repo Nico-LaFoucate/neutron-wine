@@ -1,0 +1,158 @@
+# neutron-winewayland-layered-alpha-sanitize
+#
+# Repair invalid premultiplied pixels in per-pixel-alpha (UpdateLayeredWindow) SHM buffers, and apply
+# the SetLayeredWindowAttributes global alpha.
+#
+# Layered ARGB8888 SHM buffers are premultiplied. GDI drawing writes alpha=0 with non-zero RGB
+# (invalid premultiplied data); passed straight through, those pixels composite as transparent, so
+# LrC's WS_EX_LAYERED mask dropdown / overlay-tip TEXT rendered see-through. (Pairs with the win32u
+# shape fix that stops the alpha-derived window shape from punching the same pixels out.)
+#
+# copy_pixel_region()/wayland_shm_buffer_copy_data() gain an (alpha_bits, sanitize) pair:
+#  - sanitize (per-pixel-alpha layered surfaces): pass the app's real alpha through, but force any
+#    alpha==0 && RGB!=0 pixel opaque (repair invalid premultiplied data GDI produced).
+#  - alpha_bits (SLWA LWA_ALPHA constant, or 0xff000000 default-opaque for a layered surface with no
+#    per-pixel mask): OR-ed into every pixel, mirroring winex11's layered path.
+#  - unchanged for non-layered (0 = plain copy; shaped -> force opaque).
+#
+diff --git a/dlls/winewayland.drv/window_surface.c b/dlls/winewayland.drv/window_surface.c
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -266,10 +266,23 @@
+ /**********************************************************************
+  *          copy_pixel_region
+  */
++/* NEUTRON: alpha_bits is OR-ed into every 32-bit pixel as it is copied (mirrors winex11's
++ * layered-surface path in bitblt.c). 0 means a plain memcpy (pass GDI/per-pixel alpha through);
++ * 0xff000000 forces opaque; a SetLayeredWindowAttributes LWA_ALPHA constant (alpha<<24) applies a
++ * global window alpha. Without this, layered SHM buffers kept GDI's untouched (zero) alpha byte,
++ * so LrC's WS_EX_LAYERED mask/tooltip popups rendered translucent/unreadable.
++ *
++ * sanitize (used for per-pixel-alpha / UpdateLayeredWindow surfaces): pass the app's real
++ * per-pixel alpha through, but repair INVALID premultiplied pixels — alpha==0 with RGB!=0.
++ * wl_shm ARGB8888 is premultiplied, so such pixels cannot come from a well-formed ULW bitmap;
++ * they are produced by GDI painting (TextOut/fills/blits write alpha=0) mixed into the layered
++ * surface. Making them opaque keeps GDI-drawn popup content (LrC mask dropdown text) readable
++ * while genuine ULW transparency (all-zero pixels, AA edges with alpha>0) is preserved. */
+ static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
+                               char *dst_pixels, RECT *dst_rect,
+-                              HRGN region, BOOL force_opaque)
++                              HRGN region, UINT alpha_bits, BOOL sanitize)
+ {
++    BOOL force_opaque = alpha_bits != 0;
+     static const int bpp = WINEWAYLAND_BYTES_PER_PIXEL;
+     RGNDATA *rgndata = get_region_data(region);
+     RECT *rgn_rect;
+@@ -304,21 +317,44 @@
+         /* Fast path for full width rectangles. */
+         if (width * bpp == src_stride && src_stride == dst_stride)
+         {
+-            if (force_opaque)
++            if (sanitize)
+             {
+                 for (x = 0; x < height * width; ++x)
+-                    ((UINT32 *)dst)[x] = ((UINT32 *)src)[x] | 0xff000000;
++                {
++                    UINT32 v = ((const UINT32 *)src)[x];
++                    if (!(v & 0xff000000) && (v & 0x00ffffff)) v |= 0xff000000;
++                    ((UINT32 *)dst)[x] = v;
++                }
++            }
++            else if (force_opaque)
++            {
++                for (x = 0; x < height * width; ++x)
++                    ((UINT32 *)dst)[x] = ((UINT32 *)src)[x] | alpha_bits;
+             }
+             else memcpy(dst, src, height * width * 4);
+             continue;
+         }
+ 
+-        if (force_opaque)
++        if (sanitize)
+         {
+             for (y = 0; y < height; y++)
+             {
+                 for (x = 0; x < width; ++x)
+-                    ((UINT32 *)dst)[x] = ((UINT32 *)src)[x] | 0xff000000;
++                {
++                    UINT32 v = ((const UINT32 *)src)[x];
++                    if (!(v & 0xff000000) && (v & 0x00ffffff)) v |= 0xff000000;
++                    ((UINT32 *)dst)[x] = v;
++                }
++                src += src_stride;
++                dst += dst_stride;
++            }
++        }
++        else if (force_opaque)
++        {
++            for (y = 0; y < height; y++)
++            {
++                for (x = 0; x < width; ++x)
++                    ((UINT32 *)dst)[x] = ((UINT32 *)src)[x] | alpha_bits;
+                 src += src_stride;
+                 dst += dst_stride;
+             }
+@@ -342,11 +378,11 @@
+  */
+ static void wayland_shm_buffer_copy_data(struct wayland_shm_buffer *buffer,
+                                          const char *bits, RECT *rect,
+-                                         HRGN region, BOOL force_opaque)
++                                         HRGN region, UINT alpha_bits, BOOL sanitize)
+ {
+     RECT buffer_rect = {0, 0, buffer->width, buffer->height};
+     TRACE("buffer=%p bits=%p rect=%s\n", buffer, bits, wine_dbgstr_rect(rect));
+-    copy_pixel_region(bits, rect, buffer->map_data, &buffer_rect, region, force_opaque);
++    copy_pixel_region(bits, rect, buffer->map_data, &buffer_rect, region, alpha_bits, sanitize);
+ }
+ 
+ static void wayland_shm_buffer_copy(struct wayland_shm_buffer *src,
+@@ -357,7 +393,8 @@
+     RECT dst_rect = {0, 0, dst->width, dst->height};
+     TRACE("src=%p dst=%p\n", src, dst);
+     copy_pixel_region(src->map_data, &src_rect, dst->map_data, &dst_rect, region,
+-                      src->format == WL_SHM_FORMAT_XRGB8888 && dst->format == WL_SHM_FORMAT_ARGB8888);
++                      (src->format == WL_SHM_FORMAT_XRGB8888 && dst->format == WL_SHM_FORMAT_ARGB8888)
++                          ? 0xff000000 : 0, FALSE);
+ }
+ 
+ /**********************************************************************
+@@ -468,8 +505,37 @@
+         copy_from_window_region = shm_buffer->damage_region;
+     }
+ 
+-    wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+-                                 shape_bits && !wws->layered);
++    /* NEUTRON: layered-surface alpha policy (root-caused 2026-07-18):
++     * - SetLayeredWindowAttributes LWA_ALPHA constant (window_surface->alpha_bits = alpha<<24):
++     *   OR it into every pixel, mirroring winex11's layered path.
++     * - Per-pixel alpha (UpdateLayeredWindow, window_surface->alpha_mask set): pass the app's
++     *   alpha through but SANITIZE invalid premultiplied pixels (alpha==0, RGB!=0 -> opaque).
++     *   Those pixels are produced by GDI painting (TextOut/fills/dcomp swapchain blits write
++     *   alpha=0) mixed into the ULW surface; LrC's mask dropdown / overlay tips paint their
++     *   entire content that way and rendered see-through. Genuine ULW transparency is all-zero
++     *   premultiplied pixels and is preserved. Pairs with the win32u dce.c change that stops
++     *   the alpha-derived surface SHAPE from punching those same pixels out (which is why the
++     *   earlier force-opaque-interior attempt failed: wayland_shm_buffer_copy_shape re-zeroed
++     *   every GDI-drawn pixel right after the copy).
++     * - Layered with neither (no attributes yet): opaque.
++     * - Non-layered but shaped: force opaque, the shape cuts the edges. */
++    {
++        UINT alpha_bits;
++        BOOL sanitize = FALSE;
++        if (wws->layered)
++        {
++            alpha_bits = window_surface->alpha_bits;
++            if (alpha_bits == (UINT)-1)
++            {
++                alpha_bits = 0;
++                if (window_surface->alpha_mask) sanitize = TRUE;
++                else alpha_bits = 0xff000000;
++            }
++        }
++        else alpha_bits = shape_bits ? 0xff000000 : 0;
++        wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
++                                     alpha_bits, sanitize);
++    }
+     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
+ 
+     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);

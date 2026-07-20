@@ -1,0 +1,40 @@
+# neutron-win32u-layered-shape-alpha
+#
+# Don't punch GDI-painted pixels out of an UpdateLayeredWindow's alpha-derived shape.
+#
+# set_surface_shape() derives a 1bpp window shape from a per-pixel-alpha (ULW) surface by treating
+# every alpha==0 pixel as transparent. But GDI drawing (TextOut/fills/blits) writes alpha=0 with
+# NON-zero RGB into 32bpp surfaces. When an app paints with plain GDI into a ULW popup, every
+# GDI-drawn pixel (all the text glyphs and body) got punched out of the shape -> fully transparent.
+#
+# Repro (Adobe Lightroom Classic, Develop): the "Create New Mask" dropdown and full-screen overlay
+# tips are WS_EX_LAYERED ULW popups whose content LrC paints with GDI; their text rendered
+# see-through to whatever window was beneath. Diagnosed via a per-pixel class histogram at flush
+# (tens of thousands of alpha=0/RGB!=0 "invalid premultiplied" pixels per flush).
+#
+# Fix: punch a pixel out of the alpha-derived shape only when it is ENTIRELY zero (RGB=0 AND
+# alpha=0) — a genuine premultiplied fully-transparent pixel. All-zero can only be real layered
+# transparency, so legitimate ULW shapes (fades, shadows, rounded corners) still work; GDI-painted
+# pixels stay in-shape. Pair with the winewayland sanitize change that forces those invalid pixels
+# opaque. Generic (all drivers); only alters invalid premultiplied pixels Windows renders via DWM.
+#
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index cf641c4ec2b..af3594d5000 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -491,7 +491,14 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
+         {
+             for (x = dirty->left; x < dirty->right; x += 8)
+             {
+-                shape[x / 8] &= shape_from_alpha_mask( (UINT32 *)color + x, alpha_mask, alpha );
++                /* NEUTRON: punch a pixel out of the alpha-derived shape only when it is entirely
++                 * zero (a genuine premultiplied fully-transparent pixel). GDI drawing (TextOut,
++                 * fills, blits) writes alpha=0 with non-zero RGB; when an app mixes GDI painting
++                 * into an UpdateLayeredWindow (per-pixel alpha) surface, punching all alpha==0
++                 * pixels made every GDI-painted pixel fully transparent (LrC Develop mask dropdown
++                 * / overlay tips: see-through text). All-zero pixels can only be genuine layered
++                 * transparency, so real ULW shapes (fades, shadows, rounded corners) still work. */
++                shape[x / 8] &= shape_from_alpha_mask( (UINT32 *)color + x, alpha_mask ? ~0u : 0, alpha );
+                 shape[x / 8] &= shape_from_color_key_32( (UINT32 *)color + x, color_mask, color_key );
+             }
+         }

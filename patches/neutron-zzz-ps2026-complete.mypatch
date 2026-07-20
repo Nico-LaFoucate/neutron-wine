@@ -1,0 +1,1628 @@
+--- a/dlls/dwmapi/dwmapi_main.c
++++ b/dlls/dwmapi/dwmapi_main.c
+@@ -219,25 +219,11 @@
+             int border_x = GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+             int border_y = GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+             int count = 1; /* close button */
+-            int width = window_rect.right - window_rect.left;
+ 
+             if (style & WS_MINIMIZEBOX) count++;
+             if (style & WS_MAXIMIZEBOX) count++;
+ 
+-            /* NEUTRON P2c: the caption-button bounds are window-relative, so only the
+-             * window WIDTH matters here. Under winewayland a maximized window can carry a
+-             * stale/garbage Win32 origin (Photoshop), making GetWindowRect degenerate
+-             * (left > right, negative width) and the bounds land off-window -> the app
+-             * paints its caption buttons in the wrong place (black box). Fall back to the
+-             * client width, which stays correct, whenever the window width isn't sane. */
+-            if (width <= 0)
+-            {
+-                RECT client_rect;
+-                if (GetClientRect(hwnd, &client_rect))
+-                    width = client_rect.right - client_rect.left;
+-            }
+-
+-            rect->right = width - border_x;
++            rect->right = window_rect.right - window_rect.left - border_x;
+             rect->left = rect->right - count * btn_w;
+             rect->top = border_y;
+             rect->bottom = rect->top + btn_h;
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -4378,9 +4378,153 @@
+ static HRESULT WINAPI dwritetextlayout_HitTestPoint(IDWriteTextLayout4 *iface,
+     FLOAT pointX, FLOAT pointY, BOOL* is_trailinghit, BOOL* is_inside, DWRITE_HIT_TEST_METRICS *metrics)
+ {
+-    FIXME("%p, %.8e, %.8e, %p, %p, %p): stub\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
++    struct dwrite_textlayout *layout = impl_from_IDWriteTextLayout4(iface);
++    struct layout_effective_run *run, *hit = NULL;
++    struct layout_line *line = NULL;
++    float line_top = 0.0f, line_bottom = 0.0f, best_dist = 0.0f;
++    BOOL y_inside = FALSE, x_inside = FALSE;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %.8e, %.8e, %p, %p, %p.\n", iface, pointX, pointY, is_trailinghit, is_inside, metrics);
++
++    *is_trailinghit = FALSE;
++    *is_inside = FALSE;
++    memset(metrics, 0, sizeof(*metrics));
++
++    if (FAILED(hr = layout_compute_effective_runs(layout)))
++        return hr;
++
++    /* Pass 1: pick the target line by vertical position, preferring the line that
++       actually contains pointY, otherwise the vertically closest one. */
++    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
++    {
++        float top = run->origin.y - run->line->baseline;
++        float bottom = top + run->line->height;
++        float dist = pointY < top ? top - pointY : (pointY >= bottom ? pointY - bottom : 0.0f);
++
++        if (!line || dist < best_dist)
++        {
++            line = run->line;
++            line_top = top;
++            line_bottom = bottom;
++            best_dist = dist;
++            y_inside = dist == 0.0f;
++        }
++    }
++
++    if (!line)
++    {
++        /* Empty layout - report a zero-length box at the origin. */
++        metrics->height = layout->metrics.height;
++        return S_OK;
++    }
++
++    /* Pass 2: within the target line, find the run under pointX, or the closest one. */
++    LIST_FOR_EACH_ENTRY(run, &layout->effective_runs, struct layout_effective_run, entry)
++    {
++        float left, right;
++
++        if (run->line != line)
++            continue;
++
++        left = run->left + run->align_dx;
++        right = left + run->width;
++
++        if (!hit)
++            hit = run;
++
++        if (pointX >= left && pointX < right)
++        {
++            hit = run;
++            x_inside = TRUE;
++            break;
++        }
++
++        /* Otherwise keep the right-most run that starts at or before pointX. */
++        if (pointX >= left)
++            hit = run;
++    }
++
++    if (!hit)
++    {
++        metrics->top = line_top;
++        metrics->height = line_bottom - line_top;
++        return S_OK;
++    }
++
++    {
++        float left = hit->left + hit->align_dx;
++        BOOL rtl = !!(hit->bidi_level & 1);
++
++        if (hit->object)
++        {
++            /* Inline object - a single indivisible box. */
++            metrics->textPosition = hit->start_position;
++            metrics->length = hit->length;
++            metrics->left = left;
++            metrics->top = line_top;
++            metrics->width = hit->width;
++            metrics->height = hit->line->height;
++            metrics->bidiLevel = hit->bidi_level;
++            metrics->isText = FALSE;
++            metrics->isTrimmed = hit->trimming;
++
++            *is_trailinghit = pointX >= left + hit->width / 2.0f;
++        }
++        else
++        {
++            UINT32 cluster = hit->first_cluster, cursor = hit->start_position;
++            UINT32 last = hit->start_position + hit->length;
++            float cluster_left = left, cluster_width = 0.0f;
++
++            /* Walk clusters of this run in visual order to find the one under pointX. */
++            while (cursor < last && cluster < layout->cluster_count)
++            {
++                float w = layout->clustermetrics[cluster].width;
++                float off = rtl ?
++                        hit->width - get_cluster_range_width(layout, hit->first_cluster, cluster) - w :
++                        get_cluster_range_width(layout, hit->first_cluster, cluster);
++
++                cluster_left = left + off;
++                cluster_width = w;
++                if (pointX < cluster_left + w)
++                    break;
++
++                cursor += layout->clustermetrics[cluster].length;
++                cluster++;
++            }
++
++            /* Clamp to the last cluster of the run if pointX is past its end. */
++            if ((cluster >= layout->cluster_count || cursor >= last) && cluster > hit->first_cluster)
++            {
++                cluster--;
++                cursor -= layout->clustermetrics[cluster].length;
++                cluster_width = layout->clustermetrics[cluster].width;
++                cluster_left = left + (rtl ?
++                        hit->width - get_cluster_range_width(layout, hit->first_cluster, cluster) - cluster_width :
++                        get_cluster_range_width(layout, hit->first_cluster, cluster));
++            }
++
++            metrics->textPosition = cursor;
++            metrics->length = cluster < layout->cluster_count ? layout->clustermetrics[cluster].length : 0;
++            metrics->left = cluster_left;
++            metrics->top = line_top;
++            metrics->width = cluster_width;
++            metrics->height = hit->line->height;
++            metrics->bidiLevel = hit->bidi_level;
++            metrics->isText = TRUE;
++            metrics->isTrimmed = hit->trimming;
++
++            /* Trailing hit when the point is past the visual middle of the cluster. */
++            if (cluster_width > 0.0f)
++                *is_trailinghit = rtl ? pointX < cluster_left + cluster_width / 2.0f :
++                        pointX >= cluster_left + cluster_width / 2.0f;
++        }
++
++        *is_inside = x_inside && y_inside;
++    }
++
++    return S_OK;
+ }
+ 
+ static struct layout_effective_run *layout_get_effective_run_for_position(struct dwrite_textlayout *layout,
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -1291,9 +1291,14 @@
+ static HRESULT WINAPI dwritefactory_CreateEllipsisTrimmingSign(IDWriteFactory7 *iface, IDWriteTextFormat *format,
+     IDWriteInlineObject **trimming_sign)
+ {
++    HRESULT hr;
++
+     TRACE("%p, %p, %p.\n", iface, format, trimming_sign);
+ 
+-    return create_trimmingsign(iface, format, trimming_sign);
++    hr = create_trimmingsign(iface, format, trimming_sign);
++    ERR("NEUTRON trimsign format=%p hr=%#lx sign=%p\n", format, hr,
++        trimming_sign ? *trimming_sign : NULL);
++    return hr;
+ }
+ 
+ static HRESULT WINAPI dwritefactory_CreateTextAnalyzer(IDWriteFactory7 *iface, IDWriteTextAnalyzer **analyzer)
+--- a/dlls/gdiplus/graphics.c
++++ b/dlls/gdiplus/graphics.c
+@@ -737,23 +737,12 @@
+     return alpha_blend_pixels_hrgn(graphics, dst_x, dst_y, src, src_width, src_height, src_stride, NULL, fmt);
+ }
+ 
+-/* NOTE: start and end pixels must be in pre-multiplied ARGB format */
+-static FORCEINLINE ARGB blend_colors_premult(ARGB start, ARGB end, REAL position)
+-{
+-    UINT pos = position * 255.0f + 0.5f;
+-    return
+-        (((((start >> 24)       ) << 8) + (((end >> 24)       ) - ((start >> 24)       )) * pos) >> 8) << 24 |
+-        (((((start >> 16) & 0xff) << 8) + (((end >> 16) & 0xff) - ((start >> 16) & 0xff)) * pos) >> 8) << 16 |
+-        (((((start >>  8) & 0xff) << 8) + (((end >>  8) & 0xff) - ((start >>  8) & 0xff)) * pos) >> 8) <<  8 |
+-        (((((start      ) & 0xff) << 8) + (((end      ) & 0xff) - ((start      ) & 0xff)) * pos) >> 8);
+-}
+-
+ static ARGB blend_colors(ARGB start, ARGB end, REAL position)
+ {
+     INT start_a, end_a, final_a;
+     INT pos;
+ 
+-    pos = (INT)(position * 255.0f + 0.5f);
++    pos = gdip_round(position * 0xff);
+ 
+     start_a = ((start >> 24) & 0xff) * (pos ^ 0xff);
+     end_a = ((end >> 24) & 0xff) * pos;
+@@ -1159,11 +1148,6 @@
+     return ((DWORD*)(bits))[(x - src_rect->X) + (y - src_rect->Y) * src_rect->Width];
+ }
+ 
+-static FORCEINLINE int positive_ceilf(float f)
+-{
+-    return f - (int)f > 0.0f ? f + 1.0f : f;
+-}
+-
+ static ARGB resample_bitmap_pixel(GDIPCONST GpRect *src_rect, LPBYTE bits, UINT width,
+     UINT height, GpPointF *point, GDIPCONST GpImageAttributes *attributes,
+     InterpolationMode interpolation, PixelOffsetMode offset_mode)
+@@ -1184,12 +1168,12 @@
+         ARGB top, bottom;
+         float x_offset;
+ 
+-        leftx = (INT)point->X;
+-        leftxf = (REAL)leftx;
+-        rightx = positive_ceilf(point->X);
+-        topy = (INT)point->Y;
+-        topyf = (REAL)topy;
+-        bottomy = positive_ceilf(point->Y);
++        leftxf = floorf(point->X);
++        leftx = (INT)leftxf;
++        rightx = (INT)ceilf(point->X);
++        topyf = floorf(point->Y);
++        topy = (INT)topyf;
++        bottomy = (INT)ceilf(point->Y);
+ 
+         if (leftx == rightx && topy == bottomy)
+             return sample_bitmap_pixel(src_rect, bits, width, height,
+@@ -1233,75 +1217,6 @@
+     }
+ }
+ 
+-static ARGB resample_bitmap_pixel_premult(GDIPCONST GpRect *src_rect, LPBYTE bits, UINT width,
+-    UINT height, GpPointF *point, GDIPCONST GpImageAttributes *attributes,
+-    InterpolationMode interpolation, PixelOffsetMode offset_mode)
+-{
+-    static int fixme;
+-
+-    switch (interpolation)
+-    {
+-    default:
+-        if (!fixme++)
+-            FIXME("Unimplemented interpolation %i\n", interpolation);
+-        /* fall-through */
+-    case InterpolationModeBilinear:
+-    {
+-        REAL leftxf, topyf;
+-        INT leftx, rightx, topy, bottomy;
+-        ARGB topleft, topright, bottomleft, bottomright;
+-        ARGB top, bottom;
+-        float x_offset;
+-
+-        leftx = (INT)point->X;
+-        leftxf = (REAL)leftx;
+-        rightx = positive_ceilf(point->X);
+-        topy = (INT)point->Y;
+-        topyf = (REAL)topy;
+-        bottomy = positive_ceilf(point->Y);
+-
+-        if (leftx == rightx && topy == bottomy)
+-            return sample_bitmap_pixel(src_rect, bits, width, height,
+-                leftx, topy, attributes);
+-
+-        topleft = sample_bitmap_pixel(src_rect, bits, width, height,
+-            leftx, topy, attributes);
+-        topright = sample_bitmap_pixel(src_rect, bits, width, height,
+-            rightx, topy, attributes);
+-        bottomleft = sample_bitmap_pixel(src_rect, bits, width, height,
+-            leftx, bottomy, attributes);
+-        bottomright = sample_bitmap_pixel(src_rect, bits, width, height,
+-            rightx, bottomy, attributes);
+-
+-        x_offset = point->X - leftxf;
+-        top = blend_colors_premult(topleft, topright, x_offset);
+-        bottom = blend_colors_premult(bottomleft, bottomright, x_offset);
+-
+-        return blend_colors_premult(top, bottom, point->Y - topyf);
+-    }
+-    case InterpolationModeNearestNeighbor:
+-    {
+-        FLOAT pixel_offset;
+-        switch (offset_mode)
+-        {
+-        default:
+-        case PixelOffsetModeNone:
+-        case PixelOffsetModeHighSpeed:
+-            pixel_offset = 0.5;
+-            break;
+-
+-        case PixelOffsetModeHalf:
+-        case PixelOffsetModeHighQuality:
+-            pixel_offset = 0.0;
+-            break;
+-        }
+-        return sample_bitmap_pixel(src_rect, bits, width, height,
+-            floorf(point->X + pixel_offset), point->Y + pixel_offset, attributes);
+-    }
+-
+-    }
+-}
+-
+ static REAL intersect_line_scanline(const GpPointF *p1, const GpPointF *p2, REAL y)
+ {
+     return (p1->X - p2->X) * (p2->Y - y) / (p2->Y - p1->Y) + p2->X;
+@@ -3448,10 +3363,8 @@
+             lockeddata.Scan0 = src_data;
+             if (!do_resampling && bitmap->format == PixelFormat32bppPARGB)
+                 lockeddata.PixelFormat = apply_image_attributes(imageAttributes, NULL, 0, 0, 0, ColorAdjustTypeBitmap, bitmap->format);
+-            else if (imageAttributes != &defaultImageAttributes)
+-                lockeddata.PixelFormat = PixelFormat32bppARGB;
+             else
+-                lockeddata.PixelFormat = PixelFormat32bppPARGB;
++                lockeddata.PixelFormat = PixelFormat32bppARGB;
+ 
+             stat = GdipBitmapLockBits(bitmap, &src_area, ImageLockModeRead|ImageLockModeUserInputBuf,
+                 lockeddata.PixelFormat, &lockeddata);
+@@ -3523,14 +3436,8 @@
+                     {
+                         if (src_pointf.X >= srcx && src_pointf.X < srcx + srcwidth &&
+                             src_pointf.Y >= srcy && src_pointf.Y < srcy + srcheight)
+-                        {
+-                            if (lockeddata.PixelFormat != PixelFormat32bppPARGB)
+-                                *dst_color = resample_bitmap_pixel(&src_area, src_data, bitmap->width, bitmap->height, &src_pointf,
+-                                                                   imageAttributes, interpolation, offset_mode);
+-                            else
+-                                *dst_color = resample_bitmap_pixel_premult(&src_area, src_data, bitmap->width, bitmap->height, &src_pointf,
+-                                                                           imageAttributes, interpolation, offset_mode);
+-                        }
++                            *dst_color = resample_bitmap_pixel(&src_area, src_data, bitmap->width, bitmap->height, &src_pointf,
++                                                               imageAttributes, interpolation, offset_mode);
+                         dst_color++;
+                     }
+                 }
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -918,6 +918,39 @@
+     }
+ 
+     if (alertable) alert_fd = get_inproc_alert_fd();
++#ifdef NTSYNC_IOC_EVENT_READ
++    if (count == 1 && syncs[0]->type == INPROC_SYNC_INTERNAL &&
++        (!timeout || timeout->QuadPart == TIMEOUT_INFINITE))
++    {
++        /* NEUTRON diag: poll a would-be-infinite internal(queue) wait with 2s timeouts and read the
++         * event state each timeout. Distinguishes stale-object (signaled stays 0) from edge-miss
++         * (event becomes signaled=1 and a fresh wait recovers). Logs only when a wait actually stalls. */
++        static FILE *neutron_i;
++        unsigned int tid = (unsigned)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
++        LARGE_INTEGER to;
++        int iter = 0;
++        if (!neutron_i) neutron_i = fopen( "~/neutron-cli.log", "a" );
++        for (;;)
++        {
++            to.QuadPart = -20000000;  /* 2s relative */
++            ret = linux_wait_objs( inproc_device_fd, 1, objs, type, alert_fd, &to );
++            if (ret != STATUS_TIMEOUT) break;
++            {
++                struct ntsync_event_args ea = {0};
++                int sg = ioctl( objs[0], NTSYNC_IOC_EVENT_READ, &ea ) == 0 ? (int)ea.signaled : -1;
++                if (neutron_i && iter < 12)
++                    { fprintf( neutron_i, "IPW-POLL tid %04x fd=%d timedout signaled=%d manual=%d iter=%d\n",
++                               tid, objs[0], sg, (int)ea.manual, iter ); fflush( neutron_i ); }
++                iter++;
++            }
++        }
++        if (neutron_i && iter > 0)
++            { fprintf( neutron_i, "IPW-POLL tid %04x fd=%d RECOVERED after %d timeouts ret=%08x\n",
++                       tid, objs[0], iter, (unsigned)ret ); fflush( neutron_i ); }
++        release_inproc_sync( syncs[0] );
++        return ret;
++    }
++#endif
+     ret = linux_wait_objs( inproc_device_fd, count, objs, type, alert_fd, timeout );
+ 
+     while (count--) release_inproc_sync( syncs[count] );
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -577,11 +577,7 @@
+ 
+     pthread_mutex_init( &surface->mutex, NULL );
+ 
+-    /* NEUTRON: initialise a fresh surface to a dark neutral rather than white. This content is only
+-     * visible transiently before the window paints, but window_surface recreation during an interactive
+-     * resize (every 128px bucket) exposes it as a full-window flash — white flashes hard against a dark
+-     * (Adobe) UI, a dark grey blends in. Harmless elsewhere (also transient). */
+-    memset( window_surface_get_color( surface, info ), 0x20, info->bmiHeader.biSizeImage );
++    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+ 
+     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
+     return surface;
+@@ -1737,11 +1733,6 @@
+     RECT rect;
+     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+ 
+-    /* NEUTRON: a real BeginPaint means the app validated this window's update
+-     * region -> clear its WM_PAINT circuit-breaker count (message.c) so legit
+-     * paint/resize loops never trip it. */
+-    { extern void neutron_break_validate( HWND hwnd ); neutron_break_validate( hwnd ); }
+-
+     NtUserHideCaret( hwnd );
+ 
+     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+--- a/dlls/win32u/hook.c
++++ b/dlls/win32u/hook.c
+@@ -80,6 +80,9 @@
+ {
+     HHOOK handle = 0;
+ 
++    if (id == WH_SHELL || id == WH_MOUSE || id == WH_CBT)
++        ERR( "neutron-shell: INSTALL hook id=%d tid=%lu proc=%p\n", id, (unsigned long)tid, proc );
++
+     if (!proc)
+     {
+         RtlSetLastWin32Error( ERROR_INVALID_FILTER_PROC );
+@@ -479,6 +482,7 @@
+ 
+ LRESULT call_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size_t lparam_size )
+ {
++    if (id == WH_SHELL) ERR( "neutron-shell: deliver WH_SHELL code=%d hwnd=%p\n", code, (HWND)wparam );
+     return call_message_hooks( id, code, wparam, lparam, lparam_size, 0, FALSE );
+ }
+ 
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1982,8 +1982,24 @@
+     TRACE( "hwnd %p, previous %p, mouse %u, focus %u, new_active_thread_id %04x\n",
+            hwnd, previous, mouse, focus, new_active_thread_id );
+ 
++    /* NEUTRON diag: log activations to see if the doc window ever becomes active (dock-on-activate). */
++    {
++        WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
++        cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++        l = NtUserGetClassName( hwnd, FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++        for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
++        ERR( "neutron-activate: set_active hwnd=%p class=%s prev=%p focus=%u mouse=%u\n", hwnd, cb, previous, focus, mouse );
++    }
++
+     if (previous == hwnd)
+     {
++        {   /* NEUTRON diag: activation skipped (already-active) -> NO WM_ACTIVATE sent to this hwnd */
++            WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
++            cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++            l = NtUserGetClassName( hwnd, FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++            for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
++            ERR( "neutron-wmactivate: SKIP-already-active hwnd=%p class=%s mouse=%u\n", hwnd, cb, mouse );
++        }
+         if (prev) *prev = hwnd;
+         goto done;
+     }
+@@ -2066,6 +2082,14 @@
+ 
+     if (!(winflags & WIN_IS_IN_ACTIVATION) && is_window(hwnd))
+     {
++        {   /* NEUTRON diag: the actual WM_ACTIVATE wparam this hwnd receives (WA_ACTIVE vs WA_CLICKACTIVE) */
++            WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
++            cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++            l = NtUserGetClassName( hwnd, FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++            for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
++            ERR( "neutron-wmactivate: SEND hwnd=%p class=%s wparam=%s mouse=%u prev=%p\n",
++                 hwnd, cb, mouse ? "WA_CLICKACTIVE" : "WA_ACTIVE", mouse, previous );
++        }
+         send_message( hwnd, WM_NCACTIVATE, hwnd == NtUserGetForegroundWindow(), (LPARAM)previous );
+         send_message( hwnd, WM_ACTIVATE,
+                       MAKEWPARAM( mouse ? WA_CLICKACTIVE : WA_ACTIVE, is_iconic(hwnd) ? 0x20 : 0 ),
+@@ -2208,6 +2232,15 @@
+     DWORD new_thread_id;
+     HWND previous = 0;
+ 
++    {   /* NEUTRON diag: source of foreground changes. internal=1 => winewayland (NtUserSetForegroundWindowInternal);
++           internal=0 => app (NtUserSetForegroundWindow). Pinpoints if the PSFloatC->Photoshop re-grab is wayland-driven. */
++        WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
++        cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++        l = NtUserGetClassName( hwnd, FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++        for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
++        ERR( "neutron-setfg: hwnd=%p class=%s mouse=%u internal=%u\n", hwnd, cb, mouse, internal );
++    }
++
+     if (mouse) hwnd = get_full_window_handle( hwnd );
+     new_thread_id = get_window_thread( hwnd, NULL );
+ 
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3240,9 +3240,15 @@
+         /* if we get here, we have a sent message; call the window procedure */
+         info.prev = thread_info->receive_info;
+         thread_info->receive_info = &info;
++        if (info.msg.message == 0x52f)  /* NEUTRON diag: Adobe Core.dll WM_USER+303 marshalling */
++            ERR("NEUTRON-DISPATCH msg %04x hwnd %p type %d info %p prev %p\n",
++                info.msg.message, info.msg.hwnd, info.type, &info, info.prev);
+         result = call_window_proc( info.msg.hwnd, info.msg.message, info.msg.wParam,
+                                    info.msg.lParam, info.type, FALSE, WMCHAR_MAP_RECVMESSAGE,
+                                    info.type == MSG_ASCII );
++        if (info.msg.message == 0x52f)  /* NEUTRON diag: did wndproc return? is reply sent or skipped? */
++            ERR("NEUTRON-REPLY msg %04x returned recv_info_ok=%d result=%lx\n",
++                info.msg.message, thread_info->receive_info == &info, (long)result);
+         if (thread_info->receive_info == &info)
+             reply_winproc_result( result, info.msg.hwnd, info.msg.message,
+                                   info.msg.wParam, info.msg.lParam );
+@@ -3779,7 +3785,16 @@
+             continue;
+         }
+ 
+-        wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
++        {   /* NEUTRON diag: log around the ntsync wait to catch a lost QS_SMRESULT wakeup */
++            static FILE *neutron_c;
++            unsigned int tid = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
++            DWORD r;
++            if (!neutron_c) neutron_c = fopen( "~/neutron-cli.log", "a" );
++            if (neutron_c) { fprintf( neutron_c, "WMR tid %04x WAIT wake_bits=%08x mask=%08x\n",
++                                      tid, wake_bits, wake_mask ); fflush( neutron_c ); }
++            r = wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
++            if (neutron_c) { fprintf( neutron_c, "WMR tid %04x WOKE ret=%08x\n", tid, (unsigned)r ); fflush( neutron_c ); }
++        }
+     }
+ }
+ 
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -52,6 +52,10 @@
+     struct window_rects rects;        /* window rects in window DPI, relative to the parent client area */
+     RECT               normal_rect;   /* Normal window rect saved when maximized/minimized */
+     RECT               present_rect;  /* present rect for exclusive fullscreen mode */
++    HMONITOR           monitor_override; /* NEUTRON: driver-authoritative monitor for this window (0 = none).
++                                          * On Wayland the win32 position is fictional; the graphics driver
++                                          * knows the surface's real output and stamps it here so the window's
++                                          * monitor/DPI and maximize target follow the surface, not the position. */
+     POINT              min_pos;       /* Position for minimized window */
+     POINT              max_pos;       /* Position for maximized window */
+     WCHAR             *text;          /* Window text */
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3056,6 +3056,34 @@
+     return NULL;
+ }
+ 
++/* NEUTRON: resolve the active monitor whose RAW dpi matches want_raw. Used to map a Wayland output to
++ * an HMONITOR without relying on monitor POSITIONS, which can be stale in an app process (the display
++ * model may be built before the compositor advertised geometry). Also logs the monitor list. */
++HMONITOR monitor_handle_from_raw_dpi( UINT want_raw )
++{
++    struct monitor *monitor;
++    HMONITOR match = 0;
++    UINT best_delta = ~0u;
++    UINT x, y;
++
++    if (!lock_display_devices( FALSE )) return 0;
++    LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
++    {
++        UINT raw, eff, delta;
++        if (!is_monitor_active( monitor )) continue;
++        eff = monitor_get_dpi( monitor, MDT_DEFAULT, &x, &y );
++        raw = monitor_get_dpi( monitor, MDT_RAW_DPI, &x, &y );
++        ERR( "neutron-monlist: handle=%p raw_dpi=%u eff_dpi=%u primary=%d\n",
++             monitor->handle, raw, eff, is_monitor_primary( monitor ) );
++        /* Nearest match, not exact: want_raw comes from the compositor's fractional scale
++         * (scale*96, e.g. 1.7*96=163.2->163) which can round a couple dpi off a monitor's raw dpi. */
++        delta = raw > want_raw ? raw - want_raw : want_raw - raw;
++        if (delta < best_delta) { best_delta = delta; match = monitor->handle; }
++    }
++    unlock_display_devices();
++    return match;
++}
++
+ /* display_lock must be held */
+ static RECT monitors_get_union_rect( UINT dpi, MONITOR_DPI_TYPE type )
+ {
+@@ -3148,6 +3176,36 @@
+ /**********************************************************************
+  *              get_win_monitor_dpi
+  */
++/* NEUTRON: a window's driver-authoritative monitor override (0 if none / cross-process). */
++HMONITOR get_window_monitor_override( HWND hwnd )
++{
++    HMONITOR mon = 0;
++    WND *win = get_win_ptr( hwnd );
++    if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
++    {
++        mon = win->monitor_override;
++        release_win_ptr( win );
++    }
++    return mon;
++}
++
++/* NEUTRON: monitor dpi for a resolved HMONITOR (mirrors monitor_dpi_from_rect). display_lock taken. */
++UINT monitor_dpi_from_handle( HMONITOR handle, UINT *raw_dpi )
++{
++    struct monitor *monitor;
++    UINT ret = system_dpi, x, y;
++
++    if (!lock_display_devices( FALSE )) return 0;
++    if ((monitor = get_monitor_from_handle( handle )))
++    {
++        *raw_dpi = monitor_get_dpi( monitor, MDT_RAW_DPI, &x, &y );
++        ret = monitor_get_dpi( monitor, MDT_DEFAULT, &x, &y );
++    }
++    unlock_display_devices();
++
++    return ret;
++}
++
+ UINT get_win_monitor_dpi( HWND hwnd, UINT *raw_dpi )
+ {
+     UINT dpi = NTUSER_DPI_CONTEXT_GET_DPI( get_window_dpi_awareness_context( hwnd ) );
+@@ -3176,6 +3234,12 @@
+     {
+         rect = is_iconic( hwnd ) ? win->normal_rect : win->rects.window;
+         release_win_ptr( win );
++        /* NEUTRON: DELIBERATELY does NOT consult win->monitor_override. The override exists only to steer
++         * monitor_from_window (so get_maximized_rect targets the surface's real output — fixes maximize-
++         * too-big). It must NOT drive per-monitor DPI here: doing so made win32u report 96 while PS still
++         * rendered its UI at 163 (no WM_DPICHANGED honored under Wayland's fictional positioning) → the
++         * surface presented a 163-rendered buffer at 1.0x → "huge" floating. Scale is left to #1's
++         * compositor-preferred-scale path (position + preferred_scale), which is correct for floating. */
+     }
+ 
+     return monitor_dpi_from_rect( rect, dpi, raw_dpi );
+@@ -4779,9 +4843,17 @@
+ {
+     RECT rect;
+     WINDOWPLACEMENT wp;
++    HMONITOR override;
+ 
+     TRACE( "(%p, 0x%08x)\n", hwnd, flags );
+ 
++    /* NEUTRON: a driver-authoritative monitor wins over the (fictional-on-Wayland) window position, so
++     * MonitorFromWindow and maximize (get_maximized_rect) follow the surface's REAL output. NOTE: this is
++     * the ONLY place the override is honored — get_win_monitor_dpi/apply_window_pos deliberately ignore it
++     * (driving per-monitor DPI from it presented PS's 163-rendered UI at 1.0x = "huge"; scale is left to
++     * #1's compositor-preferred-scale path). So the override fixes maximize sizing without touching scale. */
++    if ((override = get_window_monitor_override( hwnd ))) return override;
++
+     wp.length = sizeof(wp);
+     if (is_iconic( hwnd ) && NtUserGetWindowPlacement( hwnd, &wp ))
+         return monitor_from_rect( &wp.rcNormalPosition, flags, dpi );
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -164,6 +164,9 @@
+ extern INT get_display_depth( UNICODE_STRING *name );
+ extern RECT get_display_rect( const WCHAR *display );
+ extern UINT get_win_monitor_dpi( HWND hwnd, UINT *raw_dpi );
++extern HMONITOR get_window_monitor_override( HWND hwnd );
++extern UINT monitor_dpi_from_handle( HMONITOR handle, UINT *raw_dpi );
++extern HMONITOR monitor_handle_from_raw_dpi( UINT want_raw );
+ extern RECT get_primary_monitor_rect( UINT dpi );
+ extern DWORD get_process_layout(void);
+ extern COLORREF get_sys_color( int index );
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1429,6 +1429,9 @@
+ 
+ static void neutron_on_window_hidden( HWND hwnd );  /* NEUTRON: defined later, used by hide paths */
+ static void neutron_log_shown( HWND hwnd, const char *via );  /* NEUTRON diag: log window shows */
++static void neutron_geom_log( const char *tag, HWND hwnd, const RECT *win, const RECT *client );  /* NEUTRON avenue-3 */
++static void neutron_class_ascii( HWND hwnd, char *out /* [64] */ );  /* NEUTRON: defined later */
++static void neutron_mask_trace( HWND hwnd, UINT swp_flags, const RECT *oldw, const RECT *neww ); /* NEUTRON mask-storm */
+ 
+ /* Helper function for SetWindowLong(). */
+ static LONG_PTR set_window_long_internal( HWND hwnd, INT offset, UINT size,
+@@ -1942,6 +1945,31 @@
+         rects->client = map_dpi_rect( rects->client, window_dpi, dpi );
+         rects->visible = map_dpi_rect( rects->visible, window_dpi, dpi );
+         release_win_ptr( win );
++        {   /* NEUTRON screenrect-trace (NEUTRON_SCREENRECT_TRACE=1): log GetWindowRect-style
++             * COORDS_SCREEN readbacks so we can catch the anchor read LrC uses to place mask
++             * dropdowns. When that read returns a bad (empty / origin-anchored) rect, LrC falls
++             * back to centering the popup on screen ("far from click" / checkbox teleport). Log
++             * ALL screen reads (bounded budget) so a timestamp diff vs the popup CREATE pins the
++             * exact anchor value the app fought. */
++            static int srt = -1;
++            static LONG srt_budget = 20000;
++            if (srt < 0) { const char *e = getenv("NEUTRON_SCREENRECT_TRACE"); srt = (e && e[0]=='1') ? 1 : 0; }
++            if (srt && relative == COORDS_SCREEN)
++            {
++                RECT *w = &rects->window;
++                BOOL empty = (w->right <= w->left) || (w->bottom <= w->top);
++                BOOL badorigin = (w->left <= 0) && (w->top <= 0);   /* a right-side control at/left of origin = bad anchor */
++                if ((empty || badorigin) && InterlockedDecrement( &srt_budget ) >= 0)
++                {
++                    char c[64];
++                    neutron_class_ascii( hwnd, c );
++                    ERR("neutron-srect: hwnd=%p class=%s screen=(%d,%d %dx%d)%s%s\n", hwnd, c,
++                        (int)w->left, (int)w->top, (int)(w->right-w->left), (int)(w->bottom-w->top),
++                        empty ? " EMPTY" : "", badorigin ? " ORIGIN" : "");
++                }
++            }
++        }
++        neutron_geom_log( "READ", hwnd, &rects->window, &rects->client );  /* NEUTRON avenue-3: input rect read */
+         return TRUE;
+     }
+ 
+@@ -2265,6 +2293,63 @@
+            rect->top <= info->rcMonitor.top && rect->bottom >= info->rcMonitor.bottom;
+ }
+ 
++/* NEUTRON: WM_DPICHANGED is only defined in winuser.rh, not the C headers win32u includes. */
++#ifndef WM_DPICHANGED
++#define WM_DPICHANGED 0x02e0
++#endif
++
++/* NEUTRON: gate for the experimental cross-monitor WM_DPICHANGED sender (the ③+④ approach). OFF by
++ * default — on Wayland the win32 window position is fictional so this fights the restore logic; the
++ * shipping default relies on the winewayland driver-side scale fix. Set NEUTRON_DPI_34=1 to enable. */
++static BOOL neutron_dpi_34(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_DPI_34" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++/* NEUTRON: set (monitor!=0) or clear a window's driver-authoritative monitor. If this changes the
++ * window's effective raw dpi and it is per-monitor-DPI aware, notify it with WM_DPICHANGED so it
++ * re-renders at the new dpi. Called by the graphics driver when the surface enters a new output. */
++static UINT set_win_monitor_override( HWND hwnd, UINT want_raw )
++{
++    UINT old_raw = 0, new_raw = 0;
++    HMONITOR monitor, old;
++    WND *win;
++
++    /* Resolve by dpi, not position (app-process monitor positions can be stale). want_raw==0 clears. */
++    monitor = want_raw ? monitor_handle_from_raw_dpi( want_raw ) : 0;
++    get_win_monitor_dpi( hwnd, &old_raw );   /* honors the CURRENT override */
++    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
++    old = win->monitor_override;
++    win->monitor_override = monitor;
++    release_win_ptr( win );
++    if (old == monitor) return TRUE;
++
++    get_win_monitor_dpi( hwnd, &new_raw );   /* honors the NEW override */
++    if (new_raw && old_raw && new_raw != old_raw &&
++        NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) ))
++    {
++        UINT dpi = get_thread_dpi();
++        RECT r;
++        if (get_window_rect( hwnd, &r, dpi ))
++        {
++            int w = r.right - r.left, h = r.bottom - r.top;
++            RECT s = r;
++            s.right  = s.left + muldiv( w, new_raw, old_raw );
++            s.bottom = s.top  + muldiv( h, new_raw, old_raw );
++            /* NEUTRON experiment: do NOT send WM_DPICHANGED. Sending it to just this one toplevel (while
++             * PS's ~40 other surfaces still resolve dpi by their fictional position) destabilized PS's
++             * layout and regressed floating. Keep the override purely so monitor_from_window /
++             * get_maximized_rect target the surface's REAL monitor (fixes the maximize-too-big case);
++             * leave sizing to #1's compositor-scale path. Log the transition we would have announced. */
++            ERR( "neutron-dpichg: hwnd=%p override dpi %u->%u suggest=(%ld,%ld,%ld,%ld) [WM_DPICHANGED suppressed]\n",
++                 hwnd, old_raw, new_raw, (long)s.left, (long)s.top, (long)s.right, (long)s.bottom );
++        }
++    }
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           apply_window_pos
+  *
+@@ -2277,6 +2362,8 @@
+     WND *win;
+     HWND owner_hint, surface_win = 0, toplevel;
+     UINT raw_dpi, monitor_dpi, dpi = get_thread_dpi();
++    UINT old_raw_dpi = 0; /* NEUTRON: window's monitor raw dpi before the move (for WM_DPICHANGED) */
++    HMONITOR monitor_override;  /* NEUTRON: driver-authoritative monitor, or 0 */
+     BOOL ret, is_layered, is_child, need_icons = FALSE;
+     struct window_rects old_rects;
+     RECT extra_rects[3];
+@@ -2291,10 +2378,25 @@
+     if (swp_flags & SWP_HIDEWINDOW) neutron_on_window_hidden( hwnd );  /* NEUTRON: window hidden via SetWindowPos */
+     if (swp_flags & SWP_SHOWWINDOW) neutron_log_shown( hwnd, "SWP" );  /* NEUTRON diag */
+ 
++    /* NEUTRON: the monitor override deliberately does NOT drive per-monitor DPI here (same reason as in
++     * get_win_monitor_dpi: it made win32u report 96 while PS rendered 163 → "huge"). The override serves
++     * ONLY to steer monitor_from_window so get_maximized_rect targets the surface's real output. Window
++     * DPI/scale is left to position + #1's compositor-preferred-scale path. */
++    monitor_override = 0;
+     if (is_child) monitor_dpi = get_win_monitor_dpi( toplevel, &raw_dpi );
++    else if (monitor_override) monitor_dpi = monitor_dpi_from_handle( monitor_override, &raw_dpi );
+     else monitor_dpi = monitor_dpi_from_rect( new_rects->window, dpi, &raw_dpi );
+ 
+     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
++    /* NEUTRON: capture the monitor raw dpi at the OLD position so we can fire WM_DPICHANGED if the
++     * move crosses into a monitor with a different dpi (see the sender after the pos is applied).
++     * With an override old==new so the position-based sender stays inert (the override setter fires it). */
++    if (is_child) { /* no toplevel dpi tracking */ }
++    else if (monitor_override) monitor_dpi_from_handle( monitor_override, &old_raw_dpi );
++    else monitor_dpi_from_rect( old_rects.window, dpi, &old_raw_dpi );
++    neutron_geom_log( "APPLY-old", hwnd, &old_rects.window, &old_rects.client );   /* NEUTRON avenue-3: resize issued */
++    neutron_geom_log( "APPLY-new", hwnd, &new_rects->window, &new_rects->client ); /* to canvas-chain window */
++    neutron_mask_trace( hwnd, swp_flags, &old_rects.window, &new_rects->window );  /* NEUTRON mask-storm delta */
+     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+ 
+     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
+@@ -2455,7 +2557,39 @@
+ 
+         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
+                                         get_driver_window_surface( new_surface, raw_dpi ) );
++        {
++            static unsigned neutron_awp_n;
++            if (((neutron_awp_n++) & 0xFF) == 0)
++                ERR("NEUTRON-AWP hwnd=%p toplevel=%p swp=%08x win=(%d,%d,%d,%d) old=(%d,%d,%d,%d)\n",
++                    hwnd, toplevel, swp_flags,
++                    (int)new_rects->window.left, (int)new_rects->window.top,
++                    (int)new_rects->window.right, (int)new_rects->window.bottom,
++                    (int)old_rects.window.left, (int)old_rects.window.top,
++                    (int)old_rects.window.right, (int)old_rects.window.bottom);
++        }
+         update_client_surfaces( toplevel );
++
++        /* NEUTRON: if this move took a per-monitor-DPI-aware top-level window onto a monitor with a
++         * different dpi, tell it so it re-renders its UI at the new dpi. Wine has no WM_DPICHANGED
++         * sender, so a PMv2 app (e.g. Photoshop) dragged from a 163-dpi 4K to a 96-dpi 1080p keeps
++         * rendering at 163 = far too large. Sent here — after the win ptr is released (2385) and the
++         * driver repositioned — so the app's synchronous SetWindowPos in response reenters cleanly
++         * (and finds the dpi unchanged, terminating). Matches Windows, which sends WM_DPICHANGED
++         * synchronously during the cross-monitor move. */
++        if (neutron_dpi_34() && !is_child && raw_dpi && old_raw_dpi && raw_dpi != old_raw_dpi &&
++            NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) ))
++        {
++            RECT suggested = new_rects->window;
++            int w = suggested.right - suggested.left, h = suggested.bottom - suggested.top;
++            /* suggest a rect scaled by the dpi ratio (keep the window physically the same size),
++             * as Windows does; the app may honor or override it. */
++            suggested.right  = suggested.left + muldiv( w, raw_dpi, old_raw_dpi );
++            suggested.bottom = suggested.top  + muldiv( h, raw_dpi, old_raw_dpi );
++            ERR( "neutron-dpichg: hwnd=%p dpi %u->%u suggest=(%ld,%ld,%ld,%ld)\n", hwnd,
++                 old_raw_dpi, raw_dpi, (long)suggested.left, (long)suggested.top,
++                 (long)suggested.right, (long)suggested.bottom );
++            send_message( hwnd, WM_DPICHANGED, MAKELONG( raw_dpi, raw_dpi ), (LPARAM)&suggested );
++        }
+     }
+ 
+     return ret;
+@@ -4888,6 +5022,10 @@
+ static const WCHAR neutron_psview_class[] = {'P','S','V','i','e','w','C',0};
+ static const WCHAR neutron_docwindow_class[] =
+     {'O','W','L','.','D','o','c','u','m','e','n','t','W','i','n','d','o','w',0};
++/* PS 2026 uses the SHORT class "OWL.Document" for the new document window (PS 2025 used
++   "OWL.DocumentWindow"). Path A keyed only on the long name -> silently no-op'd on PS 2026. */
++static const WCHAR neutron_document_class[] =
++    {'O','W','L','.','D','o','c','u','m','e','n','t',0};
+ static BOOL neutron_class_is( HWND hwnd, const WCHAR *want )
+ {
+     WCHAR bufW[64];
+@@ -4902,6 +5040,143 @@
+     return !wcscmp( bufW, want );
+ }
+ 
++/* === NEUTRON Path B: native force-show of the deferred OWL workspace docks. ===================
++   On File>New the OWL document + its dock hierarchy (Dock->TabPane->TabGroup->Document + panels)
++   are built and reparented under the "Photoshop" frame, but under winewayland PS leaves their
++   WS_VISIBLE clear (deferred to ~make-8) so the canvas never renders. We reveal them ONCE, in
++   show_window's safe context, top-down (ancestors first so children can map). This is exactly the
++   force-show half of the app-side neutron_psdock.c helper, ported into win32u WITHOUT its
++   frame-jitter/2px-nudge and WITHOUT its decaying 10s repaint timer -> no canvas perturbation. */
++static void neutron_class_ascii( HWND hwnd, char *out /* [64] */ )
++{
++    WCHAR bufW[64];
++    UNICODE_STRING name;
++    int len, i;
++    name.Buffer = bufW; name.MaximumLength = sizeof(bufW); name.Length = 0;
++    len = NtUserGetClassName( hwnd, FALSE, &name );
++    if (len < 0 || len >= 64) len = 0;
++    for (i = 0; i < len; i++) out[i] = (char)bufW[i];
++    out[len] = 0;
++}
++static BOOL neutron_ascii_has( const char *hay, const char *needle )
++{
++    int i, j;
++    for (i = 0; hay[i]; i++)
++    {
++        for (j = 0; needle[j] && hay[i + j] == needle[j]; j++) {}
++        if (!needle[j]) return TRUE;
++    }
++    return FALSE;
++}
++/* The workspace dock classes to reveal (mirrors neutron_psdock.c want_show()). */
++static BOOL neutron_want_show( const char *c )
++{
++    return neutron_ascii_has( c, "OWL.Dock" )    || neutron_ascii_has( c, "OWL.TabPane" )
++        || neutron_ascii_has( c, "OWL.TabGroup" )|| neutron_ascii_has( c, "OWL.Palette" )
++        || neutron_ascii_has( c, "OWL.Document" )|| neutron_ascii_has( c, "OWL.WindowGroup" )
++        || neutron_ascii_has( c, "OWL.ResizeGripper" ) || neutron_ascii_has( c, "PSViewC" );
++}
++/* Home screen + floating popups are hidden on purpose: never show them, never descend into them. */
++static BOOL neutron_skip_subtree( const char *c )
++{
++    return neutron_ascii_has( c, "WelcomeScreen" ) || neutron_ascii_has( c, "PSFloat" );
++}
++static int neutron_force_show_docks( HWND parent, int depth )
++{
++    HWND *list;
++    char cb[64];
++    int i, n = 0;
++    if (depth > 14) return 0;
++    if (!(list = list_window_children( parent ))) return 0;
++    for (i = 0; list[i]; i++)
++    {
++        neutron_class_ascii( list[i], cb );
++        if (neutron_skip_subtree( cb )) continue;                 /* leave home/float as PS put it */
++        if (neutron_want_show( cb ) && !(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
++        {
++            RECT rc = {0, 0, 0, 0};
++            get_client_rect( list[i], &rc, get_thread_dpi() );
++            if (rc.right - rc.left > 1 && rc.bottom - rc.top > 1)  /* real geometry, not a placeholder */
++            {
++                NtUserShowWindow( list[i], SW_SHOWNA );
++                NtUserRedrawWindow( list[i], NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW );
++                n++;
++            }
++        }
++        n += neutron_force_show_docks( list[i], depth + 1 );
++    }
++    free( list );
++    return n;
++}
++
++/* === NEUTRON avenue-3: capture the OWL relayout's geometry INPUT (rect reads) and OUTPUT (resize
++   issues) for the canvas ancestor chain during the doc-create window, to localize the query that
++   returns a placeholder (484x484 / 100x500-style) rect vs the real document area. */
++static LONG neutron_relayout_trace;    /* 1 while tracing the doc-create relayout */
++static LONG neutron_relayout_budget;   /* remaining log lines (hard cap on volume) */
++static BOOL neutron_is_relayout_win( HWND hwnd, const char *c )
++{
++    if (neutron_ascii_has( c, "OWL.Dock" ) || neutron_ascii_has( c, "OWL.TabPane" )
++        || neutron_ascii_has( c, "OWL.TabGroup" ) || neutron_ascii_has( c, "OWL.Document" )
++        || neutron_ascii_has( c, "OWL.WindowGroup" ) || neutron_ascii_has( c, "PSViewC" )
++        || neutron_ascii_has( c, "PSFloatC" )) return TRUE;
++    if (!strcmp( c, "Photoshop" )) return TRUE;                 /* the app frame (available area source) */
++    if (!strcmp( c, "Static" ))                                /* the GPU swapchain host = Static child of PSViewC */
++    {
++        char pc[64]; HWND p = NtUserGetAncestor( hwnd, GA_PARENT );
++        if (p) { neutron_class_ascii( p, pc ); if (neutron_ascii_has( pc, "PSViewC" )) return TRUE; }
++    }
++    return FALSE;
++}
++static void neutron_geom_log( const char *tag, HWND hwnd, const RECT *win, const RECT *client )
++{
++    char c[64];
++    if (!neutron_relayout_trace) return;
++    neutron_class_ascii( hwnd, c );
++    if (!neutron_is_relayout_win( hwnd, c )) return;
++    if (InterlockedDecrement( &neutron_relayout_budget ) < 0) { neutron_relayout_trace = 0; return; }
++    ERR( "neutron-geom: %s hwnd=%p class=%s win=(%ld,%ld %ldx%ld) client=%ldx%ld\n",
++         tag, hwnd, c,
++         win ? (long)win->left : 0, win ? (long)win->top : 0,
++         win ? (long)(win->right - win->left) : 0, win ? (long)(win->bottom - win->top) : 0,
++         client ? (long)(client->right - client->left) : -1, client ? (long)(client->bottom - client->top) : -1 );
++}
++
++/* === NEUTRON mask-storm trace (env-gated NEUTRON_MASK_TRACE=1): during the LrC 2nd-mask
++   relayout non-convergence, log every apply_window_pos with class + hwnd + old->new geometry.
++   Real size/pos changes are always logged; pure no-op moves are throttled 1/256 to gauge
++   volume without flooding. Bounded hard budget so a runaway storm can't fill the disk. The
++   goal is to see, in ONE run, whether a window oscillates between two sizes (a genuine size
++   fight) or is re-issued at a STABLE size forever (the app's convergence check failing on a
++   value that is actually stable -> the fought readback is elsewhere, e.g. scale/DPI). */
++static int neutron_mask_trace_on( void )
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_MASK_TRACE" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++static LONG neutron_mask_budget = 60000;
++static LONG neutron_mask_nop_n;
++static void neutron_mask_trace( HWND hwnd, UINT swp_flags, const RECT *oldw, const RECT *neww )
++{
++    char c[64];
++    int ow, oh, nw, nh;
++    BOOL sized, moved;
++    if (!neutron_mask_trace_on()) return;
++    ow = oldw->right - oldw->left; oh = oldw->bottom - oldw->top;
++    nw = neww->right - neww->left; nh = neww->bottom - neww->top;
++    sized = (ow != nw) || (oh != nh);
++    moved = (oldw->left != neww->left) || (oldw->top != neww->top);
++    if (!sized && !moved) { if (((neutron_mask_nop_n++) & 0xFF) != 0) return; }  /* throttle no-ops 1/256 */
++    if (InterlockedDecrement( &neutron_mask_budget ) < 0) return;
++    neutron_class_ascii( hwnd, c );
++    ERR( "neutron-mask: %s%s hwnd=%p class=%s swp=%08x old=(%ld,%ld %dx%d) new=(%ld,%ld %dx%d)\n",
++         sized ? "SZ" : (moved ? "MV" : "NOP"), "",
++         hwnd, c, swp_flags,
++         (long)oldw->left, (long)oldw->top, ow, oh,
++         (long)neww->left, (long)neww->top, nw, nh );
++}
++
+ /* NEUTRON diag: log when a substantial window becomes visible, with class/size/root, so we can
+    see per-make whether PS shows the doc canvas early (make-1) or defers it (~make-5). */
+ static void neutron_log_shown( HWND hwnd, const char *via )
+@@ -4996,12 +5271,30 @@
+ /* Set when an OWL.DocumentWindow is created; the actual welcome dismiss is DEFERRED to
+    show_window. Doing window ops here (mid-NtUserCreateWindowEx) crashes via re-entrancy. */
+ static LONG neutron_dismiss_pending;
++/* NEUTRON Path A (kept as an opt-in debug lever only, NEUTRON_SHELL_FIX=1): emit
++   HSHELL_WINDOWREPLACED on the doc-create transition. Proven INSUFFICIENT alone (PS still hides the
++   docks), so Path B (force-show below) is the default. */
++static LONG neutron_shell_emit_pending;
++/* NEUTRON Path B: set on the doc-create transition; consumed once in show_window to force-show the
++   deferred OWL workspace docks. */
++static LONG neutron_dockshow_pending;
+ static void neutron_on_window_created( HWND hwnd )
+ {
+-    if (neutron_class_is( hwnd, neutron_docwindow_class ))
++    /* Match BOTH the PS 2026 short class "OWL.Document" and the PS 2025 "OWL.DocumentWindow". */
++    if (neutron_class_is( hwnd, neutron_document_class ) || neutron_class_is( hwnd, neutron_docwindow_class ))
+     {
+-        ERR( "neutron: OWL.DocumentWindow %p created -> scheduling welcome dismiss\n", hwnd );
++        ERR( "neutron: OWL document %p created -> welcome dismiss + dock force-show armed\n", hwnd );
+         InterlockedExchange( &neutron_dismiss_pending, 1 );
++        InterlockedExchange( &neutron_shell_emit_pending, 1 );
++        /* NEUTRON avenue-3: arm the geometry trace for the doc-create relayout window. Bounded line
++           budget auto-disarms it (see neutron_geom_log) so it can't flood the whole session. */
++        InterlockedExchange( &neutron_relayout_budget, 20000 );
++        InterlockedExchange( &neutron_relayout_trace, 1 );
++        /* Bounded pass budget (NOT a timer/hammer): a few workspace/doc window ops follow doc-create;
++           run the force-show on the first few so a dock whose geometry lands a beat late still gets
++           revealed. Capped hard at NEUTRON_DOCKSHOW_PASSES; each pass is idempotent (shows only
++           still-hidden windows) and it stops for good once the budget is spent. */
++        InterlockedExchange( &neutron_dockshow_pending, 3 );
+     }
+ }
+ 
+@@ -5037,6 +5330,27 @@
+         neutron_walk_welcomes( 0, 0, TRUE );
+     }
+ 
++    /* NEUTRON Path B: an OWL document was created and its dock hierarchy is now built + reparented
++       under the frame, but WS_VISIBLE is deferred so the canvas never renders. On the first few
++       workspace/doc window ops after doc-create (the dock tree is assembled by then), reveal the
++       whole workspace dock tree. Runs BEFORE the switch below, so the entry-captured was_visible
++       protects our freshly-shown windows from this call's own hide. Bounded (budget from
++       neutron_dockshow_pending), no jitter, no timer, no decaying repaint. */
++    if (neutron_dockshow_pending > 0)
++    {
++        char neutron_cb[64];
++        neutron_class_ascii( hwnd, neutron_cb );
++        if (neutron_want_show( neutron_cb ) && InterlockedDecrement( &neutron_dockshow_pending ) >= 0)
++        {
++            HWND neutron_root = NtUserGetAncestor( hwnd, GA_ROOT );
++            int neutron_shown = neutron_force_show_docks( neutron_root ? neutron_root : 0, 0 );
++            ERR( "neutron: Path B force-show docks (via %s, budget->%d, root=%p) -> revealed %d window(s)\n",
++                 neutron_cb, (int)neutron_dockshow_pending, neutron_root, neutron_shown );
++        }
++        else if (neutron_dockshow_pending < 0)
++            InterlockedExchange( &neutron_dockshow_pending, 0 );  /* clamp if a race drove it negative */
++    }
++
+     if ((!(style & (WS_POPUP | WS_CHILD))
+          || ((style & (WS_POPUP | WS_CHILD | WS_CAPTION)) == (WS_POPUP | WS_CAPTION)))
+         && !get_window_relative( hwnd, GW_OWNER )
+@@ -5137,10 +5451,32 @@
+         /* if parent is not visible simply toggle WS_VISIBLE and return */
+         if (show_flag) set_window_style_bits( hwnd, WS_VISIBLE, 0 );
+         else set_window_style_bits( hwnd, 0, WS_VISIBLE );
++        {   /* NEUTRON diag: child-under-hidden-parent toggle path — did WS_VISIBLE actually stick? */
++            char nc[64]; neutron_class_ascii( hwnd, nc );
++            if ((nc[0]=='O'&&nc[1]=='W'&&nc[2]=='L'&&nc[3]=='.') || (nc[0]=='P'&&nc[1]=='S'&&(nc[2]=='F'||nc[2]=='V')))
++            {
++                DWORD s2 = get_window_long( hwnd, GWL_STYLE );
++                ERR( "neutron-branch: TOGGLE hwnd=%p class=%s cmd=%d show_flag=%d parent=%p(hidden) -> style=%08lx vis=%d\n",
++                     hwnd, nc, cmd, show_flag, parent, (unsigned long)s2, (s2 & WS_VISIBLE) ? 1 : 0 );
++            }
++        }
+     }
+     else
++    {
+         NtUserSetWindowPos( hwnd, HWND_TOP, newPos.left, newPos.top,
+                             newPos.right - newPos.left, newPos.bottom - newPos.top, swp );
++        if (swp & SWP_SHOWWINDOW)
++        {   /* NEUTRON diag: SetWindowPos(SHOWWINDOW) path — did WS_VISIBLE stick? */
++            char nc[64]; neutron_class_ascii( hwnd, nc );
++            if ((nc[0]=='O'&&nc[1]=='W'&&nc[2]=='L'&&nc[3]=='.') || (nc[0]=='P'&&nc[1]=='S'&&(nc[2]=='F'||nc[2]=='V')))
++            {
++                DWORD s2 = get_window_long( hwnd, GWL_STYLE );
++                HWND pp = NtUserGetAncestor( hwnd, GA_PARENT );
++                ERR( "neutron-branch: SETPOS hwnd=%p class=%s cmd=%d parent=%p parentvis=%d swp=%08x -> style=%08lx vis=%d\n",
++                     hwnd, nc, cmd, pp, pp ? is_window_visible( pp ) : -1, swp, (unsigned long)s2, (s2 & WS_VISIBLE) ? 1 : 0 );
++            }
++        }
++    }
+ 
+     new_style = get_window_long( hwnd, GWL_STYLE );
+     if (((style ^ new_style) & WS_MINIMIZE) != 0)
+@@ -5216,20 +5552,33 @@
+         neutron_log_shown( hwnd, "SHOW" );  /* NEUTRON diag */
+         neutron_maybe_dismiss_welcome( hwnd );
+ 
+-        /* NEUTRON (gated NEUTRON_SHELL_FIX): Wine never emits HSHELL_WINDOWREPLACED (0xd), which OWL's
+-           ghost/dock WH_SHELL hook keys on -> PS documents never dock as tabs. Emit it when a top-level
+-           window is shown so OWL re-evaluates docking. Broad first cut to test responsiveness. */
+-        {
+-            static int neutron_shell_fix = -1;
+-            if (neutron_shell_fix < 0)
++        /* NEUTRON Path A: OWL's ghost/dock WH_SHELL hook keys on HSHELL_WINDOWREPLACED (0xd) to
++           re-evaluate document docking; Wine never emits it, so the workspace docks stay deferred
++           (WS_VISIBLE unset) until ~make-8. Emit it ONCE, tightly scoped to the doc-create
++           transition (an OWL.DocumentWindow was just created -> neutron_shell_emit_pending), for
++           the shown window's root top-level, so OWL re-runs its dock/show logic on the FIRST
++           File>New. This replaces the earlier "broad first cut" that emitted for every top-level
++           show (a stability risk in other apps); NEUTRON_SHELL_FIX=1 keeps that broad mode as an
++           opt-in debug override only. */
++        {
++            static int neutron_shell_broad = -1;
++            BOOL neutron_emit = FALSE;
++            if (neutron_shell_broad < 0)
+             {
+                 const char *e = getenv( "NEUTRON_SHELL_FIX" );
+-                neutron_shell_fix = (e && e[0] == '1') ? 1 : 0;
++                neutron_shell_broad = (e && e[0] == '1') ? 1 : 0;
+             }
+-            if (neutron_shell_fix && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD))
++            InterlockedExchange( &neutron_shell_emit_pending, 0 );       /* Path A OFF by default (proven insufficient) */
++            if (neutron_shell_broad && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD))
++                neutron_emit = TRUE;                                     /* opt-in debug override (NEUTRON_SHELL_FIX=1) */
++            if (neutron_emit)
+             {
+-                ERR( "neutron-shell: EMIT HSHELL_WINDOWREPLACED hwnd=%p\n", hwnd );
+-                call_hooks( WH_SHELL, HSHELL_WINDOWREPLACED, (WPARAM)hwnd, 0, 0 );
++                HWND neutron_root = NtUserGetAncestor( hwnd, GA_ROOT );
++                if (neutron_root)
++                {
++                    ERR( "neutron-shell: EMIT HSHELL_WINDOWREPLACED root=%p (doc-create)\n", neutron_root );
++                    call_hooks( WH_SHELL, HSHELL_WINDOWREPLACED, (WPARAM)neutron_root, 0, 0 );
++                }
+             }
+         }
+     }
+@@ -6541,6 +6890,9 @@
+         return param == MDT_EFFECTIVE_DPI ? dpi : raw_dpi;
+     }
+ 
++    case NtUserCallHwndParam_SetWinMonitor: /* NEUTRON */
++        return set_win_monitor_override( hwnd, (UINT)param );
++
+     case NtUserCallHwndParam_SetRawWindowPos:
+     {
+         struct set_raw_window_pos_params *params = (void *)param;
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -185,6 +185,41 @@
+           output_info_cmp_primary_x_y);
+ }
+ 
++/* NEUTRON: (re)compute each output's arranged physical position into output->current.x/y, running the
++ * same overlap resolution the display-device build uses. The display-device update only runs in the
++ * DESKTOP process (maybe_init_display_devices bails elsewhere), so an app process (e.g. Photoshop) that
++ * needs an output's monitor rect — to reposition a window on output-enter — must recompute it here
++ * rather than read a stale/zero value. Deterministic on the (global) compositor output state, so it
++ * matches win32u's monitor origins (which come from the desktop process). Locks output_mutex. */
++void wayland_output_arrange_positions(void)
++{
++    struct wayland_output *output;
++    struct output_info *output_info;
++    struct wl_array output_info_array;
++
++    wl_array_init(&output_info_array);
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        if (!output->current.current_mode) continue;
++        output_info = wl_array_add(&output_info_array, sizeof(*output_info));
++        if (output_info) output_info->output = &output->current;
++    }
++
++    output_info_array_arrange_physical_coords(&output_info_array);
++
++    wl_array_for_each(output_info, &output_info_array)
++    {
++        output_info->output->x = output_info->x;
++        output_info->output->y = output_info->y;
++    }
++
++    wl_array_release(&output_info_array);
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++}
++
+ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,
+                                    void *param)
+ {
+@@ -322,6 +357,12 @@
+ 
+     wl_array_for_each(output_info, &output_info_array)
+     {
++        /* NEUTRON: publish the arranged physical position (post overlap-resolution) back onto the
++         * output so a surface entering this output can be repositioned onto the matching Win32
++         * monitor (whose rc_monitor origin is exactly this x,y). output_info->output aliases
++         * &output->current, and we hold output_mutex. */
++        output_info->output->x = output_info->x;
++        output_info->output->y = output_info->y;
+         wayland_add_device_source(device_manager, param, state_flags, output_info);
+         wayland_add_device_monitor(device_manager, param, output_info);
+         wayland_add_device_modes(device_manager, param, output_info);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -231,8 +231,26 @@
+                                               uint32_t scale)
+ {
+     struct wayland_surface *surface = data;
+-    surface->preferred_scale = scale / 120.0;
+-    TRACE("hwnd=%p scale120=%u (%.4f)\n", surface->hwnd, scale, surface->preferred_scale);
++    double old_scale = surface->preferred_scale;
++    double new_scale = scale / 120.0;
++
++    surface->preferred_scale = new_scale;
++    TRACE("hwnd=%p scale120=%u (%.4f)\n", surface->hwnd, scale, new_scale);
++
++    /* NEUTRON per-monitor DPI (#2): the compositor's preferred fractional scale is the single
++     * authoritative, already-debounced signal for which output this surface is on — KWin resolves
++     * a multi-output straddle itself and sends ONE value only when the surface's predominant output
++     * changes (unlike wl_surface.enter, which fires per-overlapping-output and caused a 163<->96
++     * flip-flop). On a real change, post the derived raw dpi to the window thread so win32u can stamp
++     * the surface's real monitor as authoritative (NtUserSetWinMonitor). Same signal #1 sizes from, so
++     * win32u's per-monitor dpi and the rendered buffer scale can never disagree. */
++    if (surface->hwnd)
++    {
++        UINT new_dpi = (UINT)(new_scale * 96.0 + 0.5);
++        UINT old_dpi = (UINT)(old_scale * 96.0 + 0.5);
++        if (new_dpi >= 48 && new_dpi != old_dpi)
++            NtUserPostMessage(surface->hwnd, WM_WAYLAND_OUTPUT_CHANGE, (WPARAM)new_dpi, 0);
++    }
+ }
+ 
+ static const struct wp_fractional_scale_v1_listener fractional_scale_listener =
+@@ -240,6 +258,36 @@
+     fractional_scale_handle_preferred,
+ };
+ 
++/* NEUTRON: trace which wl_output a toplevel surface overlaps. NOTE: this does NOT drive per-monitor
++ * DPI — wl_surface.enter fires once per overlapping output, so a window straddling two monitors is
++ * "entered" on both, which produced a 163<->96 DPI flip-flop when we acted on it. The authoritative,
++ * compositor-debounced monitor signal is wp_fractional_scale_v1.preferred_scale instead (see
++ * fractional_scale_handle_preferred), so this handler is trace-only. */
++static void wl_surface_handle_enter(void *data, struct wl_surface *wl_surface,
++                                    struct wl_output *wl_output)
++{
++    HWND hwnd = data;
++    struct wayland_output *output;
++    uint32_t id = 0;
++
++    if (wl_output && (output = wl_output_get_user_data(wl_output)))
++        id = output->global_id;
++    TRACE("hwnd=%p wl_output=%p output_id=%u\n", hwnd, wl_output, id);
++}
++
++static void wl_surface_handle_leave(void *data, struct wl_surface *wl_surface,
++                                    struct wl_output *wl_output)
++{
++    /* A leave alone doesn't say where the window went; the enter for the destination
++     * output drives the reposition, so nothing to do here. */
++}
++
++static const struct wl_surface_listener wl_surface_listener =
++{
++    .enter = wl_surface_handle_enter,
++    .leave = wl_surface_handle_leave,
++};
++
+ struct wayland_surface *wayland_surface_create(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+@@ -261,6 +309,9 @@
+         goto err;
+     }
+     wl_surface_set_user_data(surface->wl_surface, hwnd);
++    /* NEUTRON: listen for output enter/leave to reposition onto the right monitor for per-monitor
++     * DPI. Uses the same hwnd user_data, so wl_surface lookups elsewhere are unaffected. */
++    wl_surface_add_listener(surface->wl_surface, &wl_surface_listener, hwnd);
+ 
+     surface->wp_viewport =
+         wp_viewporter_get_viewport(process_wayland.wp_viewporter,
+@@ -556,6 +607,20 @@
+     assert(owner->xdg_surface);
+     assert(!surface->role || surface->role == WAYLAND_SURFACE_ROLE_POPUP);
+ 
++    {   /* NEUTRON popup-trace (NEUTRON_POPUP_TRACE=1) */
++        static int pt = -1;
++        if (pt < 0) { const char *e = getenv("NEUTRON_POPUP_TRACE"); pt = (e && e[0]=='1') ? 1 : 0; }
++        if (pt)
++            ERR("neutron-mkpopup: hwnd=%p owner=%p rect=(%d,%d %dx%d) ownerRect=(%d,%d) cfg=(%d,%d) "
++                "xdg_popup=%p ownerMatch=%d curSerial=%u branch=%s\n",
++                surface->hwnd, owner->hwnd,
++                (int)rect->left, (int)rect->top, (int)(rect->right-rect->left), (int)(rect->bottom-rect->top),
++                (int)owner->window.rect.left, (int)owner->window.rect.top, config.x, config.y,
++                surface->xdg_popup, surface->owner_hwnd == owner->hwnd, surface->current.serial,
++                (surface->xdg_popup && surface->owner_hwnd == owner->hwnd)
++                    ? (surface->current.serial ? "REPOSITION" : "DROP-noserial") : "CREATE");
++    }
++
+     /* Already a popup of this owner: just reposition if the geometry changed. */
+     if (surface->xdg_popup && surface->owner_hwnd == owner->hwnd)
+     {
+@@ -1430,6 +1495,8 @@
+     }
+ }
+ 
++static unsigned neutron_dbg_n;
++
+ static void wayland_client_surface_update(struct client_surface *client)
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+@@ -1438,6 +1505,9 @@
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
++    if (((neutron_dbg_n++) & 0xFF) == 0)
++        ERR("NEUTRON-UPD hwnd=%p toplevel=%p visible=%d\n", hwnd, toplevel, NtUserIsWindowVisible(hwnd));
++
+     if (toplevel && NtUserIsWindowVisible(hwnd))
+         wayland_client_surface_attach(surface, toplevel);
+     else
+@@ -1530,6 +1600,12 @@
+         return;
+     }
+ 
++    if (((neutron_dbg_n++) & 0xFF) == 0)
++        ERR("NEUTRON-ATTACH hwnd=%p toplevel=%p client_toplevel=%p tl_changed=%d wlsurf_cur=%p wlsurf_cached=%p wlsurf_changed=%d\n",
++            hwnd, toplevel, client->toplevel, client->toplevel != toplevel,
++            surface->wl_surface, client->toplevel_wl_surface,
++            client->toplevel_wl_surface != surface->wl_surface);
++
+     /* Reparent if the toplevel changed, or if the toplevel's wl_surface was
+      * recreated (e.g. a role change to/from an unmanaged popup/subsurface left
+      * the client subsurface parented to a now-destroyed wl_surface). */
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -670,6 +670,32 @@
+         toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+     }
+ 
++    {   /* NEUTRON popup-trace (env NEUTRON_POPUP_TRACE=1): for popup/tool-window candidates,
++         * dump the finalized role decision so we can see why LrC's mask tool flyouts become
++         * floating xdg_toplevels (which Wayland can't position → "far from click"/teleport)
++         * instead of xdg_popups anchored to their owner. */
++        static int pt = -1;
++        if (pt < 0) { const char *e = getenv("NEUTRON_POPUP_TRACE"); pt = (e && e[0]=='1') ? 1 : 0; }
++        if (pt)
++        {
++            DWORD st = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++            DWORD ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++            if ((st & WS_POPUP) || (ex & WS_EX_TOOLWINDOW))
++            {
++                HWND gwowner = NtUserGetWindowRelative(hwnd, GW_OWNER);
++                const char *role = toplevel_surface ? "SUBSURFACE"
++                                 : (owner_surface ? "XDG_POPUP" : "XDG_TOPLEVEL");
++                ERR("neutron-popup: hwnd=%p st=%08x ex=%08x managed=%d owner_hint=%p gwowner=%p "
++                    "owner_surf=%p toplevel=%p toplevel_surf=%p rect=(%d,%d %dx%d) -> %s\n",
++                    hwnd, (unsigned)st, (unsigned)ex, managed, owner_hint, gwowner,
++                    owner_surface, toplevel, toplevel_surface,
++                    (int)new_rects->window.left, (int)new_rects->window.top,
++                    (int)(new_rects->window.right - new_rects->window.left),
++                    (int)(new_rects->window.bottom - new_rects->window.top), role);
++            }
++        }
++    }
++
+     data->rects = *new_rects;
+     data->is_fullscreen = fullscreen;
+     data->managed = managed;
+@@ -920,6 +946,47 @@
+     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+ }
+ 
++/* NEUTRON: gate for the driver-authoritative per-monitor-DPI path (#2). OFF by default while it's
++ * being validated; set NEUTRON_DPI_34=1 to enable. The always-on driver-side scale fix in
++ * wayland_win_data_get_config handles correct SIZING regardless; this adds crisp native-dpi rendering
++ * + correct maximize target by telling win32u the surface's real monitor. */
++static BOOL neutron_dpi_follow(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_DPI_34" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++/**********************************************************************
++ *           wayland_window_output_change
++ *
++ * NEUTRON: the compositor's preferred fractional scale for this toplevel surface changed to `raw_dpi`
++ * (posted from fractional_scale_handle_preferred). On Wayland the win32 window position is fictional
++ * (the compositor owns toplevel placement), so instead of moving the window we stamp the surface's REAL
++ * monitor (resolved from that dpi) as the window's authoritative monitor in win32u (NtUserSetWinMonitor).
++ * win32u's MonitorFromWindow / GetDpiForWindow / maximize-target then follow the surface, and
++ * per-monitor DPI applies stably regardless of where the (fictional) rect lands. Driving this from the
++ * compositor's debounced preferred_scale (one value on settle) — not wl_surface.enter (per-overlapping-
++ * output) — is what makes the override stable instead of flip-flopping across a monitor straddle.
++ */
++static void wayland_window_output_change(HWND hwnd, UINT raw_dpi)
++{
++    struct wayland_win_data *data;
++    BOOL is_toplevel;
++
++    if (!neutron_dpi_follow()) return;
++    if (!raw_dpi) return;
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    is_toplevel = data->wayland_surface &&
++                  wayland_surface_is_toplevel(data->wayland_surface);
++    wayland_win_data_release(data);
++    if (!is_toplevel) return;
++
++    ERR("neutron-outchg: hwnd=%p want_dpi=%u\n", hwnd, raw_dpi);
++    NtUserSetWinMonitor(hwnd, raw_dpi);
++}
++
+ /**********************************************************************
+  *           WAYLAND_WindowMessage
+  */
+@@ -933,6 +1000,9 @@
+     case WM_WAYLAND_CONFIGURE:
+         wayland_configure_window(hwnd);
+         return 0;
++    case WM_WAYLAND_OUTPUT_CHANGE:
++        wayland_window_output_change(hwnd, (UINT)wp);
++        return 0;
+     case WM_WAYLAND_SET_FOREGROUND:
+         ERR( "neutron-wlsetfg: winewayland foregrounding hwnd=%p\n", hwnd );
+         NtUserSetForegroundWindowInternal(hwnd);
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -533,6 +533,41 @@
+             }
+         }
+         else alpha_bits = shape_bits ? 0xff000000 : 0;
++        {   /* NEUTRON layer-trace (NEUTRON_LAYER_TRACE=1) */
++            static int lt = -1;
++            if (lt < 0) { const char *e = getenv("NEUTRON_LAYER_TRACE"); lt = (e && e[0]=='1') ? 1 : 0; }
++            if (lt)
++            {
++                DWORD ex = NtUserGetWindowLongW(window_surface->hwnd, GWL_EXSTYLE);
++                if ((ex & WS_EX_LAYERED) || wws->layered)
++                {
++                    /* Pixel-class histogram of the flushed area: all-zero / invalid (a=0,rgb!=0) /
++                     * opaque / semi-transparent. Pins what the app+GDI actually produced. */
++                    unsigned int n_zero = 0, n_invalid = 0, n_opaque = 0, n_semi = 0;
++                    int hx, hy, w = surface_rect.right, h = surface_rect.bottom;
++                    int t = max(rect->top + dirty->top, 0), b = min(rect->top + dirty->bottom, h);
++                    int l = max(rect->left + dirty->left, 0), r = min(rect->left + dirty->right, w);
++                    for (hy = t; hy < b; hy++)
++                    {
++                        const UINT32 *row = (const UINT32 *)color_bits + hy * w;
++                        for (hx = l; hx < r; hx++)
++                        {
++                            UINT32 v = row[hx], a = v >> 24;
++                            if (!v) n_zero++;
++                            else if (!a) n_invalid++;
++                            else if (a == 0xff) n_opaque++;
++                            else n_semi++;
++                        }
++                    }
++                    ERR("neutron-layer: hwnd=%p ex=%08x wws_layered=%d fmt=%s surf.alpha_bits=%08x alpha_mask=%08x color_key=%08x -> applied=%08x sanitize=%d shape=%d px[zero=%u inval=%u opq=%u semi=%u]\n",
++                        window_surface->hwnd, (unsigned)ex, wws->layered,
++                        (buffer_format==WL_SHM_FORMAT_ARGB8888)?"ARGB":"XRGB",
++                        window_surface->alpha_bits, window_surface->alpha_mask,
++                        (unsigned)window_surface->color_key, alpha_bits, sanitize, !!shape_bits,
++                        n_zero, n_invalid, n_opaque, n_semi);
++                }
++            }
++        }
+         wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+                                      alpha_bits, sanitize);
+     }
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -1420,6 +1420,7 @@
+     NtUserCallHwndParam_SetRawWindowPos,
+     NtUserCallHwndParam_GetPrivateData,
+     NtUserCallHwndParam_SetPrivateData,
++    NtUserCallHwndParam_SetWinMonitor, /* NEUTRON: driver sets a window's authoritative monitor */
+ };
+ 
+ struct get_window_rects_params
+@@ -1637,6 +1638,14 @@
+     return NtUserCallHwndParam( hwnd, type, NtUserCallHwndParam_GetWinMonitorDpi );
+ }
+ 
++/* NEUTRON: graphics-driver call to set a window's authoritative monitor by that monitor's RAW dpi
++ * (the surface's real output), overriding win32's position-based monitor/DPI inference. win32u resolves
++ * the dpi to a monitor handle (positions can be stale in an app process). Pass 0 to clear. */
++static inline UINT NtUserSetWinMonitor( HWND hwnd, UINT raw_dpi )
++{
++    return NtUserCallHwndParam( hwnd, raw_dpi, NtUserCallHwndParam_SetWinMonitor );
++}
++
+ struct set_raw_window_pos_params
+ {
+     RECT rect;
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -183,6 +183,8 @@
+ {
+     __u32 count;
+     if (debug_level) fprintf( stderr, "set_inproc_event %d\n", sync->fd );
++    if (sync->type == INPROC_SYNC_INTERNAL) { static FILE *nf; if (!nf) nf = fopen( "~/neutron-srv.log", "a" );
++        if (nf) { fprintf( nf, "NEUTRON-SET fd=%d\n", sync->fd ); fflush( nf ); } }
+     ioctl( sync->fd, NTSYNC_IOC_EVENT_SET, &count );
+ }
+ 
+@@ -190,6 +192,8 @@
+ {
+     __u32 count;
+     if (debug_level) fprintf( stderr, "reset_inproc_event %d\n", sync->fd );
++    if (sync->type == INPROC_SYNC_INTERNAL) { static FILE *nf; if (!nf) nf = fopen( "~/neutron-srv.log", "a" );
++        if (nf) { fprintf( nf, "NEUTRON-RST fd=%d\n", sync->fd ); fflush( nf ); } }
+     ioctl( sync->fd, NTSYNC_IOC_EVENT_RESET, &count );
+ }
+ 
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -62,6 +62,7 @@
+ {
+     struct list            sender_entry;  /* entry in sender list */
+     struct message        *msg;           /* message the result is for */
++    unsigned int           orig_msg;      /* NEUTRON diag: msg code, survives msg=NULL at receive */
+     struct message_result *recv_next;     /* next in receiver list */
+     struct msg_queue      *sender;        /* sender queue */
+     struct msg_queue      *receiver;      /* receiver queue */
+@@ -139,6 +140,7 @@
+     int                    keystate_lock;   /* owns an input keystate lock */
+     queue_shm_t           *shared;          /* queue in session shared memory */
+     unsigned int           ignore_post_msg; /* ignore post messages newer than this unique id */
++    unsigned int           neutron_tid;     /* NEUTRON diag: owning thread id, for cross-proc correlation */
+ };
+ 
+ struct hotkey
+@@ -320,6 +322,7 @@
+         queue->hooks           = NULL;
+         queue->keystate_lock   = 0;
+         queue->ignore_post_msg = 0;
++        queue->neutron_tid     = thread->id;   /* NEUTRON diag */
+ 
+         list_init( &queue->send_result );
+         list_init( &queue->callback_result );
+@@ -1003,6 +1006,23 @@
+             /* wake sender queue if waiting on this result */
+             if (list_head(&res->sender->send_result) == &res->sender_entry)
+                 set_queue_bits( res->sender, QS_SMRESULT );
++            /* NEUTRON diag: for the Adobe 0x52f marshalling reply, reveal the head-strand (blocking send B).
++             * Write to a fixed file so capture doesn't depend on wineserver stderr routing. */
++            if (res->orig_msg >= 0x400)   /* WM_USER+ : cross-thread marshalling range */
++            {
++                static FILE *neutron_f;
++                if (!neutron_f) neutron_f = fopen( "~/neutron-srv.log", "a" );
++                if (neutron_f)
++                {
++                    fprintf( neutron_f, "NEUTRON-SRV msg=%04x stored: sender_tid=%04x is_head=%d status=%d snd_fd=%d\n",
++                             res->orig_msg,
++                             res->sender->neutron_tid,
++                             list_head( &res->sender->send_result ) == &res->sender_entry,
++                             get_queue_status(res->sender),
++                             get_inproc_sync_fd( (struct inproc_sync *)res->sender->sync ) );
++                    fflush( neutron_f );
++                }
++            }
+         }
+     }
+     else if (!res->receiver) free_result( res );
+@@ -1072,6 +1092,7 @@
+     if (result)
+     {
+         result->msg          = msg;
++        result->orig_msg     = msg->msg;   /* NEUTRON diag */
+         result->sender       = send_queue;
+         result->receiver     = recv_queue;
+         result->replied      = 0;
+@@ -3490,6 +3511,13 @@
+         if (!(entry = list_head( &queue->send_result ))) return;  /* no reply ready */
+ 
+         result = LIST_ENTRY( entry, struct message_result, sender_entry );
++        if (result->orig_msg >= 0x400)   /* NEUTRON diag: sender woke + is checking its reply */
++        {
++            static FILE *neutron_g;
++            if (!neutron_g) neutron_g = fopen( "~/neutron-srv.log", "a" );
++            if (neutron_g) { fprintf( neutron_g, "NEUTRON-GMR consumer_tid=%04x msg=%04x replied=%d cancel=%d\n",
++                                      queue->neutron_tid, result->orig_msg, result->replied, req->cancel ); fflush( neutron_g ); }
++        }
+         if (result->replied || req->cancel)
+         {
+             if (result->replied)
+--- a/server/user.h
++++ b/server/user.h
+@@ -233,14 +233,8 @@
+ 
+ static inline int scale_dpi( int val, unsigned int dpi_from, unsigned int dpi_to )
+ {
+-    /* NEUTRON: do the arithmetic in signed 64-bit. "val * dpi_to" with int *
+-     * unsigned promotes val to unsigned, so a negative coordinate (e.g. the
+-     * -5,-5 origin of a maximized window) wraps to a huge positive value
+-     * (-5 -> 26349489 at 163->96 dpi), corrupting every cross-process
+-     * GetWindowRect/placement of a negative-origin window under a scaled
+-     * (fractional-scale/LogPixels) display. */
+-    if (val >= 0) return ((__int64)val * dpi_to + (dpi_from / 2)) / dpi_from;
+-    return ((__int64)val * dpi_to - (dpi_from / 2)) / dpi_from;
++    if (val >= 0) return (val * dpi_to + (dpi_from / 2)) / dpi_from;
++    return (val * dpi_to - (dpi_from / 2)) / dpi_from;
+ }
+ 
+ static inline void scale_dpi_rect( struct rectangle *rect, unsigned int dpi_from, unsigned int dpi_to )

@@ -1,0 +1,42 @@
+# neutron-winewayland-toolpopup-managed
+#
+# Keep an owned, captionless tool-window popup a STABLE xdg_popup (never a floating xdg_toplevel).
+#
+# is_window_managed() returns TRUE for a window that is (momentarily) the active window or gets a
+# SetWindowPos without SWP_NOACTIVATE. For LrC's mask flyouts (WS_POPUP | WS_EX_TOOLWINDOW, owned by
+# the main frame) that made the window flip between xdg_popup (managed=0, correctly anchored to its
+# owner) and xdg_toplevel (managed=1) — and Wayland cannot position an xdg_toplevel, so each flip
+# threw the popup to a compositor-chosen spot. Observed: the mask panel oscillated TOPLEVEL<->POPUP
+# ~6x per open; the "Create New Mask" dropdown appeared far from the click and the panel "teleported
+# to center" when a checkbox was clicked.
+#
+# Fix: an owned, captionless WS_EX_TOOLWINDOW (non-WS_EX_APPWINDOW) WS_POPUP is a flyout anchored to
+# its owner -> never managed, so WAYLAND_WindowPosChanged routes it through the xdg_popup path every
+# time. A genuine floating tool palette carries a caption or WS_EX_APPWINDOW and is unaffected.
+#
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -464,6 +485,22 @@
+     /* child windows are not managed */
+     style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
+     if ((style & (WS_CHILD|WS_POPUP)) == WS_CHILD) return FALSE;
++    /* NEUTRON: an owned, captionless tool-window popup is a flyout anchored to its owner (e.g. LrC's
++     * mask type-picker and mask adjustment flyouts). It needs a STABLE xdg_popup role. If
++     * is_window_managed ever returns TRUE for it — which it does the moment the popup momentarily
++     * becomes the active window or gets a pos change without SWP_NOACTIVATE — it flips to a floating
++     * xdg_toplevel, which Wayland cannot position; the popup then jumps to a compositor-chosen spot
++     * and flickers as the role oscillates back and forth ("dropdown far from click" / "checkbox
++     * teleports the panel to center"). Keep it unmanaged so WAYLAND_WindowPosChanged anchors it to
++     * its owner as an xdg_popup. A genuine floating tool palette carries a caption or WS_EX_APPWINDOW
++     * and is unaffected. */
++    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    if ((style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION && (ex_style & WS_EX_TOOLWINDOW) &&
++        !(ex_style & WS_EX_APPWINDOW))
++    {
++        HWND owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
++        if (owner && owner != hwnd) return FALSE;
++    }
+     /* activated windows are managed */
+     if (!(swp_flags & (SWP_NOACTIVATE|SWP_HIDEWINDOW))) return TRUE;
+     if (hwnd == get_active_window()) return TRUE;
