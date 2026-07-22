@@ -1,0 +1,56 @@
+# neutron-version-datafile-fast
+#
+# GetFileVersionInfoSize/GetFileVersionInfo were ~360x slower than they should be
+# on very large executables. Wine mapped the target PE with
+# LOAD_LIBRARY_AS_IMAGE_RESOURCE (a SEC_IMAGE mapping), which does eager
+# section-layout work proportional to the image's virtual size. On a 208 MB binary
+# (Adobe Photoshop.exe) that mapping alone costs ~60 ms, and the version APIs map
+# the file twice (size query + read) -> ~120 ms per version read.
+#
+# Lightroom Classic's "Edit in Photoshop" detector reads Photoshop.exe's version
+# resource on every Edit-In menu validation, and the menu fires that validation
+# ~40 times per open, so the ~120 ms compounded into a ~10-second stall each time
+# the submenu was opened.
+#
+# Fix: use LOAD_LIBRARY_AS_DATAFILE instead. A plain datafile mapping is demand-paged
+# and does no section layout, so it is ~190x faster (0.3 ms vs 60 ms), and the
+# version-resource FindResource/LoadResource path returns byte-identical data
+# (verified: same 816-byte VS_VERSION_INFO, same parsed ProductVersion). Measured
+# end-to-end: Size+Get on Photoshop.exe 121.7 ms -> 0.42 ms (288x); the LrC
+# submenu-open stall dropped from ~10 s to ~100 ms.
+#
+# Upstreamable as-is (no Neutron-specific dependency).
+diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
+index 108b78638b8..3e7063c29ff 100644
+--- a/dlls/kernelbase/version.c
++++ b/dlls/kernelbase/version.c
+@@ -772,7 +772,13 @@ DWORD WINAPI GetFileVersionInfoSizeExW( DWORD flags, LPCWSTR filename, LPDWORD r
+     if (flags & ~FILE_VER_GET_LOCALISED)
+         FIXME("flags 0x%lx ignored\n", flags & ~FILE_VER_GET_LOCALISED);
+
+-    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
++    /* Neutron: AS_DATAFILE, not AS_IMAGE_RESOURCE. Mapping a large PE as SEC_IMAGE
++     * does eager section-layout work that costs ~60ms on a 208MB binary (Adobe
++     * Photoshop.exe); a plain datafile mapping is ~190x faster and the version
++     * resource FindResource/LoadResource returns byte-identical data. LrC's PS
++     * detector reads this version resource on every Edit-In menu validate, so the
++     * SEC_IMAGE cost turned into a ~10s menu-open stall. */
++    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_DATAFILE )))
+     {
+         HRSRC hRsrc = NULL;
+         if (!(flags & FILE_VER_GET_LOCALISED))
+@@ -877,7 +883,13 @@ BOOL WINAPI GetFileVersionInfoExW( DWORD flags, LPCWSTR filename, DWORD ignored,
+     if (flags & ~FILE_VER_GET_LOCALISED)
+         FIXME("flags 0x%lx ignored\n", flags & ~FILE_VER_GET_LOCALISED);
+
+-    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_IMAGE_RESOURCE )))
++    /* Neutron: AS_DATAFILE, not AS_IMAGE_RESOURCE. Mapping a large PE as SEC_IMAGE
++     * does eager section-layout work that costs ~60ms on a 208MB binary (Adobe
++     * Photoshop.exe); a plain datafile mapping is ~190x faster and the version
++     * resource FindResource/LoadResource returns byte-identical data. LrC's PS
++     * detector reads this version resource on every Edit-In menu validate, so the
++     * SEC_IMAGE cost turned into a ~10s menu-open stall. */
++    if ((hModule = LoadLibraryExW( filename, 0, LOAD_LIBRARY_AS_DATAFILE )))
+     {
+         HRSRC hRsrc = NULL;
+         if (!(flags & FILE_VER_GET_LOCALISED))

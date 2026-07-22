@@ -305,6 +305,18 @@ child window through `SetWindowPlacement`; confirmed live — all 1113 filmstrip
 Touches: `dlls/win32u/window.c`. (Applies after `neutron-cep-child-surface` which also touches this
 file; order-safe.)
 
+### `neutron-version-datafile-fast.mypatch`
+`GetFileVersionInfoSize`/`GetFileVersionInfo` map the target PE with `LOAD_LIBRARY_AS_DATAFILE` instead
+of `LOAD_LIBRARY_AS_IMAGE_RESOURCE`. The `AS_IMAGE_RESOURCE` (`SEC_IMAGE`) mapping does eager
+section-layout work proportional to the image's virtual size — ~60 ms on a 208 MB binary
+(`Photoshop.exe`) — and the version APIs map twice (size + read). Lightroom Classic reads Photoshop's
+version resource on every "Edit In" menu validation (~40× per submenu open), turning that into a ~10 s
+stall. The datafile mapping is demand-paged (no section layout), ~190× faster (0.3 ms vs 60 ms), and
+the version-resource `FindResource`/`LoadResource` path returns byte-identical data (verified: same
+816-byte `VS_VERSION_INFO`, same parsed ProductVersion). Measured: Size+Get on Photoshop.exe
+121.7 ms → 0.42 ms (288×); the LrC submenu stall dropped ~10 s → ~100 ms. Touches:
+`dlls/kernelbase/version.c`. Upstreamable. Plain-English writeup: neutron `docs/wiki/PERFORMANCE.md`.
+
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
 ### `neutron-present-timing.mypatch`
