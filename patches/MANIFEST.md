@@ -197,6 +197,18 @@ UXP home-screen locale/i18n fix (storage-based loader) so the Premiere home scre
 ### `windows-web-jsonobjectstatics.mypatch`
 Supporting JSONObject statics fix (pairs with the home-screen fix).
 
+### `neutron-srw-wake-fastpath.mypatch`
+Suite-wide sync-primitive speedup in `dlls/ntdll/sync.c` (helps Chromium/CEF's `base::Lock`=SRWLOCK and
+MSVC `std::mutex`/`condition_variable`-heavy Adobe apps; found while profiling the Premiere tab-switch
+stall). Wine took a **global** 256-bucket futex spinlock on every `RtlReleaseSRWLock*` / `RtlWakeAddress*`
+even with zero waiters — and all page-aligned locks hash to bucket 0, so a 339-thread app bounced that one
+cacheline across all cores. Fix: no-waiter wake fast path — lock-free empty-bucket check in
+`RtlWakeAddress*`, skip the wake in `RtlReleaseSRWLockShared` unless `exclusive_waiters` is set, and
+register the waiter **before** comparing the value in `RtlWaitOnAddress` with a full barrier between
+(store-buffer pairing) — lost-wakeup-safe (SB-litmus reasoned). Microbench (8 threads, worst-case same
+bucket): uncontended SRW excl 22×, shared 38×, no-waiter `WakeConditionVariable` ~90×; contended handoff
+~5–8% slower. Independent of every other patch (nothing else touches `sync.c`). Touches: `dlls/ntdll/sync.c`.
+
 ### `neutron-iocp-completion.mypatch`
 Wineserver fix in `async_set_result()` (`server/async.c`): queue an IOCP completion packet for
 async I/O on an fd bound to a completion port that has **no APC context**. Premiere's UXP layer
