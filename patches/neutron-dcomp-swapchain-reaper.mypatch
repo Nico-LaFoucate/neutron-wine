@@ -1,0 +1,155 @@
+# neutron-dcomp-swapchain-reaper
+#
+# Premiere Edit<->Export tab-switch stall fix. Applies on top of neutron-dcomp-bridge +
+# neutron-dcomp-crossproc + neutron-dcomp-resize-fixes. Touches: dlls/dcomp/device.c.
+#
+# On a workspace switch CEF's GPU process (CEPHtmlEngine --type=gpu-process) recreates its
+# swapchain for the resized panel; the next Present re-registers via register_presentation,
+# which dropped the LAST ref to the RETIRED swapchain synchronously on the app's Present
+# thread while holding presentations_cs. DXVK's teardown (Presenter::destroyResources) waits
+# unbounded on an abandoned present that never completes -> the GPU process main thread hung
+# >=120s holding presentations_cs, Chromium killed it (exit_code=2) + respawned it, and the
+# multi-second Vulkan re-init was the visible stall.
+#
+# Fix: swap the new swapchain in under the lock, then hand the retired swapchain to a one-shot
+# reaper thread OUTSIDE the lock/off the Present thread. Worst case = one parked ~0%-CPU thread
+# + one leaked presenter per switch (DXVK m_presentPending follow-up) instead of GPU-process
+# death. Emits ERR "neutron-reap: queued/released ... in N ms" for A/B observability.
+diff --git a/dlls/dcomp/device.c b/dlls/dcomp/device.c
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -188,6 +188,77 @@
+ static INIT_ONCE presentations_once = INIT_ONCE_STATIC_INIT;
+ static HANDLE presentations_thread;
+ 
++/* NEUTRON gpu-churn fix (Premiere Edit<->Export stall):
++ * The final IDXGISwapChain_Release of a RETIRED swapchain must never run
++ * synchronously on the app's Present thread, and never under presentations_cs.
++ *
++ * Proven failure (gpu-churn.log, 2026-07-23): on a workspace switch CEF's GPU
++ * process (CEPHtmlEngine --type=gpu-process) recreates its swapchain for the
++ * resized panel; the next Present re-registers via dcomp_register_external ->
++ * register_presentation, which (a) took presentations_cs and (b) dropped the
++ * LAST reference to the old DXVK swapchain in place. DXVK's teardown
++ * (~D3D11SwapChain -> Presenter::destroyResources) waits UNBOUNDED on
++ * m_surfaceCond until !m_presentPending -- a present that will never complete
++ * once the app has abandoned the old swapchain mid-frame. The GPU process main
++ * thread hung >=120s holding presentations_cs (RtlpWaitForCriticalSection
++ * "blocked by <main tid>" at dcomp+0x10260 == presentations_cs), Chromium
++ * killed it (exit_code=2) and respawned it; the multi-second Vulkan re-init is
++ * the visible stall.
++ *
++ * Fix: swap the new swapchain in under the lock, then hand the old one to a
++ * one-shot reaper thread. If DXVK's teardown wait never satisfies, only the
++ * reaper idles (0%% CPU); the render thread, the blit thread and the process
++ * survive. Worst case is one parked thread + one leaked presenter per
++ * workspace switch, instead of GPU-process death. */
++struct swapchain_reaper_item
++{
++    IDXGISwapChain *swapchain;
++    ID3D11Texture2D *staging;
++};
++
++static DWORD WINAPI swapchain_reaper_proc(void *arg)
++{
++    struct swapchain_reaper_item *item = arg;
++    ULONGLONG t0 = GetTickCount64();
++
++    if (item->staging) ID3D11Texture2D_Release(item->staging);
++    if (item->swapchain) IDXGISwapChain_Release(item->swapchain);
++
++    /* ERR on purpose (project instrumentation style): tells the A/B log whether
++     * retired swapchains actually finish releasing (fast = fully resolved) or
++     * this line never appears (reaper parked = quarantined DXVK teardown hang,
++     * potential VRAM leak per switch — investigate DXVK m_presentPending). */
++    ERR("neutron-reap: released swapchain=%p staging=%p in %llu ms\n",
++        item->swapchain, item->staging, GetTickCount64() - t0);
++    free(item);
++    return 0;
++}
++
++static void release_swapchain_async(IDXGISwapChain *swapchain, ID3D11Texture2D *staging)
++{
++    struct swapchain_reaper_item *item;
++    HANDLE thread;
++
++    if (!swapchain && !staging) return;
++
++    if ((item = calloc(1, sizeof(*item))))
++    {
++        item->swapchain = swapchain;
++        item->staging = staging;
++        if ((thread = CreateThread(NULL, 0, swapchain_reaper_proc, item, 0, NULL)))
++        {
++            ERR("neutron-reap: queued async release of retired swapchain=%p staging=%p\n",
++                swapchain, staging);
++            CloseHandle(thread);
++            return;
++        }
++        free(item);
++    }
++    /* Allocation/thread failure: fall back to the old synchronous release. */
++    if (staging) ID3D11Texture2D_Release(staging);
++    if (swapchain) IDXGISwapChain_Release(swapchain);
++}
++
+ static void blit_swapchain_to_hwnd(struct presentation *p)
+ {
+     IDXGISwapChain *swapchain = p->swapchain;
+@@ -568,10 +639,19 @@
+             p->cross_proc = target_cross_proc;
+             if (p->swapchain != swapchain)
+             {
+-                if (p->swapchain) IDXGISwapChain_Release(p->swapchain);
++                /* NEUTRON gpu-churn fix: retire the old swapchain OUTSIDE the lock and
++                 * OFF this (the app's Present) thread — the final release can wedge
++                 * forever in DXVK's Presenter::destroyResources (see reaper above). */
++                IDXGISwapChain *old_swapchain = p->swapchain;
++                ID3D11Texture2D *old_staging = p->staging;
+                 p->swapchain = swapchain; /* take QI ref */
+                 /* NEUTRON M1a: swapchain (and possibly its D3D device) changed -> drop the cached staging. */
+-                if (p->staging) { ID3D11Texture2D_Release(p->staging); p->staging = NULL; p->staging_w = p->staging_h = 0; }
++                p->staging = NULL; p->staging_w = p->staging_h = 0;
++                /* NEUTRON perf gate: force a fresh present-count comparison on the new swapchain. */
++                p->have_present_count = FALSE;
++                LeaveCriticalSection(&presentations_cs);
++                release_swapchain_async(old_swapchain, old_staging);
++                return;
+             }
+             else IDXGISwapChain_Release(swapchain);
+             LeaveCriticalSection(&presentations_cs);
+@@ -595,6 +675,7 @@
+ static void unregister_presentations_for_hwnd(HWND hwnd)
+ {
+     struct presentation *p, *next;
++    struct list removed = LIST_INIT(removed);
+ 
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
+@@ -608,14 +689,21 @@
+             if (p->present_hwnd && p->present_hwnd != hwnd)
+                 RemovePropW(p->present_hwnd, L"__wine_dcomp_present");
+             list_remove(&p->entry);
+-            if (p->swapchain) IDXGISwapChain_Release(p->swapchain);
+-            if (p->staging) ID3D11Texture2D_Release(p->staging); /* NEUTRON M1a cached staging */
+-            if (p->px_view) UnmapViewOfFile(p->px_view);
+-            if (p->px_map) CloseHandle(p->px_map);
+-            free(p);
++            list_add_tail(&removed, &p->entry);
+         }
+     }
+     LeaveCriticalSection(&presentations_cs);
++
++    /* NEUTRON gpu-churn fix: do the final swapchain releases outside the lock and
++     * off this thread — same DXVK teardown wedge as in register_presentation. */
++    LIST_FOR_EACH_ENTRY_SAFE(p, next, &removed, struct presentation, entry)
++    {
++        list_remove(&p->entry);
++        release_swapchain_async(p->swapchain, p->staging);
++        if (p->px_view) UnmapViewOfFile(p->px_view);
++        if (p->px_map) CloseHandle(p->px_map);
++        free(p);
++    }
+ }
+ 
+ /* Walk a visual subtree and register any swapchain content against hwnd. */

@@ -156,6 +156,21 @@ of crashing deep in vkd3d `d3d12core` (the observed AV) — `mt_entered`/`have_p
 `GetClientRect` is changing) so a stale readback isn't stretched into the resizing window; (3) **cache the
 staging texture**, recreate only on size/swapchain change instead of allocating ~33 MB every 16 ms tick.
 
+### `neutron-dcomp-swapchain-reaper.mypatch`
+Premiere Edit↔Export tab-switch stall fix — applies on top of the three dcomp patches above (same
+`dlls/dcomp/device.c`; the name sorts last so it applies after `resize-fixes`, whose `p->staging` cache it
+references). On a workspace switch CEF's GPU process (`CEPHtmlEngine --type=gpu-process`) recreates its
+swapchain for the resized panel and `register_presentation` dropped the **last** reference to the retired
+swapchain **synchronously on the app's Present thread, under `presentations_cs`**; DXVK's
+`Presenter::destroyResources` then waits unbounded on an abandoned present that never completes → the
+GPU-process main thread hung ≥120 s holding the lock, Chromium killed it (`exit_code=2`) + respawned it, and
+the multi-second Vulkan re-init was the visible stall. Fix: swap the new swapchain in under the lock, then
+hand the retired swapchain to a **one-shot reaper thread** off the Present thread / outside `presentations_cs`
+(`release_swapchain_async` / `swapchain_reaper_proc`); same hazard fixed in `unregister_presentations_for_hwnd`.
+Worst case = one parked ~0%-CPU thread + one leaked presenter per switch (DXVK `m_presentPending` follow-up)
+instead of GPU-process death. Emits `ERR "neutron-reap: queued/released … in N ms"` for A/B observability.
+Touches: `dlls/dcomp/device.c`.
+
 ### `neutron-cep-child-surface.mypatch`
 The owner-process half of the cross-process present path: in `win32u/window.c`, CEF/CEP/WebView2 panel-host
 **child** windows are denied their own `window_surface` (`needs_surface = FALSE`) so the consumer blits the
