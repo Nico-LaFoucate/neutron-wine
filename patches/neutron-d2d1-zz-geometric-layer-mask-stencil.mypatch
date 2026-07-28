@@ -1,6 +1,6 @@
 --- a/dlls/d2d1/device.c
 +++ b/dlls/d2d1/device.c
-@@ -307,6 +307,162 @@
+@@ -307,6 +307,167 @@
   * Returns TRUE if a list was installed. Conservative: any non-rectangle member, a non-WINDING
   * fill mode, more pieces than we hold, or ANY overlap between pieces (which would blend a
   * translucent draw twice) leaves the list empty and the bounding-box clip in force. */
@@ -28,7 +28,12 @@
 +    D3D11_BLEND_DESC bd;
 +    HRESULT hr;
 +
-+    if (!context->target.bitmap)
++    /* target.bitmap and target.command_list share a union, so a non-NULL
++     * bitmap pointer proves nothing -- check the type. push_layer_clip runs
++     * BEFORE PushLayer's command-list branch, so without this the mask would be
++     * rasterised into a command list reinterpreted as a bitmap. A command list
++     * records the layer instead; there is nothing to stencil against. */
++    if (context->target.type != D2D_TARGET_BITMAP || !context->target.bitmap)
 +        return FALSE;
 +
 +    if (context->stencil_dsv
@@ -163,7 +168,7 @@
  static BOOL d2d_device_context_install_mask_rects(struct d2d_device_context *context,
          ID2D1Geometry *mask, const D2D1_MATRIX_3X2_F *mask_transform)
  {
-@@ -565,9 +721,29 @@
+@@ -565,9 +726,29 @@
      else
          WARN("Failed to push layer clip rect.\n");
  
@@ -196,7 +201,7 @@
  }
  
  static void d2d_device_context_pop_layer_clip(struct d2d_device_context *context)
-@@ -579,6 +755,35 @@
+@@ -579,6 +760,35 @@
          context->mask_owner = 0;
          context->mask_rect_count = 0;
      }
@@ -232,7 +237,7 @@
      if (context->layer_clipped[context->layer_depth - 1])
          d2d_clip_stack_pop(&context->clip_stack);
  }
-@@ -643,16 +848,40 @@
+@@ -643,16 +853,40 @@
      }
      ID3D11DeviceContext1_RSSetScissorRects(context, 1, &scissor_rect);
      ID3D11DeviceContext1_RSSetState(context, render_target->rs);
@@ -278,7 +283,7 @@
      if (opacity_brush)
          d2d_brush_bind_resources(opacity_brush, render_target, 1);
  
-@@ -660,7 +889,7 @@
+@@ -660,7 +894,7 @@
       * to each piece in turn instead of to their bounding box. D3D scissors one rect per draw,
       * so the draw is issued once per piece; pieces are verified disjoint when the list is
       * installed, so no pixel is covered twice. */
@@ -287,7 +292,7 @@
      {
          unsigned i;
  
-@@ -1087,6 +1316,23 @@
+@@ -1087,6 +1321,23 @@
              IDWriteRenderingParams_Release(context->text_rendering_params);
          if (context->bs)
              ID3D11BlendState_Release(context->bs);
@@ -311,7 +316,7 @@
          ID3D11RasterizerState_Release(context->rs);
          ID3D11Buffer_Release(context->vb);
          ID3D11Buffer_Release(context->ib);
-@@ -3024,6 +3270,30 @@
+@@ -3024,6 +3275,30 @@
          context->mask_owner = 0;
      }
  
