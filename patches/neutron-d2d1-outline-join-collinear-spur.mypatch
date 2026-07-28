@@ -1,0 +1,21 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2961,6 +2961,18 @@
+     ccw = d2d_point_ccw(&origin, prev, next);
+     if (ccw == 0.0f)
+     {
++        /* The tangents are collinear, which covers two very different cases:
++         * the path carries straight on through p0 (prev and next point in
++         * opposite directions), or it doubles back on itself (they point the
++         * same way). A straight continuation needs no join at all -- the two
++         * segment bands already meet flush -- and emitting the doubling-back
++         * geometry for it threw a 25 unit spur along the path direction. This
++         * fires on every tangent-continuous join, e.g. each corner of a
++         * rounded rectangle whose curve control point continues the incoming
++         * edge, which is how UI toolkits build buttons and scrollbar thumbs. */
++        if (d2d_point_dot(prev, next) < 0.0f)
++            return TRUE;
++
+         d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+         d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+         d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,

@@ -1,0 +1,157 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3033,24 +3033,25 @@
+     ccw = d2d_point_ccw(&origin, prev, next);
+     if (ccw == 0.0f)
+     {
+-        /* The tangents are collinear, which covers two very different cases:
+-         * the path carries straight on through p0 (prev and next point in
+-         * opposite directions), or it doubles back on itself (they point the
+-         * same way). A straight continuation needs no join at all -- the two
+-         * segment bands already meet flush -- and emitting the doubling-back
+-         * geometry for it threw a 25 unit spur along the path direction. This
+-         * fires on every tangent-continuous join, e.g. each corner of a
+-         * rounded rectangle whose curve control point continues the incoming
+-         * edge, which is how UI toolkits build buttons and scrollbar thumbs. */
+-        if (d2d_point_dot(prev, next) < 0.0f)
+-            return TRUE;
++        /* The tangents are collinear, which covers two cases: the path carries
++         * straight on through p0, or it doubles back on itself. Neither needs
++         * join geometry.
++         *
++         * A straight continuation needs none because the two segment bands
++         * already meet flush. A doubling-back turn is a 180 degree corner, so
++         * its miter ratio is infinite and any finite miter limit bevels it --
++         * and a bevel across a 180 degree turn is degenerate, i.e. no
++         * geometry at all.
++         *
++         * Wine emitted the same quad for both, extending a hardcoded 25.0f
++         * units along the path direction. That is a spur sticking out of the
++         * outline, and unlike the miter in the vertex shader it is baked into
++         * the vertex POSITION, so the miter limit cannot rein it in. It fires
++         * on every tangent-continuous join -- e.g. each corner of a rounded
++         * rectangle whose curve control point continues the incoming edge,
++         * which is how UI toolkits build buttons and scrollbar thumbs. */
++        return TRUE;
+ 
+-        d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
+-        d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
+-        d2d_outline_vertex_set(&v[2], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
+-                 prev->x,  prev->y,  prev->x,  prev->y);
+-        d2d_outline_vertex_set(&v[3], p0->x + 25.0f * -prev->x, p0->y + 25.0f * -prev->y,
+-                -prev->x, -prev->y, -prev->x, -prev->y);
+     }
+     else if (ccw < 0.0f)
+     {
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1657,8 +1657,11 @@
+     return hr;
+ }
+ 
++/* D2D's documented default when no stroke style is supplied. */
++#define D2D1_DEFAULT_MITER_LIMIT 10.0f
++
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width)
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit)
+ {
+     D3D11_MAPPED_SUBRESOURCE map_desc;
+     ID3D11DeviceContext *d3d_context;
+@@ -1686,6 +1689,8 @@
+     cb_data->transform_geometry._22 = geometry_transform->_22;
+     cb_data->transform_geometry._32 = geometry_transform->_32;
+     cb_data->transform_geometry.stroke_width = stroke_width;
++    cb_data->misc.x = miter_limit;
++    cb_data->misc.y = cb_data->misc.z = cb_data->misc.w = 0.0f;
+ 
+     w = &context->drawing_state.transform;
+ 
+@@ -1708,14 +1713,16 @@
+ }
+ 
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+-        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width)
++        const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
++        float miter_limit)
+ {
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
+     ID3D11Buffer *ib, *vb;
+     HRESULT hr;
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width)))
++    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width,
++            miter_limit)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -1868,7 +1875,8 @@
+             stroke_width /= context->drawing_state.transform.m11;
+     }
+ 
+-    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width);
++    d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width,
++            stroke_style_impl ? stroke_style_impl->desc.miterLimit : D2D1_DEFAULT_MITER_LIMIT);
+ }
+ 
+ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+@@ -1886,7 +1894,8 @@
+     buffer_data.SysMemPitch = 0;
+     buffer_data.SysMemSlicePitch = 0;
+ 
+-    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f)))
++    if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f,
++            D2D1_DEFAULT_MITER_LIMIT)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -3975,7 +3984,8 @@
+     if (r->filled)
+         d2d_device_context_fill_geometry(context, geometry_impl, brush_impl, NULL);
+     else
+-        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, r->stroke_width);
++        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, r->stroke_width,
++                D2D1_DEFAULT_MITER_LIMIT);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInk(ID2D1DeviceContext6 *iface,
+@@ -4809,6 +4819,7 @@
+     "float stroke_width;\n"
+     "float4 transform_rtx;\n"
+     "float4 transform_rty;\n"
++    "float4 misc;\n"
+     "\n"
+     "struct output\n"
+     "{\n"
+@@ -4845,6 +4856,17 @@
+     "    l = -dot(v_p, q_next) / (1.0f + dot(q_prev, q_next));\n"
+     "    q_i = l * q_prev + v_p;\n"
+     "\n"
++    "    /* |q⃑ᵢ| is exactly the miter ratio: as the corner closes,\n"
++    "     * 1 + (q̂ₚᵣₑᵥ · q̂ₙₑₓₜ) tends to zero and the join shoots off to\n"
++    "     * infinity. D2D bounds it by the stroke style\'s miter limit -- past\n"
++    "     * that the corner is bevelled instead. Wine applied no limit at all,\n"
++    "     * so a sharp corner grew an unbounded spike out of the outline. */\n"
++    "    {\n"
++    "        float miter = length(q_i);\n"
++    "        if (miter > misc.x)\n"
++    "            q_i *= misc.x / miter;\n"
++    "    }\n"
++    "\n"
+     "    o.b = float4(0.0, 0.0, 0.0, 0.0);\n"
+     "\n"
+     "    o.p = mul(float3(position, 1.0f), transform_geometry) + stroke_width * 0.5f * q_i;\n"
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -500,6 +500,10 @@
+     } transform_geometry;
+     struct d2d_vec4 transform_rtx;
+     struct d2d_vec4 transform_rty;
++    /* .x = miter limit. Appended rather than folded into transform_geometry's
++     * pad slot so the existing cbuffer packing is untouched; shaders that do
++     * not declare it simply ignore the extra 16 bytes. */
++    struct d2d_vec4 misc;
+ };
+ 
+ struct d2d_device_context_ops

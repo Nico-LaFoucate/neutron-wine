@@ -1,0 +1,102 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3731,6 +3731,75 @@
+     return TRUE;
+ }
+ 
++/* The fill below is built as "triangulate the chord polygon, then add or
++ * subtract the curve's lens". That decomposition is only valid while the
++ * bezier's control triangle stays clear of the rest of the outline: if the
++ * triangle has swallowed another vertex, the polygon and the lens cover the
++ * same ground twice and the fill keeps a wedge of material the shape never
++ * had -- a spur sticking out of an otherwise rounded corner.
++ *
++ * Wine already splits control triangles that overlap EACH OTHER (see the loop
++ * in d2d_geometry_resolve_beziers); this covers the case where a single
++ * triangle has grown over the figure it belongs to. Premiere's corner pieces
++ * hit it constantly: their control points sit on the far side of the very
++ * corner they round, so the triangle encloses that corner's vertex. */
++static BOOL d2d_geometry_bezier_swallows_vertex(const struct d2d_geometry *geometry,
++        const struct d2d_segment_idx *idx)
++{
++    const struct d2d_figure *figure;
++    D2D1_RECT_F bounds;
++    const D2D1_POINT_2F *a[3];
++    size_t i, j;
++
++    figure = &geometry->u.path.figures[idx->figure_idx];
++    a[0] = &figure->vertices[idx->vertex_idx];
++    a[1] = &figure->bezier_controls[idx->control_idx];
++    a[2] = &figure->vertices[idx->vertex_idx + 1];
++
++    /* A degenerate triangle covers no area and cannot swallow anything. */
++    if (d2d_point_ccw(a[0], a[1], a[2]) == 0.0f)
++        return FALSE;
++
++    bounds.left   = fminf(a[0]->x, fminf(a[1]->x, a[2]->x));
++    bounds.top    = fminf(a[0]->y, fminf(a[1]->y, a[2]->y));
++    bounds.right  = fmaxf(a[0]->x, fmaxf(a[1]->x, a[2]->x));
++    bounds.bottom = fmaxf(a[0]->y, fmaxf(a[1]->y, a[2]->y));
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        const struct d2d_figure *f = &geometry->u.path.figures[i];
++
++        if (f->flags & D2D_FIGURE_FLAG_HOLLOW)
++            continue;
++
++        for (j = 0; j < f->vertex_count; ++j)
++        {
++            const D2D1_POINT_2F *v = &f->vertices[j];
++            float d0, d1, d2;
++
++            /* The segment's own endpoints are on the triangle, not in it. */
++            if (i == idx->figure_idx && (j == idx->vertex_idx || j == idx->vertex_idx + 1))
++                continue;
++
++            /* Control triangles are small and most vertices are nowhere near
++             * them, so reject on bounds before doing any exact arithmetic. */
++            if (v->x <= bounds.left || v->x >= bounds.right
++                    || v->y <= bounds.top || v->y >= bounds.bottom)
++                continue;
++
++            d0 = d2d_point_ccw(a[0], a[1], v);
++            d1 = d2d_point_ccw(a[1], a[2], v);
++            d2 = d2d_point_ccw(a[2], a[0], v);
++
++            if ((d0 > 0.0f && d1 > 0.0f && d2 > 0.0f)
++                    || (d0 < 0.0f && d1 < 0.0f && d2 < 0.0f))
++                return TRUE;
++        }
++    }
++
++    return FALSE;
++}
++
+ static HRESULT d2d_geometry_resolve_beziers(struct d2d_geometry *geometry)
+ {
+     struct d2d_segment_idx idx_p, idx_q;
+@@ -3742,6 +3811,23 @@
+     if (!d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p))
+         return S_OK;
+ 
++    /* Split control triangles that have grown over a vertex of the outline.
++     * Halving pulls the triangle back onto the curve, so a couple of levels is
++     * always enough in practice; the limit only bounds pathological input
++     * (e.g. a vertex sitting exactly on the curve, which never clears). */
++    do
++    {
++        unsigned int depth = 0;
++
++        while (depth++ < 8 && d2d_geometry_bezier_swallows_vertex(geometry, &idx_p))
++        {
++            if (!d2d_geometry_split_bezier(geometry, &idx_p))
++                return E_OUTOFMEMORY;
++        }
++    } while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p));
++
++    d2d_geometry_get_first_bezier_segment_idx(geometry, &idx_p);
++
+     /* Split overlapping bezier control triangles. */
+     while (d2d_geometry_get_next_bezier_segment_idx(geometry, &idx_p))
+     {

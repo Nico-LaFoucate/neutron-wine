@@ -1,0 +1,136 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -1057,39 +1057,111 @@
+     return TRUE;
+ }
+ 
++/* Split a cubic Bézier at t, returning the left half in l[] and the right in r[]
++ * (de Casteljau). Both halves are cubics that together reproduce the original. */
++static void d2d_cubic_split(const D2D1_POINT_2F *p, float t, D2D1_POINT_2F *l, D2D1_POINT_2F *r)
++{
++    D2D1_POINT_2F a, b, c, d, e, f;
++
++#define LERP(o, u, v) do { (o).x = (u).x + ((v).x - (u).x) * t; \
++                           (o).y = (u).y + ((v).y - (u).y) * t; } while (0)
++    LERP(a, p[0], p[1]); LERP(b, p[1], p[2]); LERP(c, p[2], p[3]);
++    LERP(d, a, b);       LERP(e, b, c);
++    LERP(f, d, e);
++#undef LERP
++
++    l[0] = p[0]; l[1] = a; l[2] = d; l[3] = f;
++    r[0] = f;    r[1] = e; r[2] = c; r[3] = p[3];
++}
++
++/* How many pieces a cubic must be cut into before each piece is within tolerance of
++ * its best quadratic approximation. The error of that approximation is bounded by
++ * sqrt(3)/36 * |p3 - 3*p2 + 3*p1 - p0|, and subdividing into n pieces scales it by
++ * 1/n^3, so n = cbrt(error / tolerance). */
++static unsigned int d2d_cubic_quadratic_piece_count(const D2D1_POINT_2F *p)
++{
++    static const float tolerance = 0.05f;
++    float dx, dy, error, n;
++
++    dx = p[3].x - 3.0f * p[2].x + 3.0f * p[1].x - p[0].x;
++    dy = p[3].y - 3.0f * p[2].y + 3.0f * p[1].y - p[0].y;
++    error = 0.0481125224f * sqrtf(dx * dx + dy * dy);
++    if (error <= tolerance)
++        return 1;
++
++    n = ceilf(cbrtf(error / tolerance));
++    if (n < 1.0f)
++        return 1;
++    if (n > 32.0f)
++        return 32;
++    return (unsigned int)n;
++}
++
++static bool d2d_figure_add_single_bezier(struct d2d_figure *figure, const D2D1_POINT_2F *c)
++{
++    D2D1_RECT_F bezier_bounds;
++    D2D1_POINT_2F p;
++
++    if (!d2d_figure_add_original_bezier_controls(figure, 1, &c[1])
++            || !d2d_figure_add_original_bezier_controls(figure, 1, &c[2]))
++    {
++        return false;
++    }
++
++    /* Approximate this cubic Bézier with a quadratic one. The caller has already
++     * subdivided it far enough that the approximation is within tolerance. */
++    p.x = (c[1].x + c[2].x) * 0.75f;
++    p.y = (c[1].y + c[2].y) * 0.75f;
++    p.x -= (figure->vertices[figure->vertex_count - 1].x + c[3].x) * 0.25f;
++    p.y -= (figure->vertices[figure->vertex_count - 1].y + c[3].y) * 0.25f;
++    figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_BEZIER;
++
++    d2d_rect_get_bezier_bounds(&bezier_bounds, &figure->vertices[figure->vertex_count - 1],
++            &p, &c[3]);
++
++    if (!d2d_figure_add_bezier_controls(figure, 1, &p))
++        return false;
++
++    if (!d2d_figure_add_vertex(figure, c[3]))
++        return false;
++
++    d2d_rect_union(&figure->bounds, &bezier_bounds);
++
++    return true;
++}
++
+ static bool d2d_figure_add_beziers(struct d2d_figure *figure, const D2D1_BEZIER_SEGMENT *beziers,
+         UINT32 count)
+ {
+-    D2D1_POINT_2F p;
+-    unsigned int i;
++    unsigned int i, j, pieces;
+ 
+     for (i = 0; i < count; ++i)
+     {
+-        D2D1_RECT_F bezier_bounds;
++        D2D1_POINT_2F c[4], piece[4], rest[4];
+ 
+-        if (!d2d_figure_add_original_bezier_controls(figure, 1, &beziers[i].point1)
+-                || !d2d_figure_add_original_bezier_controls(figure, 1, &beziers[i].point2))
++        c[0] = figure->vertices[figure->vertex_count - 1];
++        c[1] = beziers[i].point1;
++        c[2] = beziers[i].point2;
++        c[3] = beziers[i].point3;
++
++        /* A single quadratic cannot represent an arbitrary cubic; approximating one
++         * with one quadratic put the curve several pixels off for anything but a
++         * gentle bend, which showed up as bites taken out of filled shapes. Cut the
++         * cubic into as many sub-cubics as accuracy requires first. Each piece is
++         * still a cubic carrying its own two control points, so the geometry streams
++         * back out unchanged in shape. */
++        pieces = d2d_cubic_quadratic_piece_count(c);
++
++        for (j = 0; j < pieces - 1; ++j)
+         {
+-            return false;
++            d2d_cubic_split(c, 1.0f / (float)(pieces - j), piece, rest);
++            if (!d2d_figure_add_single_bezier(figure, piece))
++                return false;
++            memcpy(c, rest, sizeof(c));
+         }
+ 
+-        /* FIXME: This tries to approximate a cubic Bézier with a quadratic one. */
+-        p.x = (beziers[i].point1.x + beziers[i].point2.x) * 0.75f;
+-        p.y = (beziers[i].point1.y + beziers[i].point2.y) * 0.75f;
+-        p.x -= (figure->vertices[figure->vertex_count - 1].x + beziers[i].point3.x) * 0.25f;
+-        p.y -= (figure->vertices[figure->vertex_count - 1].y + beziers[i].point3.y) * 0.25f;
+-        figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_BEZIER;
+-
+-        d2d_rect_get_bezier_bounds(&bezier_bounds, &figure->vertices[figure->vertex_count - 1],
+-                &p, &beziers[i].point3);
+-
+-        if (!d2d_figure_add_bezier_controls(figure, 1, &p))
++        if (!d2d_figure_add_single_bezier(figure, c))
+             return false;
+-
+-        if (!d2d_figure_add_vertex(figure, beziers[i].point3))
+-            return false;
+-
+-        d2d_rect_union(&figure->bounds, &bezier_bounds);
+     }
+ 
+     return true;

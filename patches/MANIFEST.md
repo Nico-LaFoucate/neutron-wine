@@ -3,7 +3,15 @@
 Patches are applied on top of the upstream Wine base (see `../build/WINE_BASE`) by `../build/build.sh`,
 which drops them into `wine-tkg-git/wine-tkg-userpatches/` (wine-tkg applies every `*.mypatch` there).
 
-Order is insignificant — patches touch distinct files/regions, and each is generated against the
+⚠️ **Order is NOT insignificant for the `neutron-d2d1-*` set** (2026-07-29): those six patches touch the
+same regions of `geometry.c`/`device.c` and build on each other — `neutron-d2d1-zz-geometric-layer-mask-stencil`
+modifies `push_layer_clip`/`install_mask_rects` introduced by `neutron-d2d1-layer-clip-dcdirect`, and
+`neutron-d2d1-stroke-join-bound-miter-limit` edits the join code introduced by
+`neutron-d2d1-outline-join-collinear-spur`. wine-tkg applies `*.mypatch` **alphabetically**, and the names are
+chosen so that order is correct (hence the `zz-` prefix). **Verify the d2d1 set in ALPHABETICAL order, not the
+order you generated them in** — a `g`-named stencil patch failed 6 of 8 hunks before being renamed.
+
+For the rest of the set, order is insignificant — those patches touch distinct files/regions, and each is generated against the
 **staging-applied base** (not plain upstream), so every patch applies cleanly on the wine-tkg staging
 tree in any order (verified: the full set reproduces the working source byte-for-byte). wine-tkg applies
 `*.mypatch` alphabetically. The build requires `_user_patches_no_confirm="true"` in `customization.cfg`
