@@ -4258,51 +4258,6 @@ index b3560f09c12..6385236b065 100644
      struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
      struct d2d_geometry_realization *object;
      HRESULT hr;
-@@ -2921,10 +3938,22 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateStrokedGeometryRealiza
- static void STDMETHODCALLTYPE d2d_device_context_DrawGeometryRealization(ID2D1DeviceContext6 *iface,
-         ID2D1GeometryRealization *realization, ID2D1Brush *brush)
- {
-+    NEUTRON_API_TIME();
-     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
-     struct d2d_geometry_realization *r = unsafe_impl_from_ID2D1GeometryRealization(realization);
-+    struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
-+    const struct d2d_geometry *geometry_impl;
- 
--    FIXME("iface %p, realization %p, brush %p semi-stub!\n", iface, realization, brush);
-+    TRACE("iface %p, realization %p, brush %p.\n", iface, realization, brush);
-+
-+    if (FAILED(context->error.code))
-+        return;
-+
-+    if (context->target.type == D2D_TARGET_UNKNOWN)
-+    {
-+        d2d_device_context_set_error(context, D2DERR_WRONG_STATE);
-+        return;
-+    }
- 
-     if (context->target.type == D2D_TARGET_COMMAND_LIST)
-     {
-@@ -2939,11 +3968,20 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawGeometryRealization(ID2D1De
-         }
-         return;
-     }
-+
-+    /* Wine keeps the realization's source geometry rather than baking a separate
-+     * mesh, so rendering it is equivalent to Fill/DrawGeometry on that geometry. */
-+    geometry_impl = unsafe_impl_from_ID2D1Geometry(r->geometry);
-+    if (r->filled)
-+        d2d_device_context_fill_geometry(context, geometry_impl, brush_impl, NULL);
-+    else
-+        d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, r->stroke_width);
- }
- 
- static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInk(ID2D1DeviceContext6 *iface,
-         const D2D1_INK_POINT *start_point, ID2D1Ink **ink)
- {
-+    NEUTRON_API_TIME();
-     FIXME("iface %p, start_point %p, ink %p stub!\n", iface, start_point, ink);
- 
-     return E_NOTIMPL;
 @@ -2952,6 +3990,7 @@ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInk(ID2D1DeviceContext
  static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInkStyle(ID2D1DeviceContext6 *iface,
          const D2D1_INK_STYLE_PROPERTIES *ink_style_properties, ID2D1InkStyle **ink_style)
