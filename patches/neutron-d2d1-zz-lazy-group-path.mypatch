@@ -1,0 +1,444 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3963,6 +3963,9 @@
+     }
+ }
+ 
++/* NEUTRON LAZY GROUP PATH: defined below, next to d2d_geometry_group_init. */
++static HRESULT d2d_geometry_group_require_path(struct d2d_geometry *geometry);
++
+ HRESULT d2d_geometry_require_tessellation(struct d2d_geometry *geometry)
+ {
+     LONG prev;
+@@ -3985,9 +3988,12 @@
+          * made every group-drawn UI element disappear in an earlier build.) */
+         struct d2d_geometry *path_impl;
+ 
+-        path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry->u.group.path);
+-        if (SUCCEEDED(geometry->tess_hr = d2d_geometry_require_tessellation(path_impl)))
+-            geometry->fill = path_impl->fill;
++        if (SUCCEEDED(geometry->tess_hr = d2d_geometry_group_require_path(geometry)))
++        {
++            path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry->u.group.path);
++            if (SUCCEEDED(geometry->tess_hr = d2d_geometry_require_tessellation(path_impl)))
++                geometry->fill = path_impl->fill;
++        }
+     }
+     else
+     {
+@@ -6814,7 +6820,8 @@
+     {
+         for (i = 0; i < geometry->u.group.geometry_count; ++i)
+             ID2D1Geometry_Release(geometry->u.group.src_geometries[i]);
+-        ID2D1PathGeometry_Release(geometry->u.group.path);
++        if (geometry->u.group.path)
++            ID2D1PathGeometry_Release(geometry->u.group.path);
+         free(geometry->u.group.src_geometries);
+         memset(&geometry->outline, 0, sizeof(geometry->outline));
+         memset(&geometry->fill, 0, sizeof(geometry->fill));
+@@ -6844,19 +6851,54 @@
+ 
+     TRACE("iface %p, transform %p, bounds %p.\n", iface, transform, bounds);
+ 
+-    return ID2D1PathGeometry_GetBounds(geometry->u.group.path, transform, bounds);
++    /* NEUTRON LAZY GROUP PATH: the bounds of a union are the union of the bounds, so
++     * this needs no combined path -- which matters because layer masks ask for bounds
++     * and nothing else, and building the path for them is the single biggest slice of
++     * CreateGeometryGroup. */
++    {
++        D2D1_RECT_F b, m;
++        unsigned int i;
++        BOOL have = FALSE;
++        HRESULT hr;
++
++        b.left = b.top = FLT_MAX;
++        b.right = b.bottom = -FLT_MAX;
++        for (i = 0; i < geometry->u.group.geometry_count; ++i)
++        {
++            if (FAILED(hr = ID2D1Geometry_GetBounds(geometry->u.group.src_geometries[i], transform, &m)))
++                return hr;
++            if (m.left > m.right || m.top > m.bottom)
++                continue;                       /* empty member */
++            if (m.left   < b.left)   b.left   = m.left;
++            if (m.top    < b.top)    b.top    = m.top;
++            if (m.right  > b.right)  b.right  = m.right;
++            if (m.bottom > b.bottom) b.bottom = m.bottom;
++            have = TRUE;
++        }
++        if (!have)
++        {
++            b.left = b.top = FLT_MAX;
++            b.right = b.bottom = -FLT_MAX;
++        }
++        *bounds = b;
++        return S_OK;
++    }
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_GetWidenedBounds(ID2D1GeometryGroup *iface,
+         float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
+         float tolerance, D2D1_RECT_F *bounds)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, bounds %p.\n",
+             iface, stroke_width, stroke_style, transform, tolerance, bounds);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_GetWidenedBounds(geometry->u.group.path, stroke_width, stroke_style, transform,
+             tolerance, bounds);
+ }
+@@ -6865,12 +6907,16 @@
+         D2D1_POINT_2F point, float stroke_width, ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform,
+         float tolerance, BOOL *contains)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, point %s, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, contains %p.\n",
+             iface, debug_d2d_point_2f(&point), stroke_width, stroke_style, transform, tolerance, contains);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_StrokeContainsPoint(geometry->u.group.path, point, stroke_width,
+             stroke_style, transform, tolerance, contains);
+ }
+@@ -6878,24 +6924,32 @@
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_FillContainsPoint(ID2D1GeometryGroup *iface,
+         D2D1_POINT_2F point, const D2D1_MATRIX_3X2_F *transform, float tolerance, BOOL *contains)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, point %s, transform %p, tolerance %.8e, contains %p.\n",
+             iface, debug_d2d_point_2f(&point), transform, tolerance, contains);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_FillContainsPoint(geometry->u.group.path, point, transform, tolerance, contains);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_CompareWithGeometry(ID2D1GeometryGroup *iface,
+         ID2D1Geometry *geometry2, const D2D1_MATRIX_3X2_F *transform, float tolerance, D2D1_GEOMETRY_RELATION *relation)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, geometry %p, transform %p, tolerance %.8e, relation %p.\n",
+             iface, geometry2, transform, tolerance, relation);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_CompareWithGeometry(geometry->u.group.path, geometry2, transform, tolerance, relation);
+ }
+ 
+@@ -6903,23 +6957,31 @@
+         D2D1_GEOMETRY_SIMPLIFICATION_OPTION option, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+         ID2D1SimplifiedGeometrySink *sink)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, option %#x, transform %p, tolerance %.8e, sink %p.\n",
+             iface, option, transform, tolerance, sink);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_Simplify(geometry->u.group.path, option, transform, tolerance, sink);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_Tessellate(ID2D1GeometryGroup *iface,
+         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1TessellationSink *sink)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_Tessellate(geometry->u.group.path, transform, tolerance, sink);
+ }
+ 
+@@ -6927,12 +6989,16 @@
+         ID2D1Geometry *geometry2, D2D1_COMBINE_MODE combine_mode, const D2D1_MATRIX_3X2_F *transform,
+         float tolerance, ID2D1SimplifiedGeometrySink *sink)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, geometry %p, combine_mode %#x, transform %p, tolerance %.8e, sink %p.\n",
+             iface, geometry2, combine_mode, transform, tolerance, sink);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_CombineWithGeometry(geometry->u.group.path, geometry2, combine_mode,
+             transform, tolerance, sink);
+ }
+@@ -6940,33 +7006,45 @@
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_Outline(ID2D1GeometryGroup *iface,
+         const D2D1_MATRIX_3X2_F *transform, float tolerance, ID2D1SimplifiedGeometrySink *sink)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, transform %p, tolerance %.8e, sink %p.\n", iface, transform, tolerance, sink);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_Outline(geometry->u.group.path, transform, tolerance, sink);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_ComputeArea(ID2D1GeometryGroup *iface,
+         const D2D1_MATRIX_3X2_F *transform, float tolerance, float *area)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, transform %p, tolerance %.8e, area %p.\n", iface, transform, tolerance, area);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_ComputeArea(geometry->u.group.path, transform, tolerance, area);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_geometry_group_ComputeLength(ID2D1GeometryGroup *iface,
+         const D2D1_MATRIX_3X2_F *transform, float tolerance, float *length)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, transform %p, tolerance %.8e, length %p.\n", iface, transform, tolerance, length);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_ComputeLength(geometry->u.group.path, transform, tolerance, length);
+ }
+ 
+@@ -6974,12 +7052,16 @@
+         float length, const D2D1_MATRIX_3X2_F *transform, float tolerance, D2D1_POINT_2F *point,
+         D2D1_POINT_2F *tangent)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, length %.8e, transform %p, tolerance %.8e, point %p, tangent %p.\n",
+             iface, length, transform, tolerance, point, tangent);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_ComputePointAtLength(geometry->u.group.path, length, transform, tolerance,
+             point, tangent);
+ }
+@@ -6988,12 +7070,16 @@
+         ID2D1StrokeStyle *stroke_style, const D2D1_MATRIX_3X2_F *transform, float tolerance,
+         ID2D1SimplifiedGeometrySink *sink)
+ {
++    HRESULT hr;
+     NEUTRON_API_TIME();
+     struct d2d_geometry *geometry = impl_from_ID2D1GeometryGroup(iface);
+ 
+     TRACE("iface %p, stroke_width %.8e, stroke_style %p, transform %p, tolerance %.8e, sink %p.\n",
+             iface, stroke_width, stroke_style, transform, tolerance, sink);
+ 
++    if (FAILED(hr = d2d_geometry_group_require_path(geometry)))
++        return hr;
++
+     return ID2D1PathGeometry_Widen(geometry->u.group.path, stroke_width, stroke_style, transform,
+             tolerance, sink);
+ }
+@@ -7059,6 +7145,12 @@
+ static void d2d_geometry_group_stream(struct d2d_geometry *geometry,
+         const D2D_MATRIX_3X2_F *transform, ID2D1GeometrySink *sink)
+ {
++    /* NOTE: this returns void. An earlier attempt guarded only the HRESULT-returning
++     * entry points, skipped this one, and dereferenced a NULL path on the first nested
++     * mask -- Premiere would not launch. Bail out quietly instead. */
++    if (FAILED(d2d_geometry_group_require_path(geometry)) || !geometry->u.group.path)
++        return;
++
+     d2d_geometry_stream((ID2D1Geometry *)geometry->u.group.path, NULL, sink);
+ }
+ 
+@@ -7090,27 +7182,73 @@
+     geometry->u.group.geometry_count = geometry_count;
+     geometry->u.group.fill_mode = fill_mode;
+ 
+-    if (FAILED(hr = ID2D1Factory_CreatePathGeometry(factory, &geometry->u.group.path)))
++    /* NEUTRON LAZY GROUP PATH: the inner path is built on first use, by
++     * d2d_geometry_group_require_path(). Both the path and the outline copy that
++     * used to happen here now happen there. */
++    geometry->u.group.path = NULL;
++    geometry->u.group.path_hr = S_OK;
++    InterlockedExchange(&geometry->u.group.path_pending, 1);
++    /* The fill is resolved from the inner path, so it stays pending too -- and it
++     * must be marked pending HERE, not inside the builder: require_tessellation()
++     * tests tess_pending FIRST and early-returns, so a group created and then
++     * filled would resolve nothing and draw EMPTY. That is exactly what made every
++     * group-drawn UI element vanish in an earlier attempt at this change. */
++    InterlockedExchange(&geometry->tess_pending, 1);
++
++    return S_OK;
++}
++
++/* Build the group's combined path: stream every member into a fresh path geometry
++ * and close it, then take the by-value copy of its outline (strokes read that).
++ * Deferred from group_init -- see the note on u.group.path_pending. */
++static HRESULT d2d_geometry_group_require_path(struct d2d_geometry *geometry)
++{
++    ID2D1PathGeometry *path;
++    ID2D1GeometrySink *sink;
++    unsigned int i, spin = 0;
++    HRESULT hr;
++    LONG prev;
++
++    if (!InterlockedCompareExchange(&geometry->u.group.path_pending, 0, 0))
++        return geometry->u.group.path_hr;
++
++    if ((prev = InterlockedCompareExchange(&geometry->u.group.path_pending, 2, 1)) != 1)
+     {
+-        d2d_geometry_cleanup(geometry);
+-        return hr;
++        while (InterlockedCompareExchange(&geometry->u.group.path_pending, 0, 0) == 2)
++        {
++            if (++spin < 64)
++                YieldProcessor();
++            else
++                Sleep(0);
++        }
++        return geometry->u.group.path_hr;
+     }
+ 
+-    if (SUCCEEDED(hr = ID2D1PathGeometry_Open(geometry->u.group.path, &sink)))
++    if (SUCCEEDED(hr = ID2D1Factory_CreatePathGeometry(geometry->factory, &path)))
+     {
+-        ID2D1GeometrySink_SetFillMode(sink, fill_mode);
+-        for (i = 0; i < geometry_count; ++i)
++        if (SUCCEEDED(hr = ID2D1PathGeometry_Open(path, &sink)))
++        {
++            ID2D1GeometrySink_SetFillMode(sink, geometry->u.group.fill_mode);
++            for (i = 0; i < geometry->u.group.geometry_count; ++i)
++            {
++                ID2D1GeometrySink_SetSegmentFlags(sink, 0);
++                d2d_geometry_stream(geometry->u.group.src_geometries[i], NULL, sink);
++            }
++            hr = ID2D1GeometrySink_Close(sink);
++            ID2D1GeometrySink_Release(sink);
++        }
++        if (FAILED(hr))
+         {
+-            ID2D1GeometrySink_SetSegmentFlags(sink, 0);
+-            d2d_geometry_stream(geometries[i], NULL, sink);
++            ID2D1PathGeometry_Release(path);
++            path = NULL;
+         }
+-        hr = ID2D1GeometrySink_Close(sink);
+-        ID2D1GeometrySink_Release(sink);
+     }
+ 
+     if (SUCCEEDED(hr))
+     {
+-        struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)geometry->u.group.path);
++        struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path);
++
++        geometry->u.group.path = path;
+ 
+         /* NEUTRON LAZY TESSELLATION: the group takes a BY-VALUE copy of the inner path's
+          * tessellation. The OUTLINE is already complete (it is built while the figures are
+@@ -7123,18 +7261,23 @@
+          * d2d_geometry_require_tessellation(). Copying an empty fill here and never resolving
+          * it is what made every group-drawn UI element disappear in an earlier build. */
+         geometry->outline = path_impl->outline;
+-        InterlockedExchange(&geometry->tess_pending, 1);
+-    }
+-
+-    if (FAILED(hr))
+-    {
+-        d2d_geometry_cleanup(geometry);
+-        ID2D1PathGeometry_Release(geometry->u.group.path);
+     }
+ 
++    geometry->u.group.path_hr = hr;
++    InterlockedExchange(&geometry->u.group.path_pending, 0);   /* publishes to waiters */
+     return hr;
+ }
+ 
++/* Strokes render from geometry->outline, which for a group is a copy taken when the
++ * inner path is built -- so the build has to be forced before it is read. Callers
++ * outside geometry.c (d2d_device_context_draw_geometry) go through this. */
++HRESULT d2d_geometry_require_outline(struct d2d_geometry *geometry)
++{
++    if (geometry->ID2D1Geometry_iface.lpVtbl != (const ID2D1GeometryVtbl *)&d2d_geometry_group_vtbl)
++        return S_OK;
++    return d2d_geometry_group_require_path(geometry);
++}
++
+ struct d2d_geometry *unsafe_impl_from_ID2D1Geometry(ID2D1Geometry *iface)
+ {
+     if (!iface)
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1716,6 +1716,11 @@
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
+         float miter_limit)
+ {
++    /* NEUTRON LAZY GROUP PATH: a group's outline is a copy taken when its combined
++     * path is built, and that build is deferred -- force it before reading below. */
++    if (FAILED(d2d_geometry_require_outline((struct d2d_geometry *)geometry)))
++        return;
++
+     D3D11_SUBRESOURCE_DATA buffer_data;
+     D3D11_BUFFER_DESC buffer_desc;
+     ID3D11Buffer *ib, *vb;
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -350,6 +350,8 @@
+ 
+ struct d2d_geometry;
+ HRESULT d2d_geometry_require_tessellation(struct d2d_geometry *geometry);
++/* NEUTRON LAZY GROUP PATH: force a group's combined path before reading ->outline. */
++HRESULT d2d_geometry_require_outline(struct d2d_geometry *geometry);
+ 
+ /* NEUTRON op-trace (env NEUTRON_D2D_OPTRACE=1): per-frame op/clear log for the timeline
+  * rows -- does the app WIPE its own panel and then draw almost nothing? */
+@@ -1088,6 +1090,16 @@
+             UINT32 geometry_count;
+             D2D1_FILL_MODE fill_mode;
+             ID2D1PathGeometry *path;
++            /* NEUTRON LAZY GROUP PATH: building `path` means streaming every member into a
++             * fresh path and closing it, which is 82-95% of CreateGeometryGroup's cost
++             * (measured). Premiere issues 300-433 of these PER FRAME while zooming, and the
++             * count swing between smooth and choppy frames is the largest of any call, so the
++             * build is deferred until something actually needs the combined shape. Most
++             * groups are only ever used as layer masks, where GetBounds alone suffices and
++             * the union of the members' bounds answers that without any path at all.
++             * Claimed per geometry: 1 = pending, 2 = another thread is building, 0 = done. */
++            LONG path_pending;
++            HRESULT path_hr;
+         } group;
+     } u;
+ };
