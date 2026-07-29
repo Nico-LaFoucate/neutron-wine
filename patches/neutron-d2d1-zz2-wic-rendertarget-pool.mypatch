@@ -1,0 +1,259 @@
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -99,6 +99,144 @@
+     return S_OK;
+ }
+ 
++
++/* ---- NEUTRON WIC RENDER-TARGET POOL ------------------------------------
++ * Premiere creates ~29 of these per frame and releases them again. Nothing in
++ * the object depends on WHICH IWICBitmap it wraps except the bitmap pointer
++ * itself, so a released target is parked on the factory and reused for the next
++ * request of the same size/format. What that saves is the device-context init,
++ * the CPU-readable staging texture (cost scales with area) and the D3D texture
++ * + DXGI surface -- measured ~167us per create, 4.78ms/frame.
++ *
++ * A pooled target MUST come back with default drawing state: D2D render targets
++ * are stateful (transform, dpi, antialias modes, tags) and an app is entitled to
++ * assume a fresh one. */
++static void d2d_wic_render_target_reset_state(struct d2d_wic_render_target *rt,
++        const D2D1_RENDER_TARGET_PROPERTIES *desc)
++{
++    static const D2D1_MATRIX_3X2_F identity_transform = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
++    ID2D1RenderTarget *target = rt->dxgi_target;
++    float dpi_x = desc->dpiX, dpi_y = desc->dpiY;
++
++    if (dpi_x == 0.0f || dpi_y == 0.0f)
++    {
++        dpi_x = 96.0f;
++        dpi_y = 96.0f;
++    }
++    ID2D1RenderTarget_SetTransform(target, &identity_transform);
++    ID2D1RenderTarget_SetDpi(target, dpi_x, dpi_y);
++    ID2D1RenderTarget_SetAntialiasMode(target, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
++    ID2D1RenderTarget_SetTextAntialiasMode(target, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
++    ID2D1RenderTarget_SetTags(target, 0, 0);
++    ID2D1RenderTarget_SetTextRenderingParams(target, NULL);
++}
++
++static struct d2d_wic_render_target *d2d_wic_render_target_pool_take(struct d2d_factory *factory,
++        IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc, UINT32 width, UINT32 height,
++        DXGI_FORMAT format, D2D1_ALPHA_MODE alpha_mode)
++{
++    struct d2d_wic_render_target *rt, *found = NULL;
++
++    EnterCriticalSection(&factory->cs);
++    LIST_FOR_EACH_ENTRY(rt, &factory->wic_rt_pool, struct d2d_wic_render_target, pool_entry)
++    {
++        if (rt->width == width && rt->height == height && rt->pool_format == format
++                && rt->pool_alpha_mode == alpha_mode
++                && rt->pool_usage == (unsigned int)desc->usage)
++        {
++            found = rt;
++            break;
++        }
++    }
++    if (found)
++    {
++        list_remove(&found->pool_entry);
++        --factory->wic_rt_pool_size;
++    }
++    LeaveCriticalSection(&factory->cs);
++
++    if (!found)
++        return NULL;
++
++    IWICBitmap_AddRef(found->bitmap = bitmap);
++    found->refcount = 1;
++    d2d_wic_render_target_reset_state(found, desc);
++    return found;
++}
++
++/* Returns TRUE when the target has been parked for reuse instead of destroyed. */
++static BOOL d2d_wic_render_target_pool_put(struct d2d_wic_render_target *rt)
++{
++    struct d2d_factory *factory;
++    BOOL pooled = FALSE;
++
++    if (!rt->pool_factory)
++        return FALSE;
++
++    factory = unsafe_impl_from_ID2D1Factory((ID2D1Factory *)rt->pool_factory);
++
++    EnterCriticalSection(&factory->cs);
++    if (factory->wic_rt_pool_size < D2D_WIC_RT_POOL_MAX)
++    {
++        list_add_head(&factory->wic_rt_pool, &rt->pool_entry);
++        ++factory->wic_rt_pool_size;
++        pooled = TRUE;
++    }
++    LeaveCriticalSection(&factory->cs);
++
++    if (pooled)
++    {
++        /* the bitmap is the only per-use part; drop it and keep the resources */
++        IWICBitmap_Release(rt->bitmap);
++        rt->bitmap = NULL;
++    }
++    return pooled;
++}
++
++void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory)
++{
++    struct d2d_wic_render_target *rt, *rt2;
++
++    LIST_FOR_EACH_ENTRY_SAFE(rt, rt2, &factory->wic_rt_pool, struct d2d_wic_render_target, pool_entry)
++    {
++        list_remove(&rt->pool_entry);
++        ID3D10Texture2D_Release(rt->readback_texture);
++        IUnknown_Release(rt->dxgi_inner);
++        IDXGISurface_Release(rt->dxgi_surface);
++        free(rt);
++    }
++    factory->wic_rt_pool_size = 0;
++}
++
++
++static HRESULT d2d_wic_resolve_pixel_format(D2D1_PIXEL_FORMAT *format, const WICPixelFormatGUID *wic_format);
++
++/* Shape a request the same way d2d_wic_render_target_init does, then look for a
++ * parked target that matches. Returns NULL on any mismatch or unsupported
++ * format so the caller simply builds one normally. */
++struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
++        IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc)
++{
++    D2D1_RENDER_TARGET_PROPERTIES rt_desc;
++    WICPixelFormatGUID bitmap_format;
++    UINT32 width, height;
++
++    if (FAILED(IWICBitmap_GetSize(bitmap, &width, &height)))
++        return NULL;
++    if (FAILED(IWICBitmap_GetPixelFormat(bitmap, &bitmap_format)))
++        return NULL;
++
++    rt_desc = *desc;
++    if (FAILED(d2d_wic_resolve_pixel_format(&rt_desc.pixelFormat, &bitmap_format)))
++        return NULL;
++    if (rt_desc.pixelFormat.format != DXGI_FORMAT_B8G8R8A8_UNORM
++            && rt_desc.pixelFormat.format != DXGI_FORMAT_R8G8B8A8_UNORM)
++        return NULL;
++
++    return d2d_wic_render_target_pool_take(factory, bitmap, desc, width, height,
++            rt_desc.pixelFormat.format, rt_desc.pixelFormat.alphaMode);
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_wic_render_target_QueryInterface(IUnknown *iface, REFIID iid, void **out)
+ {
+     NEUTRON_API_TIME();
+@@ -130,6 +268,11 @@
+ 
+     if (!refcount)
+     {
++        /* NEUTRON WIC RENDER-TARGET POOL: keep it for the next request of the
++         * same shape rather than tearing down the context and textures. */
++        if (d2d_wic_render_target_pool_put(render_target))
++            return 0;
++
+         IWICBitmap_Release(render_target->bitmap);
+         ID3D10Texture2D_Release(render_target->readback_texture);
+         IUnknown_Release(render_target->dxgi_inner);
+@@ -298,6 +441,14 @@
+         return hr;
+     }
+ 
++    /* NEUTRON WIC RENDER-TARGET POOL: remember the shape so a released target can
++     * be matched to a later request. */
++    render_target->pool_factory = factory;
++    render_target->pool_format = texture_desc.Format;
++    render_target->pool_alpha_mode = rt_desc.pixelFormat.alphaMode;
++    render_target->pool_usage = (unsigned int)desc->usage;
++    list_init(&render_target->pool_entry);
++
+     if (FAILED(hr = IUnknown_QueryInterface(render_target->dxgi_inner,
+             &IID_ID2D1RenderTarget, (void **)&render_target->dxgi_target)))
+     {
+--- a/dlls/d2d1/factory.c
++++ b/dlls/d2d1/factory.c
+@@ -159,6 +159,7 @@
+         {
+             d2d_effect_registration_cleanup(reg);
+         }
++        d2d_factory_drain_wic_rt_pool(factory);   /* NEUTRON WIC RT POOL */
+         DeleteCriticalSection(&factory->cs);
+         free(factory);
+     }
+@@ -425,6 +426,18 @@
+ 
+     TRACE("iface %p, target %p, desc %p, render_target %p.\n", iface, target, desc, render_target);
+ 
++    /* NEUTRON WIC RENDER-TARGET POOL: hand back a released target of the same
++     * shape instead of rebuilding the context and textures. */
++    {
++        struct d2d_wic_render_target *pooled;
++
++        if ((pooled = d2d_wic_render_target_pool_lookup(factory, target, desc)))
++        {
++            *render_target = pooled->dxgi_target;
++            return S_OK;
++        }
++    }
++
+     if (!(object = calloc(1, sizeof(*object))))
+         return E_OUTOFMEMORY;
+ 
+@@ -1449,6 +1462,7 @@
+     factory->refcount = 1;
+     d2d_factory_reload_sysmetrics(factory);
+     list_init(&factory->effects);
++    list_init(&factory->wic_rt_pool);   /* NEUTRON WIC RT POOL */
+     InitializeCriticalSection(&factory->cs);
+     InitOnceInitialize(&factory->init_builtins);
+ }
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -664,6 +664,13 @@
+     IUnknown IUnknown_iface;
+     LONG refcount;
+ 
++    /* NEUTRON WIC RENDER-TARGET POOL: see d2d_factory.wic_rt_pool. */
++    struct list pool_entry;
++    ID2D1Factory1 *pool_factory;
++    DXGI_FORMAT pool_format;
++    D2D1_ALPHA_MODE pool_alpha_mode;
++    unsigned int pool_usage;
++
+     IDXGISurface *dxgi_surface;
+     ID2D1RenderTarget *dxgi_target;
+     IUnknown *dxgi_inner;
+@@ -1229,14 +1236,31 @@
+ 
+     CRITICAL_SECTION cs;
+     D2D1_FACTORY_TYPE factory_type;
++    /* NEUTRON WIC RENDER-TARGET POOL: Premiere creates ~29 WIC bitmap render
++     * targets PER FRAME and releases them again -- 4.78ms/frame in creation
++     * alone, and each one also brings its own EndDraw GPU round trip (7.25ms
++     * more), together 20% of a 59ms frame. Creating one costs ~167us: a device
++     * context init (~65-88us), a CPU-readable STAGING texture whose cost scales
++     * with area (15-76us), plus the D3D texture and DXGI surface. None of that
++     * depends on WHICH IWICBitmap is wrapped -- only on size and format -- so a
++     * released target is kept here and handed back to the next request of the
++     * same shape, with its drawing state reset. */
++    struct list wic_rt_pool;
++    unsigned int wic_rt_pool_size;
+ };
+ 
++#define D2D_WIC_RT_POOL_MAX 24
++
+ static inline struct d2d_factory *unsafe_impl_from_ID2D1Factory(ID2D1Factory *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_factory, ID2D1Factory7_iface);
+ }
+ 
+ void d2d_effects_init_builtins(struct d2d_factory *factory);
++/* NEUTRON WIC RENDER-TARGET POOL */
++struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
++        IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
++void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory);
+ HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
+         bool allow_get_dxgi_device, REFIID iid, void **device);
+ struct d2d_effect_registration * d2d_factory_get_registered_effect(ID2D1Factory *factory,
