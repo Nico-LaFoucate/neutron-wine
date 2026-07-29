@@ -1,0 +1,185 @@
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -583,12 +583,89 @@
+         d2d_clip_stack_pop(&context->clip_stack);
+ }
+ 
++/* ---- NEUTRON BATCHED DEVICE-CONTEXT STATE ------------------------------
++ * d2d shares one D3D device with the application, so it keeps its pipeline state
++ * in its own ID3DDeviceContextState and swapped it in and straight back out
++ * around EVERY primitive. Measured on this hardware that pair costs ~14us -- of a
++ * ~19us primitive, i.e. three quarters of the cost of drawing anything at all.
++ * Premiere issues ~330 primitives per timeline frame, so it was paying ~4.6ms a
++ * frame purely to swap state objects back and forth.
++ *
++ * Install the state on the first primitive instead and leave it installed, then
++ * put the application's state back at EndDraw/Flush -- the points at which d2d
++ * hands the device back (an app sharing the device must Flush before using it).
++ * Consecutive primitives then cost no swap at all.
++ *
++ * Which state is installed is tracked on the FACTORY, not the render target,
++ * because all render targets from a factory share one immediate context: if a
++ * second render target draws in between, it swaps its own state in and takes
++ * ownership, and the first one swaps back when its turn comes round again. The
++ * field is only touched under the factory cs -- the same lock the draw path
++ * already holds. */
++static struct d2d_factory *d2d_device_context_get_factory(struct d2d_device_context *context)
++{
++    return unsafe_impl_from_ID2D1Factory((ID2D1Factory *)context->factory);
++}
++
++static void d2d_device_context_install_state(struct d2d_device_context *context,
++        ID3D11DeviceContext1 *d3d_context)
++{
++    struct d2d_factory *factory = d2d_device_context_get_factory(context);
++    ID3DDeviceContextState *prev;
++
++    if (!factory)
++    {
++        /* no factory to track through: fall back to the swap-per-primitive behaviour */
++        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev);
++        context->d3d_prev_state = prev;
++        context->d3d_state_borrowed = TRUE;
++        return;
++    }
++
++    if (factory->d3d_current_state == context->d3d_state)
++        return;
++
++    ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, context->d3d_state, &prev);
++    if (!factory->d3d_current_state)
++        factory->d3d_app_state = prev;      /* first take-over: this is the app's state */
++    else if (prev)
++        ID3DDeviceContextState_Release(prev);/* another d2d target's; it holds its own ref */
++    factory->d3d_current_state = context->d3d_state;
++}
++
++/* Put the application's state back. Called where d2d yields the device: EndDraw,
++ * Flush, and context teardown. Safe to call when nothing is installed. */
++void d2d_device_context_release_state(struct d2d_device_context *context)
++{
++    struct d2d_factory *factory = d2d_device_context_get_factory(context);
++    ID3D11DeviceContext1 *d3d_context;
++
++    if (!factory)
++        return;
++
++    if (context->cs)
++        EnterCriticalSection(context->cs);
++
++    if (factory->d3d_current_state)
++    {
++        ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
++        ID3D11DeviceContext1_SwapDeviceContextState(d3d_context, factory->d3d_app_state, NULL);
++        ID3D11DeviceContext1_Release(d3d_context);
++        if (factory->d3d_app_state)
++            ID3DDeviceContextState_Release(factory->d3d_app_state);
++        factory->d3d_app_state = NULL;
++        factory->d3d_current_state = NULL;
++    }
++
++    if (context->cs)
++        LeaveCriticalSection(context->cs);
++}
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
+         struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+ {
+     struct d2d_shape_resources *shape_resources = &render_target->shape_resources[shape_type];
+-    ID3DDeviceContextState *prev_state;
+     ID3D11Device1 *device = render_target->d3d_device;
+     ID3D11DeviceContext1 *context;
+     ID3D11Buffer *vs_cb = render_target->vs_cb, *ps_cb = render_target->ps_cb;
+@@ -612,7 +689,7 @@
+         EnterCriticalSection(render_target->cs);
+ 
+     ID3D11Device1_GetImmediateContext1(device, &context);
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_state, &prev_state);
++    d2d_device_context_install_state(render_target, context);
+ 
+     ID3D11DeviceContext1_IASetInputLayout(context, shape_resources->il);
+     ID3D11DeviceContext1_IASetPrimitiveTopology(context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+@@ -698,9 +775,16 @@
+             ID3D11DeviceContext1_Draw(context, index_count, 0);
+     }
+ 
+-    ID3D11DeviceContext1_SwapDeviceContextState(context, prev_state, NULL);
++    /* NEUTRON: the state stays installed -- released at EndDraw/Flush. */
++    if (render_target->d3d_state_borrowed)
++    {
++        ID3D11DeviceContext1_SwapDeviceContextState(context, render_target->d3d_prev_state, NULL);
++        if (render_target->d3d_prev_state)
++            ID3DDeviceContextState_Release(render_target->d3d_prev_state);
++        render_target->d3d_prev_state = NULL;
++        render_target->d3d_state_borrowed = FALSE;
++    }
+     ID3D11DeviceContext1_Release(context);
+-    ID3DDeviceContextState_Release(prev_state);
+ 
+     if (render_target->cs)
+         LeaveCriticalSection(render_target->cs);
+@@ -1109,6 +1193,9 @@
+                 }
+             }
+         }
++        /* NEUTRON BATCHED STATE: a context must never be destroyed while its state
++         * is still the one installed on the shared immediate context. */
++        d2d_device_context_release_state(context);
+         if (context->d3d_state)
+             ID3DDeviceContextState_Release(context->d3d_state);
+         if (context->target.object)
+@@ -2784,6 +2871,10 @@
+ 
+     FIXME("iface %p, tag1 %p, tag2 %p stub!\n", iface, tag1, tag2);
+ 
++    /* NEUTRON BATCHED STATE: Flush is where an app sharing the device is told it
++     * may use it again, so hand the pipeline state back here. */
++    d2d_device_context_release_state(context);
++
+     if (context->ops && context->ops->device_context_present)
+         context->ops->device_context_present(context->outer_unknown);
+ 
+@@ -3050,6 +3141,8 @@
+ 
+     TRACE("iface %p, tag1 %p, tag2 %p.\n", iface, tag1, tag2);
+ 
++    d2d_device_context_release_state(context);
++
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+         FIXME("Unimplemented for command list target.\n");
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -557,6 +557,9 @@
+     struct d2d_device *device;
+     ID3D11Device1 *d3d_device;
+     ID3DDeviceContextState *d3d_state;
++    /* NEUTRON BATCHED STATE fallback when the factory cannot be resolved */
++    ID3DDeviceContextState *d3d_prev_state;
++    BOOL d3d_state_borrowed;
+     struct
+     {
+         ID2D1Image *object;
+@@ -1247,6 +1250,13 @@
+      * depends on WHICH IWICBitmap is wrapped -- only on size and format -- so a
+      * released target is kept here and handed back to the next request of the
+      * same shape, with its drawing state reset. */
++    /* NEUTRON BATCHED DEVICE-CONTEXT STATE: which render target's ID3DDeviceContextState
++     * is currently installed on the shared immediate context, and the state that was
++     * installed before d2d first took over. Guarded by cs (the same lock the draw path
++     * already takes). See d2d_device_context_install_state(). */
++    ID3DDeviceContextState *d3d_current_state;
++    ID3DDeviceContextState *d3d_app_state;
++
+     struct list wic_rt_pool;
+     unsigned int wic_rt_pool_size;
+ };
+@@ -1263,6 +1273,7 @@
+ struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
+         IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
+ void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory);
++void d2d_device_context_release_state(struct d2d_device_context *context);
+ HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
+         bool allow_get_dxgi_device, REFIID iid, void **device);
+ struct d2d_effect_registration * d2d_factory_get_registered_effect(ID2D1Factory *factory,
