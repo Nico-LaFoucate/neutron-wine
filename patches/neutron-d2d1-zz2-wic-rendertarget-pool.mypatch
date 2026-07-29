@@ -1,6 +1,6 @@
 --- a/dlls/d2d1/wic_render_target.c
 +++ b/dlls/d2d1/wic_render_target.c
-@@ -99,6 +99,144 @@
+@@ -99,6 +99,172 @@
      return S_OK;
  }
  
@@ -13,15 +13,27 @@
 + * the CPU-readable staging texture (cost scales with area) and the D3D texture
 + * + DXGI surface -- measured ~167us per create, 4.78ms/frame.
 + *
-+ * A pooled target MUST come back with default drawing state: D2D render targets
-+ * are stateful (transform, dpi, antialias modes, tags) and an app is entitled to
-+ * assume a fresh one. */
++ * A pooled target MUST come back INDISTINGUISHABLE FROM A FRESH ONE, in two
++ * respects:
++ *
++ *  - Drawing state. D2D render targets are stateful (transform, dpi, antialias
++ *    modes, tags, primitive blend, unit mode) and an app is entitled to assume
++ *    defaults on a target it just created.
++ *
++ *  - Pixel content. d2d_wic_render_target_present() copies the WHOLE texture to
++ *    the WIC bitmap on every EndDraw, so any pixel the app does not draw this
++ *    time is published from the texture. A freshly created texture reads as
++ *    zeroes, so an app may legitimately draw only part of the target and expect
++ *    the rest transparent; without this clear it would instead get whatever the
++ *    previous tenant of the pooled target drew. */
 +static void d2d_wic_render_target_reset_state(struct d2d_wic_render_target *rt,
 +        const D2D1_RENDER_TARGET_PROPERTIES *desc)
 +{
 +    static const D2D1_MATRIX_3X2_F identity_transform = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
++    static const float clear_colour[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 +    ID2D1RenderTarget *target = rt->dxgi_target;
 +    float dpi_x = desc->dpiX, dpi_y = desc->dpiY;
++    ID3D10Device *device;
 +
 +    if (dpi_x == 0.0f || dpi_y == 0.0f)
 +    {
@@ -34,6 +46,18 @@
 +    ID2D1RenderTarget_SetTextAntialiasMode(target, D2D1_TEXT_ANTIALIAS_MODE_DEFAULT);
 +    ID2D1RenderTarget_SetTags(target, 0, 0);
 +    ID2D1RenderTarget_SetTextRenderingParams(target, NULL);
++    if (rt->pool_context)
++    {
++        ID2D1DeviceContext_SetPrimitiveBlend(rt->pool_context, D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
++        ID2D1DeviceContext_SetUnitMode(rt->pool_context, D2D1_UNIT_MODE_DIPS);
++    }
++
++    if (rt->pool_rtv)
++    {
++        ID3D10Texture2D_GetDevice(rt->readback_texture, &device);
++        ID3D10Device_ClearRenderTargetView(device, rt->pool_rtv, clear_colour);
++        ID3D10Device_Release(device);
++    }
 +}
 +
 +static struct d2d_wic_render_target *d2d_wic_render_target_pool_take(struct d2d_factory *factory,
@@ -75,7 +99,9 @@
 +    struct d2d_factory *factory;
 +    BOOL pooled = FALSE;
 +
-+    if (!rt->pool_factory)
++    /* Without the view a reused target could not be cleared back to the zeroes a
++     * freshly created one reads as, and present() publishes the whole texture. */
++    if (!rt->pool_factory || !rt->pool_rtv)
 +        return FALSE;
 +
 +    factory = unsafe_impl_from_ID2D1Factory((ID2D1Factory *)rt->pool_factory);
@@ -105,6 +131,8 @@
 +    LIST_FOR_EACH_ENTRY_SAFE(rt, rt2, &factory->wic_rt_pool, struct d2d_wic_render_target, pool_entry)
 +    {
 +        list_remove(&rt->pool_entry);
++        if (rt->pool_rtv)
++            ID3D10RenderTargetView_Release(rt->pool_rtv);
 +        ID3D10Texture2D_Release(rt->readback_texture);
 +        IUnknown_Release(rt->dxgi_inner);
 +        IDXGISurface_Release(rt->dxgi_surface);
@@ -145,7 +173,7 @@
  static HRESULT STDMETHODCALLTYPE d2d_wic_render_target_QueryInterface(IUnknown *iface, REFIID iid, void **out)
  {
      NEUTRON_API_TIME();
-@@ -130,6 +268,11 @@
+@@ -130,7 +296,14 @@
  
      if (!refcount)
      {
@@ -155,15 +183,28 @@
 +            return 0;
 +
          IWICBitmap_Release(render_target->bitmap);
++        if (render_target->pool_rtv)
++            ID3D10RenderTargetView_Release(render_target->pool_rtv);
          ID3D10Texture2D_Release(render_target->readback_texture);
          IUnknown_Release(render_target->dxgi_inner);
-@@ -298,6 +441,14 @@
+         IDXGISurface_Release(render_target->dxgi_surface);
+@@ -194,6 +367,7 @@
+     WICPixelFormatGUID bitmap_format;
+     ID3D10Texture2D *texture;
+     IDXGIDevice *dxgi_device;
++    ID3D10Resource *resource;
+     ID2D1Device *device;
+     HRESULT hr;
+ 
+@@ -298,6 +472,16 @@
          return hr;
      }
  
 +    /* NEUTRON WIC RENDER-TARGET POOL: remember the shape so a released target can
 +     * be matched to a later request. */
 +    render_target->pool_factory = factory;
++    render_target->pool_rtv = NULL;
++    render_target->pool_context = NULL;
 +    render_target->pool_format = texture_desc.Format;
 +    render_target->pool_alpha_mode = rt_desc.pixelFormat.alphaMode;
 +    render_target->pool_usage = (unsigned int)desc->usage;
@@ -172,6 +213,36 @@
      if (FAILED(hr = IUnknown_QueryInterface(render_target->dxgi_inner,
              &IID_ID2D1RenderTarget, (void **)&render_target->dxgi_target)))
      {
+@@ -308,6 +492,29 @@
+         return hr;
+     }
+ 
++    /* NEUTRON WIC RENDER-TARGET POOL: resources needed to hand this target back
++     * out looking fresh -- a view for the content clear, and the device context
++     * for the state bits that live above ID2D1RenderTarget. Created last so no
++     * failure path above has to unwind them; if either fails the target simply
++     * never gets pooled (pool_take() checks pool_rtv). */
++    if (SUCCEEDED(IDXGISurface_QueryInterface(render_target->dxgi_surface,
++            &IID_ID3D10Resource, (void **)&resource)))
++    {
++        if (FAILED(ID3D10Device1_CreateRenderTargetView(d3d_device, resource, NULL, &render_target->pool_rtv)))
++            render_target->pool_rtv = NULL;
++        ID3D10Resource_Release(resource);
++    }
++    /* Borrowed, deliberately: this object's refcount IS the count of interfaces
++     * handed out on the aggregated context (see dxgi_target above -- calloc
++     * zeroes refcount and that QI is what makes it 1). Keeping a real reference
++     * here would be a self-reference the target could never drop, so take the
++     * pointer and give the reference straight back. */
++    if (SUCCEEDED(IUnknown_QueryInterface(render_target->dxgi_inner,
++            &IID_ID2D1DeviceContext, (void **)&render_target->pool_context)))
++        ID2D1DeviceContext_Release(render_target->pool_context);
++    else
++        render_target->pool_context = NULL;
++
+     render_target->bitmap = bitmap;
+     IWICBitmap_AddRef(bitmap);
+ 
 --- a/dlls/d2d1/factory.c
 +++ b/dlls/d2d1/factory.c
 @@ -159,6 +159,7 @@
@@ -211,7 +282,7 @@
  }
 --- a/dlls/d2d1/d2d1_private.h
 +++ b/dlls/d2d1/d2d1_private.h
-@@ -664,6 +664,13 @@
+@@ -664,6 +664,15 @@
      IUnknown IUnknown_iface;
      LONG refcount;
  
@@ -221,11 +292,13 @@
 +    DXGI_FORMAT pool_format;
 +    D2D1_ALPHA_MODE pool_alpha_mode;
 +    unsigned int pool_usage;
++    ID3D10RenderTargetView *pool_rtv;
++    ID2D1DeviceContext *pool_context;
 +
      IDXGISurface *dxgi_surface;
      ID2D1RenderTarget *dxgi_target;
      IUnknown *dxgi_inner;
-@@ -1229,14 +1236,31 @@
+@@ -1229,14 +1238,31 @@
  
      CRITICAL_SECTION cs;
      D2D1_FACTORY_TYPE factory_type;
