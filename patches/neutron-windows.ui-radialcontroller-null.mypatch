@@ -1,0 +1,76 @@
+# neutron-windows.ui-radialcontroller-null
+#
+# Premiere project-load CRASH fix (c0000005). Touches: dlls/windows.ui/radialcontroller.c,
+# which is added by wine-tkg's staging patches, so this applies on top of those.
+#
+# RadialController is the Surface Dial API. Wine's IRadialControllerInterop::CreateForWindow
+# called factory_RadialController_ActivateInstance -- which returns E_NOTIMPL WITHOUT writing
+# the out-param -- and then returned S_OK. The caller therefore saw success plus an unwritten
+# (NULL/garbage) pointer, called a method on it, and jumped through a null vtable. Observed as
+# an unhandled c0000005 with rax=rbx=0 when Premiere loads a project.
+#
+# CreateForWindow/GetForWindow are documented FAILABLE APIs -- Surface Dial is optional
+# hardware -- so the correct answer is a clean failure with a NULLed out-param, which makes
+# the app take its no-dial path. Also NULLs the out-param in both ActivateInstance stubs so
+# no other caller can inherit the same garbage.
+--- a/dlls/windows.ui/radialcontroller.c
++++ b/dlls/windows.ui/radialcontroller.c
+@@ -107,6 +107,12 @@
+ static HRESULT WINAPI factory_RadialController_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+     FIXME( "iface %p, instance %p stub!\n", iface, instance );
++    /* NEUTRON: MUST NULL the out-param on failure. Callers (e.g. Adobe Premiere on
++     * project load) that get a non-NULL/garbage instance with a failure HRESULT — or
++     * worse, via the CreateForWindow path that used to return S_OK — call a method on
++     * it and jump through a null/garbage vtable -> c0000005. Surface Dial is optional
++     * hardware; a clean failure + NULL makes the app take its no-dial path. */
++    if (instance) *instance = NULL;
+     return E_NOTIMPL;
+ }
+ 
+@@ -129,12 +135,16 @@
+ 
+ static HRESULT WINAPI radialcontroller_interop_CreateForWindow( IRadialControllerInterop *iface, HWND window, REFIID riid, void **radialcontroller )
+ {
+-    struct radialcontroller_statics *impl = impl_from_IRadialControllerInterop ( iface );
+-
+     TRACE( "(window %p, riid %s, radialcontroller %p)\n", window, debugstr_guid( riid ), radialcontroller );
+ 
+-    factory_RadialController_ActivateInstance( &impl->IActivationFactory_iface, (IInspectable **)radialcontroller );
+-    return S_OK;
++    /* NEUTRON: the old code called ActivateInstance (which returns E_NOTIMPL without
++     * writing the out-param) then returned S_OK -> the caller got success + an
++     * unwritten/NULL pointer and called a method on it -> null-vtable crash (observed:
++     * Premiere project-load c0000005 with rax=rbx=0). RadialController.CreateForWindow
++     * is a documented failable API (no Surface Dial hardware); return a clean failure +
++     * NULL so the app takes its no-dial path. */
++    if (radialcontroller) *radialcontroller = NULL;
++    return E_NOTIMPL;
+ }
+ 
+ static const struct IRadialControllerInteropVtbl radialcontroller_interop_vtbl =
+@@ -260,6 +270,7 @@
+ static HRESULT WINAPI factory_RadialControllerConfiguration_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
+ {
+     FIXME( "iface %p, instance %p.\n", iface, instance );
++    if (instance) *instance = NULL; /* NEUTRON: NULL out on failure (see RadialController) */
+     return E_NOTIMPL;
+ }
+ 
+@@ -282,12 +293,12 @@
+ 
+ static HRESULT WINAPI radialcontrollerconfiguration_interop_GetForWindow( IRadialControllerConfigurationInterop *iface, HWND window, REFIID riid, void **radialcontrollerconfiguration )
+ {
+-    struct radialcontrollerconfiguration_statics *impl = impl_from_IRadialControllerConfigurationInterop ( iface );
+-
+     TRACE( "(window %p, riid %s, radialcontrollerconfiguration %p)\n", window, debugstr_guid( riid ), radialcontrollerconfiguration );
+ 
+-    factory_RadialControllerConfiguration_ActivateInstance( &impl->IActivationFactory_iface, (IInspectable **)radialcontrollerconfiguration );
+-    return S_OK;
++    /* NEUTRON: same bug as CreateForWindow — used to return S_OK with an unwritten
++     * out-param. Clean failure + NULL. */
++    if (radialcontrollerconfiguration) *radialcontrollerconfiguration = NULL;
++    return E_NOTIMPL;
+ }
+ 
+ static const struct IRadialControllerConfigurationInteropVtbl radialcontrollerconfiguration_interop_vtbl =

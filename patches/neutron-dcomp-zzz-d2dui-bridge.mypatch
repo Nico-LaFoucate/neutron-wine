@@ -1,0 +1,797 @@
+# neutron-dcomp-zzz-d2dui-bridge
+#
+# The D2D-UI / CEF delivery bridge for Premiere's GPU-accelerated UI mode.
+# Touches: dlls/dcomp/device.c.
+#
+# ORDERING: named zzz-* deliberately. It applies on top of ALL the other neutron-dcomp-*
+# patches (bridge, crossproc, resize-fixes, swapchain-reaper) and edits code they introduce.
+# wine-tkg applies *.mypatch alphabetically, and "zzz" sorts after bridge/crossproc/
+# resize-fixes/swapchain-reaper under both C and locale collation. Do not rename it to
+# something that sorts earlier.
+#
+# What it adds:
+#   * NEUTRON_DCOMP_NATIVE  - gate for the native D2D-UI delivery path.
+#   * NEUTRON_CEF_MAX_FPS   - caps CEF panel blit rate (Premiere's CEP panels otherwise
+#                             blit as fast as they present, burning CPU on the UI thread).
+#   * NEUTRON_DCOMP_SKIP_CEF, NEUTRON_RESIZE_TOL - companion gates/tunables.
+#   * NeutronBoundedAcquire - bounded stamp acquire, replacing an unbounded wait.
+#
+# SUPERSEDES, deliberately: the IDXGISwapChain::GetLastPresentCount skip gate added by the
+# earlier dcomp patches is replaced by a `pending_blit` counter set on every Present via the
+# register hook. GetLastPresentCount is unreliable for the DISCARD d2d1 swapchains Premiere
+# uses, so the old gate both skipped real frames and let stale ones through. A diff of this
+# patch therefore shows those lines being REMOVED -- that is intended, not a regression.
+#
+# The __TRY/__EXCEPT_PAGE_FAULT guard around the swapchain read (added by resize-fixes to
+# survive a concurrent resize tearing down the backbuffer) is PRESERVED and extended.
+#
+# ⚠️ Still carries diagnostics: NEUTRON_ZTREE_DIAG (z-order tree dump) and
+# NEUTRON_BLIT_FAULT_INJECT (fault-injection test hook). Both are env-gated and inert when
+# unset, but they are DEBUG PROBES, not fixes -- strip or move them to patches/diagnostic/
+# before this ships anywhere user-facing.
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -39,6 +39,11 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dcomp);
+ 
++/* NEUTRON R3b: max per-tick client-size delta (px) still treated as "not resizing"
++ * so steady-state / fractional-scale-jitter windows keep blitting. A genuine
++ * maximize/restore jumps far more and is still paused. */
++#define NEUTRON_RESIZE_TOL 24
++
+ struct composition_device
+ {
+     IDCompositionDesktopDevice IDCompositionDesktopDevice_iface;
+@@ -104,6 +109,17 @@
+     BOOL   cross_proc; /* present_hwnd owned by another process (CEF panel) -> use shared px path */
+     UINT   last_present_count; /* NEUTRON perf: skip the staging copy when the swapchain hasn't presented */
+     BOOL   have_present_count;
++    LONG   pending_blit; /* NEUTRON M4: set on every Present (register hook), cleared after a blit;
++                          * the RELIABLE present-count gate for DISCARD d2d1 swapchains where
++                          * IDXGISwapChain::GetLastPresentCount is unreliable. */
++    IUnknown *content_id; /* NEUTRON M4: raw identity of the presented content (NOT ref-held) for
++                           * the per-Present fast-path dedup — avoids QI + find_cef_panel_host per Present. */
++    LONG   last_black; /* NEUTRON round-34 ztree diag: latest readback classification
++                        * (-1 unknown, 0 has-content, 1 black/uniform). Diag-only. */
++    ULONGLONG last_blit_ms; /* NEUTRON round-38: CEF blit fps cap bookkeeping */
++    BOOL   no_blit; /* NEUTRON round-35 NATIVE mode: same-proc window presents its own
++                     * Vulkan subsurface natively; keep the registration (ztree diag /
++                     * A-B revert) but perform NO readback and NO GDI blit for it. */
+     BOOL   t_first_present; /* NEUTRON cold-start timing: first present observed */
+     BOOL   t_first_deliver; /* NEUTRON cold-start timing: first frame delivered to shared mem */
+     ID3D11Texture2D *staging; /* NEUTRON perf: cached staging texture, recreated only on size change */
+@@ -259,8 +275,96 @@
+     if (swapchain) IDXGISwapChain_Release(swapchain);
+ }
+ 
++/* NEUTRON GPU-D2D-UI DIAG (env NEUTRON_D2DUI_DIAG=1): trace the register->blit
++ * dispatch so we can see why the same-process D2D-UI windows are never blitted.
++ * Inert unless the env var is set. */
++static int neutron_d2dui_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { char b[8]; v = (GetEnvironmentVariableA("NEUTRON_D2DUI_DIAG", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++    return v;
++}
++
++/* NEUTRON round-35 NATIVE mode (env NEUTRON_DCOMP_NATIVE=1): same-process D2D-UI
++ * windows present their own Vulkan client subsurfaces natively (winewayland
++ * NEUTRON_NATIVE_STACK orders them per win32 z). The same-proc bridge becomes
++ * DORMANT: register only (ztree diag + easy A/B revert), NO __wine_dcomp_blit
++ * mark, NO bounded-acquire stamp, NO readback, NO GDI blit. The cross-process
++ * CEF/CEP shared-mem path is unchanged (those genuinely need the bridge). */
++static int neutron_dcomp_native(void)
++{
++    static int v = -1;
++    if (v < 0) { char b[8]; v = (GetEnvironmentVariableA("NEUTRON_DCOMP_NATIVE", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++    return v;
++}
++
++/* NEUTRON round-38 (separable perf piece): cap the cross-proc CEF/CEP readback+
++ * blit rate. The Captioneer/home CEF panel render-loops at 60fps, forcing full-
++ * panel GPU readback + shm copy + GDI blit + surface flush each frame (~1.3-6
++ * GB/s of memory/bus traffic, the round-37 trace's dominant measured cost).
++ * Env NEUTRON_CEF_MAX_FPS=N (0/unset = uncapped). */
++static int neutron_cef_max_fps(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[16];
++        v = (GetEnvironmentVariableA("NEUTRON_CEF_MAX_FPS", b, sizeof(b))) ? atoi(b) : 0;
++        if (v < 0) v = 0;
++    }
++    return v;
++}
++
++/* NEUTRON bounded-acquire handshake (round 32). Private DXVK interface --
++ * must match INeutronBoundedAcquire in dxvk's dxgi_interfaces.h. We stamp
++ * every swapchain we readback-blit so DXVK bounds its otherwise-infinite WSI
++ * waits (image acquire / present fences / present-wait) for exactly those
++ * chains. Window-property marking cannot scope them: composition swapchains
++ * carry a DXVK-internal DUMMY hwnd, not the bridge-marked host, so DXVK's
++ * GetPropW(__wine_dcomp_blit) test never fires for them (round-31 finding).
++ * A COM stamp on the swapchain object itself is handle-independent. */
++DEFINE_GUID(IID_INeutronBoundedAcquire, 0xb5d0f6a1, 0x7c4e, 0x4d2a, 0x9b, 0x8e, 0x3f, 0x5a, 0x2c, 0x1d, 0x0e, 0x9f);
++
++typedef struct INeutronBoundedAcquire INeutronBoundedAcquire;
++struct INeutronBoundedAcquireVtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(INeutronBoundedAcquire *iface, REFIID riid, void **out);
++    ULONG   (STDMETHODCALLTYPE *AddRef)(INeutronBoundedAcquire *iface);
++    ULONG   (STDMETHODCALLTYPE *Release)(INeutronBoundedAcquire *iface);
++    HRESULT (STDMETHODCALLTYPE *SetBoundedAcquire)(INeutronBoundedAcquire *iface);
++};
++struct INeutronBoundedAcquire { const struct INeutronBoundedAcquireVtbl *lpVtbl; };
++
++/* Stamp a swapchain as bridge-managed. Returns 1 if DXVK acknowledged. */
++static int neutron_stamp_bounded_acquire(IDXGISwapChain *swapchain)
++{
++    INeutronBoundedAcquire *ba = NULL;
++    if (SUCCEEDED(IDXGISwapChain_QueryInterface(swapchain, &IID_INeutronBoundedAcquire, (void **)&ba)) && ba)
++    {
++        ba->lpVtbl->SetBoundedAcquire(ba);
++        ba->lpVtbl->Release(ba);
++        return 1;
++    }
++    return 0;
++}
++
+ static void blit_swapchain_to_hwnd(struct presentation *p)
+ {
++    /* NEUTRON DIAG: log entry once per (hwnd,cross_proc) — proves whether blit is
++     * even called for the same-process D2D-UI windows. */
++    if (neutron_d2dui_diag())
++    {
++        static struct { HWND h; BOOL xp; } seen[64]; static int n;
++        HWND h = p->present_hwnd; int i; BOOL s = FALSE;
++        for (i = 0; i < n; i++) if (seen[i].h == h && seen[i].xp == p->cross_proc) { s = TRUE; break; }
++        if (!s && n < 64)
++        {
++            seen[n].h = h; seen[n++].xp = p->cross_proc;
++            ERR("neutron-d2dui: BLIT-ENTER hwnd=%p cross_proc=%d swapchain=%p\n", h, p->cross_proc, p->swapchain);
++        }
++    }
++
++    {
+     IDXGISwapChain *swapchain = p->swapchain;
+     HWND hwnd = p->present_hwnd;
+     ID3D11Texture2D *backbuffer = NULL, *staging = NULL;
+@@ -278,39 +382,64 @@
+     static LONG diag_n;
+     LONG n;
+     BOOL diag;
+-    /* volatile so their post-__TRY values survive a page fault in the guarded block
+-     * (must not skip the mt Leave -> would deadlock the app's resize). */
+-    volatile BOOL mt_entered = FALSE, have_pixels = FALSE;
++    BOOL mt_entered = FALSE, have_pixels = FALSE;
+ 
+     n = InterlockedIncrement(&diag_n);
+     diag = (n % 120 == 1);
+ 
+-    /* NEUTRON: the app can resize/recreate this swapchain from another thread on
+-     * maximize/un-maximize; our read then races its backbuffer teardown and faults
+-     * deep in the D3D/DXGI/vkd3d layer (observed: unhandled AV in d3d12core on
+-     * un-maximize). Guard the whole swapchain access with a page-fault handler and
+-     * just drop the frame — this async blit is best-effort. The swapchain and device
+-     * are ref-held (alive), so leaving the mt lock + releasing the objects afterwards
+-     * stays safe; only the backbuffer contents are transiently invalid. */
+-    __TRY
+-    {
+-        UINT count = 0;
+-        if (p->cross_proc && SUCCEEDED(IDXGISwapChain_GetLastPresentCount(swapchain, &count)) &&
+-            p->have_present_count && count == p->last_present_count)
++    /* NEUTRON round-33 LEAK-PROOF READBACK (fix B). DESIGN RULE: no D3D/DXVK call
++     * may execute under a swallowed-SEH guard. The round-32 freeze root (core-
++     * proven): a page fault inside CopyResource/Map was caught by the old
++     * whole-block __EXCEPT_PAGE_FAULT here; the SEH unwind skipped DXVK's C++
++     * RAII unlock, permanently leaking the shared D3D10 device lock
++     * (owner=blit-thread, counter=1) -> every thread touching the immediate
++     * context deadlocked (main UI thread frozen in RecursiveSpinlock::lock).
++     * Object lifetime needs no SEH: our caller holds presentations_cs, which
++     * also serializes register/unregister's p->swapchain / p->staging updates,
++     * and GetBuffer/GetDevice/GetImmediateContext return COM refs that keep the
++     * DXVK objects alive across a concurrent app-side ResizeBuffers. So:
++     *  - Enter / CopyResource / Map / Unmap / Leave all run OUTSIDE any __TRY,
++     *    HRESULT-checked, with Leave guaranteed on every path below;
++     *  - __TRY guards ONLY the raw pixel memcpy from the mapped staging (the
++     *    sole legitimately-faultable region; no lock is held *inside* wine code
++     *    there beyond mt, and the guard skips no unlock -- Unmap and Leave run
++     *    after __ENDTRY on both the normal and the fault path). */
++    {
++        /* NEUTRON M4: RELIABLE present gate for ALL windows via the pending_blit flag set
++         * by the per-Present register hook. (GetLastPresentCount was cross_proc-only and is
++         * unreliable for the DISCARD/bitblt-model d2d1 HwndRenderTarget swapchains -> it
++         * never skipped -> the same-proc D2D-UI windows were read back+blitted every 16ms
++         * = the lag.) Skip the readback for any window that did NOT Present since our last
++         * blit. InterlockedExchange reads AND consumes the flag. */
++        BOOL do_blit = InterlockedExchange(&p->pending_blit, FALSE);
++        /* stats: total/skip/blit, logged ~every 2s so we SEE the gate engage */
++        {
++            static LONG g_calls, g_skips, g_blits; static ULONGLONG g_t;
++            ULONGLONG now; LONG c;
++            InterlockedIncrement(&g_calls);
++            if (!do_blit) InterlockedIncrement(&g_skips); else InterlockedIncrement(&g_blits);
++            c = g_calls; now = GetTickCount64();
++            if (g_t == 0) g_t = now;
++            if (now - g_t >= 2000)
++            {
++                g_t = now;
++                ERR("neutron-gate: 2s window calls=%ld blits=%ld skips=%ld (gate %s)\n",
++                    c, g_blits, g_skips, g_skips > 0 ? "ENGAGED" : "not-skipping");
++                InterlockedExchange(&g_calls, 0); InterlockedExchange(&g_blits, 0); InterlockedExchange(&g_skips, 0);
++            }
++        }
++        if (!do_blit)
+         {
+-            /* No new frame presented since our last blit: skip. */
++            /* no new Present since our last blit: skip the readback */
+         }
+         else
+         {
+-            if (p->cross_proc)
+             {
+-                p->last_present_count = count;
+-                p->have_present_count = TRUE;
+                 if (!p->t_first_present)
+                 {
+                     p->t_first_present = TRUE;
+-                    ERR("neutron-time: sc=%p host=%p FIRST-PRESENT tick=%llu presentcount=%u\n",
+-                        swapchain, hwnd, GetTickCount64(), count);
++                    ERR("neutron-time: sc=%p host=%p FIRST-PRESENT tick=%llu\n",
++                        swapchain, hwnd, GetTickCount64());
+                 }
+             }
+ 
+@@ -365,34 +494,66 @@
+                         {
+                             if ((packed = malloc((SIZE_T)desc.Width * 4 * desc.Height)))
+                             {
+-                                for (y = 0; y < desc.Height; y++)
+-                                    memcpy((BYTE *)packed + (SIZE_T)y * desc.Width * 4,
+-                                           (BYTE *)map.pData + (SIZE_T)y * map.RowPitch,
+-                                           (SIZE_T)desc.Width * 4);
++                                /* volatile: its post-__TRY value must survive a fault */
++                                volatile BOOL copy_ok = TRUE;
++                                __TRY
++                                {
++                                    /* TEST-ONLY fault injection (NEUTRON_BLIT_FAULT_INJECT=1):
++                                     * force a read fault inside the guarded copy region to
++                                     * prove the fault path releases the device lock (round-33
++                                     * offline validation). Inert unless the env var is set. */
++                                    {
++                                        static int inj = -1;
++                                        if (inj < 0) { char b[8]; inj = (GetEnvironmentVariableA("NEUTRON_BLIT_FAULT_INJECT", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++                                        if (inj) { volatile const char *bad = (const char *)(ULONG_PTR)16; (void)*bad; }
++                                    }
++                                    for (y = 0; y < desc.Height; y++)
++                                        memcpy((BYTE *)packed + (SIZE_T)y * desc.Width * 4,
++                                               (BYTE *)map.pData + (SIZE_T)y * map.RowPitch,
++                                               (SIZE_T)desc.Width * 4);
++                                }
++                                __EXCEPT_PAGE_FAULT
++                                {
++                                    static LONG raced_n;
++                                    LONG rn = InterlockedIncrement(&raced_n);
++                                    if (rn == 1 || !(rn % 240))
++                                        ERR("neutron dcomp: readback copy faulted (n=%ld), dropping frame (no lock held in guard)\n", rn);
++                                    copy_ok = FALSE;
++                                }
++                                __ENDTRY
++                                have_pixels = copy_ok;
+                             }
++                            /* outside the guard: runs on both the normal and fault path */
+                             ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+-                            have_pixels = TRUE;
+                         }
+                     }
+                 }
+             }
+         }
+     }
+-    __EXCEPT_PAGE_FAULT
+-    {
+-        static LONG raced_n;
+-        if (!(InterlockedIncrement(&raced_n) % 240))
+-            WARN("neutron dcomp: blit raced a swapchain resize (n=%ld), dropping frame\n", raced_n);
+-        have_pixels = FALSE;
+-    }
+-    __ENDTRY
+ 
++    /* outside any guard: the mt Leave ALWAYS runs (counter returns to 0) */
+     if (mt_entered)
+     {
+         ID3D10Multithread_Leave(mt);
+     }
+     if (mt) ID3D10Multithread_Release(mt);
+ 
++    /* NEUTRON DIAG: once per hwnd, did the readback produce pixels? Distinguishes
++     * "blit never called" from "called but readback null (GetBuffer/Map failed)". */
++    if (neutron_d2dui_diag())
++    {
++        static struct { HWND h; } seenr[64]; static int nr;
++        int i; BOOL s = FALSE;
++        for (i = 0; i < nr; i++) if (seenr[i].h == hwnd) { s = TRUE; break; }
++        if (!s && nr < 64)
++        {
++            seenr[nr++].h = hwnd;
++            ERR("neutron-d2dui: READBACK hwnd=%p cross_proc=%d have_pixels=%d\n",
++                hwnd, p->cross_proc, have_pixels);
++        }
++    }
++
+     if (!have_pixels)
+     {
+         free(packed);
+@@ -504,6 +665,55 @@
+     else if (packed)
+     {
+         /* same-process target (e.g. the program-monitor canvas): the classic GDI blit works. */
++        BOOL blit_ok = FALSE;
++        int content_dd;
++
++        hdc = NULL;
++        /* NEUTRON M4 BUG-2 FIX: measure whole-frame variation of the readback. The blit
++         * OVERWRITES the window_surface via StretchDIBits, so blitting a UNIFORM/BLACK
++         * readback would CLOBBER the window's real GDI-painted content (e.g. the timeline
++         * paints via GDI into the shared surface but only Presents its swapchain on
++         * interaction -> its swapchain readback is stale/black -> our blit painted black
++         * over it -> "invisible until you hover"). So: skip the blit when the readback is
++         * uniform (black/empty) -> never clobber good GDI content with black. Non-uniform
++         * (real D2D content) always blits. Also helps the ~14 BLACK-readback windows. */
++        BOOL uniform_black;
++        {
++            const DWORD *px = packed;
++            UINT W = desc.Width, H = desc.Height, gx, gy;
++            DWORD ref = px[(SIZE_T)(H/2)*W + W/2];
++            content_dd = 0;
++            for (gy = 0; gy < 40; gy++) for (gx = 0; gx < 40; gx++)
++                if (px[(SIZE_T)(H*gy/40)*W + (W*gx/40)] != ref) content_dd++;
++            /* Skip ONLY a uniform *black* readback (the stale/empty swapchain that would
++             * clobber real GDI content). A uniform NON-black readback (e.g. a solid
++             * 0x1d1d1d/0x2c2c2c panel background) is genuine content -> must still blit,
++             * else the panel goes WHITE. (Round-26 over-skip: skipped ALL uniform frames.) */
++            uniform_black = (content_dd < 2) && ((ref & 0xffffff) <= 0x080808);
++            /* NEUTRON round-34 ztree diag: remember latest classification (diag-only) */
++            InterlockedExchange(&p->last_black, uniform_black ? 1 : 0);
++        }
++
++        /* diag (env NEUTRON_D2DUI_DIAG=1): per-hwnd readback content once. */
++        {
++            static int d2dui = -1;
++            if (d2dui < 0) { char b[8]; d2dui = (GetEnvironmentVariableA("NEUTRON_D2DUI_DIAG", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++            if (d2dui)
++            {
++                static struct { HWND h; int best; } seen[48]; static int nseen;
++                int si, slot = -1;
++                for (si = 0; si < nseen; si++) if (seen[si].h == hwnd) { slot = si; break; }
++                if (slot < 0 && nseen < 48) { slot = nseen++; seen[slot].h = hwnd; seen[slot].best = -1; }
++                if (slot >= 0 && content_dd > seen[slot].best)
++                {
++                    seen[slot].best = content_dd;
++                    ERR("neutron-d2dui: SAMEPROC hwnd=%p %ux%u densegrid40=%d -> %s\n",
++                        hwnd, desc.Width, desc.Height, content_dd,
++                        content_dd >= 3 ? "HAS-CONTENT" : "BLACK/UNIFORM");
++                }
++            }
++        }
++
+         memset(&bmi, 0, sizeof(bmi));
+         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+         bmi.bmiHeader.biWidth = desc.Width;
+@@ -512,15 +722,31 @@
+         bmi.bmiHeader.biBitCount = 32;
+         bmi.bmiHeader.biCompression = BI_RGB;
+ 
+-        if ((hdc = GetDC(hwnd)))
++        if (!uniform_black && (hdc = GetDC(hwnd)))
+         {
+             GetClientRect(hwnd, &rc);
+             SetStretchBltMode(hdc, COLORONCOLOR);
+-            StretchDIBits(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
++            blit_ok = StretchDIBits(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                           0, 0, desc.Width, desc.Height,
+-                          packed, &bmi, DIB_RGB_COLORS, SRCCOPY);
++                          packed, &bmi, DIB_RGB_COLORS, SRCCOPY) != 0;
+             ReleaseDC(hwnd, hdc);
+         }
++        {
++            static int d2dui = -1;
++            if (d2dui < 0) { char b[8]; d2dui = (GetEnvironmentVariableA("NEUTRON_D2DUI_DIAG", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++            if (d2dui)
++            {
++                static struct { HWND h; } seenb[48]; static int nseenb;
++                int si; BOOL s = FALSE;
++                for (si = 0; si < nseenb; si++) if (seenb[si].h == hwnd) { s = TRUE; break; }
++                if (!s && nseenb < 48)
++                {
++                    seenb[nseenb++].h = hwnd;
++                    ERR("neutron-d2dui: BLIT hwnd=%p gotDC=%d StretchDIBits_ok=%d client=%ldx%ld\n",
++                        hwnd, hdc != NULL, blit_ok, rc.right - rc.left, rc.bottom - rc.top);
++                }
++            }
++        }
+     }
+     free(packed);
+ 
+@@ -530,17 +756,26 @@
+     if (ctx) ID3D11DeviceContext_Release(ctx);
+     if (d3d_device) ID3D11Device_Release(d3d_device);
+     if (backbuffer) ID3D11Texture2D_Release(backbuffer);
++    }
+ }
+ 
++/* NEUTRON round-34 ztree diag: forward decls (definitions after this function) */
++static int neutron_ztree_diag(void);
++static void ztree_dump(void);
++
+ static DWORD WINAPI presentations_proc(void *arg)
+ {
+     for (;;)
+     {
+         struct presentation *p;
++        int nlive = 0;
++        static ULONGLONG regt;
++        ULONGLONG now;
+ 
+         EnterCriticalSection(&presentations_cs);
+         LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
+         {
++            nlive++;
+             if (p->swapchain && p->present_hwnd && IsWindow(p->present_hwnd))
+             {
+                 /* NEUTRON R3 (resize glitch): pause blits while the target is mid-resize.
+@@ -549,19 +784,160 @@
+                  * once it settles (a frame drop here is already accepted behaviour). */
+                 RECT rc = {0};
+                 LONG cw = 0, ch = 0;
+-                if (GetClientRect(p->present_hwnd, &rc)) { cw = rc.right - rc.left; ch = rc.bottom - rc.top; }
+-                if (cw == p->last_client_w && ch == p->last_client_h)
++                LONG dw, dh;
++                BOOL gcr = GetClientRect(p->present_hwnd, &rc);
++                if (gcr) { cw = rc.right - rc.left; ch = rc.bottom - rc.top; }
++                dw = cw - p->last_client_w; if (dw < 0) dw = -dw;
++                dh = ch - p->last_client_h; if (dh < 0) dh = -dh;
++                /* NEUTRON R3b: the original guard blitted only when cw==last_client
++                 * for two consecutive ticks, to avoid stretching a stale readback
++                 * during a resize. But under winewayland fractional scale the client
++                 * rect JITTERS ~10px every tick (e.g. 3840x2031<->3830x2021), which
++                 * never satisfies strict equality -> the whole GPU UI was starved and
++                 * stayed black. Blit whenever the size is non-zero and changed by only
++                 * a small amount since last tick (jitter / slow drag); still pause on a
++                 * genuine large resize step (maximize/restore = hundreds of px). */
++                if (p->no_blit)
++                {
++                    /* NEUTRON round-35 NATIVE mode: window presents its own Vulkan
++                     * subsurface; the bridge performs no readback and no blit for it
++                     * (registration kept only for ztree diag / A-B revert). */
++                }
++                else if (p->cross_proc && neutron_cef_max_fps() > 0 &&
++                         GetTickCount64() - p->last_blit_ms < (ULONGLONG)(1000 / neutron_cef_max_fps()))
++                {
++                    /* NEUTRON round-38: CEF fps cap -- skip this tick; pending_blit
++                     * stays set so the NEXT eligible tick blits the fresh frame. */
++                }
++                else if (cw > 0 && ch > 0 && dw <= NEUTRON_RESIZE_TOL && dh <= NEUTRON_RESIZE_TOL)
++                {
+                     blit_swapchain_to_hwnd(p);
++                    p->last_blit_ms = GetTickCount64();
++                }
++                else if (neutron_d2dui_diag())
++                {
++                    /* Log first time we SKIP a given hwnd for size-instability (and again
++                     * only if it keeps changing) — is the resize guard starving the UI? */
++                    static struct { HWND h; LONG w, hh; int n; } sk[64]; static int nsk;
++                    int i, slot = -1;
++                    for (i = 0; i < nsk; i++) if (sk[i].h == p->present_hwnd) { slot = i; break; }
++                    if (slot < 0 && nsk < 64) { slot = nsk++; sk[slot].h = p->present_hwnd; sk[slot].n = 0; }
++                    if (slot >= 0 && sk[slot].n < 4)
++                    {
++                        sk[slot].n++;
++                        ERR("neutron-d2dui: SKIP-RESIZE hwnd=%p cross_proc=%d gcr=%d cur=%ldx%ld last=%ldx%ld\n",
++                            p->present_hwnd, p->cross_proc, gcr, cw, ch, p->last_client_w, p->last_client_h);
++                    }
++                }
+                 p->last_client_w = cw;
+                 p->last_client_h = ch;
+             }
++            else if (neutron_d2dui_diag())
++            {
++                static struct { HWND h; } sg[64]; static int nsg;
++                HWND h = p->present_hwnd; int i; BOOL s = FALSE;
++                for (i = 0; i < nsg; i++) if (sg[i].h == h) { s = TRUE; break; }
++                if (!s && nsg < 64)
++                {
++                    sg[nsg++].h = h;
++                    ERR("neutron-d2dui: SKIP-GUARD hwnd=%p cross_proc=%d swapchain=%p present_hwnd=%p iswin=%d\n",
++                        p->hwnd, p->cross_proc, p->swapchain, p->present_hwnd,
++                        p->present_hwnd ? IsWindow(p->present_hwnd) : 0);
++                }
++            }
+         }
+         LeaveCriticalSection(&presentations_cs);
++        /* NEUTRON M4: confirm the registration list stays BOUNDED (dedup working). Should
++         * plateau at the true live-window count (~15-25), never climb into the thousands. */
++        now = GetTickCount64();
++        if (regt == 0) regt = now;
++        if (now - regt >= 2000) { regt = now; ERR("neutron-reg: %d live registrations\n", nlive); }
++        /* NEUTRON round-34 ztree diag: dump the real win32 z-order every ~5s */
++        if (neutron_ztree_diag())
++        {
++            static ULONGLONG zt;
++            if (now - zt >= 5000)
++            {
++                zt = now;
++                EnterCriticalSection(&presentations_cs);
++                ztree_dump();
++                LeaveCriticalSection(&presentations_cs);
++            }
++        }
+         Sleep(16);
+     }
+     return 0;
+ }
+ 
++/* NEUTRON round-34 ZTREE DIAG (env NEUTRON_ZTREE_DIAG=1, read-only): dump the real
++ * win32 z-order tree of every toplevel that hosts registered (swapchain) windows,
++ * top-of-z first (GW_CHILD walks topmost->bottom via GW_HWNDNEXT). Per window:
++ * class, rect, style, visibility, whether it has a registered swapchain, and the
++ * latest readback classification (BLACK vs HAS-CONTENT). This is the R1 de-risk
++ * data for the native pivot: prove that mirroring win32 z-order puts content
++ * windows above black containers. Called from the blit thread every ~5s while
++ * holding presentations_cs (all queries are read-only user32 calls). */
++static int neutron_ztree_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { char b[8]; v = (GetEnvironmentVariableA("NEUTRON_ZTREE_DIAG", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++    return v;
++}
++
++static struct presentation *ztree_find(HWND hwnd)
++{
++    struct presentation *p;
++    LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++        if (p->present_hwnd == hwnd || p->hwnd == hwnd) return p;
++    return NULL;
++}
++
++static void ztree_dump_window(HWND hwnd, int depth, int *budget)
++{
++    WCHAR clsw[64]; char cls[64]; int j = 0;
++    RECT rc = {0};
++    HWND c;
++    struct presentation *p = ztree_find(hwnd);
++    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
++    const char *content = "-";
++
++    if ((*budget)-- <= 0) return;
++    if (GetClassNameW(hwnd, clsw, 64) <= 0) clsw[0] = 0;
++    while (clsw[j] && j < 40) { cls[j] = (char)clsw[j]; j++; } cls[j] = 0;
++    GetWindowRect(hwnd, &rc);
++    if (p) content = (p->last_black < 0) ? "sc:unknown" : (p->last_black ? "sc:BLACK" : "sc:CONTENT");
++
++    ERR("neutron-ztree: %*s[%d] hwnd=%p cls=%s rect=%ld,%ld-%ldx%ld style=%08lx vis=%d %s\n",
++        depth * 2, "", depth, hwnd, cls, rc.left, rc.top,
++        rc.right - rc.left, rc.bottom - rc.top, style,
++        (style & WS_VISIBLE) ? 1 : 0, content);
++
++    /* GW_CHILD = TOPMOST child; GW_HWNDNEXT walks DOWN the z-order */
++    for (c = GetWindow(hwnd, GW_CHILD); c && depth < 6; c = GetWindow(c, GW_HWNDNEXT))
++        ztree_dump_window(c, depth + 1, budget);
++}
++
++static void ztree_dump(void)
++{
++    HWND roots[8]; int nroots = 0, i;
++    struct presentation *p;
++    LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++    {
++        HWND root = GetAncestor(p->present_hwnd, GA_ROOT);
++        BOOL seen = FALSE;
++        if (!root) continue;
++        for (i = 0; i < nroots; i++) if (roots[i] == root) { seen = TRUE; break; }
++        if (!seen && nroots < 8) roots[nroots++] = root;
++    }
++    for (i = 0; i < nroots; i++)
++    {
++        int budget = 120;
++        HWND owner = GetWindow(roots[i], GW_OWNER);
++        ERR("neutron-ztree: ==== ROOT %p (owner=%p) top-of-z first ====\n", roots[i], owner);
++        ztree_dump_window(roots[i], 0, &budget);
++    }
++}
++
+ static BOOL CALLBACK presentations_init(INIT_ONCE *once, void *param, void **ctx)
+ {
+     InitializeCriticalSection(&presentations_cs);
+@@ -578,6 +954,38 @@
+ 
+     if (!hwnd || !content)
+         return;
++
++    /* NEUTRON M4 FAST PATH (dedup the register storm): register_presentation runs on
++     * EVERY Present -- thousands/sec for a hot CEF/HTML panel (measured 9153x for one
++     * hwnd). The old code did a QI + find_cef_panel_host ancestor walk + ERR logging on
++     * every one of those before the by-hwnd dedup -> a CPU/refcount storm that grew the
++     * blit-thread's per-tick cost until the process died from resource exhaustion (no
++     * fastfail/coredump = not a crash, a livelock). If (hwnd, content) is ALREADY
++     * registered, just mark a blit pending and return -- no QI, no ancestor walk, no log. */
++    InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
++    EnterCriticalSection(&presentations_cs);
++    LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++    {
++        if (p->hwnd == hwnd)
++        {
++            /* ★ pending_blit MUST be set on EVERY Present for this window, regardless of
++             * whether content_id matches — this is the gate signal. (Round 26 bug: it was
++             * set only inside the content_id-match branch, which never matched, so
++             * pending was never set -> gate skipped 100% -> white screen.) */
++            InterlockedExchange(&p->pending_blit, TRUE);
++            if (p->content_id == content)
++            {
++                /* fast path: same window, same content -> nothing else to update; skip the
++                 * expensive QI + find_cef_panel_host ancestor walk + logging. */
++                LeaveCriticalSection(&presentations_cs);
++                return;
++            }
++            /* hwnd matched but content changed -> fall to the slow path (QI + update). */
++            break;
++        }
++    }
++    LeaveCriticalSection(&presentations_cs);
++
+     if (FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain, (void **)&swapchain)))
+         return;
+ 
+@@ -595,6 +1003,48 @@
+          * same-process (program-monitor canvas) -> classic GDI blit. */
+         target_cross_proc = (tpid && tpid != GetCurrentProcessId());
+     }
++
++    /* NEUTRON DIAG A/B (env NEUTRON_DCOMP_SKIP_CEF=1): do NOT register/blit cross-process
++     * CEF/CEP panels. A hot CEF panel (Chrome_WidgetWin_0 HTML extension) render-loops
++     * ~1700 presents during project load; this isolates whether that panel's interaction
++     * with our shared-mem bridge is the livelock (hang clears with this set => ours) or
++     * whether the panel storms Adobe-internally regardless (still hangs => not ours). */
++    if (target_cross_proc)
++    {
++        static int skip = -1;
++        if (skip < 0) { char b[8]; skip = (GetEnvironmentVariableA("NEUTRON_DCOMP_SKIP_CEF", b, sizeof(b)) && b[0]=='1') ? 1 : 0; }
++        if (skip)
++        {
++            static HWND seen[32]; static int nseen; int i; BOOL s = FALSE;
++            for (i = 0; i < nseen; i++) if (seen[i] == hwnd) { s = TRUE; break; }
++            if (!s && nseen < 32) { seen[nseen++] = hwnd; ERR("neutron-skipcef: NOT registering cross_proc hwnd=%p\n", hwnd); }
++            IDXGISwapChain_Release(swapchain);
++            return;
++        }
++    }
++    /* NEUTRON bounded-acquire (round 32): every swapchain that reaches this point
++     * will be readback-blitted by the bridge -- its Vulkan present is best-effort
++     * and its Wayland surface may never composite. Stamp it so DXVK bounds its
++     * WSI waits (the deadlock fix); the stamp is idempotent and slow-path only
++     * (the per-Present fast path returns before this). Swapchains the bridge does
++     * NOT register (real present path / video) are never stamped and keep DXVK's
++     * stock infinite waits, so their vsync pacing is untouched. */
++    if (!(neutron_dcomp_native() && !target_cross_proc)) /* round-35: native same-proc chains need no stamp (DXVK bounds by swap-effect) */
++    {
++        static HWND stamped_seen[64]; static int nstamped_seen;
++        int ok = neutron_stamp_bounded_acquire(swapchain);
++        if (neutron_d2dui_diag())
++        {
++            int i; BOOL s = FALSE;
++            for (i = 0; i < nstamped_seen; i++) if (stamped_seen[i] == hwnd) { s = TRUE; break; }
++            if (!s && nstamped_seen < 64)
++            {
++                stamped_seen[nstamped_seen++] = hwnd;
++                ERR("neutron-bounded: STAMP hwnd=%p swapchain=%p cross_proc=%d -> %s\n",
++                    hwnd, swapchain, target_cross_proc, ok ? "ACK" : "NOT-SUPPORTED (old dxvk?)");
++            }
++        }
++    }
+     {
+         /* NEUTRON diag: log the full ancestor chain (class + pid) once per hwnd so we can see whether a
+          * ForHwnd swapchain's CEF child resolves up to the Adobe-owned HTMLEXTENSION host. */
+@@ -628,6 +1078,35 @@
+                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_FRAMECHANGED);
+     }
+ 
++    /* NEUTRON GPU-D2D-UI (milestone 3): mark same-process bridge-managed windows so
++     * winewayland can SUPPRESS their competing Vulkan client subsurface. With GPU
++     * accel on, every D2D-UI window presents a DXGI swapchain -> winewayland places
++     * that swapchain's client subsurface ABOVE the GDI window_surface, occluding the
++     * content the bridge blits there (the toplevel's own black full-size surface hides
++     * the whole UI). The bridge already delivers content via GetDC+StretchDIBits, so
++     * the client subsurface is redundant AND harmful; the mark lets winewayland drop
++     * it (env NEUTRON_DCOMP_SUPPRESS_CLIENT=1) so the GDI content shows. */
++    if (!target_cross_proc && hwnd && !neutron_dcomp_native()) /* round-35: native mode never marks/suppresses same-proc windows */
++    {
++        SetPropW(hwnd, L"__wine_dcomp_blit", (HANDLE)(ULONG_PTR)1);
++        /* NEUTRON diag: log every window we MARK for suppression, once per hwnd, so a
++         * project-load capture shows whether the workspace container frames get marked. */
++        if (neutron_d2dui_diag())
++        {
++            static HWND seen[128]; static int nseen;
++            int i; BOOL s = FALSE;
++            for (i = 0; i < nseen; i++) if (seen[i] == hwnd) { s = TRUE; break; }
++            if (!s && nseen < 128)
++            {
++                RECT rc = {0};
++                seen[nseen++] = hwnd;
++                GetClientRect(hwnd, &rc);
++                ERR("neutron-d2dui: MARK hwnd=%p %ldx%ld (dcomp-blit, cross_proc=0)\n",
++                    hwnd, rc.right - rc.left, rc.bottom - rc.top);
++            }
++        }
++    }
++
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
+     EnterCriticalSection(&presentations_cs);
+@@ -637,6 +1116,10 @@
+         {
+             p->present_hwnd = target;
+             p->cross_proc = target_cross_proc;
++            p->no_blit = (neutron_dcomp_native() && !target_cross_proc); /* round-35 native */
++            /* NEUTRON M4: this function is the per-Present hook -> mark a blit pending so
++             * the 16ms blit thread only reads back windows that actually presented. */
++            InterlockedExchange(&p->pending_blit, TRUE);
+             if (p->swapchain != swapchain)
+             {
+                 /* NEUTRON gpu-churn fix: retire the old swapchain OUTSIDE the lock and
+@@ -645,6 +1128,7 @@
+                 IDXGISwapChain *old_swapchain = p->swapchain;
+                 ID3D11Texture2D *old_staging = p->staging;
+                 p->swapchain = swapchain; /* take QI ref */
++                p->content_id = content; /* NEUTRON M4: update fast-path identity */
+                 /* NEUTRON M1a: swapchain (and possibly its D3D device) changed -> drop the cached staging. */
+                 p->staging = NULL; p->staging_w = p->staging_h = 0;
+                 /* NEUTRON perf gate: force a fresh present-count comparison on the new swapchain. */
+@@ -664,7 +1148,11 @@
+         p->hwnd = hwnd;
+         p->present_hwnd = target;
+         p->cross_proc = target_cross_proc;
++        p->no_blit = (neutron_dcomp_native() && !target_cross_proc); /* round-35 native */
+         p->swapchain = swapchain; /* take QI ref */
++        p->content_id = content; /* NEUTRON M4: fast-path identity */
++        p->pending_blit = TRUE; /* NEUTRON M4: fresh present -> blit once */
++        p->last_black = -1; /* NEUTRON round-34 ztree diag: content unknown yet */
+         list_add_tail(&presentations, &p->entry);
+         TRACE("registered presentation hwnd %p (blit target %p) swapchain %p.\n", hwnd, target, swapchain);
+     }
+@@ -1417,16 +1905,26 @@
+         ERR("gluon-register-fallback: null hwnd -> using pending_hwnd %p for swapchain %p\n",
+             hwnd, swapchain);
+     }
+-    {
+-        IDXGISwapChain *sc = NULL;
+-        DXGI_SWAP_CHAIN_DESC d = {0};
+-        if (swapchain && SUCCEEDED(IUnknown_QueryInterface(swapchain, &IID_IDXGISwapChain, (void **)&sc)) && sc)
++    /* NEUTRON M4: this runs on EVERY Present -- the QI+GetDesc+ERR here was per-present
++     * overhead (part of the register storm). Log only ONCE per hwnd, gated on diag. */
++    if (neutron_d2dui_diag())
++    {
++        static HWND seen[128]; static int nseen;
++        int i; BOOL s = FALSE;
++        for (i = 0; i < nseen; i++) if (seen[i] == hwnd) { s = TRUE; break; }
++        if (!s && nseen < 128)
+         {
+-            IDXGISwapChain_GetDesc(sc, &d);
+-            IDXGISwapChain_Release(sc);
++            IDXGISwapChain *sc = NULL;
++            DXGI_SWAP_CHAIN_DESC d = {0};
++            seen[nseen++] = hwnd;
++            if (swapchain && SUCCEEDED(IUnknown_QueryInterface(swapchain, &IID_IDXGISwapChain, (void **)&sc)) && sc)
++            {
++                IDXGISwapChain_GetDesc(sc, &d);
++                IDXGISwapChain_Release(sc);
++            }
++            ERR("neutron-reg-ext: hwnd=%p swapchain=%p %ux%u fmt=%d\n",
++                hwnd, swapchain, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format);
+         }
+-        ERR("neutron-reg-ext: hwnd=%p swapchain=%p %ux%u fmt=%d\n",
+-            hwnd, swapchain, d.BufferDesc.Width, d.BufferDesc.Height, d.BufferDesc.Format);
+     }
+     TRACE("%p, %p.\n", hwnd, swapchain);
+     register_presentation(hwnd, swapchain);
