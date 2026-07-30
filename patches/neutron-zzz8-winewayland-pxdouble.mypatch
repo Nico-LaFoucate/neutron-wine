@@ -1,0 +1,174 @@
+# neutron-zzz8-winewayland-pxdouble
+#
+# The consumer half of the double-buffered CEP pixel handoff. Pairs with
+# neutron-dcomp-zzz2-direct-publish, which is the producer.
+#
+# ORDERING: "zzz8" so it sorts AFTER neutron-winewayland.mypatch, whose code it edits.
+# Note that a name like "neutron-winewayland-zzz-*" would NOT work: '-' (0x2d) sorts
+# before '.' (0x2e), so it would land before neutron-winewayland.mypatch, not after.
+#
+# WHY: the producer used to write the frame in place while this side blitted straight out
+# of the same memory, so a blit could catch a half-written frame. Publishing directly from
+# the mapped GPU staging lengthened the write (~1 ms memcpy -> ~1.6 ms of strided rows) and
+# made it show up as visible flicker in the Captioneer panel.
+#
+# Now: two slots. Read `active` ONCE per blit -- a producer publishing mid-blit must not
+# make this side switch slots halfway. Anything other than 0/1 means a producer that
+# predates the double buffer, so fall back to slot 0 rather than reading out of bounds.
+diff --git a/dlls/winewayland.drv/dllmain.c b/dlls/winewayland.drv/dllmain.c
+index 8055d883ee0..01e6a3c768b 100644
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -93,6 +94,152 @@ static DWORD WINAPI clipboard_thread(void *arg)
+     return 0;
+ }
+ 
++/* NEUTRON: cross-process CEP panel present consumer.
++ * dcomp (in the CEF process) writes a panel's swapchain pixels into a named shared section keyed by
++ * the Adobe-app-owned host hwnd, and registers that hwnd in a shared registry. Wine's window_surface
++ * is per-process, so the pixels MUST be blitted in the owner process. This thread runs in every
++ * process; for each registered host hwnd that THIS process owns, it blits the shared pixels
++ * same-process (GetDC hits the real surface) and asks win32u to flush (win=OWN -> the subsurface
++ * commits). Registry-driven (not EnumWindows) and scoped to registered panels, to avoid racing the
++ * GUI thread's surface lifecycle during the startup window-creation storm. */
++#define NEUTRON_PX_MAXW 4096
++#define NEUTRON_PX_MAXH 2304
++/* NEUTRON DOUBLE BUFFER -- must match dlls/dcomp/device.c exactly; staged together. The
++ * producer fills the slot this one is not reading and publishes `active` atomically, so a
++ * blit can never catch a half-written frame. */
++struct neutron_px_shbuf { LONG seq, width, height, active; BYTE pixels[1]; };
++#define NEUTRON_PX_SLOT  ((SIZE_T)NEUTRON_PX_MAXW * NEUTRON_PX_MAXH * 4)
++#define NEUTRON_PX_BYTES (sizeof(struct neutron_px_shbuf) + 2 * NEUTRON_PX_SLOT)
++#define NEUTRON_REG_MAX 64
++struct neutron_registry { LONG count; DWORD hwnds[NEUTRON_REG_MAX]; };
++
++struct neutron_consumer_slot { HWND hwnd; HANDLE map; struct neutron_px_shbuf *view; LONG last_seq; unsigned since_blit; };
++static struct neutron_consumer_slot neutron_slots[NEUTRON_REG_MAX];
++/* Force a refresh blit at least this often (ticks of ~16ms) even when the content seq is unchanged, to
++ * restore any repaint that clobbered the child region in the toplevel surface. ~30 ticks ~= 0.5s. */
++#define NEUTRON_REFRESH_TICKS 30
++
++static struct neutron_px_shbuf *neutron_consumer_open(HWND hwnd)
++{
++    static const WCHAR fmt[] = L"__neutron_dcomp_px_%08x";
++    WCHAR name[64];
++    int i, free_i = -1;
++    for (i = 0; i < NEUTRON_REG_MAX; i++)
++    {
++        if (neutron_slots[i].hwnd == hwnd && neutron_slots[i].view) return neutron_slots[i].view;
++        if (!neutron_slots[i].hwnd && free_i < 0) free_i = i;
++    }
++    if (free_i < 0) return NULL;
++    wsprintfW(name, fmt, (DWORD)(ULONG_PTR)hwnd);
++    neutron_slots[free_i].map = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
++    if (!neutron_slots[free_i].map) return NULL;
++    neutron_slots[free_i].view = MapViewOfFile(neutron_slots[free_i].map, FILE_MAP_READ, 0, 0, NEUTRON_PX_BYTES);
++    if (!neutron_slots[free_i].view) { CloseHandle(neutron_slots[free_i].map); neutron_slots[free_i].map = NULL; return NULL; }
++    neutron_slots[free_i].hwnd = hwnd;
++    neutron_slots[free_i].last_seq = 0;
++    return neutron_slots[free_i].view;
++}
++
++static void neutron_consumer_present(HWND hwnd)
++{
++    struct neutron_px_shbuf *sh = neutron_consumer_open(hwnd);
++    LONG seq, w, h;
++    int i;
++    BITMAPINFO bmi;
++    HDC hdc;
++    RECT rc;
++    if (!sh) return;
++    seq = sh->seq;
++    for (i = 0; i < NEUTRON_REG_MAX; i++) if (neutron_slots[i].hwnd == hwnd) break;
++    /* Blit when CEF presented a new frame (seq changed); otherwise only refresh occasionally to
++     * restore any repaint that clobbered the child region -- not a full 7.6MB blit every 16ms. */
++    if (i < NEUTRON_REG_MAX && neutron_slots[i].last_seq == seq)
++    {
++        if (neutron_slots[i].since_blit < NEUTRON_REFRESH_TICKS) { neutron_slots[i].since_blit++; return; }
++    }
++    w = sh->width; h = sh->height;
++    if (w <= 0 || h <= 0 || w > NEUTRON_PX_MAXW || h > NEUTRON_PX_MAXH) return;
++
++    memset(&bmi, 0, sizeof(bmi));
++    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++    bmi.bmiHeader.biWidth = w;
++    bmi.bmiHeader.biHeight = -h; /* top-down */
++    bmi.bmiHeader.biPlanes = 1;
++    bmi.bmiHeader.biBitCount = 32;
++    bmi.bmiHeader.biCompression = BI_RGB;
++
++    if ((hdc = GetDC(hwnd)))
++    {
++        static int (WINAPI *p_SetStretchBltMode)(HDC, int);
++        static int (WINAPI *p_StretchDIBits)(HDC, int, int, int, int, int, int, int, int,
++                                             const void *, const BITMAPINFO *, UINT, DWORD);
++        if (!p_StretchDIBits)
++        {
++            HMODULE g = LoadLibraryW(L"gdi32.dll");
++            if (g)
++            {
++                p_SetStretchBltMode = (void *)GetProcAddress(g, "SetStretchBltMode");
++                p_StretchDIBits = (void *)GetProcAddress(g, "StretchDIBits");
++            }
++        }
++        GetClientRect(hwnd, &rc);
++        if (p_SetStretchBltMode) p_SetStretchBltMode(hdc, COLORONCOLOR);
++        if (p_StretchDIBits)
++        {
++            /* Read `active` ONCE. A producer publishing mid-blit must not make us switch
++             * slots halfway. Anything other than 0/1 means a producer that predates the
++             * double buffer -- fall back to slot 0 rather than reading out of bounds. */
++            LONG act = sh->active;
++            const BYTE *src = (const BYTE *)sh->pixels + ((act == 1) ? NEUTRON_PX_SLOT : 0);
++            p_StretchDIBits(hdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
++                            0, 0, w, h, src, &bmi, DIB_RGB_COLORS, SRCCOPY);
++        }
++        ReleaseDC(hwnd, hdc);
++        /* GetDC(host) drew into the TOPLEVEL window_surface (clipped to the child); flush it to commit
++         * (the GUI thread does not reliably flush a region dirtied by our cross-thread GDI blit -- without
++         * this the panel stays white). NOTE: cross-thread flush; the resize freeze is a SEPARATE
++         * cross-process-window-resize issue, not this. */
++        NtUserCallHwnd(GetAncestor(hwnd, GA_ROOT), NtUserCallHwnd_NeutronFlushSurface);
++        if (i < NEUTRON_REG_MAX) { neutron_slots[i].last_seq = seq; neutron_slots[i].since_blit = 0; }
++    }
++}
++
++static DWORD WINAPI neutron_present_consumer_thread(void *arg)
++{
++    static const WCHAR reg_nameW[] = L"__neutron_dcomp_registry";
++    DWORD self = GetCurrentProcessId();
++    HANDLE rh = NULL;
++    struct neutron_registry *reg = NULL;
++    for (;;)
++    {
++        /* Open + map the shared registry once, then read it live each tick (it's shared memory).
++         * Retry the open until CEF creates it; a process with no CEF panels just never maps it. */
++        if (!reg)
++        {
++            if (!rh) rh = OpenFileMappingW(FILE_MAP_READ, FALSE, reg_nameW);
++            if (rh) reg = MapViewOfFile(rh, FILE_MAP_READ, 0, 0, sizeof(*reg));
++        }
++        if (reg)
++        {
++            LONG n = reg->count, i;
++            if (n > NEUTRON_REG_MAX) n = NEUTRON_REG_MAX;
++            for (i = 0; i < n; i++)
++            {
++                HWND hwnd = (HWND)(ULONG_PTR)reg->hwnds[i];
++                DWORD pid = 0;
++                if (!hwnd) continue;
++                GetWindowThreadProcessId(hwnd, &pid);
++                /* Gate on IsWindowVisible: Premiere keeps multiple CEP hosts registered (e.g. a
++                 * tabbed-away/hidden panel that still renders); only present the on-screen one. */
++                if (pid == self && IsWindow(hwnd) && IsWindowVisible(hwnd))
++                    neutron_consumer_present(hwnd);
++            }
++        }
++        Sleep(16);
++    }
++    return 0;
++}
++
+ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
+ {
+     DWORD tid;

@@ -48,9 +48,62 @@
 # keyed on the shared buffer merely EXISTING. A frame larger than that buffer skips the
 # direct path and must still be published by the packed path -- keying on existence
 # silently dropped those frames. It is keyed on `direct_used` instead.
+#
+# ⚠️ FOLLOW-UP: THE FLICKER THIS CAUSED, AND THE REAL FIX (same day).
+# The direct publish worked -- dcomp's share of process copy traffic fell 22.7% -> 9.7%,
+# normalised for session length -- but the Captioneer panel FLICKERED. Mechanism: the
+# consumer blits straight out of the shared buffer, and the write went from one ~1 ms
+# 6.5 MB memcpy to ~1.6 ms of strided row copies, so a half-written frame got blitted far
+# more often. Tearing was ALWAYS possible there (the producer already overwrote the buffer
+# while the consumer could be reading); this widened the window enough to see it. Calling
+# it "not a new race" in the original note was true and beside the point.
+#
+# So the shared buffer is now DOUBLE-BUFFERED: the producer fills the slot the consumer is
+# not reading and publishes the index atomically, which removes the tear entirely rather
+# than narrowing it -- strictly better than the behaviour that predated this patch. The
+# `reserved` header field becomes `active`, so only the pixel area grows (2 slots).
+#
+# ⛔ THE CONSUMER MUST BE STAGED TOO -- neutron-zzz8-winewayland-pxdouble.mypatch. The
+# layout is duplicated in dlls/winewayland.drv/dllmain.c and both sides must agree. A new
+# producer with an old consumer is not corrupt (the consumer just always reads slot 0, so
+# the panel updates at half rate), but it is wrong. Every staging script now carries the
+# pair together.
 --- a/dlls/dcomp/device.c
 +++ b/dlls/dcomp/device.c
-@@ -348,6 +348,75 @@
+@@ -136,15 +136,29 @@
+  * so the subsurface actually commits. */
+ #define NEUTRON_PX_MAXW 4096
+ #define NEUTRON_PX_MAXH 2304
++/* NEUTRON DOUBLE BUFFER. The consumer blits straight out of this mapping, so a frame
++ * written in place can be blitted half-updated -- the producer writes ~6.5 MB while the
++ * consumer may be mid-StretchDIBits. That was always possible; publishing directly from
++ * the mapped staging (neutron-dcomp-zzz2-direct-publish) widened the write from one ~1 ms
++ * memcpy to ~1.6 ms of strided row copies and made it VISIBLE as panel flicker.
++ *
++ * So: two slots. The producer fills the one the consumer is NOT reading and then publishes
++ * the index atomically, which removes the tear entirely rather than narrowing it -- better
++ * than the behaviour that predated the direct publish.
++ *
++ * `active` reuses the old `reserved` field, so the header layout is unchanged; only the
++ * pixel area doubles. Producer and consumer MUST be staged together (the mapping size and
++ * the meaning of that field both change). */
+ struct neutron_px_shbuf
+ {
+     LONG  seq;      /* bumped after each fully-written frame */
+     LONG  width;
+     LONG  height;
+-    LONG  reserved;
+-    BYTE  pixels[1]; /* width*height*4, BGRA top-down */
++    LONG  active;   /* slot the consumer should read: 0 or 1 (was `reserved`) */
++    BYTE  pixels[1]; /* two slots of NEUTRON_PX_SLOT, BGRA top-down */
+ };
+-#define NEUTRON_PX_BYTES (sizeof(struct neutron_px_shbuf) + (SIZE_T)NEUTRON_PX_MAXW * NEUTRON_PX_MAXH * 4)
++#define NEUTRON_PX_SLOT  ((SIZE_T)NEUTRON_PX_MAXW * NEUTRON_PX_MAXH * 4)
++#define NEUTRON_PX_BYTES (sizeof(struct neutron_px_shbuf) + 2 * NEUTRON_PX_SLOT)
+ 
+ #define NEUTRON_REG_MAX 64
+ struct neutron_registry
+@@ -348,6 +362,75 @@
      return 0;
  }
  
@@ -126,7 +179,7 @@
  static void blit_swapchain_to_hwnd(struct presentation *p)
  {
      /* NEUTRON DIAG: log entry once per (hwnd,cross_proc) — proves whether blit is
-@@ -385,6 +454,11 @@
+@@ -385,6 +468,11 @@
      BOOL mt_entered = FALSE, have_pixels = FALSE;
      /* NEUTRON DIRECT PUBLISH: set when the frame went straight from the mapped staging
       * into the shared buffer, so the cross-proc block below has nothing left to do. */
@@ -138,7 +191,7 @@
  
      n = InterlockedIncrement(&diag_n);
      diag = (n % 120 == 1);
-@@ -445,6 +519,10 @@
+@@ -445,6 +533,10 @@
                  }
              }
  
@@ -149,7 +202,7 @@
              if (FAILED(hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&backbuffer)))
              {
                  if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
-@@ -494,7 +572,52 @@
+@@ -494,7 +586,58 @@
                          }
                          else
                          {
@@ -169,9 +222,11 @@
 +                                                              desc.Width, desc.Height);
 +                                    if (dd >= 2)
 +                                    {
++                                        BYTE *slot = (BYTE *)direct_sh->pixels
++                                                + (direct_sh->active ? 0 : NEUTRON_PX_SLOT);
 +                                        UINT yy;
 +                                        for (yy = 0; yy < desc.Height; yy++)
-+                                            memcpy((BYTE *)direct_sh->pixels + (SIZE_T)yy * desc.Width * 4,
++                                            memcpy(slot + (SIZE_T)yy * desc.Width * 4,
 +                                                   (BYTE *)map.pData + (SIZE_T)yy * map.RowPitch,
 +                                                   (SIZE_T)desc.Width * 4);
 +                                    }
@@ -189,6 +244,10 @@
 +                                {
 +                                    direct_sh->width = desc.Width;
 +                                    direct_sh->height = desc.Height;
++                                    /* Publish the slot BEFORE the seq bump: the consumer
++                                     * keys "is there a new frame" off seq, so it must never
++                                     * see a new seq pointing at the slot still being written. */
++                                    InterlockedExchange(&direct_sh->active, direct_sh->active ? 0 : 1);
 +                                    InterlockedIncrement(&direct_sh->seq);
 +                                    if (!p->t_first_deliver)
 +                                    {
@@ -203,7 +262,7 @@
                              {
                                  /* volatile: its post-__TRY value must survive a fault */
                                  volatile BOOL copy_ok = TRUE;
-@@ -562,7 +685,12 @@
+@@ -562,7 +705,12 @@
          goto done;
      }
  
@@ -217,3 +276,14 @@
      {
          /* NEUTRON cross-process CEP panel: hand the pixels to the owner process via shared memory;
           * winewayland's consumer thread (owner-side) blits + flushes them. See struct neutron_px_shbuf. */
+@@ -649,7 +797,9 @@
+                 {
+                     sh->width = desc.Width;
+                     sh->height = desc.Height;
+-                    memcpy(sh->pixels, packed, (SIZE_T)desc.Width * 4 * desc.Height);
++                    memcpy((BYTE *)sh->pixels + (sh->active ? 0 : NEUTRON_PX_SLOT),
++                           packed, (SIZE_T)desc.Width * 4 * desc.Height);
++                    InterlockedExchange(&sh->active, sh->active ? 0 : 1);
+                     InterlockedIncrement(&sh->seq);
+                     if (!p->t_first_deliver)
+                     {
