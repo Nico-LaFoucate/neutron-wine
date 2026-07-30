@@ -1,0 +1,186 @@
+# neutron-roundtrip-probes  (DIAGNOSTIC -- INCLUDE_DIAGNOSTIC=1 only)
+#
+# The instrumentation that measured the GPU<->CPU round trip on 2026-07-30. Inert unless
+# WINEDEBUG=+nroundtrip (d2d1) / +nwiclock (windowscodecs).
+#
+# d2d1:          counts bytes/calls for the DOWNLOAD (d2d_wic_render_target_present, GPU->CPU per
+#                EndDraw) and the UPLOAD (CreateBitmapFromWicBitmap).
+# windowscodecs: counts who READS a WIC bitmap -- Lock(read), Lock(write), CopyPixels -- and
+#                records CopyPixels caller return addresses for offline resolution.
+#
+# WHAT THEY ESTABLISHED (30 s Premiere timeline zoom, 11.10-17, GPU mode):
+#   download 27,838 calls / 33.8 GB     upload 18,498 calls / 4.6 GB
+#   app Lock-for-read: 43
+#   CopyPixels: dvaui.dll 27,795  |  d2d1 18,505
+#
+# Two conclusions, neither reachable without these probes:
+#  1. The download is ~7x the upload -- the long-standing "54% of uploads are bitmaps just
+#     downloaded" framing had the ratio backwards.
+#  2. lock_read=43 SUGGESTS the app never reads back, and that is WRONG. Caller attribution
+#     (__builtin_return_address(0) resolved against /proc/pid/maps) shows dvaui.dll calling
+#     CopyPixels 27,795 times against 27,838 downloads -- Premiere reads essentially every
+#     bitmap, through CopyPixels rather than Lock. A lazy download would MOVE the copy, not
+#     remove it. Keep the caller attribution: the aggregate counter alone is misleading.
+#
+# Keep these until the intermediate-buffer work lands; they are how it gets verified.
+diff --git a/dlls/d2d1/bitmap.c b/dlls/d2d1/bitmap.c
+index 3392c5627ed..088b38c5dee 100644
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -797,6 +797,10 @@ HRESULT d2d_bitmap_create_from_wic_bitmap(struct d2d_device_context *context, IW
+     rect.Y = 0;
+     rect.Width = size.width;
+     rect.Height = size.height;
++    InterlockedExchangeAdd64(&neutron_rt_upload_calls, 1);
++    InterlockedExchangeAdd64(&neutron_rt_upload_bytes, (LONG64)data_size);
++    neutron_rt_report();
++
+     if (FAILED(hr = IWICBitmapSource_CopyPixels(bitmap_source, &rect, pitch, data_size, data)))
+     {
+         WARN("Failed to copy bitmap pixels, hr %#lx.\n", hr);
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 25678928f8d..a2571b58cbb 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -20,6 +20,15 @@
+ #define __WINE_D2D1_PRIVATE_H
+ 
+ #include "wine/debug.h"
++
++/* NEUTRON: GPU<->CPU round-trip accounting.
++ * The 11.10-17 profile puts 29% of Premiere's UI thread on ucrtbase!memmove, and the standing
++ * theory is the WIC round trip: d2d_wic_render_target_present() copies the WHOLE texture GPU->CPU
++ * on every EndDraw, and CreateBitmapFromWicBitmap copies it straight back CPU->GPU. Measure both
++ * halves before designing anything -- the last three "obvious" targets were wrong. */
++extern LONG64 neutron_rt_download_calls, neutron_rt_download_bytes;
++extern LONG64 neutron_rt_upload_calls, neutron_rt_upload_bytes;
++void neutron_rt_report(void);
+ #include "wine/list.h"
+ 
+ #include <assert.h>
+diff --git a/dlls/d2d1/factory.c b/dlls/d2d1/factory.c
+index 22c8d079c16..31eaf99d592 100644
+--- a/dlls/d2d1/factory.c
++++ b/dlls/d2d1/factory.c
+@@ -24,6 +24,19 @@
+ 
+ WINE_DECLARE_DEBUG_CHANNEL(winediag);
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
++WINE_DECLARE_DEBUG_CHANNEL(nroundtrip);
++
++LONG64 neutron_rt_download_calls, neutron_rt_download_bytes;
++LONG64 neutron_rt_upload_calls, neutron_rt_upload_bytes;
++
++void neutron_rt_report(void)
++{
++    if (!TRACE_ON(nroundtrip)) return;
++    if ((neutron_rt_download_calls + neutron_rt_upload_calls) % 256) return;
++    TRACE_(nroundtrip)("neutron-roundtrip: download %I64u calls / %I64u MB   upload %I64u calls / %I64u MB\n",
++            neutron_rt_download_calls, neutron_rt_download_bytes >> 20,
++            neutron_rt_upload_calls, neutron_rt_upload_bytes >> 20);
++}
+ 
+ struct d2d_settings d2d_settings =
+ {
+diff --git a/dlls/d2d1/wic_render_target.c b/dlls/d2d1/wic_render_target.c
+index 1d70bddfc4e..a82bb7d2052 100644
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -92,6 +92,11 @@ static HRESULT d2d_wic_render_target_present(IUnknown *outer_unknown)
+         dst += dst_pitch;
+     }
+ 
++    InterlockedExchangeAdd64(&neutron_rt_download_calls, 1);
++    InterlockedExchangeAdd64(&neutron_rt_download_bytes,
++            (LONG64)render_target->height * render_target->bpp * render_target->width);
++    neutron_rt_report();
++
+     ID3D10Texture2D_Unmap(render_target->readback_texture, 0);
+     IWICBitmapLock_Release(bitmap_lock);
+ 
+diff --git a/dlls/windowscodecs/bitmap.c b/dlls/windowscodecs/bitmap.c
+index e7d8b27d94a..9700e91526e 100644
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -34,6 +34,60 @@
+ DEFINE_GUID(IID_CMetaBitmapRenderTarget, 0x0ccd7824,0xdc16,0x4d09,0xbc,0xa8,0x6b,0x09,0xc4,0xef,0x55,0x35);
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wincodecs);
++WINE_DECLARE_DEBUG_CHANNEL(nwiclock);
++
++/* NEUTRON: who actually READS a WIC bitmap?
++ *
++ * d2d_wic_render_target_present() copies the WHOLE texture GPU->CPU on every EndDraw --
++ * measured in Premiere's timeline zoom: 20,511 presents / 24.8 GB in 30 s, five times the
++ * 5.1 GB that CreateBitmapFromWicBitmap copies back. Deferring that download until someone
++ * actually reads the bitmap would remove most of it -- BUT ONLY IF the pixels are usually
++ * never read on the CPU. If the app reads every one, a lazy scheme just moves the cost.
++ *
++ * So count the readers. Expected attribution:
++ *   lock_write  ~= d2d1's own present (it Locks for WRITE to get its destination pointer)
++ *   copypixels  ~= d2d1's CreateBitmapFromWicBitmap upload (it reads via CopyPixels)
++ *   lock_read   == everything else, i.e. THE APP genuinely reading pixels back
++ * lock_read near zero => lazy download is worth building. */
++static LONG neutron_wic_lock_read, neutron_wic_lock_write, neutron_wic_copypixels;
++
++/* WHO calls CopyPixels? ~31k of the 50k calls are NOT d2d1's CreateBitmapFromWicBitmap upload
++ * (18,913), and that remainder matches the download count almost exactly -- so something reads
++ * each rendered bitmap once. If that reader is the APP, deferring the download gains nothing.
++ * Record raw return addresses; resolve them offline against the process maps. */
++#define NEUTRON_CP_SLOTS 8
++static ULONG_PTR neutron_cp_ret[NEUTRON_CP_SLOTS];
++static LONG neutron_cp_hits[NEUTRON_CP_SLOTS];
++
++static void neutron_cp_record(void *ret)
++{
++    ULONG_PTR a = (ULONG_PTR)ret;
++    int i;
++    for (i = 0; i < NEUTRON_CP_SLOTS; i++)
++    {
++        if (neutron_cp_ret[i] == a) { InterlockedIncrement(&neutron_cp_hits[i]); return; }
++        if (!neutron_cp_ret[i]) { neutron_cp_ret[i] = a; InterlockedIncrement(&neutron_cp_hits[i]); return; }
++    }
++}
++
++static void neutron_cp_report(void)
++{
++    int i;
++    if (!TRACE_ON(nwiclock)) return;
++    for (i = 0; i < NEUTRON_CP_SLOTS; i++)
++        if (neutron_cp_ret[i])
++            TRACE_(nwiclock)("neutron-cpcaller: ret=%p hits=%ld\n",
++                             (void *)neutron_cp_ret[i], neutron_cp_hits[i]);
++}
++
++static void neutron_wic_report(void)
++{
++    LONG r = neutron_wic_lock_read, w = neutron_wic_lock_write, c = neutron_wic_copypixels;
++    if (!TRACE_ON(nwiclock)) return;
++    if ((r + w + c) % 128) return;
++    TRACE_(nwiclock)("neutron-wiclock: lock_read=%ld lock_write=%ld copypixels=%ld\n", r, w, c);
++    neutron_cp_report();
++}
+ 
+ /* WARNING: .NET Media Integration Layer (MIL) directly dereferences
+  * BitmapImpl members and depends on its exact layout.
+@@ -361,6 +415,9 @@ static HRESULT WINAPI BitmapImpl_CopyPalette(IWICBitmap *iface,
+ static HRESULT WINAPI BitmapImpl_CopyPixels(IWICBitmap *iface,
+     const WICRect *prc, UINT cbStride, UINT cbBufferSize, BYTE *pbBuffer)
+ {
++    InterlockedIncrement(&neutron_wic_copypixels);
++    neutron_cp_record(__builtin_return_address(0));
++    neutron_wic_report();
+     BitmapImpl *This = impl_from_IWICBitmap(iface);
+     TRACE("(%p,%s,%u,%u,%p)\n", iface, debug_wic_rect(prc), cbStride, cbBufferSize, pbBuffer);
+ 
+@@ -377,6 +434,10 @@ static HRESULT WINAPI BitmapImpl_Lock(IWICBitmap *iface, const WICRect *prcLock,
+ 
+     TRACE("(%p,%s,%lx,%p)\n", iface, debug_wic_rect(prcLock), flags, ppILock);
+ 
++    if (flags & WICBitmapLockWrite) InterlockedIncrement(&neutron_wic_lock_write);
++    else if (flags & WICBitmapLockRead) InterlockedIncrement(&neutron_wic_lock_read);
++    neutron_wic_report();
++
+     if (!(flags & (WICBitmapLockRead|WICBitmapLockWrite)) || !ppILock)
+         return E_INVALIDARG;
+ 
