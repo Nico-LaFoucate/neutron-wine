@@ -1,0 +1,160 @@
+# neutron-wicprobe  (DIAGNOSTIC -- INCLUDE_DIAGNOSTIC=1 only)
+#
+# The probe that decided whether the WIC intermediate buffer could be removed. Inert
+# unless WINEDEBUG=+nwicprobe. Companion to neutron-roundtrip-probes.mypatch, which
+# measures the BYTES; this one measures the SHAPE of the access.
+#
+# Three things could have killed the read-through design, all cheaper to measure than to
+# discover after a build:
+#   Q1 THREADING  -- read-through moves the D3D Map to whichever thread asks for pixels.
+#                    Touching D3D off the drawing thread is the freeze class this project
+#                    already killed once. If reads usually came from another thread the
+#                    fast path would never run.
+#   Q2 SHAPE      -- full-rect at matching stride is trivial to serve; sub-rects and
+#                    stride conversion are not.
+#   Q3 MULTIPLICITY -- one read per frame is one map per frame; many reads would churn.
+#
+# RESULT (30 s Premiere timeline zoom, 11.10-17, GPU UI mode):
+#   presents=44702 (full=44702 orphan=17037)
+#   reads=25954 (same_tid=25954 first=25896 extra=58 fullrect=25954 stride_ok=17146 no_present=0)
+#
+#   Q1  same thread                 25954/25954 = 100.0%   -> PASS, unambiguously
+#   Q2  full rect                   25954/25954 = 100.0%   -> PASS
+#       matching stride             17146/25954 =  66.1%   -> 100% of the APP's own reads;
+#                                                             the 34% remainder is d2d1's
+#                                                             own upload path
+#   Q3  single read per frame       25896/25954 =  99.8%   -> PASS
+#
+# ⚠️ READ THE "presents" NUMBER CORRECTLY. It counts every WIC write-lock, not presents:
+# d2d1's own counters put real presents at 16,927 of those 44,702, so `orphan` is diluted
+# by unrelated bitmaps and does NOT mean 38% of downloads are wasted. Cross-checking
+# against d2d1 instead: 25,954 total reads minus 8,929 d2d1 upload reads = 17,025 app
+# reads against 16,927 downloads = 1.006 reads per download. Premiere reads every
+# downloaded bitmap exactly once. That ratio, not `orphan`, is the number that justified
+# the work.
+#
+# Keep this until the read-through path has soaked: re-running it is how a regression in
+# the "same thread, full rect, read once" assumption would be caught.
+diff --git a/dlls/windowscodecs/bitmap.c b/dlls/windowscodecs/bitmap.c
+index e7d8b27d94a..b4b883271a5 100644
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -34,6 +34,7 @@
+ DEFINE_GUID(IID_CMetaBitmapRenderTarget, 0x0ccd7824,0xdc16,0x4d09,0xbc,0xa8,0x6b,0x09,0xc4,0xef,0x55,0x35);
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wincodecs);
++WINE_DECLARE_DEBUG_CHANNEL(nwicprobe);
+ 
+ /* WARNING: .NET Media Integration Layer (MIL) directly dereferences
+  * BitmapImpl members and depends on its exact layout.
+@@ -56,8 +57,52 @@ typedef struct BitmapImpl {
+     WICPixelFormatGUID pixelformat;
+     double dpix, dpiy;
+     CRITICAL_SECTION cs;
++    /* NEUTRON PROBE -- appended AFTER every field MIL knows about, so the layout
++     * the warning above protects is untouched. */
++    DWORD nprobe_write_tid;
++    LONG nprobe_reads_since_write;
+ } BitmapImpl;
+ 
++/* ---- NEUTRON PROBE: is the WIC intermediate buffer removable? ---------------
++ *
++ * Established already (see patches/diagnostic/neutron-roundtrip-probes.mypatch): every
++ * bitmap d2d1 renders is downloaded GPU->CPU into a WIC bitmap and then read straight
++ * back out again by dvaui via CopyPixels -- 33.8 GB and 27,795 reads per 30 s. The WIC
++ * bitmap is a pure intermediate, so CopyPixels could read the mapped staging texture
++ * directly and one of the two copies would disappear.
++ *
++ * Three things can kill that design, and all three are cheaper to measure than to
++ * discover after a build:
++ *
++ *  Q1 THREADING (fatal if wrong). The Map would move from the presenting thread to
++ *     whichever thread calls CopyPixels. Taking the D3D10 device lock on a thread that
++ *     otherwise never touches D3D is exactly the deadlock class this project already
++ *     killed once, so the implementation must fall back to a copy when the threads
++ *     differ. If they usually differ, the fast path never runs and the work is wasted.
++ *
++ *  Q2 SHAPE. Reading through to the texture is trivial for a full-rect read at matching
++ *     stride and progressively less so for sub-rects and stride conversion. Which is it?
++ *
++ *  Q3 MULTIPLICITY. One read per present means one Map per present. Several reads per
++ *     present means Map/Unmap churn that could eat the saving. And a present with NO
++ *     read means the download was pure waste -- that one is upside, not risk.
++ *
++ * Inert unless WINEDEBUG=+nwicprobe. */
++static LONG np_cp_total, np_cp_same_tid, np_cp_first, np_cp_extra;
++static LONG np_cp_fullrect, np_cp_stride_ok, np_cp_no_present;
++static LONG np_wr_total, np_wr_fullrect, np_wr_orphan;
++
++static void neutron_probe_report(void)
++{
++    if (!TRACE_ON(nwicprobe)) return;
++    if ((np_cp_total + np_wr_total) % 512) return;
++    TRACE_(nwicprobe)("neutron-wicprobe: presents=%ld (full=%ld orphan=%ld)  reads=%ld "
++            "(same_tid=%ld first=%ld extra=%ld fullrect=%ld stride_ok=%ld no_present=%ld)\n",
++            np_wr_total, np_wr_fullrect, np_wr_orphan,
++            np_cp_total, np_cp_same_tid, np_cp_first, np_cp_extra,
++            np_cp_fullrect, np_cp_stride_ok, np_cp_no_present);
++}
++
+ typedef struct BitmapLockImpl {
+     IWICBitmapLock IWICBitmapLock_iface;
+     LONG ref;
+@@ -364,6 +409,27 @@ static HRESULT WINAPI BitmapImpl_CopyPixels(IWICBitmap *iface,
+     BitmapImpl *This = impl_from_IWICBitmap(iface);
+     TRACE("(%p,%s,%u,%u,%p)\n", iface, debug_wic_rect(prc), cbStride, cbBufferSize, pbBuffer);
+ 
++    if (TRACE_ON(nwicprobe))
++    {
++        InterlockedIncrement(&np_cp_total);
++        if (!This->nprobe_write_tid)
++            InterlockedIncrement(&np_cp_no_present);
++        else
++        {
++            if (This->nprobe_write_tid == GetCurrentThreadId())
++                InterlockedIncrement(&np_cp_same_tid);
++            if (InterlockedIncrement(&This->nprobe_reads_since_write) == 1)
++                InterlockedIncrement(&np_cp_first);
++            else
++                InterlockedIncrement(&np_cp_extra);
++        }
++        if (!prc || (!prc->X && !prc->Y && prc->Width == This->width && prc->Height == This->height))
++            InterlockedIncrement(&np_cp_fullrect);
++        if (cbStride == This->stride)
++            InterlockedIncrement(&np_cp_stride_ok);
++        neutron_probe_report();
++    }
++
+     return copy_pixels(This->bpp, This->data, This->width, This->height,
+         This->stride, prc, cbStride, cbBufferSize, pbBuffer);
+ }
+@@ -416,6 +482,20 @@ static HRESULT WINAPI BitmapImpl_Lock(IWICBitmap *iface, const WICRect *prcLock,
+     result->data = This->data + This->stride * prcLock->Y +
+         (This->bpp * prcLock->X)/8;
+ 
++    if (TRACE_ON(nwicprobe) && (flags & WICBitmapLockWrite))
++    {
++        /* d2d_wic_render_target_present() is the only thing that write-locks these
++         * bitmaps, so a write lock stands in for "a present just landed here". */
++        InterlockedIncrement(&np_wr_total);
++        if (prcLock->Width == This->width && prcLock->Height == This->height)
++            InterlockedIncrement(&np_wr_fullrect);
++        if (This->nprobe_write_tid && !This->nprobe_reads_since_write)
++            InterlockedIncrement(&np_wr_orphan);   /* previous frame was never read */
++        This->nprobe_write_tid = GetCurrentThreadId();
++        This->nprobe_reads_since_write = 0;
++        neutron_probe_report();
++    }
++
+     IWICBitmap_AddRef(&This->IWICBitmap_iface);
+     *ppILock = &result->IWICBitmapLock_iface;
+ 
+@@ -831,6 +911,8 @@ HRESULT BitmapImpl_Create(UINT uiWidth, UINT uiHeight, UINT stride, UINT datasiz
+     This->bpp = bpp;
+     memcpy(&This->pixelformat, pixelFormat, sizeof(GUID));
+     This->dpix = This->dpiy = 0.0;
++    This->nprobe_write_tid = 0;
++    This->nprobe_reads_since_write = 0;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": BitmapImpl.lock");
+ 

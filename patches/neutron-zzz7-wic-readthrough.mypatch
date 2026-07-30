@@ -1,0 +1,1049 @@
+# neutron-zzz7-wic-readthrough  (env NEUTRON_WIC_READTHROUGH=1 -- OFF BY DEFAULT)
+#
+# WHAT THE USER NOTICES
+#   Premiere's timeline is choppy when zooming. After the heap and font-cache fixes landed,
+#   the single largest remaining cost on the UI thread was not drawing at all -- it was
+#   MEMORY COPYING: `ucrtbase!memmove` at 29% of the thread.
+#
+# WHERE IT COMES FROM
+#   Premiere draws its interface in small pieces, each rendered by Direct2D onto the graphics
+#   card and then handed back as a WIC bitmap. Wine copied every finished piece down from the
+#   card into that WIC bitmap, and Premiere immediately copied it out again into its own
+#   buffer. The WIC bitmap in the middle was pure overhead. Measured over 30 s of timeline
+#   zooming: 20.5 GB down, then essentially all of it straight back out again.
+#
+#   Windows does not pay this. There, a WIC bitmap render target is a SOFTWARE target --
+#   Direct2D renders straight into the bitmap's own memory and there is no round trip at all.
+#   Wine always renders on the GPU, so the readback exists only here. That makes it a Wine
+#   bug in the sense that matters: same binary, same work, extra cost.
+#
+# THE FIX
+#   present() maps the staging texture as it always did, but instead of copying through the
+#   WIC bitmap it ATTACHES the mapping to it (private interface, see wine/neutron_wicgpu.h).
+#   CopyPixels then serves the app straight out of that mapping. One copy instead of two.
+#
+# WHY IT IS SAFE -- the two rules the design is built around
+#   1. NO D3D OFF THE DRAWING THREAD. This project already killed one freeze class caused by
+#      touching D3D from threads that otherwise never do. Every D3D call (Map, Unmap, texture
+#      lifetime) stays on presenting threads: the bitmap's release callback only QUEUES, and
+#      the next present drains the queue. A handoff also holds a reference on the factory, so
+#      a bitmap outliving the factory cannot queue onto a freed list.
+#   2. THE PIXELS OUTLIVE THE READER. The render-target pool recycles targets between bitmaps,
+#      so present GIVES THE TEXTURE AWAY and takes another from a small pool. The texture
+#      follows the data and a later frame can never overwrite pixels somebody is still
+#      waiting to read. Anything that cannot be served this way -- a write lock, an exotic
+#      shape, the outstanding-handoff cap, a non-Wine windowscodecs -- MATERIALISES and falls
+#      back to exactly the old code. Correctness never depends on the fast path being taken.
+#
+# WHAT DECIDED IT WAS WORTH BUILDING (probe: patches/diagnostic/neutron-wicprobe.mypatch)
+#   Three things could have killed the design; all three were measured first, in one 30 s run:
+#     read on the thread that drew   100.0%  (25,954 / 25,954)  <- the fatal one, and it passed
+#     read covers the whole image    100.0%
+#     matching row spacing           100.0%  of the app's own reads
+#     only one read per drawn frame   99.8%
+#     app reads per download          1.006  (17,025 reads / 16,927 downloads)
+#   Premiere reads every downloaded bitmap exactly once, in full, on the drawing thread, and
+#   never touches it again. A textbook removable intermediate.
+#
+# VERIFICATION -- preserved-fixes/harnesses/wicrt.c, run BOTH ways, 227 pixel checks each:
+#     NEUTRON_WIC_READTHROUGH=0  ->  227 checks, 0 failures
+#     NEUTRON_WIC_READTHROUGH=1  ->  227 checks, 0 failures   (CAP HIT x32, declined=0)
+#   It compares pixel VALUES, not survival: the failure mode here is a bitmap quietly showing
+#   the WRONG FRAME, which any "did it crash" test passes with a completely broken build.
+#   The test that matters is interleave(): draw A, draw B, THEN read A. A naive deferred
+#   download hands A the texture B has since drawn over and A silently returns B's pixels.
+#
+# ⚠️ THE FIRST PREMIERE RUN FAILED, AND THE TWO BUGS ARE WORTH KEEPING WRITTEN DOWN.
+# Harness-green is not app-green: both bugs needed a real workload to show up at all.
+#
+#  1. THE FALLBACK PATH DOUBLE-COPIED. When a handoff is refused, present falls back to the
+#     old Lock(WRITE) path -- and the Lock hook dutifully MATERIALISED the previous frame
+#     into a buffer present was about to overwrite completely. A whole wasted copy on top of
+#     the copy the fallback already does, so the moment the cap was reached the fix cost
+#     MORE than it saved. present() now detaches without materialising first.
+#
+#  2. THE CAP WAS SIZED FROM A WRONG MENTAL MODEL. A mapping is released when the bitmap is
+#     REDRAWN or DESTROYED -- not when it is read. So the outstanding set is the number of
+#     LIVE render-target bitmaps, not the number waiting to be read, and Premiere keeps far
+#     more alive than "one read per frame, arriving immediately" suggested. A 32-frame cap
+#     saturated after 64 presents and then fell back 14,278 times in one 30 s run.
+#     The quantity actually worth bounding is MEMORY, so the limit is now a byte budget
+#     (NEUTRON_WIC_READTHROUGH_MB, default 192) with a generous count backstop -- and the
+#     PEAK working set is logged, so the next sizing decision comes from a measurement.
+#
+# ⚠️ OFF BY DEFAULT. It changes who owns rendered pixels and when they are copied; it gets the
+# same soak-behind-a-switch rollout the large-block heap cache got. Turn it on with
+# NEUTRON_WIC_READTHROUGH=1.
+#
+# ⚠️ DIAGNOSTICS PRINT AT POWERS OF TWO, then every 512. A plain modulo prints NOTHING on a
+# short run, which is indistinguishable from the code never executing -- that misread this
+# path twice during development, and the cap-fallback path looked dead when it was firing 32
+# times just past the last sampling boundary. Rare events (cap hit, declined) print every time.
+diff --git a/include/wine/neutron_wicgpu.h b/include/wine/neutron_wicgpu.h
+new file mode 100644
+index 00000000000..89123f5dba1
+--- /dev/null
++++ b/include/wine/neutron_wicgpu.h
+@@ -0,0 +1,105 @@
++/*
++ * NEUTRON: letting a WIC bitmap serve its pixels straight out of GPU-resident memory.
++ *
++ * THE PROBLEM, in plain terms
++ * --------------------------
++ * When Premiere draws a piece of its interface, Direct2D renders it on the graphics
++ * card. Wine then copies the result down into a WIC bitmap, and Premiere immediately
++ * copies it again out of that bitmap into its own buffer. The WIC bitmap in the middle
++ * is pure overhead: measured over 30 seconds of timeline zooming, 20.5 GB goes down into
++ * it and essentially all of it straight back out, and `memmove` is 29% of the UI thread.
++ *
++ * Measured on 2026-07-30 (windowscodecs probe, Premiere 2025, GPU UI mode):
++ *
++ *     app reads per download            1.006      (17,025 reads / 16,927 downloads)
++ *     read on the thread that drew      100.0%     (25,954 / 25,954)
++ *     read covers the whole image       100.0%
++ *     read uses the same row spacing    100.0%     (of the app's own reads)
++ *     only one read per drawn frame      99.8%
++ *
++ * So every downloaded bitmap is read exactly once, in full, at matching stride, on the
++ * drawing thread, and is then never touched again. It is as pure an intermediate as it
++ * gets, and the middle copy can be removed.
++ *
++ * HOW
++ * ---
++ * d2d1's present() maps the staging texture as it already does, but instead of copying
++ * the pixels into the WIC bitmap it ATTACHES the mapping to the bitmap through the
++ * interface below. windowscodecs then serves CopyPixels directly out of that mapping.
++ * One copy instead of two.
++ *
++ * TWO RULES THIS CONTRACT EXISTS TO ENFORCE
++ * -----------------------------------------
++ * 1. NO D3D OFF THE DRAWING THREAD. This project has already killed one freeze class
++ *    caused by touching D3D from threads that otherwise never do. So d2d1 keeps every
++ *    D3D call (Map, Unmap, texture lifetime) on presenting threads: release() below is
++ *    explicitly allowed to be called from any thread and must therefore do no D3D work
++ *    itself -- it queues, and the next present drains the queue.
++ *
++ * 2. THE PIXELS MUST OUTLIVE THE READER. The render-target pool recycles staging
++ *    textures between bitmaps, so a bitmap that still owes someone its pixels cannot be
++ *    left pointing at a texture that has been handed to the next frame. d2d1 therefore
++ *    gives the texture AWAY to the bitmap and takes a fresh one; the texture follows the
++ *    data, and reuse can never overwrite a pending read.
++ *
++ * A bitmap that cannot serve a request out of the mapping (an odd sub-rect, a write
++ * lock, a pixel-format query that needs real memory) MATERIALISES first: it performs the
++ * copy it had deferred, into its own buffer, and drops the source. Correctness never
++ * depends on the fast path being taken, which is also why QueryInterface failing -- for
++ * example against a native windowscodecs -- simply falls back to the old behaviour.
++ */
++
++#ifndef __WINE_NEUTRON_WICGPU_H
++#define __WINE_NEUTRON_WICGPU_H
++
++/* Callbacks supplied by the pixel producer (d2d1). All are called with the bitmap's own
++ * lock held, so they must not call back into the bitmap. */
++struct neutron_wicgpu_source
++{
++    /* Serve a CopyPixels request straight from the mapping. Return S_FALSE to decline
++     * (the bitmap then materialises and serves it from its own memory instead), any
++     * failure HRESULT to fail the call. */
++    HRESULT (CDECL *copy_pixels)(void *ctx, UINT bpp, UINT width, UINT height,
++            const WICRect *rc, UINT dst_stride, UINT dst_size, BYTE *dst);
++
++    /* Perform the deferred download into the bitmap's own buffer. Called at most once
++     * per attached source, immediately before the source is released. */
++    HRESULT (CDECL *materialize)(void *ctx, BYTE *dst, UINT dst_stride,
++            UINT height, UINT row_bytes);
++
++    /* The bitmap is finished with this source. MAY BE CALLED FROM ANY THREAD, including
++     * during bitmap destruction -- see rule 1 above: do no D3D work here. */
++    void (CDECL *release)(void *ctx);
++};
++
++/* Private interface, exposed by Wine's own windowscodecs BitmapImpl via QueryInterface.
++ * {6e657574-726f-6e01-77-69-63-67-70-75-30-31} -- "neutron" + "wicgpu01". */
++DEFINE_GUID(IID_INeutronWicGpuBitmap, 0x6e657574,0x726f,0x6e01,0x77,0x69,0x63,0x67,0x70,0x75,0x30,0x31);
++
++typedef struct INeutronWicGpuBitmap INeutronWicGpuBitmap;
++
++typedef struct INeutronWicGpuBitmapVtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(INeutronWicGpuBitmap *iface, REFIID iid, void **out);
++    ULONG   (STDMETHODCALLTYPE *AddRef)(INeutronWicGpuBitmap *iface);
++    ULONG   (STDMETHODCALLTYPE *Release)(INeutronWicGpuBitmap *iface);
++
++    /* Attach a GPU-resident source, replacing (and releasing) any source already
++     * attached. Passing a NULL source detaches without materialising -- only correct
++     * when the caller is about to overwrite every pixel, which is exactly what a
++     * full-surface present does. Returns S_OK when the source was taken. */
++    HRESULT (STDMETHODCALLTYPE *SetSource)(INeutronWicGpuBitmap *iface,
++            const struct neutron_wicgpu_source *ops, void *ctx);
++} INeutronWicGpuBitmapVtbl;
++
++struct INeutronWicGpuBitmap
++{
++    const INeutronWicGpuBitmapVtbl *lpVtbl;
++};
++
++#define INeutronWicGpuBitmap_QueryInterface(p,a,b) (p)->lpVtbl->QueryInterface(p,a,b)
++#define INeutronWicGpuBitmap_AddRef(p)             (p)->lpVtbl->AddRef(p)
++#define INeutronWicGpuBitmap_Release(p)            (p)->lpVtbl->Release(p)
++#define INeutronWicGpuBitmap_SetSource(p,a,b)      (p)->lpVtbl->SetSource(p,a,b)
++
++#endif /* __WINE_NEUTRON_WICGPU_H */
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 9c78aaf92e2..cb227dd80d5 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -745,14 +1241,102 @@ struct d2d_factory
+ 
+     CRITICAL_SECTION cs;
+     D2D1_FACTORY_TYPE factory_type;
++    /* NEUTRON WIC RENDER-TARGET POOL: Premiere creates ~29 WIC bitmap render
++     * targets PER FRAME and releases them again -- 4.78ms/frame in creation
++     * alone, and each one also brings its own EndDraw GPU round trip (7.25ms
++     * more), together 20% of a 59ms frame. Creating one costs ~167us: a device
++     * context init (~65-88us), a CPU-readable STAGING texture whose cost scales
++     * with area (15-76us), plus the D3D texture and DXGI surface. None of that
++     * depends on WHICH IWICBitmap is wrapped -- only on size and format -- so a
++     * released target is kept here and handed back to the next request of the
++     * same shape, with its drawing state reset. */
++    /* NEUTRON BATCHED DEVICE-CONTEXT STATE: which render target's ID3DDeviceContextState
++     * is currently installed on the shared immediate context, and the state that was
++     * installed before d2d first took over. Guarded by cs (the same lock the draw path
++     * already takes). See d2d_device_context_install_state(). */
++    ID3DDeviceContextState *d3d_current_state;
++    ID3DDeviceContextState *d3d_app_state;
++
++    struct list wic_rt_pool;
++    unsigned int wic_rt_pool_size;
++
++    /* NEUTRON WIC READ-THROUGH (env NEUTRON_WIC_READTHROUGH=1): rather than downloading
++     * a rendered bitmap into WIC memory and letting the app copy it out again, present()
++     * hands the staging texture's mapping to the WIC bitmap and the app is served
++     * straight from it -- one copy instead of two. See wine/neutron_wicgpu.h.
++     *
++     * The texture goes WITH the pixels, because the render-target pool recycles targets
++     * between bitmaps and must never overwrite a frame somebody is still waiting to
++     * read. So present() gives its staging texture away and takes another:
++     *   wic_gpu_recycle  -- handoffs the reader has finished with. Queued from ANY
++     *                       thread, so nothing here may touch D3D; the next present
++     *                       drains it (unmapping on a thread that already owns D3D).
++     *   wic_staging_pool -- drained textures, unmapped and ready to be taken again.
++     * Both guarded by cs. */
++    struct list wic_gpu_recycle;
++    struct list wic_staging_pool;
++    unsigned int wic_staging_pool_size;
++    unsigned int wic_gpu_outstanding;
++    SIZE_T wic_gpu_outstanding_bytes;
+ };
+ 
++#define D2D_WIC_RT_POOL_MAX 24
++/* An attached mapping is released when the bitmap is redrawn or destroyed -- NOT when it
++ * is read. So the outstanding set is the number of LIVE render-target bitmaps, not the
++ * number waiting to be read, and Premiere keeps far more of those alive than the first
++ * estimate assumed. A count-based cap of 32 saturated after 64 presents and then fell
++ * back 14,278 times.
++ *
++ * The thing actually worth bounding is MEMORY (each handoff pins one staging texture), so
++ * the real limit is bytes; the count is only a backstop against pathological tiny
++ * bitmaps. Both are deliberately generous, and the peak is logged so the next sizing
++ * decision is made from a measurement rather than another guess. */
++#define D2D_WIC_GPU_MAX_OUTSTANDING 512
++#define D2D_WIC_STAGING_POOL_MAX 64
++
++/* Memory budget for pixels waiting to be read, MB. Override: NEUTRON_WIC_READTHROUGH_MB. */
++static inline SIZE_T neutron_wic_readthrough_bytes(void)
++{
++    static SIZE_T v;
++    if (!v)
++    {
++        char buf[16];
++        unsigned mb = 0;
++        if (GetEnvironmentVariableA("NEUTRON_WIC_READTHROUGH_MB", buf, sizeof(buf)))
++            mb = strtoul(buf, NULL, 10);
++        if (!mb) mb = 192;
++        v = (SIZE_T)mb << 20;
++    }
++    return v;
++}
++
++/* NEUTRON WIC READ-THROUGH: off by default. It changes who owns rendered pixels and when
++ * they are copied, which is worth soaking behind a switch before it becomes the default
++ * -- the same rollout the large-block heap cache got. */
++static inline BOOL neutron_wic_readthrough(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        v = (GetEnvironmentVariableA("NEUTRON_WIC_READTHROUGH", buf, sizeof(buf)) && buf[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
+ static inline struct d2d_factory *unsafe_impl_from_ID2D1Factory(ID2D1Factory *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_factory, ID2D1Factory7_iface);
+ }
+ 
+ void d2d_effects_init_builtins(struct d2d_factory *factory);
++/* NEUTRON WIC RENDER-TARGET POOL */
++struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
++        IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
++void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory);
++/* NEUTRON WIC READ-THROUGH: unmap and release everything still queued or pooled. */
++void d2d_factory_drain_wic_gpu(struct d2d_factory *factory);
++void d2d_device_context_release_state(struct d2d_device_context *context);
+ HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
+         bool allow_get_dxgi_device, REFIID iid, void **device);
+ struct d2d_effect_registration * d2d_factory_get_registered_effect(ID2D1Factory *factory,
+diff --git a/dlls/d2d1/factory.c b/dlls/d2d1/factory.c
+index 80c147638cd..b7439f6ec3c 100644
+--- a/dlls/d2d1/factory.c
++++ b/dlls/d2d1/factory.c
+@@ -156,6 +159,8 @@ static ULONG STDMETHODCALLTYPE d2d_factory_Release(ID2D1Factory7 *iface)
+         {
+             d2d_effect_registration_cleanup(reg);
+         }
++        d2d_factory_drain_wic_rt_pool(factory);   /* NEUTRON WIC RT POOL */
++        d2d_factory_drain_wic_gpu(factory);       /* NEUTRON WIC READ-THROUGH */
+         DeleteCriticalSection(&factory->cs);
+         free(factory);
+     }
+@@ -1360,6 +1463,11 @@ static void d2d_factory_init(struct d2d_factory *factory, D2D1_FACTORY_TYPE fact
+     factory->refcount = 1;
+     d2d_factory_reload_sysmetrics(factory);
+     list_init(&factory->effects);
++    list_init(&factory->wic_rt_pool);   /* NEUTRON WIC RT POOL */
++    list_init(&factory->wic_gpu_recycle);    /* NEUTRON WIC READ-THROUGH */
++    list_init(&factory->wic_staging_pool);
++    factory->wic_staging_pool_size = 0;
++    factory->wic_gpu_outstanding = 0;
+     InitializeCriticalSection(&factory->cs);
+     InitOnceInitialize(&factory->init_builtins);
+ }
+diff --git a/dlls/d2d1/wic_render_target.c b/dlls/d2d1/wic_render_target.c
+index c0720e69a8a..e2ee0037150 100644
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -19,14 +19,398 @@
+ #include "d2d1_private.h"
+ #include "initguid.h"
+ #include "wincodec.h"
++#include "wine/neutron_wicgpu.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
++WINE_DECLARE_DEBUG_CHANNEL(nwicgpu);
+ 
+ static inline struct d2d_wic_render_target *impl_from_IUnknown(IUnknown *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_wic_render_target, IUnknown_iface);
+ }
+ 
++/* ---- NEUTRON WIC READ-THROUGH ----------------------------------------------
++ * See wine/neutron_wicgpu.h for what this is and the measurements behind it. The short
++ * version: present() used to copy the whole rendered image out of the staging texture
++ * into the WIC bitmap, and the app then copied it out of the WIC bitmap into its own
++ * buffer. Premiere reads every one of those bitmaps exactly once, in full, on the thread
++ * that drew it -- so the middle copy is removable. present() now hands the mapping over
++ * and the app is served directly from it.
++ *
++ * The staging texture travels WITH the pixels (present takes a fresh one), because the
++ * render-target pool recycles targets between bitmaps and must never overwrite a frame
++ * that has not been read yet. */
++struct d2d_wic_gpu_handoff
++{
++    struct list entry;
++    struct d2d_factory *factory;
++    /* A WIC bitmap may outlive the factory that rendered into it. The handoff therefore
++     * keeps the factory alive for as long as it exists -- without this, a bitmap released
++     * after the app dropped its last factory reference would queue itself onto a freed
++     * list and dereference a freed handoff. */
++    ID2D1Factory1 *factory_iface;
++    ID3D10Texture2D *texture;
++    void *data;                     /* the live mapping */
++    unsigned int row_pitch;
++    SIZE_T bytes;                   /* what this handoff pins, for the memory budget */
++    /* bpp here is BYTES per pixel (as d2d_wic_render_target counts it); windowscodecs
++     * passes BITS. The conversion happens once, in copy_pixels below. */
++    unsigned int width, height, bpp;
++};
++
++/* A staging texture that has been unmapped and can be handed to the next present. */
++struct d2d_wic_staging
++{
++    struct list entry;
++    ID3D10Texture2D *texture;
++    ID3D10Device *device;           /* borrowed: compared only, kept alive by texture */
++    unsigned int width, height;
++    DXGI_FORMAT format;
++};
++
++static LONG nwg_handed, nwg_fallback_cap, nwg_fallback_noiface, nwg_staging_hit, nwg_staging_new;
++/* Peak working set, for sizing the budget from evidence rather than from a guess. Process
++ * globals rather than per-factory: this is a diagnostic, and one number across every
++ * factory is the one worth reading. */
++static unsigned nwg_peak_count;
++static SIZE_T nwg_peak_bytes;
++
++static void d2d_wic_gpu_report(void)
++{
++    LONG n = nwg_handed + nwg_fallback_cap + nwg_fallback_noiface;
++
++    if (!TRACE_ON(nwicgpu)) return;
++    /* Powers of two, then every 512. A pure modulo prints NOTHING on a short run --
++     * indistinguishable from the path never executing, which is exactly how this first
++     * read against the harness. Powers of two give a handful of lines at any scale
++     * (1,2,4...512) and the modulo keeps running totals coming on a long one. */
++    if (n > 8 && (n & (n - 1)) && n % 512) return;
++    TRACE_(nwicgpu)("neutron-wicgpu(d2d): handed=%ld fallback_cap=%ld fallback_noiface=%ld "
++            "staging_reused=%ld staging_created=%ld peak=%u frames/%u MB\n",
++            nwg_handed, nwg_fallback_cap, nwg_fallback_noiface, nwg_staging_hit, nwg_staging_new,
++            nwg_peak_count, (unsigned)(nwg_peak_bytes >> 20));
++}
++
++/* Serve a CopyPixels request straight out of the mapping.
++ *
++ * Deliberately handles only the byte-aligned case. Everything Premiere does is 32bpp
++ * full-rect, and declining (S_FALSE) makes the bitmap materialise and run windowscodecs'
++ * own copy_pixels -- so exotic shapes stay on exactly the code that handled them before
++ * rather than on a second, subtly different implementation of the same rules. */
++static HRESULT CDECL d2d_wic_gpu_copy_pixels(void *ctx, UINT bpp, UINT width, UINT height,
++        const WICRect *rc, UINT dst_stride, UINT dst_size, BYTE *dst)
++{
++    struct d2d_wic_gpu_handoff *h = ctx;
++    unsigned int bytes_per_row, row;
++    const BYTE *src;
++    WICRect rect;
++
++    if (bpp % 8 || bpp / 8 != h->bpp || width != h->width || height != h->height)
++        return S_FALSE;
++
++    if (!rc)
++    {
++        rect.X = 0;
++        rect.Y = 0;
++        rect.Width = width;
++        rect.Height = height;
++        rc = &rect;
++    }
++    else if (rc->X < 0 || rc->Y < 0 || rc->X + rc->Width > (INT)width
++            || rc->Y + rc->Height > (INT)height)
++        return E_INVALIDARG;
++
++    bytes_per_row = (bpp * rc->Width + 7) / 8;
++    if (dst_stride < bytes_per_row)
++        return E_INVALIDARG;
++    if (dst_stride * (rc->Height - 1) + bytes_per_row > dst_size)
++        return E_INVALIDARG;
++
++    src = (const BYTE *)h->data + (size_t)h->row_pitch * rc->Y + (size_t)rc->X * h->bpp;
++    for (row = 0; row < (unsigned int)rc->Height; ++row)
++    {
++        memcpy(dst, src, bytes_per_row);
++        src += h->row_pitch;
++        dst += dst_stride;
++    }
++    return S_OK;
++}
++
++/* Perform the download that was deferred, into the bitmap's own buffer. */
++static HRESULT CDECL d2d_wic_gpu_materialize(void *ctx, BYTE *dst, UINT dst_stride,
++        UINT height, UINT row_bytes)
++{
++    struct d2d_wic_gpu_handoff *h = ctx;
++    const BYTE *src = h->data;
++    unsigned int i;
++
++    if (height > h->height) height = h->height;
++    if (row_bytes > h->row_pitch) row_bytes = h->row_pitch;
++
++    for (i = 0; i < height; ++i)
++    {
++        memcpy(dst, src, row_bytes);
++        src += h->row_pitch;
++        dst += dst_stride;
++    }
++    return S_OK;
++}
++
++/* CALLED FROM ANY THREAD -- including a bitmap being destroyed on a thread that has never
++ * touched D3D. Unmapping here would reintroduce exactly the off-thread-D3D freeze class
++ * this project already killed, so this only queues; the next present drains it. */
++static void CDECL d2d_wic_gpu_release(void *ctx)
++{
++    struct d2d_wic_gpu_handoff *h = ctx;
++    struct d2d_factory *factory = h->factory;
++    ID2D1Factory1 *factory_iface = h->factory_iface;
++
++    EnterCriticalSection(&factory->cs);
++    list_add_tail(&factory->wic_gpu_recycle, &h->entry);
++    LeaveCriticalSection(&factory->cs);
++    /* h is now owned by the queue and may already have been drained and freed -- do not
++     * touch it again. Dropping the factory reference last is what lets the factory be
++     * destroyed once nothing is outstanding; if this is the final reference its
++     * destructor drains the queue, which is the one moment unmapping happens off a
++     * presenting thread and is safe precisely because everything else is already gone. */
++    ID2D1Factory1_Release(factory_iface);
++}
++
++static const struct neutron_wicgpu_source d2d_wic_gpu_ops =
++{
++    d2d_wic_gpu_copy_pixels,
++    d2d_wic_gpu_materialize,
++    d2d_wic_gpu_release,
++};
++
++static void d2d_wic_gpu_put_staging(struct d2d_factory *factory, ID3D10Texture2D *texture,
++        const D3D10_TEXTURE2D_DESC *desc);
++
++/* Unmap everything the readers have finished with and park the textures for reuse.
++ * MUST be called from a presenting thread -- this is where the D3D work lives. */
++static void d2d_wic_gpu_drain_recycle(struct d2d_factory *factory)
++{
++    struct list done = LIST_INIT(done);
++    struct d2d_wic_gpu_handoff *h, *h2;
++    unsigned int freed = 0;
++    SIZE_T freed_bytes = 0;
++
++    EnterCriticalSection(&factory->cs);
++    list_move_tail(&done, &factory->wic_gpu_recycle);
++    LeaveCriticalSection(&factory->cs);
++
++    LIST_FOR_EACH_ENTRY_SAFE(h, h2, &done, struct d2d_wic_gpu_handoff, entry)
++    {
++        D3D10_TEXTURE2D_DESC desc;
++
++        list_remove(&h->entry);
++        ID3D10Texture2D_Unmap(h->texture, 0);
++        ID3D10Texture2D_GetDesc(h->texture, &desc);
++        d2d_wic_gpu_put_staging(factory, h->texture, &desc);
++        freed_bytes += h->bytes;
++        free(h);
++        ++freed;
++    }
++
++    if (freed)
++    {
++        EnterCriticalSection(&factory->cs);
++        factory->wic_gpu_outstanding -= freed;
++        factory->wic_gpu_outstanding_bytes -= freed_bytes;
++        LeaveCriticalSection(&factory->cs);
++    }
++}
++
++/* Park an unmapped staging texture for reuse, or release it if the pool is full.
++ * Matching is by shape AND device: a texture belongs to the device that made it, and the
++ * factory can host more than one. */
++static void d2d_wic_gpu_put_staging(struct d2d_factory *factory, ID3D10Texture2D *texture,
++        const D3D10_TEXTURE2D_DESC *desc)
++{
++    struct d2d_wic_staging *s;
++    BOOL parked = FALSE;
++
++    if ((s = malloc(sizeof(*s))))
++    {
++        s->texture = texture;
++        s->width = desc->Width;
++        s->height = desc->Height;
++        s->format = desc->Format;
++        ID3D10Texture2D_GetDevice(texture, &s->device);
++        ID3D10Device_Release(s->device);   /* borrowed; the texture keeps it alive */
++
++        EnterCriticalSection(&factory->cs);
++        if (factory->wic_staging_pool_size < D2D_WIC_STAGING_POOL_MAX)
++        {
++            list_add_head(&factory->wic_staging_pool, &s->entry);
++            ++factory->wic_staging_pool_size;
++            parked = TRUE;
++        }
++        LeaveCriticalSection(&factory->cs);
++
++        if (!parked) free(s);
++    }
++    if (!parked) ID3D10Texture2D_Release(texture);
++}
++
++/* A replacement staging texture for the one about to be given away. */
++static ID3D10Texture2D *d2d_wic_gpu_take_staging(struct d2d_factory *factory,
++        ID3D10Device *device, const D3D10_TEXTURE2D_DESC *desc)
++{
++    struct d2d_wic_staging *s, *found = NULL;
++    ID3D10Texture2D *texture = NULL;
++
++    EnterCriticalSection(&factory->cs);
++    LIST_FOR_EACH_ENTRY(s, &factory->wic_staging_pool, struct d2d_wic_staging, entry)
++    {
++        if (s->width == desc->Width && s->height == desc->Height
++                && s->format == desc->Format && s->device == device)
++        {
++            found = s;
++            break;
++        }
++    }
++    if (found)
++    {
++        list_remove(&found->entry);
++        --factory->wic_staging_pool_size;
++    }
++    LeaveCriticalSection(&factory->cs);
++
++    if (found)
++    {
++        texture = found->texture;
++        free(found);
++        InterlockedIncrement(&nwg_staging_hit);
++        return texture;
++    }
++
++    /* ID3D10Device1 derives from ID3D10Device, so the base interface is enough here. */
++    if (FAILED(ID3D10Device_CreateTexture2D(device, desc, NULL, &texture)))
++        texture = NULL;
++    else
++        InterlockedIncrement(&nwg_staging_new);
++    return texture;
++}
++
++void d2d_factory_drain_wic_gpu(struct d2d_factory *factory)
++{
++    struct d2d_wic_gpu_handoff *h, *h2;
++    struct d2d_wic_staging *s, *s2;
++
++    /* Guaranteed final totals. The periodic report is a running snapshot on a 512
++     * boundary, which on a short run is either nothing or an arbitrary prefix. */
++    if (TRACE_ON(nwicgpu))
++        TRACE_(nwicgpu)("neutron-wicgpu(d2d) FINAL: handed=%ld fallback_cap=%ld fallback_noiface=%ld "
++                "staging_reused=%ld staging_created=%ld\n",
++                nwg_handed, nwg_fallback_cap, nwg_fallback_noiface, nwg_staging_hit, nwg_staging_new);
++
++    LIST_FOR_EACH_ENTRY_SAFE(h, h2, &factory->wic_gpu_recycle, struct d2d_wic_gpu_handoff, entry)
++    {
++        list_remove(&h->entry);
++        ID3D10Texture2D_Unmap(h->texture, 0);
++        ID3D10Texture2D_Release(h->texture);
++        free(h);
++    }
++    LIST_FOR_EACH_ENTRY_SAFE(s, s2, &factory->wic_staging_pool, struct d2d_wic_staging, entry)
++    {
++        list_remove(&s->entry);
++        ID3D10Texture2D_Release(s->texture);
++        free(s);
++    }
++    factory->wic_staging_pool_size = 0;
++    factory->wic_gpu_outstanding = 0;
++}
++
++/* Drop any mapping still attached to this target's bitmap, without downloading it. Only
++ * correct immediately before overwriting the whole bitmap, which is what present does. */
++static void d2d_wic_render_target_detach(struct d2d_wic_render_target *rt)
++{
++    INeutronWicGpuBitmap *gpu;
++
++    if (FAILED(IWICBitmap_QueryInterface(rt->bitmap, &IID_INeutronWicGpuBitmap, (void **)&gpu)))
++        return;
++    INeutronWicGpuBitmap_SetSource(gpu, NULL, NULL);
++    INeutronWicGpuBitmap_Release(gpu);
++}
++
++/* Hand the freshly-mapped staging texture to the WIC bitmap. Returns TRUE when the
++ * bitmap took it, in which case the caller owes it a replacement texture and must NOT
++ * unmap. Every failure path leaves the caller free to do the ordinary download. */
++static BOOL d2d_wic_render_target_hand_off(struct d2d_wic_render_target *rt,
++        struct d2d_factory *factory, const D3D10_MAPPED_TEXTURE2D *mapped)
++{
++    INeutronWicGpuBitmap *gpu;
++    struct d2d_wic_gpu_handoff *h;
++    unsigned int outstanding;
++    SIZE_T bytes;
++    BOOL over;
++
++    if (FAILED(IWICBitmap_QueryInterface(rt->bitmap, &IID_INeutronWicGpuBitmap, (void **)&gpu)))
++    {
++        /* Not Wine's own windowscodecs, so there is nothing to hand it to. */
++        InterlockedIncrement(&nwg_fallback_noiface);
++        return FALSE;
++    }
++
++    bytes = (SIZE_T)mapped->RowPitch * rt->height;
++
++    EnterCriticalSection(&factory->cs);
++    outstanding = factory->wic_gpu_outstanding;
++    over = outstanding >= D2D_WIC_GPU_MAX_OUTSTANDING
++            || factory->wic_gpu_outstanding_bytes + bytes > neutron_wic_readthrough_bytes();
++    if (!over)
++    {
++        ++factory->wic_gpu_outstanding;
++        factory->wic_gpu_outstanding_bytes += bytes;
++        if (factory->wic_gpu_outstanding > nwg_peak_count)
++            nwg_peak_count = factory->wic_gpu_outstanding;
++        if (factory->wic_gpu_outstanding_bytes > nwg_peak_bytes)
++            nwg_peak_bytes = factory->wic_gpu_outstanding_bytes;
++    }
++    LeaveCriticalSection(&factory->cs);
++
++    if (over || !(h = malloc(sizeof(*h))))
++    {
++        if (!over)
++        {
++            EnterCriticalSection(&factory->cs);
++            --factory->wic_gpu_outstanding;
++            factory->wic_gpu_outstanding_bytes -= bytes;
++            LeaveCriticalSection(&factory->cs);
++        }
++        /* Reported every time, not on a sampling boundary. The periodic report is a
++         * running snapshot and a rare event that happens after the last boundary is
++         * simply invisible -- which is how the cap looked like it never fired. */
++        InterlockedIncrement(&nwg_fallback_cap);
++        if (TRACE_ON(nwicgpu))
++            TRACE_(nwicgpu)("neutron-wicgpu(d2d): CAP HIT, %u outstanding / %u MB -- falling "
++                    "back to the download (fallback_cap=%ld so far)\n", outstanding,
++                    (unsigned)(factory->wic_gpu_outstanding_bytes >> 20), nwg_fallback_cap);
++        INeutronWicGpuBitmap_Release(gpu);
++        return FALSE;
++    }
++
++    h->factory = factory;
++    h->factory_iface = rt->pool_factory;
++    ID2D1Factory1_AddRef(h->factory_iface);
++    h->texture = rt->readback_texture;    /* ownership moves to the bitmap */
++    h->data = mapped->pData;
++    h->row_pitch = mapped->RowPitch;
++    h->bytes = bytes;
++    h->width = rt->width;
++    h->height = rt->height;
++    h->bpp = rt->bpp;
++    list_init(&h->entry);
++
++    INeutronWicGpuBitmap_SetSource(gpu, &d2d_wic_gpu_ops, h);
++    INeutronWicGpuBitmap_Release(gpu);
++
++    InterlockedIncrement(&nwg_handed);
++    d2d_wic_gpu_report();
++    return TRUE;
++}
++
+ static HRESULT d2d_wic_render_target_present(IUnknown *outer_unknown)
+ {
+     struct d2d_wic_render_target *render_target = impl_from_IUnknown(outer_unknown);
+@@ -52,6 +436,61 @@ static HRESULT d2d_wic_render_target_present(IUnknown *outer_unknown)
+     ID3D10Device_Release(device);
+     ID3D10Resource_Release(src_resource);
+ 
++    /* NEUTRON WIC READ-THROUGH: map once and give the mapping to the bitmap instead of
++     * copying through it. Ordering matters -- the recycle queue is drained FIRST so this
++     * present can reuse a texture a reader has just finished with, and the map happens
++     * before the handoff so a failure leaves us on the ordinary path with nothing to
++     * unwind. */
++    if (neutron_wic_readthrough() && render_target->pool_factory)
++    {
++        struct d2d_factory *factory =
++                unsafe_impl_from_ID2D1Factory((ID2D1Factory *)render_target->pool_factory);
++
++        d2d_wic_gpu_drain_recycle(factory);
++
++        if (SUCCEEDED(ID3D10Texture2D_Map(render_target->readback_texture, 0,
++                D3D10_MAP_READ, 0, &mapped_texture)))
++        {
++            D3D10_TEXTURE2D_DESC desc;
++            ID3D10Texture2D *replacement;
++            ID3D10Device *dev;
++
++            ID3D10Texture2D_GetDesc(render_target->readback_texture, &desc);
++            ID3D10Texture2D_GetDevice(render_target->readback_texture, &dev);
++
++            /* Secure the replacement BEFORE giving the texture away. Handing off first
++             * and then discovering we cannot replace it would mean prising the pixels
++             * back out of a bitmap that already owns them -- an unwind path with no
++             * good outcome. This way every failure simply falls through to the copy. */
++            replacement = d2d_wic_gpu_take_staging(factory, dev, &desc);
++            ID3D10Device_Release(dev);
++
++            /* Whatever happens below, this present is about to overwrite every pixel of
++             * the bitmap, so any mapping still attached to it is dead. Detach it WITHOUT
++             * materialising -- otherwise the fallback path's Lock(WRITE) faithfully
++             * downloads the previous frame into a buffer we immediately paint over.
++             * That wasted a full copy on every fallback, on top of the copy the fallback
++             * already does, and made the fix cost more than it saved the moment the cap
++             * was reached. */
++            d2d_wic_render_target_detach(render_target);
++
++            if (replacement)
++            {
++                if (d2d_wic_render_target_hand_off(render_target, factory, &mapped_texture))
++                {
++                    /* The bitmap owns the old texture and its mapping now. This target --
++                     * which the pool may hand to a different bitmap at any moment -- draws
++                     * into the replacement, so it can never write over pixels somebody is
++                     * still reading. */
++                    render_target->readback_texture = replacement;
++                    goto end;
++                }
++                d2d_wic_gpu_put_staging(factory, replacement, &desc);
++            }
++            ID3D10Texture2D_Unmap(render_target->readback_texture, 0);
++        }
++    }
++
+     dst_rect.X = 0;
+     dst_rect.Y = 0;
+     dst_rect.Width = render_target->width;
+diff --git a/dlls/windowscodecs/bitmap.c b/dlls/windowscodecs/bitmap.c
+index e7d8b27d94a..1d5eca90887 100644
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -33,7 +33,10 @@
+ #include "initguid.h"
+ DEFINE_GUID(IID_CMetaBitmapRenderTarget, 0x0ccd7824,0xdc16,0x4d09,0xbc,0xa8,0x6b,0x09,0xc4,0xef,0x55,0x35);
+ 
++#include "wine/neutron_wicgpu.h"
++
+ WINE_DEFAULT_DEBUG_CHANNEL(wincodecs);
++WINE_DECLARE_DEBUG_CHANNEL(nwicgpu);
+ 
+ /* WARNING: .NET Media Integration Layer (MIL) directly dereferences
+  * BitmapImpl members and depends on its exact layout.
+@@ -56,6 +59,14 @@ typedef struct BitmapImpl {
+     WICPixelFormatGUID pixelformat;
+     double dpix, dpiy;
+     CRITICAL_SECTION cs;
++    /* NEUTRON: appended AFTER every field MIL knows about, so the layout the warning
++     * above protects is untouched. See wine/neutron_wicgpu.h for the whole rationale --
++     * in short, when Direct2D renders into this bitmap on the GPU it hands the mapping
++     * over instead of copying, and CopyPixels serves the app straight out of it. */
++    INeutronWicGpuBitmap INeutronWicGpuBitmap_iface;
++    const struct neutron_wicgpu_source *gpu_ops;    /* NULL => ordinary CPU bitmap */
++    void *gpu_ctx;
++    BOOL gpu_was_read;      /* diagnostic only: did anyone actually read this frame? */
+ } BitmapImpl;
+ 
+ typedef struct BitmapLockImpl {
+@@ -119,6 +130,67 @@ static void BitmapImpl_ReleaseLock(BitmapImpl *This)
+     }
+ }
+ 
++/* ---- NEUTRON: pixels served straight from GPU-resident memory ---------------
++ * Rationale, measurements and the two safety rules live in wine/neutron_wicgpu.h.
++ * Everything here is a no-op unless a producer has attached a source, so an ordinary
++ * WIC bitmap is unaffected. */
++static LONG nwg_attached, nwg_served, nwg_declined, nwg_materialized, nwg_dropped_unread;
++
++static void neutron_wicgpu_report(void)
++{
++    LONG n = nwg_attached + nwg_served;
++
++    if (!TRACE_ON(nwicgpu)) return;
++    /* Powers of two, then every 512 -- a pure modulo prints nothing at all on a short
++     * run, which reads exactly like "the path never executed". */
++    if (n > 8 && (n & (n - 1)) && n % 512) return;
++    TRACE_(nwicgpu)("neutron-wicgpu: attached=%ld served=%ld declined=%ld materialized=%ld dropped_unread=%ld\n",
++            nwg_attached, nwg_served, nwg_declined, nwg_materialized, nwg_dropped_unread);
++}
++
++/* Give the source back without performing the deferred download. Only correct when the
++ * pixels are genuinely not wanted -- the caller is about to overwrite them all, or the
++ * bitmap is being destroyed. Caller holds This->cs (or owns the last reference). */
++static void bitmap_gpu_drop(BitmapImpl *This, BOOL count_waste)
++{
++    const struct neutron_wicgpu_source *ops = This->gpu_ops;
++    void *ctx = This->gpu_ctx;
++
++    if (!ops) return;
++    This->gpu_ops = NULL;
++    This->gpu_ctx = NULL;
++    /* Only a frame nobody ever read is waste. Counting every drop would count the
++     * ordinary read-then-redraw cycle as waste too, and the resulting number would look
++     * alarming while meaning nothing -- the same way an over-broad "orphan" count made
++     * 38% of downloads look wasted when the real figure was ~0. */
++    if (count_waste && !This->gpu_was_read) InterlockedIncrement(&nwg_dropped_unread);
++    This->gpu_was_read = FALSE;
++    ops->release(ctx);
++}
++
++/* Perform the download the producer deferred, into the bitmap's own buffer, and drop the
++ * source. After this the bitmap is an ordinary CPU bitmap again. Caller holds This->cs.
++ *
++ * A failure here would leave stale pixels rather than crash, so it is reported loudly and
++ * the source is still dropped -- staying attached to a mapping we cannot read would turn
++ * one bad frame into a permanently broken bitmap. */
++static void bitmap_gpu_materialize(BitmapImpl *This)
++{
++    const struct neutron_wicgpu_source *ops = This->gpu_ops;
++    void *ctx = This->gpu_ctx;
++    HRESULT hr;
++
++    if (!ops) return;
++    This->gpu_ops = NULL;
++    This->gpu_ctx = NULL;
++    This->gpu_was_read = TRUE;
++    InterlockedIncrement(&nwg_materialized);
++    if (FAILED(hr = ops->materialize(ctx, This->data, This->stride, This->height,
++            (This->bpp * This->width + 7) / 8)))
++        ERR("Failed to materialize deferred pixels, hr %#lx -- bitmap %p may show a stale frame.\n", hr, This);
++    ops->release(ctx);
++}
++
+ 
+ static HRESULT WINAPI BitmapLockImpl_QueryInterface(IWICBitmapLock *iface, REFIID iid,
+     void **ppv)
+@@ -254,6 +326,13 @@ static HRESULT WINAPI BitmapImpl_QueryInterface(IWICBitmap *iface, REFIID iid,
+     {
+         *ppv = &This->IMILBitmap_iface;
+     }
++    else if (IsEqualIID(&IID_INeutronWicGpuBitmap, iid))
++    {
++        /* NEUTRON: private, and deliberately only answered by Wine's own bitmap. A
++         * producer that gets E_NOINTERFACE here -- against a native windowscodecs, or a
++         * bitmap implemented elsewhere -- simply keeps doing the copy. */
++        *ppv = &This->INeutronWicGpuBitmap_iface;
++    }
+     else
+     {
+         if (IsEqualIID(&IID_CMetaBitmapRenderTarget, iid))
+@@ -287,6 +366,10 @@ static ULONG WINAPI BitmapImpl_Release(IWICBitmap *iface)
+ 
+     if (ref == 0)
+     {
++        /* NEUTRON: nobody will ever read these pixels, so give the mapping back without
++         * downloading it. Done before the critical section goes away, and without taking
++         * it -- we hold the last reference. */
++        bitmap_gpu_drop(This, TRUE);
+         if (This->palette) IWICPalette_Release(This->palette);
+         This->cs.DebugInfo->Spare[0] = 0;
+         DeleteCriticalSection(&This->cs);
+@@ -364,6 +447,44 @@ static HRESULT WINAPI BitmapImpl_CopyPixels(IWICBitmap *iface,
+     BitmapImpl *This = impl_from_IWICBitmap(iface);
+     TRACE("(%p,%s,%u,%u,%p)\n", iface, debug_wic_rect(prc), cbStride, cbBufferSize, pbBuffer);
+ 
++    /* NEUTRON: this is the copy the whole exercise exists to remove. If the pixels are
++     * still sitting in GPU-resident memory, hand them to the caller from there rather
++     * than downloading them into this bitmap first and copying again. The unlocked read
++     * of gpu_ops is a fast reject for the overwhelmingly common ordinary-bitmap case;
++     * the decision is re-made under the lock. */
++    if (This->gpu_ops)
++    {
++        HRESULT hr = S_FALSE;
++
++        EnterCriticalSection(&This->cs);
++        if (This->gpu_ops)
++        {
++            hr = This->gpu_ops->copy_pixels(This->gpu_ctx, This->bpp, This->width,
++                    This->height, prc, cbStride, cbBufferSize, pbBuffer);
++            if (hr == S_FALSE)
++            {
++                /* The producer cannot serve this shape. Pay the download once and fall
++                 * through; every later read comes from ordinary memory. Reported every
++                 * time rather than on a sampling boundary -- this is meant to be rare,
++                 * so if it is not, that is the finding. */
++                InterlockedIncrement(&nwg_declined);
++                bitmap_gpu_materialize(This);
++                if (TRACE_ON(nwicgpu))
++                    TRACE_(nwicgpu)("neutron-wicgpu: DECLINED bitmap %p %ux%u bpp=%u rect=%p "
++                            "dst_stride=%u (declined=%ld so far)\n", This, This->width,
++                            This->height, This->bpp, prc, cbStride, nwg_declined);
++            }
++            else
++            {
++                This->gpu_was_read = TRUE;
++                InterlockedIncrement(&nwg_served);
++                neutron_wicgpu_report();
++            }
++        }
++        LeaveCriticalSection(&This->cs);
++        if (hr != S_FALSE) return hr;
++    }
++
+     return copy_pixels(This->bpp, This->data, This->width, This->height,
+         This->stride, prc, cbStride, cbBufferSize, pbBuffer);
+ }
+@@ -398,6 +519,17 @@ static HRESULT WINAPI BitmapImpl_Lock(IWICBitmap *iface, const WICRect *prcLock,
+         return E_FAIL;
+     }
+ 
++    /* NEUTRON: a lock hands out a raw pointer into This->data, so anything still
++     * deferred has to be brought down into real memory first. Both directions need it:
++     * a reader would otherwise see the previous frame, and a writer is entitled to
++     * modify only part of the image and leave the rest intact. */
++    if (This->gpu_ops)
++    {
++        EnterCriticalSection(&This->cs);
++        bitmap_gpu_materialize(This);
++        LeaveCriticalSection(&This->cs);
++    }
++
+     result = malloc(sizeof(BitmapLockImpl));
+     if (!result)
+         return E_OUTOFMEMORY;
+@@ -465,6 +597,62 @@ static HRESULT WINAPI BitmapImpl_SetResolution(IWICBitmap *iface,
+     return S_OK;
+ }
+ 
++/* ---- NEUTRON: INeutronWicGpuBitmap ------------------------------------------
++ * Lifetime and refcount are the bitmap's; this is a view onto it, not an object. */
++static inline BitmapImpl *impl_from_INeutronWicGpuBitmap(INeutronWicGpuBitmap *iface)
++{
++    return CONTAINING_RECORD(iface, BitmapImpl, INeutronWicGpuBitmap_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE neutron_wicgpu_QueryInterface(INeutronWicGpuBitmap *iface,
++        REFIID iid, void **out)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap(iface);
++    return IWICBitmap_QueryInterface(&This->IWICBitmap_iface, iid, out);
++}
++
++static ULONG STDMETHODCALLTYPE neutron_wicgpu_AddRef(INeutronWicGpuBitmap *iface)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap(iface);
++    return IWICBitmap_AddRef(&This->IWICBitmap_iface);
++}
++
++static ULONG STDMETHODCALLTYPE neutron_wicgpu_Release(INeutronWicGpuBitmap *iface)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap(iface);
++    return IWICBitmap_Release(&This->IWICBitmap_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE neutron_wicgpu_SetSource(INeutronWicGpuBitmap *iface,
++        const struct neutron_wicgpu_source *ops, void *ctx)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap(iface);
++
++    EnterCriticalSection(&This->cs);
++    /* Whatever was attached is about to be superseded: the producer only calls this
++     * after rendering the WHOLE image, so the previous frame's pixels are dead and
++     * downloading them would be pure waste. */
++    bitmap_gpu_drop(This, TRUE);
++    This->gpu_ops = ops;
++    This->gpu_ctx = ctx;
++    LeaveCriticalSection(&This->cs);
++
++    if (ops)
++    {
++        InterlockedIncrement(&nwg_attached);
++        neutron_wicgpu_report();
++    }
++    return S_OK;
++}
++
++static const INeutronWicGpuBitmapVtbl neutron_wicgpu_vtbl =
++{
++    neutron_wicgpu_QueryInterface,
++    neutron_wicgpu_AddRef,
++    neutron_wicgpu_Release,
++    neutron_wicgpu_SetSource,
++};
++
+ static const IWICBitmapVtbl BitmapImpl_Vtbl = {
+     BitmapImpl_QueryInterface,
+     BitmapImpl_AddRef,
+@@ -831,6 +1019,10 @@ HRESULT BitmapImpl_Create(UINT uiWidth, UINT uiHeight, UINT stride, UINT datasiz
+     This->bpp = bpp;
+     memcpy(&This->pixelformat, pixelFormat, sizeof(GUID));
+     This->dpix = This->dpiy = 0.0;
++    This->INeutronWicGpuBitmap_iface.lpVtbl = &neutron_wicgpu_vtbl;
++    This->gpu_ops = NULL;
++    This->gpu_ctx = NULL;
++    This->gpu_was_read = FALSE;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": BitmapImpl.lock");
+ 
