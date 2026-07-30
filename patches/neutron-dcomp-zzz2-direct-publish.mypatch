@@ -1,0 +1,219 @@
+# neutron-dcomp-zzz2-direct-publish  (env NEUTRON_DCOMP_DIRECT=1 -- OFF BY DEFAULT)
+#
+# ORDERING: zzz2 -- applies AFTER neutron-dcomp-zzz-d2dui-bridge, whose code it edits.
+# wine-tkg applies *.mypatch alphabetically and "zzz2" sorts after "zzz-". Do not rename.
+#
+# WHAT IT FIXES
+#   The cross-process CEP panel path copied every frame TWICE: the strided GPU staging was
+#   repacked into a malloc'd `packed` buffer, and `packed` was then copied whole into the
+#   shared buffer the owner process blits from. `packed` was a pure intermediate -- the
+#   same shape as the WIC intermediate removed by neutron-zzz7-wic-readthrough.
+#
+#   Measured with the ucrtbase memmove probe over one Premiere zoom session:
+#     blit_swapchain_to_hwnd+0xf92    863,511 calls   4.37 GB   (the repack, 5.3 KB rows)
+#     blit_swapchain_to_hwnd+0x15c8       700 calls   4.37 GB   (the whole-buffer copy)
+#   8.7 GB -- 9% of ALL copying in the process -- from ONE window. 1360x1233 x 4 bytes
+#   x 700 frames matches the logged blit_swapchain_to_hwnd dimensions exactly, so the
+#   attribution is confirmed rather than inferred.
+#
+# WHAT IT DOES
+#   Copies straight from the mapped staging into the shared buffer. Two consequences:
+#     * the whole-buffer copy disappears;
+#     * so does the repack FOR REJECTED FRAMES -- the blank-rotation filter must decide
+#       before overwriting the last good frame, and it now samples the mapped texture
+#       directly, so a rejected frame costs a few scattered reads instead of a full 6.5 MB
+#       repack. The old code always paid the repack even when it then threw the frame away.
+#
+#   The same-process path still builds `packed`: StretchDIBits needs tightly-packed rows
+#   and the GPU staging pitch is padded, so that repack is genuinely required.
+#
+# WHY IT IS SAFE
+#   * The work done UNDER THE D3D DEVICE LOCK is unchanged in size -- one full-frame copy
+#     either way. What disappears is the copy that ran outside the lock. This matters: the
+#     round-32 freeze was a leaked shared D3D10 device lock, and the surrounding code has
+#     hard rules about what may run under it. The file-mapping creation is hoisted OUT of
+#     the readback so it never happens under the lock.
+#   * The raw copy from mapped memory stays inside the existing __EXCEPT_PAGE_FAULT guard,
+#     and the guard still skips no unlock (Unmap and Leave run after __ENDTRY on both
+#     paths).
+#
+# ⚠️ ONE DELIBERATE BEHAVIOUR CHANGE. Today a fault mid-readback leaves the shared buffer
+# holding the previous good frame; writing directly means a fault can leave it torn until
+# the next good frame (~1/6 s at the capped CEF rate). Faults are rare and already logged
+# as "dropping frame". This is NOT a new race: the producer already overwrote the shared
+# buffer while the consumer could be blitting from it. Gated off by default so it can be
+# A/B'd against exactly this.
+#
+# ⚠️ A BUG THIS ALMOST SHIPPED WITH: the "already delivered, skip the rest" test was first
+# keyed on the shared buffer merely EXISTING. A frame larger than that buffer skips the
+# direct path and must still be published by the packed path -- keying on existence
+# silently dropped those frames. It is keyed on `direct_used` instead.
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -348,6 +348,75 @@
+     return 0;
+ }
+ 
++/* ---- NEUTRON DCOMP DIRECT PUBLISH (env NEUTRON_DCOMP_DIRECT=1) --------------
++ * The cross-process path copied every frame TWICE: the strided GPU staging was repacked
++ * into a malloc'd `packed` buffer, and `packed` was then copied whole into the shared
++ * buffer the owner process blits from. `packed` is a pure intermediate.
++ *
++ * Measured (ucrtbase memmove probe, one Premiere zoom session): 4.37 GB in the repack
++ * (863,511 row copies) plus 4.37 GB in the whole-buffer copy (700 x 6.5 MB) -- 8.7 GB, 9%
++ * of all the copying in the process, from ONE window.
++ *
++ * Copying straight from the mapped staging into the shared buffer removes the second copy.
++ * It also removes the FIRST one for rejected frames: the blank-rotation filter has to
++ * decide before overwriting the last good frame, and it can sample the mapped texture
++ * directly, so a frame that gets rejected now costs a few scattered reads instead of a
++ * full repack.
++ *
++ * The lock hold does not grow: the copy that runs under the D3D device lock is the same
++ * size as before, and the out-of-lock copy is what disappears.
++ *
++ * ⚠️ ONE BEHAVIOUR CHANGE, DELIBERATE. Today a page fault mid-readback leaves the shared
++ * buffer holding the previous good frame. Writing directly means a fault can leave it
++ * torn until the next good frame (~1/6 s at the capped CEF rate). Faults here are rare
++ * and already logged as "dropping frame". Note this is not a NEW race: the producer
++ * already overwrote the shared buffer while the consumer might be blitting from it.
++ * Gated off by default so it can be A/B'd against exactly this. */
++static int neutron_dcomp_direct(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[8];
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DIRECT", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
++/* Create the shared pixel buffer if it does not exist yet. Hoisted out of the readback so
++ * it can run BEFORE the D3D device lock is taken -- file-mapping creation has no business
++ * happening under that lock. */
++static struct neutron_px_shbuf *neutron_px_ensure(struct presentation *p, HWND hwnd)
++{
++    if (!p->px_view)
++    {
++        WCHAR name[64];
++        neutron_px_name(hwnd, name);
++        p->px_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
++                                       (DWORD)(NEUTRON_PX_BYTES >> 32), (DWORD)NEUTRON_PX_BYTES, name);
++        if (p->px_map)
++            p->px_view = MapViewOfFile(p->px_map, FILE_MAP_WRITE, 0, 0, NEUTRON_PX_BYTES);
++        if (p->px_view) neutron_registry_add(hwnd);
++    }
++    return p->px_view;
++}
++
++/* Whole-frame variation of the MAPPED texture, same 40x40 dense grid as the packed-buffer
++ * filter it replaces -- the sparse dark main UI is wrongly rejected by a central-only
++ * grid, which once stuck the panel on the busier Welcome frame. */
++static int neutron_px_variation(const void *pixels, UINT pitch, UINT w, UINT h)
++{
++    const BYTE *base = pixels;
++    DWORD ref = *(const DWORD *)base;
++    int gx, gy, dd = 0;
++
++    for (gy = 0; gy < 40; gy++)
++        for (gx = 0; gx < 40; gx++)
++            if (*(const DWORD *)(base + (SIZE_T)(h * gy / 40) * pitch + (SIZE_T)(w * gx / 40) * 4) != ref)
++                dd++;
++    return dd;
++}
++
+ static void blit_swapchain_to_hwnd(struct presentation *p)
+ {
+     /* NEUTRON DIAG: log entry once per (hwnd,cross_proc) — proves whether blit is
+@@ -385,6 +454,11 @@
+     BOOL mt_entered = FALSE, have_pixels = FALSE;
+     /* NEUTRON DIRECT PUBLISH: set when the frame went straight from the mapped staging
+      * into the shared buffer, so the cross-proc block below has nothing left to do. */
++    /* direct_used, NOT (direct_sh != NULL): the direct branch is also skipped for a frame
++     * larger than the shared buffer, and that frame must still be published by the packed
++     * path below. Keying the skip on direct_sh alone silently dropped those frames. */
++    BOOL direct_used = FALSE;
++    struct neutron_px_shbuf *direct_sh = NULL;
+ 
+     n = InterlockedIncrement(&diag_n);
+     diag = (n % 120 == 1);
+@@ -445,6 +519,10 @@
+                 }
+             }
+ 
++            /* Before any D3D work, and therefore before the device lock. */
++            if (neutron_dcomp_direct() && p->cross_proc)
++                direct_sh = neutron_px_ensure(p, hwnd);
++
+             if (FAILED(hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&backbuffer)))
+             {
+                 if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
+@@ -494,7 +572,52 @@
+                         }
+                         else
+                         {
+-                            if ((packed = malloc((SIZE_T)desc.Width * 4 * desc.Height)))
++                            if (direct_sh && desc.Width <= NEUTRON_PX_MAXW
++                                    && desc.Height <= NEUTRON_PX_MAXH)
++                            {
++                                direct_used = TRUE;
++                                /* Sample the mapped texture, and only copy if the frame is
++                                 * real -- a blank flip-rotation must leave the last good
++                                 * frame alone, and now costs nothing but the sampling. */
++                                volatile BOOL copy_ok = TRUE;
++                                volatile int dd = 0;
++                                __TRY
++                                {
++                                    dd = neutron_px_variation(map.pData, map.RowPitch,
++                                                              desc.Width, desc.Height);
++                                    if (dd >= 2)
++                                    {
++                                        UINT yy;
++                                        for (yy = 0; yy < desc.Height; yy++)
++                                            memcpy((BYTE *)direct_sh->pixels + (SIZE_T)yy * desc.Width * 4,
++                                                   (BYTE *)map.pData + (SIZE_T)yy * map.RowPitch,
++                                                   (SIZE_T)desc.Width * 4);
++                                    }
++                                }
++                                __EXCEPT_PAGE_FAULT
++                                {
++                                    static LONG raced_d;
++                                    LONG rn = InterlockedIncrement(&raced_d);
++                                    if (rn == 1 || !(rn % 240))
++                                        ERR("neutron dcomp: direct readback faulted (n=%ld), not publishing\n", rn);
++                                    copy_ok = FALSE;
++                                }
++                                __ENDTRY
++                                if (copy_ok && dd >= 2)
++                                {
++                                    direct_sh->width = desc.Width;
++                                    direct_sh->height = desc.Height;
++                                    InterlockedIncrement(&direct_sh->seq);
++                                    if (!p->t_first_deliver)
++                                    {
++                                        p->t_first_deliver = TRUE;
++                                        ERR("neutron-time: sc=%p host=%p FIRST-DELIVER(direct) tick=%llu dd=%d\n",
++                                            swapchain, hwnd, GetTickCount64(), dd);
++                                    }
++                                }
++                                have_pixels = copy_ok;
++                            }
++                            else if ((packed = malloc((SIZE_T)desc.Width * 4 * desc.Height)))
+                             {
+                                 /* volatile: its post-__TRY value must survive a fault */
+                                 volatile BOOL copy_ok = TRUE;
+@@ -562,7 +685,12 @@
+         goto done;
+     }
+ 
+-    if (packed && p->cross_proc)
++    if (direct_used)
++    {
++        /* Already delivered (or deliberately withheld as a blank rotation) straight from
++         * the mapped staging -- nothing further to copy. */
++    }
++    else if (packed && p->cross_proc)
+     {
+         /* NEUTRON cross-process CEP panel: hand the pixels to the owner process via shared memory;
+          * winewayland's consumer thread (owner-side) blits + flushes them. See struct neutron_px_shbuf. */
