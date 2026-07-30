@@ -7,10 +7,15 @@
 # Note that a name like "neutron-winewayland-zzz-*" would NOT work: '-' (0x2d) sorts
 # before '.' (0x2e), so it would land before neutron-winewayland.mypatch, not after.
 #
-# WHY: the producer used to write the frame in place while this side blitted straight out
-# of the same memory, so a blit could catch a half-written frame. Publishing directly from
-# the mapped GPU staging lengthened the write (~1 ms memcpy -> ~1.6 ms of strided rows) and
-# made it show up as visible flicker in the Captioneer panel.
+# WHY: the producer writes the frame while this side may be blitting straight out of the
+# same memory, so a blit can catch a half-written frame. That was true before AND after the
+# direct-publish patch; publishing from the mapped GPU staging merely lengthened the write
+# (~1 ms memcpy -> ~1.6 ms of strided rows) and so widened the window.
+#
+# ⚠️ This is a race fix on its own merits. It is NOT known to fix any reported symptom: the
+# "panel flicker" that prompted it turned out to be an animated caution symbol and a broken
+# Activate-button animation -- specific widgets, not torn frames -- which is unattributed
+# and may predate all of this. Do not cite this patch as fixing that.
 #
 # Now: two slots. Read `active` ONCE per blit -- a producer publishing mid-blit must not
 # make this side switch slots halfway. Anything other than 0/1 means a producer that

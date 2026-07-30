@@ -49,19 +49,28 @@
 # direct path and must still be published by the packed path -- keying on existence
 # silently dropped those frames. It is keyed on `direct_used` instead.
 #
-# ⚠️ FOLLOW-UP: THE FLICKER THIS CAUSED, AND THE REAL FIX (same day).
-# The direct publish worked -- dcomp's share of process copy traffic fell 22.7% -> 9.7%,
-# normalised for session length -- but the Captioneer panel FLICKERED. Mechanism: the
-# consumer blits straight out of the shared buffer, and the write went from one ~1 ms
-# 6.5 MB memcpy to ~1.6 ms of strided row copies, so a half-written frame got blitted far
-# more often. Tearing was ALWAYS possible there (the producer already overwrote the buffer
-# while the consumer could be reading); this widened the window enough to see it. Calling
-# it "not a new race" in the original note was true and beside the point.
+# ⚠️ FOLLOW-UP: THE SHARED BUFFER IS NOW DOUBLE-BUFFERED (same day).
+# Measured win first: dcomp's share of process copy traffic fell 22.7% -> 9.7%, normalised
+# for session length.
 #
-# So the shared buffer is now DOUBLE-BUFFERED: the producer fills the slot the consumer is
-# not reading and publishes the index atomically, which removes the tear entirely rather
-# than narrowing it -- strictly better than the behaviour that predated this patch. The
-# `reserved` header field becomes `active`, so only the pixel area grows (2 slots).
+# A "Captioneer panel flicker" was reported after the first run with this on, and the
+# first guess was tearing -- the consumer blits straight out of the shared buffer, and this
+# patch stretched the write from one ~1 ms 6.5 MB memcpy to ~1.6 ms of strided row copies,
+# so a half-written frame could be blitted more often.
+#
+# ⛔ THAT GUESS IS NOT SUPPORTED BY WHAT WAS ACTUALLY SEEN, and the write-up here originally
+# claimed it was. The reported symptom is NOT whole-panel tearing: it is an animated caution
+# symbol flickering and a broken UI animation when clicking Activate -- specific widgets
+# misbehaving, which is what CEF animation delivery looks like, not what a torn blit looks
+# like (that would be bands across the whole panel). The symptom has NOT been attributed,
+# has NOT been shown to be caused by this patch, and may well be pre-existing like the
+# Project-tab thumbnail flicker was. It is parked, not fixed.
+#
+# The double buffer is kept anyway, on its own merits: the producer really did overwrite
+# the shared buffer while the consumer could be blitting from it, both before and after
+# this patch. Two slots removes that race outright instead of narrowing it. That is a
+# correctness improvement -- it is NOT a fix for the reported flicker, and must not be
+# described as one.
 #
 # ⛔ THE CONSUMER MUST BE STAGED TOO -- neutron-zzz8-winewayland-pxdouble.mypatch. The
 # layout is duplicated in dlls/winewayland.drv/dllmain.c and both sides must agree. A new
