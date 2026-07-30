@@ -49,115 +49,18 @@
 # as the real mechanism; a statistic that never prints is not a measurement.
 diff --git a/dlls/dwrite/font.c b/dlls/dwrite/font.c
 index d33bc61c70e..4457568d5a3 100644
---- a/dlls/dwrite/font.c
-+++ b/dlls/dwrite/font.c
-@@ -29,6 +29,30 @@
- #include "unixlib.h"
- 
- WINE_DEFAULT_DEBUG_CHANNEL(dwrite);
-+WINE_DECLARE_DEBUG_CHANNEL(nglyph);
-+
-+/* NEUTRON: glyph-cache instrumentation + tunable size.
-+ * The size was argued for in the comment below and then never actually changed -- it stayed at
-+ * 32 KB. Rather than swap one guessed constant for another, make it tunable
-+ * (NEUTRON_DWRITE_GLYPH_CACHE_KB) and count hits/misses/evictions so the right value comes from
-+ * the measured working set. Counters are reported on the `nglyph` channel. */
-+static LONG neutron_glyph_hits, neutron_glyph_misses, neutron_glyph_evicts;
-+static LONG neutron_glyph_peak;
-+static LONG neutron_face_inits, neutron_face_clears;
-+
-+static size_t neutron_glyph_cache_max(void)
-+{
-+    static size_t v;
-+    if (!v)
-+    {
-+        char buf[16];
-+        DWORD n = GetEnvironmentVariableA("NEUTRON_DWRITE_GLYPH_CACHE_KB", buf, sizeof(buf));
-+        unsigned kb = (n && n < sizeof(buf)) ? (unsigned)atoi(buf) : 0;
-+        v = kb ? (size_t)kb * 1024 : 0x8000;   /* 32 KB = the historical default */
-+    }
-+    return v;
-+}
-+
- WINE_DECLARE_DEBUG_CHANNEL(dwrite_file);
- 
- #define MS_HEAD_TAG DWRITE_MAKE_OPENTYPE_TAG('h','e','a','d')
-@@ -99,6 +123,7 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
- 
-     if (!(e = wine_rb_get(&fontface->cache.tree, key)))
-     {
-+        InterlockedIncrement(&neutron_glyph_misses);
-         if (!(entry = calloc(1, sizeof(*entry)))) return NULL;
-         entry->key = *key;
-         list_init(&entry->mru);
-@@ -111,6 +136,7 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
-             fontface->cache.size -= (old_entry->bitmap_size + sizeof(*old_entry));
-             wine_rb_remove(&fontface->cache.tree, &old_entry->entry);
-             list_remove(&old_entry->mru);
-+            InterlockedIncrement(&neutron_glyph_evicts);
-             fontface_release_cache_entry(old_entry);
-         }
- 
-@@ -122,13 +148,22 @@ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fon
-         }
- 
-         fontface->cache.size += size;
-+        if ((LONG)fontface->cache.size > neutron_glyph_peak) neutron_glyph_peak = fontface->cache.size;
-     }
-     else
-+    {
-+        InterlockedIncrement(&neutron_glyph_hits);
-         entry = WINE_RB_ENTRY_VALUE(e, struct cache_entry, entry);
-+    }
- 
-     list_remove(&entry->mru);
-     list_add_head(&fontface->cache.mru, &entry->mru);
- 
-+    /* Report periodically. The first version defined neutron_glyph_report() and never called it,
-+     * so a size sweep produced no counters at all -- indistinguishable from "the size does not
-+     * matter". A statistic that never prints is not a measurement. */
-+    if (!((neutron_glyph_hits + neutron_glyph_misses) % 4096)) neutron_glyph_report();
-+
-     return entry;
- }
- 
-@@ -261,6 +296,16 @@ static int fontface_cache_compare(const void *k, const struct wine_rb_entry *e)
-     return memcmp(&key->m, &key2->m, sizeof(key->m));
- }
- 
-+void neutron_glyph_report(void)
-+{
-+    LONG h = neutron_glyph_hits, m = neutron_glyph_misses;
-+    if (!TRACE_ON(nglyph) || !(h + m)) return;
-+    TRACE_(nglyph)("neutron-glyph: hits=%ld misses=%ld (%ld%% hit) evictions=%ld peak=%ld KB cap=%u KB\n",
-+                   h, m, h * 100 / (h + m), neutron_glyph_evicts,
-+                   neutron_glyph_peak / 1024, (unsigned)(neutron_glyph_cache_max() / 1024));
-+    TRACE_(nglyph)("neutron-glyph: faces_created=%ld faces_cleared=%ld\n", neutron_face_inits, neutron_face_clears);
-+}
-+
- static void fontface_cache_init(struct dwrite_fontface *fontface)
- {
-     wine_rb_init(&fontface->cache.tree, fontface_cache_compare);
-@@ -274,11 +319,13 @@ static void fontface_cache_init(struct dwrite_fontface *fontface)
-      * re-rasterises them through FreeType every time. Measured: libfreetype was
-      * 12.2% of a saturated UI thread. A few MB is nothing next to the font data
-      * already resident and holds a realistic working set. */
--    fontface->cache.max_size = 0x8000;
-+    fontface->cache.max_size = neutron_glyph_cache_max();
-+    InterlockedIncrement(&neutron_face_inits);
- }
- 
- static void fontface_cache_clear(struct dwrite_fontface *fontface)
- {
-+    InterlockedIncrement(&neutron_face_clears);
-     struct cache_entry *entry, *entry2;
- 
-     LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &fontface->cache.mru, struct cache_entry, mru)
-diff --git a/dlls/dwrite/main.c b/dlls/dwrite/main.c
-index 7d5b222e6d7..78e164fa697 100644
+#
+# MEASURED IN PREMIERE (30 s zoom, GPU mode, one build A/B'd via NEUTRON_DWRITE_FACE_KEEPALIVE):
+#   fontfaces created  88,980 -> 5      (~3,000 faces/sec created while zooming)
+#   glyph cache misses 587,522 -> 424   (63% -> 99% hit)
+#   evictions               0 -> 0      peak 13 KB -> 17 KB of a 32 KB cap
+# User-confirmed the keepalive-OFF arm was 'a little choppier' (test was NOT blind --
+# corroboration, not proof; the counters are the evidence).
+# The synthetic benchmark understated the churn by 40x (2189 vs 88,980) -- it got the
+# mechanism right and the magnitude badly wrong. Confirm synthetics in the real app.
 --- a/dlls/dwrite/main.c
 +++ b/dlls/dwrite/main.c
-@@ -621,6 +621,9 @@ struct dwritefactory
+@@ -621,6 +621,9 @@
       * profile. Caching the parsed font here fixes that without touching any COM
       * refcount: caching the fontface itself would make the factory and its faces
       * reference each other and neither would ever be freed. */
@@ -167,7 +70,7 @@ index 7d5b222e6d7..78e164fa697 100644
      struct list font_objects;
      unsigned int font_object_count;
  
-@@ -635,6 +638,8 @@ static inline struct dwritefactory *impl_from_IDWriteFactory7(IDWriteFactory7 *i
+@@ -635,6 +638,8 @@
      return CONTAINING_RECORD(iface, struct dwritefactory, IDWriteFactory7_iface);
  }
  
@@ -176,7 +79,7 @@ index 7d5b222e6d7..78e164fa697 100644
  static void release_fontface_cache(struct list *fontfaces)
  {
      struct fontfacecached *fontface, *fontface2;
-@@ -672,6 +677,7 @@ static void release_dwritefactory(struct dwritefactory *factory)
+@@ -672,6 +677,7 @@
      EnterCriticalSection(&factory->cs);
      release_fontface_cache(&factory->localfontfaces);
      LeaveCriticalSection(&factory->cs);
@@ -184,7 +87,7 @@ index 7d5b222e6d7..78e164fa697 100644
      factory_release_font_objects(&factory->IDWriteFactory7_iface);
  
      LIST_FOR_EACH_ENTRY_SAFE(loader, loader2, &factory->collection_loaders, struct collectionloader, entry) {
-@@ -972,6 +978,90 @@ struct cached_font_object
+@@ -972,6 +978,106 @@
      void *key;
  };
  
@@ -216,11 +119,27 @@ index 7d5b222e6d7..78e164fa697 100644
 +    IDWriteFontFace5 *fontface;
 +};
 +
++/* Default ON -- this is a fix, not an experiment. The gate exists so a single build can be
++ * A/B'd inside one app session with counters on BOTH arms; comparing against a counter-less
++ * baseline would mean comparing measured numbers to remembered ones. */
++static BOOL factory_keepalive_enabled(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        DWORD n = GetEnvironmentVariableA("NEUTRON_DWRITE_FACE_KEEPALIVE", buf, sizeof(buf));
++        v = (n && n < sizeof(buf) && buf[0] == '0') ? 0 : 1;
++    }
++    return v;
++}
++
 +static void factory_keepalive_touch(struct dwritefactory *factory, IDWriteFontFace5 *fontface)
 +{
 +    struct neutron_keepalive *ka, *ka2, *evicted = NULL;
 +
 +    /* caller holds factory->cs */
++    if (!factory_keepalive_enabled()) return;
 +    LIST_FOR_EACH_ENTRY_SAFE(ka, ka2, &factory->fontface_keepalive, struct neutron_keepalive, entry)
 +    {
 +        if (ka->fontface != fontface) continue;
@@ -275,7 +194,7 @@ index 7d5b222e6d7..78e164fa697 100644
  static void release_cached_font_object(struct cached_font_object *cached)
  {
      struct release_font_object_params params = { cached->object };
-@@ -1128,6 +1218,7 @@ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * co
+@@ -1128,6 +1234,7 @@
                  WARN("Failed to get %s from fontface, hr %#lx.\n", debugstr_guid(riid), hr);
  
              TRACE("returning cached fontface %p\n", cached->fontface);
@@ -283,7 +202,7 @@ index 7d5b222e6d7..78e164fa697 100644
              break;
          }
      }
-@@ -1150,6 +1241,7 @@ struct fontfacecached *factory_cache_fontface(IDWriteFactory7 *iface, struct lis
+@@ -1150,6 +1257,7 @@
      cached->fontface = fontface;
      EnterCriticalSection(&factory->cs);
      list_add_tail(fontfaces, &cached->entry);
@@ -291,7 +210,7 @@ index 7d5b222e6d7..78e164fa697 100644
      LeaveCriticalSection(&factory->cs);
  
      return cached;
-@@ -2366,6 +2458,8 @@ static void init_dwritefactory(struct dwritefactory *factory, DWRITE_FACTORY_TYP
+@@ -2366,6 +2474,8 @@
      list_init(&factory->collection_loaders);
      list_init(&factory->file_loaders);
      list_init(&factory->localfontfaces);
@@ -300,3 +219,107 @@ index 7d5b222e6d7..78e164fa697 100644
      list_init(&factory->font_objects);
  
      InitializeCriticalSectionEx(&factory->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -29,6 +29,30 @@
+ #include "unixlib.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dwrite);
++WINE_DECLARE_DEBUG_CHANNEL(nglyph);
++
++/* NEUTRON: glyph-cache instrumentation + tunable size.
++ * The size was argued for in the comment below and then never actually changed -- it stayed at
++ * 32 KB. Rather than swap one guessed constant for another, make it tunable
++ * (NEUTRON_DWRITE_GLYPH_CACHE_KB) and count hits/misses/evictions so the right value comes from
++ * the measured working set. Counters are reported on the `nglyph` channel. */
++static LONG neutron_glyph_hits, neutron_glyph_misses, neutron_glyph_evicts;
++static LONG neutron_glyph_peak;
++static LONG neutron_face_inits, neutron_face_clears;
++
++static size_t neutron_glyph_cache_max(void)
++{
++    static size_t v;
++    if (!v)
++    {
++        char buf[16];
++        DWORD n = GetEnvironmentVariableA("NEUTRON_DWRITE_GLYPH_CACHE_KB", buf, sizeof(buf));
++        unsigned kb = (n && n < sizeof(buf)) ? (unsigned)atoi(buf) : 0;
++        v = kb ? (size_t)kb * 1024 : 0x8000;   /* 32 KB = the historical default */
++    }
++    return v;
++}
++
+ WINE_DECLARE_DEBUG_CHANNEL(dwrite_file);
+ 
+ #define MS_HEAD_TAG DWRITE_MAKE_OPENTYPE_TAG('h','e','a','d')
+@@ -99,6 +123,7 @@
+ 
+     if (!(e = wine_rb_get(&fontface->cache.tree, key)))
+     {
++        InterlockedIncrement(&neutron_glyph_misses);
+         if (!(entry = calloc(1, sizeof(*entry)))) return NULL;
+         entry->key = *key;
+         list_init(&entry->mru);
+@@ -111,6 +136,7 @@
+             fontface->cache.size -= (old_entry->bitmap_size + sizeof(*old_entry));
+             wine_rb_remove(&fontface->cache.tree, &old_entry->entry);
+             list_remove(&old_entry->mru);
++            InterlockedIncrement(&neutron_glyph_evicts);
+             fontface_release_cache_entry(old_entry);
+         }
+ 
+@@ -122,13 +148,22 @@
+         }
+ 
+         fontface->cache.size += size;
++        if ((LONG)fontface->cache.size > neutron_glyph_peak) neutron_glyph_peak = fontface->cache.size;
+     }
+     else
++    {
++        InterlockedIncrement(&neutron_glyph_hits);
+         entry = WINE_RB_ENTRY_VALUE(e, struct cache_entry, entry);
++    }
+ 
+     list_remove(&entry->mru);
+     list_add_head(&fontface->cache.mru, &entry->mru);
+ 
++    /* Report periodically. The first version defined neutron_glyph_report() and never called it,
++     * so a size sweep produced no counters at all -- indistinguishable from "the size does not
++     * matter". A statistic that never prints is not a measurement. */
++    if (!((neutron_glyph_hits + neutron_glyph_misses) % 4096)) neutron_glyph_report();
++
+     return entry;
+ }
+ 
+@@ -261,6 +296,16 @@
+     return memcmp(&key->m, &key2->m, sizeof(key->m));
+ }
+ 
++void neutron_glyph_report(void)
++{
++    LONG h = neutron_glyph_hits, m = neutron_glyph_misses;
++    if (!TRACE_ON(nglyph) || !(h + m)) return;
++    TRACE_(nglyph)("neutron-glyph: hits=%ld misses=%ld (%ld%% hit) evictions=%ld peak=%ld KB cap=%u KB\n",
++                   h, m, h * 100 / (h + m), neutron_glyph_evicts,
++                   neutron_glyph_peak / 1024, (unsigned)(neutron_glyph_cache_max() / 1024));
++    TRACE_(nglyph)("neutron-glyph: faces_created=%ld faces_cleared=%ld\n", neutron_face_inits, neutron_face_clears);
++}
++
+ static void fontface_cache_init(struct dwrite_fontface *fontface)
+ {
+     wine_rb_init(&fontface->cache.tree, fontface_cache_compare);
+@@ -274,11 +319,13 @@
+      * re-rasterises them through FreeType every time. Measured: libfreetype was
+      * 12.2% of a saturated UI thread. A few MB is nothing next to the font data
+      * already resident and holds a realistic working set. */
+-    fontface->cache.max_size = 0x8000;
++    fontface->cache.max_size = neutron_glyph_cache_max();
++    InterlockedIncrement(&neutron_face_inits);
+ }
+ 
+ static void fontface_cache_clear(struct dwrite_fontface *fontface)
+ {
++    InterlockedIncrement(&neutron_face_clears);
+     struct cache_entry *entry, *entry2;
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(entry, entry2, &fontface->cache.mru, struct cache_entry, mru)
