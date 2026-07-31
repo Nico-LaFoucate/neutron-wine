@@ -1,0 +1,115 @@
+# neutron-wicupload-probe  (DIAGNOSTIC -- INCLUDE_DIAGNOSTIC=1 only)
+#
+# Counts both ends of the CreateBitmapFromMemory -> CreateBitmapFromWicBitmap path so the
+# question "is the next perf target real?" can be answered before building anything.
+# Inert unless WINEDEBUG=+nwicgpu.
+#
+# ⛔ IT ANSWERED "NO" — KEEP THIS PATCH SO THE ANSWER STAYS REPRODUCIBLE.
+# Measured 2026-07-31, one 30 s Premiere timeline-zoom session:
+#     CreateBitmapFromMemory   27,136 calls / 16,180 MB
+#     reaching d2d upload      10,752 calls /  2,647 MB   (wine-sourced 100%, foreign 5)
+#     => only 16% of the traffic, and the fix would remove ONE of that slice's two copies
+#        (~2.6 GB of ~95 GB total, under 3%).
+#
+# So `CreateBitmapFromMemory` being the largest line in the copy attribution did NOT mean
+# the second copy was worth removing: 84% of those bytes are consumed somewhere OTHER than
+# the d2d upload path. A complete, reviewed design (INeutronWicCpuPixels — d2d1 borrowing
+# the WIC bitmap's buffer under its read lock) was discarded on this evidence rather than
+# built and discovered later.
+#
+# NOTE the counts vs bytes disagree: 40% of the bitmaps by COUNT reach d2d upload but only
+# 16% by BYTES, so the ones that do are well below average size. Whatever consumes the
+# other 13.5 GB handles the BIG bitmaps -- that is where to look next.
+--- a/dlls/d2d1/bitmap.c
++++ b/dlls/d2d1/bitmap.c
+@@ -18,8 +18,51 @@
+ 
+ #include "d2d1_private.h"
+ #include "wincodec.h"
++#include "wine/neutron_wicgpu.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
++WINE_DECLARE_DEBUG_CHANNEL(nwicgpu);
++
++/* ---- NEUTRON WIC-UPLOAD PROBE (WINEDEBUG=+nwicgpu) --------------------------
++ * `CreateBitmapFromMemory` is the largest single line in the copy attribution (37.6 GB of
++ * 95.5 GB per 30 s zoom). Its own copy is API-mandated -- Windows does it too -- so the only
++ * removable one is the SECOND hop here: a zero-filled ~881 KB intermediate plus a CopyPixels
++ * into it, purely to satisfy CopyPixels' destination-buffer signature.
++ *
++ * ⛔ THAT SECOND COPY IS NOT VISIBLE IN THE ATTRIBUTION. It should appear as
++ * `windowscodecs!copy_pixels`, and that line is only 3.8 GB -- two orders off the 37.6 GB
++ * motivating the work. So the bitmaps may be consumed somewhere else entirely. Four
++ * "obvious" targets on this project already died at exactly this step, so MEASURE before
++ * building anything.
++ *
++ * wine vs foreign: only Wine's own BitmapImpl answers IID_INeutronWicGpuBitmap, and the
++ * proposed fast path can only ever apply to those. */
++static LONG nwu_calls, nwu_wine, nwu_foreign;
++static LONG64 nwu_bytes;
++
++static void neutron_wicupload_probe(IWICBitmapSource *source, UINT64 bytes)
++{
++    IUnknown *impl;
++    LONG n;
++
++    if (!TRACE_ON(nwicgpu)) return;
++
++    n = InterlockedIncrement(&nwu_calls);
++    InterlockedExchangeAdd64(&nwu_bytes, (LONG64)bytes);
++    if (SUCCEEDED(IWICBitmapSource_QueryInterface(source, &IID_INeutronWicGpuBitmap, (void **)&impl)))
++    {
++        InterlockedIncrement(&nwu_wine);
++        IUnknown_Release(impl);
++    }
++    else
++        InterlockedIncrement(&nwu_foreign);
++
++    /* Powers of two, then every 512 -- a plain modulo prints nothing on a short run, which
++     * reads identically to "the path never executed". */
++    if (n > 8 && (n & (n - 1)) && n % 512) return;
++    TRACE_(nwicgpu)("neutron-wicupload: calls=%ld wine=%ld foreign=%ld MB=%d\n",
++            nwu_calls, nwu_wine, nwu_foreign, (int)(nwu_bytes >> 20));
++}
+ 
+ static inline struct d2d_bitmap *impl_from_ID2D1Bitmap1(ID2D1Bitmap1 *iface)
+ {
+@@ -797,6 +840,7 @@
+     rect.Y = 0;
+     rect.Width = size.width;
+     rect.Height = size.height;
++    neutron_wicupload_probe(bitmap_source, (UINT64)size.height * pitch);
+     if (FAILED(hr = IWICBitmapSource_CopyPixels(bitmap_source, &rect, pitch, data_size, data)))
+     {
+         WARN("Failed to copy bitmap pixels, hr %#lx.\n", hr);
+--- a/dlls/windowscodecs/imgfactory.c
++++ b/dlls/windowscodecs/imgfactory.c
+@@ -33,6 +33,13 @@
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wincodecs);
++WINE_DECLARE_DEBUG_CHANNEL(nwicgpu);
++
++/* NEUTRON WIC-UPLOAD PROBE: the session anchor. Pairs with the d2d1-side counter so both
++ * numbers come from the same run -- comparing against a figure written down on another day
++ * is how machine load gets mistaken for a result. */
++static LONG nwu_cbm_calls;
++static LONG64 nwu_cbm_bytes;
+ 
+ typedef struct {
+     IWICImagingFactory2 IWICImagingFactory2_iface;
+@@ -650,6 +657,14 @@
+ 
+             IWICBitmapLock_GetDataPointer(lock, &buffersize, &data);
+             memcpy(data, buffer, buffersize);
++            if (TRACE_ON(nwicgpu))
++            {
++                LONG n = InterlockedIncrement(&nwu_cbm_calls);
++                InterlockedExchangeAdd64(&nwu_cbm_bytes, (LONG64)buffersize);
++                if (n <= 8 || !(n & (n - 1)) || !(n % 512))
++                    TRACE_(nwicgpu)("neutron-wicupload: CBM calls=%ld MB=%d\n",
++                            nwu_cbm_calls, (int)(nwu_cbm_bytes >> 20));
++            }
+ 
+             IWICBitmapLock_Release(lock);
+         }
