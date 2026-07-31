@@ -1,7 +1,19 @@
-# neutron-dcomp-zzz2-direct-publish  (env NEUTRON_DCOMP_DIRECT=1 -- OFF BY DEFAULT)
+# neutron-dcomp-zzzz-direct-publish  (env NEUTRON_DCOMP_DIRECT=1 -- OFF BY DEFAULT)
 #
-# ORDERING: zzz2 -- applies AFTER neutron-dcomp-zzz-d2dui-bridge, whose code it edits.
-# wine-tkg applies *.mypatch alphabetically and "zzz2" sorts after "zzz-". Do not rename.
+# ORDERING: "zzzz" -- applies AFTER neutron-dcomp-zzz-d2dui-bridge, whose code it edits.
+#
+# ⛔ THIS WAS NAMED "zzz2" AND THAT WAS WRONG. It cost a build. "zzz2" sorts after "zzz-"
+# in ASCII/C collation ('-'=0x2d < '2'=0x32) but wine-tkg enumerates userpatches under the
+# SYSTEM LOCALE, which ignores punctuation at the primary level -- so it compared "zzz2..."
+# against "zzzd2dui..." and '2' sorts before 'd'. This patch therefore applied BEFORE the
+# bridge whose code it edits.
+#
+# What made it dangerous rather than merely broken: only hunk 3 FAILED. Hunks 1,2,4,5,6,7
+# "succeeded" with fuzz 1-2 at offsets of -89 to -163 lines against the wrong base. A
+# slightly luckier misapply would have produced a silently corrupted build.
+#
+# "zzzz" sorts last under BOTH collations. Verify any rename with
+# preserved-fixes/harnesses/check-patch-order.py, which fails on exactly this class.
 #
 # WHAT IT FIXES
 #   The cross-process CEP panel path copied every frame TWICE: the strided GPU staging was
@@ -188,10 +200,10 @@
  static void blit_swapchain_to_hwnd(struct presentation *p)
  {
      /* NEUTRON DIAG: log entry once per (hwnd,cross_proc) — proves whether blit is
-@@ -385,6 +468,11 @@
+@@ -383,6 +466,11 @@
+     LONG n;
+     BOOL diag;
      BOOL mt_entered = FALSE, have_pixels = FALSE;
-     /* NEUTRON DIRECT PUBLISH: set when the frame went straight from the mapped staging
-      * into the shared buffer, so the cross-proc block below has nothing left to do. */
 +    /* direct_used, NOT (direct_sh != NULL): the direct branch is also skipped for a frame
 +     * larger than the shared buffer, and that frame must still be published by the packed
 +     * path below. Keying the skip on direct_sh alone silently dropped those frames. */
@@ -200,7 +212,7 @@
  
      n = InterlockedIncrement(&diag_n);
      diag = (n % 120 == 1);
-@@ -445,6 +533,10 @@
+@@ -443,6 +531,10 @@
                  }
              }
  
@@ -211,7 +223,7 @@
              if (FAILED(hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&backbuffer)))
              {
                  if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
-@@ -494,7 +586,58 @@
+@@ -492,7 +584,58 @@
                          }
                          else
                          {
@@ -271,7 +283,7 @@
                              {
                                  /* volatile: its post-__TRY value must survive a fault */
                                  volatile BOOL copy_ok = TRUE;
-@@ -562,7 +705,12 @@
+@@ -560,7 +703,12 @@
          goto done;
      }
  
@@ -285,7 +297,7 @@
      {
          /* NEUTRON cross-process CEP panel: hand the pixels to the owner process via shared memory;
           * winewayland's consumer thread (owner-side) blits + flushes them. See struct neutron_px_shbuf. */
-@@ -649,7 +797,9 @@
+@@ -647,7 +795,9 @@
                  {
                      sh->width = desc.Width;
                      sh->height = desc.Height;

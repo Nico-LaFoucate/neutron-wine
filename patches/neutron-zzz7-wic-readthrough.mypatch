@@ -194,28 +194,10 @@ diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
 index 9c78aaf92e2..cb227dd80d5 100644
 --- a/dlls/d2d1/d2d1_private.h
 +++ b/dlls/d2d1/d2d1_private.h
-@@ -745,14 +1241,102 @@ struct d2d_factory
+@@ -1259,9 +1259,70 @@
  
-     CRITICAL_SECTION cs;
-     D2D1_FACTORY_TYPE factory_type;
-+    /* NEUTRON WIC RENDER-TARGET POOL: Premiere creates ~29 WIC bitmap render
-+     * targets PER FRAME and releases them again -- 4.78ms/frame in creation
-+     * alone, and each one also brings its own EndDraw GPU round trip (7.25ms
-+     * more), together 20% of a 59ms frame. Creating one costs ~167us: a device
-+     * context init (~65-88us), a CPU-readable STAGING texture whose cost scales
-+     * with area (15-76us), plus the D3D texture and DXGI surface. None of that
-+     * depends on WHICH IWICBitmap is wrapped -- only on size and format -- so a
-+     * released target is kept here and handed back to the next request of the
-+     * same shape, with its drawing state reset. */
-+    /* NEUTRON BATCHED DEVICE-CONTEXT STATE: which render target's ID3DDeviceContextState
-+     * is currently installed on the shared immediate context, and the state that was
-+     * installed before d2d first took over. Guarded by cs (the same lock the draw path
-+     * already takes). See d2d_device_context_install_state(). */
-+    ID3DDeviceContextState *d3d_current_state;
-+    ID3DDeviceContextState *d3d_app_state;
-+
-+    struct list wic_rt_pool;
-+    unsigned int wic_rt_pool_size;
+     struct list wic_rt_pool;
+     unsigned int wic_rt_pool_size;
 +
 +    /* NEUTRON WIC READ-THROUGH (env NEUTRON_WIC_READTHROUGH=1): rather than downloading
 +     * a rendered bitmap into WIC memory and letting the app copy it out again, present()
@@ -237,7 +219,7 @@ index 9c78aaf92e2..cb227dd80d5 100644
 +    SIZE_T wic_gpu_outstanding_bytes;
  };
  
-+#define D2D_WIC_RT_POOL_MAX 24
+ #define D2D_WIC_RT_POOL_MAX 24
 +/* An attached mapping is released when the bitmap is redrawn or destroyed -- NOT when it
 + * is read. So the outstanding set is the number of LIVE render-target bitmaps, not the
 + * number waiting to be read, and Premiere keeps far more of those alive than the first
@@ -280,41 +262,34 @@ index 9c78aaf92e2..cb227dd80d5 100644
 +    }
 +    return v;
 +}
-+
+ 
  static inline struct d2d_factory *unsafe_impl_from_ID2D1Factory(ID2D1Factory *iface)
  {
-     return CONTAINING_RECORD(iface, struct d2d_factory, ID2D1Factory7_iface);
- }
- 
- void d2d_effects_init_builtins(struct d2d_factory *factory);
-+/* NEUTRON WIC RENDER-TARGET POOL */
-+struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
-+        IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
-+void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory);
+@@ -1273,6 +1334,8 @@
+ struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
+         IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
+ void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory);
 +/* NEUTRON WIC READ-THROUGH: unmap and release everything still queued or pooled. */
 +void d2d_factory_drain_wic_gpu(struct d2d_factory *factory);
-+void d2d_device_context_release_state(struct d2d_device_context *context);
+ void d2d_device_context_release_state(struct d2d_device_context *context);
  HRESULT d2d_factory_create_device(ID2D1Factory1 *factory, IDXGIDevice *dxgi_device,
          bool allow_get_dxgi_device, REFIID iid, void **device);
- struct d2d_effect_registration * d2d_factory_get_registered_effect(ID2D1Factory *factory,
 diff --git a/dlls/d2d1/factory.c b/dlls/d2d1/factory.c
 index 80c147638cd..b7439f6ec3c 100644
 --- a/dlls/d2d1/factory.c
 +++ b/dlls/d2d1/factory.c
-@@ -156,6 +159,8 @@ static ULONG STDMETHODCALLTYPE d2d_factory_Release(ID2D1Factory7 *iface)
-         {
+@@ -160,6 +160,7 @@
              d2d_effect_registration_cleanup(reg);
          }
-+        d2d_factory_drain_wic_rt_pool(factory);   /* NEUTRON WIC RT POOL */
+         d2d_factory_drain_wic_rt_pool(factory);   /* NEUTRON WIC RT POOL */
 +        d2d_factory_drain_wic_gpu(factory);       /* NEUTRON WIC READ-THROUGH */
          DeleteCriticalSection(&factory->cs);
          free(factory);
      }
-@@ -1360,6 +1463,11 @@ static void d2d_factory_init(struct d2d_factory *factory, D2D1_FACTORY_TYPE fact
-     factory->refcount = 1;
+@@ -1463,6 +1464,10 @@
      d2d_factory_reload_sysmetrics(factory);
      list_init(&factory->effects);
-+    list_init(&factory->wic_rt_pool);   /* NEUTRON WIC RT POOL */
+     list_init(&factory->wic_rt_pool);   /* NEUTRON WIC RT POOL */
 +    list_init(&factory->wic_gpu_recycle);    /* NEUTRON WIC READ-THROUGH */
 +    list_init(&factory->wic_staging_pool);
 +    factory->wic_staging_pool_size = 0;

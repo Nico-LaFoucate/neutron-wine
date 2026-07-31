@@ -36,6 +36,22 @@ if [ "${INCLUDE_DIAGNOSTIC:-0}" = "1" ]; then
     cp "$REPO"/patches/diagnostic/*.mypatch "$TKGDIR/wine-tkg-userpatches/"
 fi
 
+# 3a. GATE: verify patch ORDERING before spending a build on it.
+# wine-tkg applies userpatches in the SYSTEM LOCALE's collation, which ignores punctuation
+# at the primary level -- so "zzz2-" sorts BEFORE "zzz-" even though ASCII says otherwise.
+# That cost a build on 2026-07-30, and it failed dangerously: only one hunk errored while
+# the rest applied with fuzz at offsets of -89..-163 lines against the wrong base. A
+# luckier misapply would have built silently-wrong binaries.
+ORDER_CHECK="$HOME/neutron/preserved-fixes/harnesses/check-patch-order.py"
+if [ -f "$ORDER_CHECK" ]; then
+    if ! python3 "$ORDER_CHECK" "$REPO/patches"; then
+        echo "build.sh: patch ordering check FAILED -- fix the names before building." >&2
+        exit 3
+    fi
+else
+    echo "build.sh: WARNING -- $ORDER_CHECK not found, ordering unverified" >&2
+fi
+
 # 3b. Force non-interactive userpatch application. The default-tkg preset sources BOTH
 # customization.cfg AND wine-tkg-profiles/advanced-customization.cfg, and the latter is
 # sourced LAST and defaults _user_patches_no_confirm="false" — which overrides our
