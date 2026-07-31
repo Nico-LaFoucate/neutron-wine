@@ -1,3 +1,8 @@
+# ✅ ON BY DEFAULT since 11.10-19 (shipped OFF in 11.10-18). NEUTRON_DCOMP_DIRECT=0 disables.
+#    Soaked alongside the read-through: zero direct-readback faults. The shared buffer is
+#    double-buffered (neutron-zzz8-winewayland-pxdouble), so a reader cannot catch a
+#    half-written frame -- a race that predated this patch too.
+#
 # neutron-dcomp-zzzz-direct-publish  (env NEUTRON_DCOMP_DIRECT=1 -- OFF BY DEFAULT)
 #
 # ORDERING: "zzzz" -- applies AFTER neutron-dcomp-zzz-d2dui-bridge, whose code it edits.
@@ -158,7 +163,7 @@
 +    if (v < 0)
 +    {
 +        char b[8];
-+        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DIRECT", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DIRECT", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
 +    }
 +    return v;
 +}

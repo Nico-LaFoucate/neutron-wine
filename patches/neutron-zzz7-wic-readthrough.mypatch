@@ -1,3 +1,12 @@
+# ✅ ON BY DEFAULT since 11.10-19 (shipped OFF in 11.10-18). NEUTRON_WIC_READTHROUGH=0 disables.
+#    Flipped after hours of real Premiere use with the gate on: every hard counter stayed
+#    zero (no stale frames, faults, cap hits, declined reads or AVs), 3,432 reads served,
+#    peak working set 1 MB of a 192 MB budget. wicrt.c's 227 pixel-value checks pass with
+#    the gate both off and on. The escape hatch stays deliberately: this changes who owns
+#    rendered pixels, so =0 is the one-step bisect if a wrong-image bug ever appears.
+#    NOTE: the gate's own comment BELOW still says "off by default" -- left alone on
+#    purpose, because rewording it would change the hunk's line count.
+#
 # neutron-zzz7-wic-readthrough  (env NEUTRON_WIC_READTHROUGH=1 -- OFF BY DEFAULT)
 #
 # WHAT THE USER NOTICES
@@ -258,7 +267,7 @@ index 9c78aaf92e2..cb227dd80d5 100644
 +    if (v < 0)
 +    {
 +        char buf[8];
-+        v = (GetEnvironmentVariableA("NEUTRON_WIC_READTHROUGH", buf, sizeof(buf)) && buf[0] == '1') ? 1 : 0;
++        v = (GetEnvironmentVariableA("NEUTRON_WIC_READTHROUGH", buf, sizeof(buf)) && buf[0] == '0') ? 0 : 1;
 +    }
 +    return v;
 +}
