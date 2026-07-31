@@ -1,0 +1,73 @@
+EndDraw must not fail for an ID2D1CommandList target.
+
+WHAT THE USER SEES: in After Effects 2025, Composition > New Composition pops
+"direct2d drawbot error. HRESULT: -2147467263" and no composition is created.
+The app is otherwise usable, so this blocks the single most important action in it.
+
+ROOT CAUSE: -2147467263 is 0x80004001 = E_NOTIMPL. AE's composition viewer draws by
+RECORDING into an ID2D1CommandList (the standard "record now, replay later" D2D
+pattern) rather than drawing straight to a render target. Wine's
+d2d_device_context_EndDraw refused that target type outright, so the viewer's very
+first draw failed and the drawbot gave up.
+
+THE FIX: a command-list target records rather than renders, so there is nothing to
+present at EndDraw -- it simply ends recording, and the app finalises the list with
+ID2D1CommandList::Close() (already implemented). Returning the accumulated error
+code, exactly as the normal path does, is the correct behaviour.
+
+MEASURED (2026-07-31, staged as a single dll on runtime 11.10-19, user-confirmed):
+  * New Composition SUCCEEDS -- the error dialog is gone;
+  * command-list use goes from 2 to 301 Close() calls in one session, i.e. AE
+    exercises the path hard once it is no longer blocked;
+  * the Composition panel changes from white to black, because AE's paint pipeline
+    now runs to completion instead of aborting partway.
+
+SCOPE -- READ BEFORE EXTENDING THIS: this patch is deliberately ONLY the EndDraw
+fix. A much larger companion change (an ID2D1CommandSink that replays a recorded
+list onto a device context, wiring up DrawImage, ~400 lines) was written and
+compile-tested, but instrumentation proved AE NEVER executes it: 48+ lists close in
+state OPEN with real content, yet there are ZERO Stream() calls, ZERO
+DrawImage-with-a-command-list, ZERO "Unhandled image" and ZERO "Only image brushes
+with bitmaps" -- AE records healthy lists and consumes them by no d2d path at all.
+Shipping unverified code in a release runtime is not worth the risk, so that work is
+parked, with its full measured result, in
+patches/unverified/README-d2d1-command-list.md. Do not resurrect it believing it
+fixes After Effects; it does not.
+
+STILL OPEN AFTER THIS (not caused by it): composition CONTENT does not render --
+shapes drawn into a comp are invisible and the panel is black. That is a separate
+bug and is NOT the command-list path.
+
+ORDERING: must apply AFTER neutron-zzz4-d2d1-batched-devicecontext-state, which adds
+the d2d_device_context_release_state() call used as leading context here. "zzz9"
+sorts after "zzz4" under the system locale's collation, which ignores punctuation
+(see preserved-fixes/harnesses/check-patch-order.py -- an earlier patch shipped
+against the wrong base because "zzz2-" collates BEFORE "zzz-").
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -3143,16 +3143,18 @@
+ 
+     d2d_device_context_release_state(context);
+ 
+-    if (context->target.type == D2D_TARGET_COMMAND_LIST)
+-    {
+-        FIXME("Unimplemented for command list target.\n");
+-        return E_NOTIMPL;
+-    }
+-
+     if (tag1)
+         *tag1 = context->error.tag1;
+     if (tag2)
+         *tag2 = context->error.tag2;
++
++    /* NEUTRON: a command-list target records rather than renders, so there is
++     * nothing to present -- ending the draw just ends recording, and the app
++     * finalises the list with ID2D1CommandList::Close(). This used to return
++     * E_NOTIMPL, which killed After Effects' composition viewer on its very
++     * first draw ("direct2d drawbot error. HRESULT: -2147467263"). */
++    if (context->target.type == D2D_TARGET_COMMAND_LIST)
++        return context->error.code;
+ 
+     if (context->ops && context->ops->device_context_present)
+     {

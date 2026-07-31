@@ -1,0 +1,101 @@
+dwrite: trailing whitespace must not cause a line to wrap.
+
+WHAT THE USER SEES: in Media Encoder and After Effects, UI titles render broken across
+several rows instead of inline -- "Frame Size" appears as "Frame" above "Size". It looks
+like a multi-word problem; it is not. SINGLE words break too ("Format", "Preset",
+"Status"), which is what finally pointed at the real trigger.
+
+ROOT CAUSE: every one of Adobe's labels ends in a TRAILING SPACE. The drawbot measures the
+label with IDWriteTextLayout::GetMetrics().width -- which by specification EXCLUDES trailing
+whitespace -- and then lays the string out at exactly that width. Wine's line breaker counted
+the trailing space toward the line width, so every such label overflowed by exactly the width
+of that space, and DWRITE_WORD_WRAPPING_WRAP rewound to the last break opportunity. That is
+why "Frame Size " became "Frame" / "Size " and "Format " became "Format" + a line holding
+only the space. DirectWrite carries both `width` and `widthIncludingTrailingWhitespace`
+precisely because trailing whitespace must not participate in this decision.
+
+THE FIX: keep accumulating `width` exactly as before and SNAPSHOT it into
+`width_no_trailing_ws` at each non-whitespace cluster; compare that in both overflow tests.
+
+⚠️ IT MUST BE A SNAPSHOT, NOT ARITHMETIC -- two earlier attempts failed on floating point,
+both caught only by the harness:
+  * deferring the additions (`width += trailing_ws + w`) RE-ASSOCIATES the sum -> 3 failures;
+  * subtracting afterwards (`width - trailing_ws`) is inexact, (a+b)-b != a -> 7 failures.
+Both shifted results by an ulp, which made strings whose natural width lands on a
+representable boundary wrap at their own width -- i.e. they reproduced the very bug being
+fixed, in fewer cases. A snapshot is the exact partial sum, bit-identical to what the old
+code compared, so text with NO trailing whitespace is provably unaffected.
+
+EVIDENCE:
+  * Traced from the app itself (`NEUTRON_DWRITE_LAYOUTTRACE=1`, preserved as
+    preserved-fixes/neutron-dwrite-layouttrace-diag.patch), which reported e.g.
+    `LINES layoutW=36.684 textW=36.684 lines=2 text=L"Format "` and
+    `LINES layoutW=55.152 textW=32.400 lines=2 text=L"Frame Size "`.
+  * Regression test preserved-fixes/harnesses/wrapinvariant.c: 17 strings (9 of them the
+    real trailing-space labels lifted verbatim from that trace) x 4 families x 5 sizes x 2
+    weights -> PASS, 0 violations, with the sanity leg (`natW-0.01` must still wrap) still
+    firing 680 times so the test can still fail.
+  * User-confirmed in Media Encoder: column headers render inline.
+
+⚠️ AN EARLIER RUN OF THAT HARNESS REPORTED "0 violations" WHILE BOTH APPS WERE VISIBLY
+BROKEN -- because none of its 8 strings had a trailing space. A harness only disproves what
+it actually exercises. The trailing-space strings are now in it permanently.
+
+This is a DirectWrite conformance bug, not an Adobe quirk: it affects any application that
+measures with `width` and then lays out at that value. Upstream-suitable.
+
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -2500,7 +2500,7 @@
+     DWRITE_WORD_WRAPPING wrap_mode = layout->format.wrapping;
+     UINT32 start_cluster, end_cluster, break_cluster;
+     UINT32 text_position = 0;
+-    float width, max_width;
++    float width, max_width, width_no_trailing_ws;
+     bool trims, wraps;
+     HRESULT hr = S_OK;
+ 
+@@ -2514,11 +2514,33 @@
+     while (remaining_clusters)
+     {
+         width = 0.0f;
++        width_no_trailing_ws = 0.0f;
+         for (end_cluster = start_cluster; end_cluster < layout->cluster_count; ++end_cluster)
+         {
+             if (layout->clustermetrics[end_cluster].isNewline) break;
++            /* NEUTRON: trailing whitespace must NOT count toward the line width when deciding
++             * to wrap. That is why DWRITE_TEXT_METRICS carries both `width` (excluding trailing
++             * whitespace) and `widthIncludingTrailingWhitespace`. Counting it here made a layout
++             * overflow on a space it was supposed to ignore:
++             *
++             *   Adobe's drawbot measures a label with GetMetrics().width -- which EXCLUDES the
++             *   trailing space -- then lays that string out at exactly that width. Every label
++             *   ending in a space therefore overflowed by the width of that space, and WRAP mode
++             *   rewound to the last break opportunity. "Format " became "Format" plus a second
++             *   line holding just the space; "Frame Size " became "Frame" / "Size ".
++             *
++             * `width` still accumulates EXACTLY as before -- same order, same associativity --
++             * and `width_no_trailing_ws` SNAPSHOTS it at the last non-whitespace cluster. It must
++             * be a snapshot, not arithmetic: deferring the additions re-associates the sum, and
++             * subtracting afterwards is inexact because (a+b)-b != a in binary floating point.
++             * Both were tried and both shifted results by an ulp, which made strings whose
++             * natural width lands on a representable boundary wrap at their own width -- the very
++             * bug being fixed. A snapshot is the exact partial sum, bit-identical to what the old
++             * code compared at that cluster, so text with no trailing whitespace is unaffected. */
+             width += layout->clustermetrics[end_cluster].width;
+-            if (wraps && width > max_width)
++            if (!layout->clustermetrics[end_cluster].isWhitespace)
++                width_no_trailing_ws = width;
++            if (wraps && width_no_trailing_ws > max_width)
+             {
+                 /* Do not consume cluster that caused overflow, while making sure
+                    some clusters are still consumed. */
+@@ -2532,7 +2554,7 @@
+         end_cluster = min(end_cluster, layout->cluster_count - 1);
+ 
+         /* Adjust end cluster for wrapping. */
+-        if (wraps && width > max_width)
++        if (wraps && width_no_trailing_ws > max_width)
+         {
+             /* Break position depends on the wrapping mode:
+ 
