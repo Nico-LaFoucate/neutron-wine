@@ -1,0 +1,1751 @@
+winewayland: capture the round-17..37 client-surface / present-path work.
+
+⛔ THIS IS A CAPTURE, NOT A SHIPPING DECISION. It lives in patches/unverified/, which
+build.sh does NOT read. Nothing changes until someone promotes it deliberately (see
+PROMOTION below).
+
+WHY IT EXISTS. On 2026-07-31 the SHIPPED 11.10-21 winewayland.so was compared against the dev
+build tree and found to contain NONE of this work -- verified on the release binary with a
+positive control (335 vs 151 `wayland` strings, so both reads were real):
+
+    feature                                    dev   shipped 11.10-21
+    NEUTRON_NATIVE_STACK (win32 z -> wl stack)   1          0
+    neutron_restack_apply                        1          0
+    NEUTRON_TRACE / NT-EV per-present trace    1/7          0
+
+An entire body of present-path engineering existed ONLY in ~/wine-tkg-git and was one
+`git clean` from being lost. That is the LEAKY EXPORT failure the project has been bitten by
+repeatedly (see wiki HOME.md), and this patch closes it.
+
+WHAT IT CARRIES (7 files, 35 hunks, ~1690 lines, all inside dlls/winewayland.drv):
+  * round-34 ABBA LOCK-ORDER FIX -- a real deadlock. wayland_client_surface_update() runs on
+    every vkQueuePresentKHR and took win_data_mutex, then called user-lock functions inside it,
+    while NtUserSetWindowPos held the user lock and waited on win_data_mutex. A present racing
+    a SetWindowPos wedged both threads (toy-repro'd + eu-stack-proven). The inversion exists in
+    STOCK upstream winewayland; games do not hit it (one swapchain, no window churn).
+    ⇒ This alone is worth shipping.
+  * round-35 NATIVE WIN32-Z-ORDER STACKING (`NEUTRON_NATIVE_STACK=1`) -- mirror the win32
+    hierarchy in the wl_subsurface stack so natively-presenting client surfaces are ordered
+    correctly instead of being suppressed.
+  * round-36 temporal suppression (`NEUTRON_TEMPORAL`), round-37 broad tracing
+    (`NEUTRON_TRACE`, the NT-EV per-present lines).
+  * round-17/18/21 suppress-set history: the `attach(NULL)` path that DESTROYS a subsurface and
+    orphans the wl_surface (present-wait then blocks forever -> DXVK CS backs up -> main thread
+    deadlocks), and the place-below alternative that avoids it.
+  * NEUTRON_WL_KEEPCLIENT (added 2026-07-31) -- do not destroy a client subsurface for a window
+    that is transiently invisible under a VISIBLE parent. Measured on After Effects: 373 of ~630
+    presents/session took the destructive branch. NOTE: this did NOT fix AE's blank composition
+    (see OPEN_ISSUES) and its parent-visible discriminator is too narrow -- 4-6 presents still
+    destroy the surface. Captured as-is; do not mistake it for a finished fix.
+
+GATES: every behaviour change is env-gated and OFF by default --
+  NEUTRON_NATIVE_STACK, NEUTRON_TEMPORAL, NEUTRON_TRACE, NEUTRON_WL_KEEPCLIENT,
+  NEUTRON_DCOMP_SUPPRESS_CLIENT, NEUTRON_WL_DIAG, NEUTRON_GDIPATH, NEUTRON_PM_FULLCOPY,
+  NEUTRON_RPC, NEUTRON_PROBE_X/Y.
+⚠️ "Env-gated" is a CLAIM UNTIL MEASURED. The round-34 lock-order fix in particular is
+structural and always-on by design. Verify default behaviour behaviourally before promoting.
+
+VERIFIED: generated against the PATCH-BUILT baseline (_work, all 54 patches applied) -- never by
+filtering a dev-tree diff, which is the trap that cost three builds. Applied to a pristine copy
+of that baseline it reproduces all 7 dev-tree files BYTE-IDENTICALLY (cmp clean), i.e. it
+rebuilds exactly the code that ran in every experiment this session.
+
+PROMOTION (do all of it, in order):
+  1. move to patches/ and run preserved-fixes/harnesses/check-patch-order.py;
+  2. cut a runtime and confirm it BUILDS (it touches unixlib.h/waylanddrv.h -- ABI surface);
+  3. smoke-test Premiere, Photoshop, Lightroom AND After Effects with every gate UNSET, and
+     confirm no behaviour change vs the previous runtime. The suite currently works without
+     this; regressing it would be a bad trade for code whose only proven win is a deadlock
+     that does not reproduce on demand.
+
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include "waylanddrv_dll.h"
++#include "unixlib.h"
+ 
+ #include "ntuser.h"
+ #include "winuser.h"
+@@ -259,5 +260,20 @@
+     /* NEUTRON: owner-side consumer for cross-process dcomp CEP panels (shared-memory pixel transport). */
+     CloseHandle(CreateThread(NULL, 0, neutron_present_consumer_thread, NULL, 0, &tid));
+ 
++    /* NEUTRON round-43 RPC: create/open the epoch control section (DXVK writes it
++     * on each GDI present) and hand its mapped VA to the unix side (same address
++     * space) so the flush repair can read it Interlocked. */
++    {
++        static const WCHAR name[] = L"__neutron_rpc_epoch";
++        HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
++                                      sizeof(struct neutron_rpc_epoch), name);
++        if (h)
++        {
++            void *view = MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
++                                       sizeof(struct neutron_rpc_epoch));
++            if (view) WAYLANDDRV_UNIX_CALL(rpc_epoch, &view);
++        }
++    }
++
+     return TRUE;
+ }
+--- a/dlls/winewayland.drv/unixlib.h
++++ b/dlls/winewayland.drv/unixlib.h
+@@ -28,7 +28,28 @@
+     waylanddrv_unix_func_init,
+     waylanddrv_unix_func_read_events,
+     waylanddrv_unix_func_init_clipboard,
++    /* NEUTRON round-43: PE hands the mapped __neutron_rpc_epoch VA to unix
++     * (same address space); unix flush reads it Interlocked. arg = &(void*). */
++    waylanddrv_unix_func_rpc_epoch,
+     waylanddrv_unix_func_count,
+ };
+ 
++/* NEUTRON round-43 RPC transport (verified cross-module, in-tree precedent =
++ * the CEF __neutron_dcomp_px section): winewayland.drv exports nothing and is a
++ * USER driver (GDI ExtEscape does not reach it), so DXVK cannot call its unixlib
++ * directly. Instead DXVK's PresentImageGdi already StretchDIBits the panel band
++ * INTO the toplevel window surface (color_bits); winewayland fills each shadow
++ * FROM color_bits at flush time. DXVK only signals WHICH flush is a chain
++ * present via this tiny shared control section (named __neutron_rpc_epoch),
++ * mapped R/W by DXVK and R/O by winewayland. Interlocked-only; no lock crosses. */
++#define NEUTRON_RPC_EPOCH_NAME L"__neutron_rpc_epoch"
++#define NEUTRON_RPC_RING 512
++struct neutron_rpc_entry { LONG hwnd, bl, bt, br, bb; }; /* band in TOPLEVEL client coords */
++struct neutron_rpc_epoch
++{
++    volatile LONG head;       /* DXVK appends here (monotonic); winewayland drains */
++    volatile LONG video_l, video_t, video_r, video_b; /* canary: non-chain video rect */
++    struct neutron_rpc_entry ring[NEUTRON_RPC_RING];
++};
++
+ #endif /* __WINE_WAYLANDDRV_UNIXLIB_H */
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -75,6 +75,12 @@
+      * window thread repositions the Win32 window onto that output's monitor so per-monitor
+      * DPI applies. */
+     WM_WAYLAND_OUTPUT_CHANGE,
++    /* NEUTRON scalefix: the compositor's precise fractional scale for this window's surface
++     * changed without crossing an integer-dpi boundary (e.g. 0 -> 1.7000 on first delivery,
++     * while the dpi-derived fallback 163/96=1.6979 was already committed); the window thread
++     * re-derives conf->scale and re-commits the viewport so the window is sized with the
++     * exact compositor scale. */
++    WM_WAYLAND_SCALE_REFRESH,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -313,6 +319,9 @@
+ {
+     struct client_surface client;
+     HWND toplevel;
++    /* NEUTRON round-36 temporal suppression: monotonic ms of the last present
++     * (client_surface_update call) for this chain; 0 = never presented. */
++    ULONGLONG last_present_ms;
+     struct wl_surface *wl_surface;
+     /* The parent wl_surface the client subsurface is currently attached to.
+      * Tracked so we can reparent when the toplevel's wayland_surface (and thus
+@@ -320,6 +329,13 @@
+     struct wl_surface *toplevel_wl_surface;
+     struct wl_subsurface *wl_subsurface;
+     struct wp_viewport *wp_viewport;
++    /* NEUTRON GPU-D2D-UI: dcomp-bridge-managed windows keep their subsurface MAPPED
++     * (so the swapchain's Wayland WSI stays healthy — frame callbacks + buffer
++     * releases flow, so DXVK/VK_KHR_present_wait never wedges) but z-ordered BELOW the
++     * toplevel GDI content surface, so the black swapchain can't occlude the bridge's
++     * blitted UI. Replaces the round-17 attach(NULL) suppress that orphaned the surface
++     * (never mapped again -> no present feedback -> main thread deadlock mid-D2D). */
++    BOOL place_below;
+ };
+ 
+ struct wayland_shm_buffer
+@@ -413,6 +429,11 @@
+                                 HRGN surface_damage_region);
+ BOOL wayland_surface_reconfigure(struct wayland_surface *surface);
+ BOOL wayland_surface_can_reconfigure(struct wayland_surface *surface);
++/* NEUTRON scalefix#2: last precise fractional scale (scale*120 wire units, 0 = none)
++ * the compositor delivered to ANY surface this process. Read atomically. Lets surfaces
++ * that never received their own wp_fractional_scale.preferred event use the precise
++ * output scale (e.g. 1.7000) instead of the imprecise raw-dpi fallback (1.6979). */
++extern LONG neutron_last_precise_scale120;
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+                                           enum wayland_surface_config_state state);
+@@ -424,6 +445,12 @@
+                                       int *window_x, int *window_y);
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
++/* NEUTRON round-36 temporal suppression: record GDI damage flushed into a
++ * toplevel's window surface (coords = toplevel window-rect space). */
++void neutron_gdi_damage_record(HWND toplevel, const RECT *rect);
++/* NEUTRON round-43 RPC (retained panel composition) */
++void neutron_rpc_flush(HWND toplevel, void *bits, int stride_px, int surf_w, int surf_h, RECT dirty);
++void neutron_rpc_set_epoch(void *ptr);
+ void wayland_surface_ensure_contents(struct wayland_surface *surface);
+ void wayland_surface_set_title(struct wayland_surface *surface, LPCWSTR title);
+ void wayland_surface_assign_icon(struct wayland_surface *surface);
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -114,6 +114,14 @@
+     return STATUS_UNSUCCESSFUL;
+ }
+ 
++/* NEUTRON round-43: receive the mapped __neutron_rpc_epoch VA from the PE side. */
++void neutron_rpc_set_epoch(void *ptr);
++static NTSTATUS waylanddrv_unix_rpc_epoch(void *arg)
++{
++    neutron_rpc_set_epoch(arg ? *(void **)arg : NULL);
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS waylanddrv_unix_init_clipboard(void *arg)
+ {
+     /* If the compositor supports zwlr_data_control_manager_v1, we don't need
+@@ -128,6 +136,7 @@
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
++    waylanddrv_unix_rpc_epoch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
+@@ -139,6 +148,7 @@
+     waylanddrv_unix_init,
+     waylanddrv_unix_read_events,
+     waylanddrv_unix_init_clipboard,
++    waylanddrv_unix_rpc_epoch,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -29,6 +29,7 @@
+ #include <unistd.h>
+ 
+ #include "waylanddrv.h"
++#include "unixlib.h"
+ #include "wine/debug.h"
+ #include "wine/server.h"
+ 
+@@ -226,6 +227,10 @@
+  *
+  * Creates a role-less wayland surface.
+  */
++/* NEUTRON scalefix#2: see waylanddrv.h. Written here (wayland event thread), read in
++ * window.c wayland_win_data_get_config (window threads); a LONG is read/written atomically. */
++LONG neutron_last_precise_scale120 = 0;
++
+ static void fractional_scale_handle_preferred(void *data,
+                                               struct wp_fractional_scale_v1 *fs,
+                                               uint32_t scale)
+@@ -237,6 +242,13 @@
+     surface->preferred_scale = new_scale;
+     TRACE("hwnd=%p scale120=%u (%.4f)\n", surface->hwnd, scale, new_scale);
+ 
++    /* NEUTRON scalefix#2: remember the last precise scale the compositor gave ANY surface
++     * so surfaces that never receive their own preferred event (KWin only sends it to some)
++     * can adopt this output's exact scale instead of the imprecise raw-dpi fallback. Only
++     * cache plausible scales (derived dpi >= 48). */
++    if ((UINT)(new_scale * 96.0 + 0.5) >= 48)
++        InterlockedExchange(&neutron_last_precise_scale120, (LONG)scale);
++
+     /* NEUTRON per-monitor DPI (#2): the compositor's preferred fractional scale is the single
+      * authoritative, already-debounced signal for which output this surface is on — KWin resolves
+      * a multi-output straddle itself and sends ONE value only when the surface's predominant output
+@@ -248,8 +260,18 @@
+     {
+         UINT new_dpi = (UINT)(new_scale * 96.0 + 0.5);
+         UINT old_dpi = (UINT)(old_scale * 96.0 + 0.5);
++        double scale_delta = new_scale - old_scale;
++        if (scale_delta < 0.0) scale_delta = -scale_delta;
+         if (new_dpi >= 48 && new_dpi != old_dpi)
+             NtUserPostMessage(surface->hwnd, WM_WAYLAND_OUTPUT_CHANGE, (WPARAM)new_dpi, 0);
++        /* NEUTRON scalefix: when the precise fraction changes but the derived integer dpi does
++         * NOT (1.7000 vs the 163-dpi fallback 1.6979 both round to 163), nothing above fires and
++         * an idle (e.g. maximized) window keeps the slightly-too-large fallback viewport forever.
++         * Post a lightweight window-thread refresh that re-runs wayland_win_data_get_config and
++         * re-commits the viewport. It touches no win32u state, so it cannot feed back into dpi
++         * changes or relayout, and it is a no-op when the recomputed scale is unchanged. */
++        if (new_dpi >= 48 && scale_delta > 0.001)
++            NtUserPostMessage(surface->hwnd, WM_WAYLAND_SCALE_REFRESH, 0, 0);
+     }
+ }
+ 
+@@ -777,12 +799,16 @@
+  * The buffer is marked as unavailable until committed and subsequently
+  * released by the compositor.
+  */
++static BOOL wayland_surface_get_frame_spill_rect(struct wayland_surface *surface,
++                                                 RECT *rect);
++
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+                                 HRGN surface_damage_region)
+ {
+     RGNDATA *surface_damage;
+     int win_width, win_height;
++    RECT spill;
+ 
+     TRACE("surface=%p shm_buffer=%p (%dx%d)\n",
+           surface, shm_buffer, shm_buffer->width, shm_buffer->height);
+@@ -803,10 +829,17 @@
+ 
+         for (;rgn_rect < rgn_rect_end; rgn_rect++)
+         {
++            /* NEUTRON PM-TRAILS FIX: inflate each damage rect by 2 buffer pixels.
++             * The surface is presented through wp_viewport at a fractional scale
++             * (e.g. 1.693); the compositor transforms buffer damage into its own
++             * coordinate space and any inward rounding there can leave 1px-wide
++             * stale slivers at the edges of thin damage rects (Premiere's moving
++             * playhead marker). Over-damage is protocol-legal and the compositor
++             * clips it; cost is a few extra texture-upload pixels per rect. */
+             wl_surface_damage_buffer(surface->wl_surface,
+-                                     rgn_rect->left, rgn_rect->top,
+-                                     rgn_rect->right - rgn_rect->left,
+-                                     rgn_rect->bottom - rgn_rect->top);
++                                     rgn_rect->left - 2, rgn_rect->top - 2,
++                                     rgn_rect->right - rgn_rect->left + 4,
++                                     rgn_rect->bottom - rgn_rect->top + 4);
+         }
+         free(surface_damage);
+     }
+@@ -814,16 +847,41 @@
+     win_width = surface->window.rect.right - surface->window.rect.left;
+     win_height = surface->window.rect.bottom - surface->window.rect.top;
+ 
+-    /* It is an error to specify a wp_viewporter source rectangle that
+-     * is partially or completely outside of the wl_buffe.
+-     * 0 is also an invalid width / height value so use 1x1 instead.
+-     */
+-    win_width = max(1, min(win_width, shm_buffer->width));
+-    win_height = max(1, min(win_height, shm_buffer->height));
+-
+-    wp_viewport_set_source(surface->wp_viewport, 0, 0,
+-                           wl_fixed_from_int(win_width),
+-                           wl_fixed_from_int(win_height));
++    /* NEUTRON overhang fix: for a self-maximized toplevel that spills its frame
++     * off the monitor, sample only the in-monitor subregion of the buffer so the
++     * off-screen frame is never presented. Setting xdg geometry alone does not
++     * crop a normal-state surface (the compositor still composites pixels outside
++     * the geometry as client-side shadow); cropping the wp_viewport source does.
++     * win_width/win_height are left at the full window size so content_width/height
++     * below stays a change-detection cookie against the full window rect. */
++    if (wayland_surface_get_frame_spill_rect(surface, &spill))
++    {
++        int sx = spill.left, sy = spill.top;
++        int sw = spill.right - spill.left, sh = spill.bottom - spill.top;
++        /* It is an error to specify a wp_viewporter source rectangle that is
++         * partially or completely outside of the wl_buffer; clamp so it stays
++         * entirely within the buffer (and never 0-sized). */
++        sx = max(0, min(sx, shm_buffer->width - 1));
++        sy = max(0, min(sy, shm_buffer->height - 1));
++        sw = max(1, min(sw, shm_buffer->width - sx));
++        sh = max(1, min(sh, shm_buffer->height - sy));
++        wp_viewport_set_source(surface->wp_viewport,
++                               wl_fixed_from_int(sx), wl_fixed_from_int(sy),
++                               wl_fixed_from_int(sw), wl_fixed_from_int(sh));
++    }
++    else
++    {
++        /* It is an error to specify a wp_viewporter source rectangle that
++         * is partially or completely outside of the wl_buffe.
++         * 0 is also an invalid width / height value so use 1x1 instead.
++         */
++        win_width = max(1, min(win_width, shm_buffer->width));
++        win_height = max(1, min(win_height, shm_buffer->height));
++
++        wp_viewport_set_source(surface->wp_viewport, 0, 0,
++                               wl_fixed_from_int(win_width),
++                               wl_fixed_from_int(win_height));
++    }
+ 
+     surface->content_width = win_width;
+     surface->content_height = win_height;
+@@ -886,6 +944,64 @@
+     OffsetRect(rect, -surface->window.rect.left, -surface->window.rect.top);
+ }
+ 
++/* NEUTRON overhang fix: env-gated diagnostics (mirrors neutron_wl_diag in window.c). */
++static BOOL neutron_wl_surf_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_WL_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++/**********************************************************************
++ *          wayland_surface_get_frame_spill_rect
++ *
++ * NEUTRON overhang fix. Some apps (e.g. Adobe Premiere) "maximize" themselves
++ * WITHOUT setting WS_MAXIMIZE: they size a normal WS_THICKFRAME toplevel so its
++ * CLIENT area fills the monitor, which spills the ~5px non-client frame off every
++ * edge. On X11/Windows the WM clips the off-screen frame; winewayland commits the
++ * whole window as one surface and KWin cannot honor the negative toplevel offset,
++ * so the spilled frame shows as a right/bottom overhang.
++ *
++ * For a NORMAL-state (non-maximized, non-fullscreen) toplevel whose window rect
++ * genuinely EXCEEDS its monitor, returns TRUE and fills *rect with the in-monitor
++ * subregion in window-local (buffer-pixel) coordinates, so callers can crop the
++ * wp_viewport source (and shrink the destination/geometry) to just the visible
++ * content. Returns FALSE (leave untouched) for popups/subsurfaces, ordinary
++ * sub-monitor windows (and windows merely dragged partly off-screen), and real
++ * maximize/fullscreen (which already clip via wayland_surface_reconfigure_geometry).
++ */
++static BOOL wayland_surface_get_frame_spill_rect(struct wayland_surface *surface,
++                                                 RECT *rect)
++{
++    HMONITOR hmonitor;
++    MONITORINFO mi;
++    int win_w, win_h, mon_w, mon_h;
++
++    if (surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
++    if (surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
++                                  WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++        return FALSE;
++
++    mi.cbSize = sizeof(mi);
++    if (!(hmonitor = NtUserMonitorFromRect(&surface->window.rect, 0)) ||
++        !NtUserGetMonitorInfo(hmonitor, (MONITORINFO *)&mi))
++        return FALSE;
++
++    win_w = surface->window.rect.right - surface->window.rect.left;
++    win_h = surface->window.rect.bottom - surface->window.rect.top;
++    mon_w = mi.rcMonitor.right - mi.rcMonitor.left;
++    mon_h = mi.rcMonitor.bottom - mi.rcMonitor.top;
++
++    /* Only clip a window that genuinely exceeds its monitor in width or height.
++     * Ordinary sub-monitor floating windows/dialogs are left completely untouched. */
++    if (win_w <= mon_w && win_h <= mon_h) return FALSE;
++
++    intersect_rect(rect, &mi.rcMonitor, &surface->window.rect);
++    if (IsRectEmpty(rect)) return FALSE;
++    OffsetRect(rect, -surface->window.rect.left, -surface->window.rect.top);
++    return TRUE;
++}
++
+ /**********************************************************************
+  *          wayland_surface_reconfigure_geometry
+  *
+@@ -958,6 +1074,9 @@
+         wp_viewport_set_destination(surface->wp_viewport, -1, -1);
+ }
+ 
++static int neutron_native_stack(void); /* round-35 native stacking (defined below) */
++static int neutron_trace(void);        /* round-37 broad trace (defined below) */
++
+ /**********************************************************************
+  *          wayland_surface_reconfigure_client
+  *
+@@ -984,10 +1103,47 @@
+ 
+     TRACE("hwnd=%p subsurface=%d,%d+%dx%d\n", surface->hwnd, x, y, width, height);
+ 
++    /* NEUTRON round-37 broad trace: computed subsurface geometry per present --
++     * catches mis-positioned / 0x0->1x1 / offscreen subsurfaces that only
++     * become visible once a later WindowPosChanged corrects them (hover-to-see). */
++    if (neutron_trace())
++        ERR("NT-EV reconfig hwnd=%p pos=%d,%d size=%dx%d place=%s t=%u\n",
++            surface->hwnd, x, y, width, height,
++            client->place_below ? "below" : "above", (unsigned)NtGetTickCount());
++
+     if (client->wl_subsurface)
+     {
+         wl_subsurface_set_position(client->wl_subsurface, x, y);
+-        wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
++        /* NEUTRON: only place_above the surface we are actually parented to. If the
++         * window was reparented (toplevel changed) the subsurface's real parent is
++         * client->toplevel_wl_surface; passing a non-parent/non-sibling here makes the
++         * compositor raise wl_subsurface "incorrect sibling" (a FATAL protocol error
++         * that disconnects the client -> "Failed to read events -> terminating process"
++         * = the project-load crash). Placing above the confirmed parent is always
++         * valid; if it doesn't match, skip (attach will recreate it correctly). */
++        if (client->toplevel_wl_surface == surface->wl_surface)
++        {
++            /* NEUTRON round-35 NATIVE mode: subsurface ordering belongs EXCLUSIVELY to
++             * neutron_restack_apply (win32-z-order mirror). Re-placing here on every
++             * present would scramble the stack (each presenting surface drops to
++             * just-above-main, so the least-recently-presenting surface -- the idle
++             * BLACK container -- floats to the top) while the order cache then
++             * suppresses the repair. Skip all place_* here in native mode. */
++            if (neutron_native_stack())
++            {
++                /* position/viewport only; ordering handled by the stacker */
++            }
++            /* NEUTRON: dcomp-bridge-managed (suppressed) surfaces go BELOW the toplevel
++             * GDI content surface so their black swapchain can't occlude/flicker, while
++             * staying MAPPED so present-wait stays healthy. Everything else stays above. */
++            else if (client->place_below)
++                wl_subsurface_place_below(client->wl_subsurface, surface->wl_surface);
++            else
++                wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
++        }
++        else
++            ERR("neutron-wl: SKIP place_above(client) hwnd=%p parent-mismatch cur=%p attached=%p\n",
++                surface->hwnd, surface->wl_surface, client->toplevel_wl_surface);
+     }
+ 
+     if (width != 0 && height != 0)
+@@ -1072,7 +1228,16 @@
+         TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
+ 
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
+-        if (toplevel_data->client_surface)
++        /* NEUTRON: place above the toplevel's client (Vulkan) surface ONLY when that
++         * client surface is genuinely a SIBLING — i.e. currently attached to THIS
++         * toplevel's wl_surface. During a reparent (a D2D-UI child hidden+reparented
++         * on project load) the toplevel's client_surface can momentarily reference a
++         * different/old parent; place_above with a non-sibling raises the FATAL
++         * wl_subsurface "incorrect sibling" protocol error -> compositor disconnect ->
++         * process terminated (the project-load crash). Falling back to the parent
++         * (toplevel_surface->wl_surface) is always valid. */
++        if (toplevel_data->client_surface &&
++            toplevel_data->client_surface->toplevel_wl_surface == toplevel_surface->wl_surface)
+             wl_subsurface_place_above(surface->wl_subsurface, toplevel_data->client_surface->wl_surface);
+         else
+             wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
+@@ -1092,10 +1257,31 @@
+ {
+     struct wayland_window_config *window = &surface->window;
+     int win_width, win_height, width, height;
++    RECT spill;
+ 
+     win_width = surface->window.rect.right - surface->window.rect.left;
+     win_height = surface->window.rect.bottom - surface->window.rect.top;
+ 
++    /* NEUTRON overhang fix: a self-maximized toplevel whose frame spills off the
++     * monitor is presented cropped to its in-monitor subregion (the source crop
++     * itself lives in wayland_surface_attach_shm). Shrink the viewport destination
++     * and xdg geometry to that subregion's logical size so the visible content maps
++     * 1:1 onto the monitor instead of overhanging its right/bottom edge. */
++    if (wayland_surface_get_frame_spill_rect(surface, &spill))
++    {
++        win_width = spill.right - spill.left;
++        win_height = spill.bottom - spill.top;
++
++        if (neutron_wl_surf_diag())
++            ERR("neutron-overhang: hwnd=%p full=%dx%d clipped=%dx%d viewport-dest=%dx%d\n",
++                surface->hwnd,
++                (int)(surface->window.rect.right - surface->window.rect.left),
++                (int)(surface->window.rect.bottom - surface->window.rect.top),
++                win_width, win_height,
++                (int)round(win_width / surface->window.scale),
++                (int)round(win_height / surface->window.scale));
++    }
++
+     wayland_surface_coords_from_window(surface, win_width, win_height,
+                                        &width, &height);
+ 
+@@ -1497,21 +1683,786 @@
+ 
+ static unsigned neutron_dbg_n;
+ 
++static void wayland_client_surface_attach_rect(struct wayland_client_surface *client, HWND toplevel, const RECT *rect);
++
++/* ===================== NEUTRON round-35: NATIVE WIN32-Z-ORDER STACKING =====================
++ * The native-present pivot: every D2D-UI window's Vulkan client subsurface SHOWS its own
++ * content; the only fix needed is ordering. Mirror the win32 hierarchy in the wl_subsurface
++ * stack: toplevel's own client surface at the bottom (or below the GDI surface when it is a
++ * black container / CEF host), children above their parents, siblings in win32 z-order
++ * (z-order data round-34: every BLACK container has a CONTENT child stacked above it).
++ * LOCK ORDER RULE (round-34 ABBA): phase A (win32 queries) runs BEFORE win_data_mutex;
++ * phase B (wl ops) runs under it and makes NO user-lock calls.
++ * Env-gated: NEUTRON_NATIVE_STACK=1. */
++
++#define NEUTRON_ZMAX 64
++
++static int neutron_trace(void); /* round-37 broad trace (defined below) */
++
++struct neutron_zlist
++{
++    HWND toplevel;
++    HWND hwnd[NEUTRON_ZMAX];
++    BOOL cef_host[NEUTRON_ZMAX]; /* __wine_dcomp_present: cross-proc CEF/CEP panel host */
++    RECT rect[NEUTRON_ZMAX];     /* window rect in toplevel window-rect space (for damage tests) */
++    UINT count;
++};
++
++/* ---- NEUTRON round-36 TEMPORAL SUPPRESSION (issues: CEF/CEP blank + invisible-
++ * until-hover). Windows composes bitblt presents and GDI paints TEMPORALLY into
++ * one surface: the latest painter wins per pixel. Native subsurfaces break that:
++ * an idle black swapchain subsurface eternally covers newer GDI content beneath
++ * it (CEP shared-mem blits, GDI-hybrid panels). Approximate the temporal rule:
++ * a window's client subsurface is placed BELOW the GDI surface while its chain
++ * is IDLE (no present for NEUTRON_IDLE_MS) AND newer GDI damage intersects its
++ * rect; the next present automatically restores it above. ---- */
++#define NEUTRON_IDLE_MS 500
++#define NEUTRON_DMG_RING 32
++
++static pthread_mutex_t neutron_dmg_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct { HWND toplevel; RECT rect; ULONGLONG ms; } neutron_dmg_ring[NEUTRON_DMG_RING];
++static unsigned neutron_dmg_head;
++
++void neutron_gdi_damage_record(HWND toplevel, const RECT *rect)
++{
++    if (neutron_trace())
++        ERR("NT-EV gdi-damage toplevel=%p rect=%ld,%ld-%ld,%ld t=%u\n",
++            toplevel, rect->left, rect->top, rect->right, rect->bottom,
++            (unsigned)NtGetTickCount());
++    pthread_mutex_lock(&neutron_dmg_mutex);
++    neutron_dmg_ring[neutron_dmg_head].toplevel = toplevel;
++    neutron_dmg_ring[neutron_dmg_head].rect = *rect;
++    neutron_dmg_ring[neutron_dmg_head].ms = NtGetTickCount();
++    neutron_dmg_head = (neutron_dmg_head + 1) % NEUTRON_DMG_RING;
++    pthread_mutex_unlock(&neutron_dmg_mutex);
++}
++
++/* was there GDI damage on this toplevel, intersecting rect, newer than since_ms? */
++static BOOL neutron_gdi_damage_since(HWND toplevel, ULONGLONG since_ms, const RECT *rect)
++{
++    unsigned i;
++    BOOL hit = FALSE;
++    pthread_mutex_lock(&neutron_dmg_mutex);
++    for (i = 0; i < NEUTRON_DMG_RING; i++)
++    {
++        const RECT *d = &neutron_dmg_ring[i].rect;
++        if (neutron_dmg_ring[i].toplevel != toplevel) continue;
++        if (neutron_dmg_ring[i].ms <= since_ms) continue;
++        if (d->left < rect->right && d->right > rect->left &&
++            d->top < rect->bottom && d->bottom > rect->top) { hit = TRUE; break; }
++    }
++    pthread_mutex_unlock(&neutron_dmg_mutex);
++    return hit;
++}
++
++/* ===================== NEUTRON round-43: RETAINED PANEL COMPOSITION (RPC) =====================
++ * Gives the single shared toplevel GDI surface MEMORY + correct ASSEMBLY. Each GDI-present chain
++ * window's last-presented pixels are retained in a CPU shadow (filled on the app's present thread
++ * via the rpc_fill unix call -- NO off-thread D3D). On every toplevel-surface flush, chain-owned
++ * regions intersecting the dirty rect are repaired from the shadows (pure memcpy into color_bits)
++ * BEFORE the wl copy, so a relayout-cascade wipe (Premiere's own GDI paint, container black,
++ * NC/erase) can never leave a hole -- content survives until the panel's own next present.
++ *
++ * FREEZE INVARIANTS (rounds 25-33 class stays dead):
++ *  - the leaf mutex (rpc_mutex) is LOCK-TERMINAL: holders do ONLY memcpy / field reads-writes,
++ *    NEVER any other lock and NEVER any NtUser call. A TLS in-leaf flag asserts this.
++ *  - fill runs on the app present thread (which holds the D3D10 device lock); it takes ONLY
++ *    rpc_mutex. repair runs in the flush path; it takes ONLY rpc_mutex. No cross-lock, no cycle.
++ *  - geometry (win_x/y/w/h, zkey) is computed on the PE side and cached here; repair never queries
++ *    the window tree.
++ * CRUX (mixing with Premiere's OWN GDI paint): geometry OWNERSHIP + sticky OURS/APP demotion.
++ * A window is demoted (repair stops for it, forever) if the live surface holds real content in its
++ * owned region that its shadow does NOT (== the app draws that window via GDI, not our present:
++ * hybrids / GDI-drawn timelines). Repair only ever restores a window's OWN retained pixels over a
++ * WIPE (surface black where shadow is real); it never overwrites fresh app content. */
++
++#define NEUTRON_RPC_MAX 96
++
++/* unix-side rect helpers (user32 IntersectRect/SetRect are unavailable here;
++ * the driver provides intersect_rect() inline in waylanddrv.h) */
++#define RPC_SETRECT(r,l,t,rr,b) do{(r).left=(l);(r).top=(t);(r).right=(rr);(r).bottom=(b);}while(0)
++#define RPC_ISEMPTY(r) ((r).left>=(r).right || (r).top>=(r).bottom)
++#define RPC_SETEMPTY(r) do{(r).left=(r).top=(r).right=(r).bottom=0;}while(0)
++
++struct rpc_shadow
++{
++    HWND      hwnd;
++    HWND      toplevel;
++    int       wx, wy, ww, wh;   /* window client rect in toplevel client coords */
++    unsigned  zkey;             /* ancestor depth: higher paints later (on top) */
++    UINT32   *pixels;           /* ww*wh BGRA, malloc'd (dumb duplicate; NOT DXVK staging) */
++    size_t    pixels_cap;       /* allocated element count */
++    RECT      valid;            /* bbox of ever-filled bands, window client coords (0-rect = none) */
++    unsigned  seq;
++    BOOL      demoted;          /* sticky */
++    BOOL      in_use;
++};
++
++static struct rpc_shadow rpc_shadows[NEUTRON_RPC_MAX];
++static pthread_mutex_t rpc_mutex = PTHREAD_MUTEX_INITIALIZER;
++static __thread int rpc_in_leaf;   /* freeze assert: no NtUser / no other lock while set */
++static RECT rpc_video_rect;        /* video canary: a known non-chain child rect (0 = unset) */
++static LONG rpc_stat_repairs, rpc_stat_repair_px, rpc_stat_demotions, rpc_stat_canary;
++static ULONGLONG rpc_stat_t0, rpc_stat_fill_bytes;
++static unsigned rpc_stat_repair_max_us;
++
++static int neutron_rpc_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_RPC"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static struct rpc_shadow *rpc_find(HWND hwnd)
++{
++    unsigned i;
++    for (i = 0; i < NEUTRON_RPC_MAX; i++)
++        if (rpc_shadows[i].in_use && rpc_shadows[i].hwnd == hwnd) return &rpc_shadows[i];
++    return NULL;
++}
++
++/* geometry of a chain window in TOPLEVEL client coords + ancestor depth.
++ * Called at FILL time (flush path, NtUser allowed here — same as the surfpix
++ * code above). NEVER called from the repair inner loop (which is lock-terminal). */
++static BOOL rpc_geometry(HWND hwnd, HWND toplevel, int *wx, int *wy, int *ww, int *wh, unsigned *zkey)
++{
++    RECT cr = {0}; POINT o = {0,0}; HWND a; unsigned d = 0;
++    if (!NtUserGetClientRect(hwnd, &cr, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return FALSE;
++    *ww = cr.right - cr.left; *wh = cr.bottom - cr.top;
++    if (*ww <= 0 || *wh <= 0 || *ww > 8192 || *wh > 8192) return FALSE;
++    NtUserMapWindowPoints(hwnd, toplevel, &o, 1, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++    *wx = o.x; *wy = o.y;
++    for (a = hwnd; a && a != toplevel && d < 32; a = NtUserGetAncestor(a, GA_PARENT)) d++;
++    *zkey = d;
++    return TRUE;
++}
++
++/* Fill a chain window's shadow FROM the toplevel surface (color_bits), where
++ * DXVK's StretchDIBits just wrote the fresh band. Called from the flush path
++ * when the epoch marks this flush as a chain present of `hwnd`. rpc_mutex +
++ * NtUser (geometry) — NtUser is BEFORE the mutex, mutex holds only memcpy. */
++void neutron_rpc_fill_from_surface(HWND hwnd, HWND toplevel, const void *surf_bits,
++                                   int stride_px, int surf_w, int surf_h, RECT dirty)
++{
++    int wx, wy, ww, wh; unsigned zkey;
++    struct rpc_shadow *s; size_t need;
++    RECT wr, hit; int y;
++    const UINT32 *surf = surf_bits;
++
++    if (!neutron_rpc_enabled() || !hwnd || !surf) return;
++    /* geometry FIRST (NtUser, RAW/physical dpi), before the leaf mutex (r34
++     * phase-A rule). The surface is PHYSICAL; window rects from rpc_geometry are
++     * physical too. DXVK's `dirty` band is in LOGICAL coords (different DPI), so
++     * we IGNORE it and fill the full physical window rect from the surface --
++     * the surface already holds this window's freshly-presented (StretchDIBits
++     * DPI-mapped) pixels. */
++    (void)dirty;
++    if (!rpc_geometry(hwnd, toplevel, &wx, &wy, &ww, &wh, &zkey)) return;
++    RPC_SETRECT(hit, wx, wy, wx + ww, wy + wh);
++    hit.left = max(hit.left, 0); hit.top = max(hit.top, 0);
++    hit.right = min(hit.right, surf_w); hit.bottom = min(hit.bottom, surf_h);
++    if (hit.right <= hit.left || hit.bottom <= hit.top) return;
++
++    pthread_mutex_lock(&rpc_mutex);
++    rpc_in_leaf = 1;
++
++    s = rpc_find(hwnd);
++    if (!s)
++    {
++        unsigned i;
++        for (i = 0; i < NEUTRON_RPC_MAX; i++) if (!rpc_shadows[i].in_use) { s = &rpc_shadows[i]; break; }
++        if (!s) goto out;
++        memset(s, 0, sizeof(*s));
++        s->in_use = TRUE; s->hwnd = hwnd;
++    }
++    /* geometry refresh + resize reset (correction #4: reset valid+realloc on size change) */
++    need = (size_t)ww * wh;
++    if (!s->pixels || s->ww != ww || s->wh != wh || s->pixels_cap < need)
++    {
++        UINT32 *np = realloc(s->pixels, need * 4);
++        if (!np) goto out;
++        s->pixels = np; s->pixels_cap = need; RPC_SETEMPTY(s->valid);
++    }
++    s->toplevel = toplevel; s->wx = wx; s->wy = wy; s->ww = ww; s->wh = wh; s->zkey = zkey;
++
++    /* copy the fresh band OUT of the surface into the shadow (window coords) */
++    for (y = hit.top; y < hit.bottom; y++)
++    {
++        const UINT32 *srow = surf + (size_t)y * stride_px + hit.left;
++        UINT32 *drow = s->pixels + (size_t)(y - wy) * ww + (hit.left - wx);
++        memcpy(drow, srow, (size_t)(hit.right - hit.left) * 4);
++    }
++    /* extend valid-region (window coords) */
++    { RECT vb = { hit.left - wx, hit.top - wy, hit.right - wx, hit.bottom - wy };
++      if (RPC_ISEMPTY(s->valid)) s->valid = vb;
++      else { s->valid.left = min(s->valid.left, vb.left); s->valid.top = min(s->valid.top, vb.top);
++             s->valid.right = max(s->valid.right, vb.right); s->valid.bottom = max(s->valid.bottom, vb.bottom); } }
++    rpc_stat_fill_bytes += (size_t)(hit.right - hit.left) * (hit.bottom - hit.top) * 4;
++out:
++    rpc_in_leaf = 0;
++    pthread_mutex_unlock(&rpc_mutex);
++}
++
++/* sample: is the surface region near-uniform-black? (wipe test) */
++static BOOL rpc_region_black(const UINT32 *surf, int stride_px, RECT r)
++{
++    int x, y, n = 0, black = 0;
++    for (y = r.top; y < r.bottom; y += max(1, (r.bottom - r.top) / 6))
++        for (x = r.left; x < r.right; x += max(1, (r.right - r.left) / 8))
++        { UINT32 v = surf[(size_t)y * stride_px + x] & 0xf0f0f0; n++; if (!v) black++; }
++    return n && black * 100 / n >= 88;
++}
++static BOOL rpc_shadow_black(const struct rpc_shadow *s, RECT r /* window coords */)
++{
++    int x, y, n = 0, black = 0;
++    for (y = r.top; y < r.bottom; y += max(1, (r.bottom - r.top) / 6))
++        for (x = r.left; x < r.right; x += max(1, (r.right - r.left) / 8))
++        { UINT32 v = s->pixels[(size_t)y * s->ww + x] & 0xf0f0f0; n++; if (!v) black++; }
++    return n && black * 100 / n >= 88;
++}
++
++/* Repair: called from the flush path on the toplevel surface bits.
++ * surf/stride_px describe color_bits (BGRA); dirty is in surface coords (==toplevel client
++ * coords, the same space PE mapped win_x/win_y into). rpc_mutex ONLY, no NtUser. */
++void neutron_rpc_repair(HWND toplevel, void *surf_bits, int stride_px, int surf_w, int surf_h, RECT dirty)
++{
++    /* paint order: collect owned windows, sort by zkey ascending (bottom-to-top) */
++    struct rpc_shadow *order[NEUTRON_RPC_MAX]; unsigned n = 0, i, j;
++    UINT32 *surf = surf_bits;
++    LARGE_INTEGER t0, t1, freq;
++    ULONGLONG px = 0;
++
++    if (!neutron_rpc_enabled() || !surf) return;
++
++    NtQueryPerformanceCounter(&t0, &freq);
++    pthread_mutex_lock(&rpc_mutex);
++    rpc_in_leaf = 1;
++
++    for (i = 0; i < NEUTRON_RPC_MAX; i++)
++    {
++        struct rpc_shadow *s = &rpc_shadows[i];
++        RECT wr, hit;
++        if (!s->in_use || s->toplevel != toplevel || s->demoted || !s->pixels) continue;
++        if (RPC_ISEMPTY(s->valid)) continue;
++        /* owned rect in surface coords = window rect ∩ valid-region, offset by win origin */
++        RPC_SETRECT(wr, s->wx + s->valid.left, s->wy + s->valid.top, s->wx + s->valid.right, s->wy + s->valid.bottom);
++        if (!intersect_rect(&hit, &wr, &dirty)) continue;
++        order[n++] = s;
++    }
++    /* insertion sort by zkey ascending */
++    for (i = 1; i < n; i++) { struct rpc_shadow *k = order[i]; for (j = i; j && order[j-1]->zkey > k->zkey; j--) order[j] = order[j-1]; order[j] = k; }
++
++    for (i = 0; i < n; i++)
++    {
++        struct rpc_shadow *s = order[i];
++        RECT wr, hit, sr, wshadow;
++        int y;
++        RPC_SETRECT(wr, s->wx + s->valid.left, s->wy + s->valid.top, s->wx + s->valid.right, s->wy + s->valid.bottom);
++        intersect_rect(&hit, &wr, &dirty);
++        /* clamp to the actual surface */
++        hit.left = max(hit.left, 0); hit.top = max(hit.top, 0);
++        hit.right = min(hit.right, surf_w); hit.bottom = min(hit.bottom, surf_h);
++        if (hit.right <= hit.left || hit.bottom <= hit.top) continue;
++        /* window-space region */
++        RPC_SETRECT(wshadow, hit.left - s->wx, hit.top - s->wy, hit.right - s->wx, hit.bottom - s->wy);
++        wshadow.left = max(0, wshadow.left); wshadow.top = max(0, wshadow.top);
++        wshadow.right = min(s->ww, wshadow.right); wshadow.bottom = min(s->wh, wshadow.bottom);
++        if (wshadow.right <= wshadow.left || wshadow.bottom <= wshadow.top) continue;
++
++        /* video canary */
++        if (!RPC_ISEMPTY(rpc_video_rect))
++        { RECT vv; if (intersect_rect(&vv, &hit, &rpc_video_rect)) rpc_stat_canary++; }
++
++        /* CRUX / demotion: if the surface holds REAL content where our shadow is BLACK,
++         * the app draws this window via GDI (hybrid) -> demote sticky, never stamp black. */
++        if (rpc_shadow_black(s, wshadow) && !rpc_region_black(surf, stride_px, hit))
++        { s->demoted = TRUE; rpc_stat_demotions++; continue; }
++        /* Only repair a WIPE: surface black where shadow is real. Otherwise leave the
++         * surface alone (idempotent for our own fresh present; respects app content). */
++        if (!rpc_region_black(surf, stride_px, hit)) continue;
++
++        RPC_SETRECT(sr, hit.left, hit.top, hit.right, hit.bottom);
++        for (y = 0; y < wshadow.bottom - wshadow.top; y++)
++        {
++            const UINT32 *srow = s->pixels + (size_t)(wshadow.top + y) * s->ww + wshadow.left;
++            UINT32 *drow = surf + (size_t)(sr.top + y) * stride_px + sr.left;
++            memcpy(drow, srow, (size_t)(wshadow.right - wshadow.left) * 4);
++        }
++        px += (ULONGLONG)(wshadow.right - wshadow.left) * (wshadow.bottom - wshadow.top);
++        rpc_stat_repairs++;
++    }
++    rpc_stat_repair_px += (LONG)px;
++
++    rpc_in_leaf = 0;
++    pthread_mutex_unlock(&rpc_mutex);
++
++    NtQueryPerformanceCounter(&t1, &freq);
++    if (px)
++    {
++        unsigned us = (unsigned)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
++        if (us > rpc_stat_repair_max_us) rpc_stat_repair_max_us = us;
++    }
++    /* stats ~every 5s */
++    {
++        ULONGLONG now = NtGetTickCount();
++        if (!rpc_stat_t0) rpc_stat_t0 = now;
++        if (now - rpc_stat_t0 >= 5000)
++        {
++            ERR("neutron-rpc-stats: repairs=%ld repairMpx=%ld demotions=%ld canaryHits=%ld fillMBps=%llu repairMaxUs=%u\n",
++                rpc_stat_repairs, rpc_stat_repair_px / 1000000, rpc_stat_demotions, rpc_stat_canary,
++                (unsigned long long)(rpc_stat_fill_bytes / 1000000 / 5), rpc_stat_repair_max_us);
++            rpc_stat_t0 = now; rpc_stat_fill_bytes = 0; rpc_stat_repair_max_us = 0;
++        }
++    }
++}
++
++/* PE -> unix: register the video (non-chain) rect for the canary (surface coords). */
++void neutron_rpc_set_video_rect(const RECT *r) { if (r) rpc_video_rect = *r; }
++
++/* PE -> unix: the mapped __neutron_rpc_epoch shared control block (same VA). */
++static struct neutron_rpc_epoch *rpc_epoch;
++static LONG rpc_epoch_last_seq;
++void neutron_rpc_set_epoch(void *ptr) { rpc_epoch = ptr; }
++
++/* Called from the toplevel-surface flush (window_surface.c). Reads the epoch to
++ * learn if THIS flush is a chain present (-> fill the presenter's shadow FROM
++ * the surface) then repairs all chain-owned regions. `bits` is color_bits
++ * (writable DIB backing); `dirty` is in surface coords. */
++void neutron_rpc_flush(HWND toplevel, void *bits, int stride_px, int surf_w, int surf_h, RECT dirty)
++{
++    if (!neutron_rpc_enabled() || !bits) return;
++
++    /* Drain ALL chain presents since the last flush (a single flush may coalesce
++     * many presents; a single-slot epoch would lose all but the last). Each
++     * entry's band in the surface holds that window's fresh pixels -> fill its
++     * shadow FROM the surface. */
++    if (rpc_epoch)
++    {
++        LONG head = rpc_epoch->head;
++        if (rpc_epoch->video_r > rpc_epoch->video_l)
++        { RECT v = { rpc_epoch->video_l, rpc_epoch->video_t, rpc_epoch->video_r, rpc_epoch->video_b };
++          neutron_rpc_set_video_rect(&v); }
++        if (head - rpc_epoch_last_seq > NEUTRON_RPC_RING) rpc_epoch_last_seq = head - NEUTRON_RPC_RING;
++        while (rpc_epoch_last_seq != head)
++        {
++            const struct neutron_rpc_entry *e = &rpc_epoch->ring[rpc_epoch_last_seq & (NEUTRON_RPC_RING - 1)];
++            HWND h = (HWND)(UINT_PTR)(ULONG)e->hwnd;
++            RECT band = { e->bl, e->bt, e->br, e->bb };
++            rpc_epoch_last_seq++;
++            if (h && band.right > band.left)
++                neutron_rpc_fill_from_surface(h, toplevel, bits, stride_px, surf_w, surf_h, band);
++        }
++    }
++    neutron_rpc_repair(toplevel, bits, stride_px, surf_w, surf_h, dirty);
++}
++
++static int neutron_native_stack(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char *e = getenv("NEUTRON_NATIVE_STACK");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
++/* NEUTRON round-37: BROAD TRACE mode (env NEUTRON_TRACE=1) -- per-window
++ * timestamped event lines (NT-EV ...) to reconstruct the live pipeline. */
++static int neutron_trace(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char *e = getenv("NEUTRON_TRACE");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
++/* NEUTRON round-37: the round-36 temporal-suppression rule is now OPT-IN
++ * (env NEUTRON_TEMPORAL=1) -- it regressed CEF/tabs live (z-order thrash);
++ * default OFF restores the round-35 milestone behavior. */
++static int neutron_temporal(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char *e = getenv("NEUTRON_TEMPORAL");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
++/* phase A: build the bottom-to-top win32 order of a toplevel's tree.
++ * USER-LOCK calls only -- must be called WITHOUT win_data_mutex held. */
++static void neutron_zorder_collect_rec(HWND hwnd, struct neutron_zlist *zl, const POINT *origin)
++{
++    static const WCHAR dcomp_present_prop[] =
++        {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','r','e','s','e','n','t',0};
++    HWND kids[NEUTRON_ZMAX];
++    UINT nk = 0, i;
++    RECT wr = {0};
++    HWND c;
++
++    if (zl->count >= NEUTRON_ZMAX) return;
++    zl->cef_host[zl->count] = !!NtUserGetProp(hwnd, dcomp_present_prop);
++    /* window rect in toplevel window-rect space (for temporal damage tests) */
++    NtUserGetWindowRect(hwnd, &wr, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++    OffsetRect(&wr, -origin->x, -origin->y);
++    zl->rect[zl->count] = wr;
++    zl->hwnd[zl->count++] = hwnd;
++    /* GW_CHILD = topmost sibling; GW_HWNDNEXT walks DOWN the z-order */
++    for (c = NtUserGetWindowRelative(hwnd, GW_CHILD); c && nk < NEUTRON_ZMAX;
++         c = NtUserGetWindowRelative(c, GW_HWNDNEXT))
++        kids[nk++] = c;
++    /* recurse bottom-of-z first so the array ends up bottom-to-top */
++    for (i = nk; i > 0; i--)
++        neutron_zorder_collect_rec(kids[i - 1], zl, origin);
++}
++
++static void neutron_zorder_collect(HWND toplevel, struct neutron_zlist *zl)
++{
++    RECT tr = {0};
++    POINT origin;
++    zl->toplevel = toplevel;
++    zl->count = 0;
++    NtUserGetWindowRect(toplevel, &tr, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
++    origin.x = tr.left; origin.y = tr.top;
++    neutron_zorder_collect_rec(toplevel, zl, &origin);
++}
++
++/* order cache: skip wl traffic when the applied order is unchanged.
++ * Guarded by win_data_mutex (restack_apply is always called under it). */
++struct neutron_zcache
++{
++    HWND toplevel;
++    struct wl_surface *parent;      /* the toplevel wl_surface the order was applied to */
++    HWND applied[NEUTRON_ZMAX];     /* hwnds whose subsurfaces were ordered */
++    BOOL below[NEUTRON_ZMAX];
++    UINT count;
++};
++static struct neutron_zcache neutron_zcaches[8];
++static LONG neutron_stack_applies;
++
++/* invalidate on subsurface (re)creation: a fresh wl_subsurface defaults to
++ * top-of-stack, so an unchanged-looking order must still be reapplied */
++static void neutron_zcache_invalidate(HWND toplevel)
++{
++    unsigned i;
++    for (i = 0; i < 8; i++)
++        if (neutron_zcaches[i].toplevel == toplevel)
++            memset(&neutron_zcaches[i], 0, sizeof(neutron_zcaches[i]));
++}
++
++static struct neutron_zcache *neutron_zcache_for(HWND toplevel)
++{
++    unsigned i;
++    for (i = 0; i < 8; i++) if (neutron_zcaches[i].toplevel == toplevel) return &neutron_zcaches[i];
++    for (i = 0; i < 8; i++) if (!neutron_zcaches[i].toplevel) { neutron_zcaches[i].toplevel = toplevel; return &neutron_zcaches[i]; }
++    /* evict slot 0 (toplevels are few; churn here is harmless) */
++    memset(&neutron_zcaches[0], 0, sizeof(neutron_zcaches[0]));
++    neutron_zcaches[0].toplevel = toplevel;
++    return &neutron_zcaches[0];
++}
++
++/* phase B: apply the collected order to the wl_subsurface stack.
++ * MUST be called with win_data_mutex held; makes NO user-lock calls. */
++static void neutron_restack_apply(HWND toplevel, const struct neutron_zlist *zl)
++{
++    struct wayland_win_data *tdata = wayland_win_data_get_nolock(toplevel);
++    struct wayland_surface *tsurf = tdata ? tdata->wayland_surface : NULL;
++    struct wayland_client_surface *cs_of[NEUTRON_ZMAX];
++    BOOL below[NEUTRON_ZMAX];
++    HWND applied[NEUTRON_ZMAX];
++    struct wl_surface *prev;
++    struct neutron_zcache *zc;
++    UINT i, n = 0, child_clients = 0;
++    int top_idx = -1;
++    BOOL changed;
++
++    if (!tsurf || !tsurf->wl_surface) return;
++
++    /* NEUTRON perf counters: real restack call/apply frequency (~5s cadence) */
++    {
++        static ULONGLONG t0; static LONG calls, applies_snapshot;
++        ULONGLONG now = NtGetTickCount();
++        calls++;
++        if (!t0) t0 = now;
++        if (now - t0 >= 5000)
++        {
++            ERR("neutron-stack-stats: 5s calls=%ld applies=%ld\n", calls, neutron_stack_applies - applies_snapshot);
++            t0 = now; calls = 0; applies_snapshot = neutron_stack_applies;
++        }
++    }
++
++    /* gather the client surfaces that are valid siblings of this toplevel
++     * (round-21 sibling-validity guard: only touch subsurfaces actually
++     * attached to THIS toplevel's current wl_surface) */
++    for (i = 0; i < zl->count && n < NEUTRON_ZMAX; i++)
++    {
++        struct wayland_win_data *d = (zl->hwnd[i] == toplevel) ? tdata : wayland_win_data_get_nolock(zl->hwnd[i]);
++        struct wayland_client_surface *cs = d ? d->client_surface : NULL;
++        if (!cs || !cs->wl_subsurface || !cs->wl_surface) continue;
++        if (cs->toplevel_wl_surface != tsurf->wl_surface) continue; /* not our sibling */
++        cs_of[n] = cs;
++        applied[n] = zl->hwnd[i];
++        /* suppress rule (round-17-proven minimal set): CEF/CEP host containers... */
++        below[n] = zl->cef_host[i];
++        /* NEUTRON round-36 TEMPORAL rule ("latest painter wins"): if this chain
++         * is IDLE and newer GDI damage (CEP shared-mem blits, GDI-hybrid paints)
++         * intersects its rect, its stale/black frame must not cover that GDI
++         * content -> place below. Its next present automatically restores it.
++         * round-37: OPT-IN only (regressed CEF/tab z-order live). */
++        if (neutron_temporal() && !below[n] && cs->last_present_ms &&
++            NtGetTickCount() - cs->last_present_ms > NEUTRON_IDLE_MS &&
++            neutron_gdi_damage_since(toplevel, cs->last_present_ms, &zl->rect[i]))
++            below[n] = TRUE;
++        if (zl->hwnd[i] == toplevel) top_idx = (int)n; else child_clients++;
++        n++;
++    }
++    /* ...plus (a) the toplevel's OWN client surface when it hosts >=1 child client
++     * subsurface (black container signature; belt-and-braces -- z-order alone
++     * already puts content children above it). */
++    if (top_idx >= 0 && child_clients > 0) below[top_idx] = TRUE;
++
++    if (!n) return;
++
++    /* order-cache: skip if identical (per-present calls must not storm wl) */
++    zc = neutron_zcache_for(toplevel);
++    changed = (zc->parent != tsurf->wl_surface) || (zc->count != n);
++    if (!changed)
++        for (i = 0; i < n; i++)
++            if (zc->applied[i] != applied[i] || zc->below[i] != below[i]) { changed = TRUE; break; }
++    if (!changed) return;
++
++    prev = tsurf->wl_surface;
++    for (i = 0; i < n; i++)
++    {
++        if (below[i])
++        {
++            /* below the GDI/main surface: can never occlude content */
++            wl_subsurface_place_below(cs_of[i]->wl_subsurface, tsurf->wl_surface);
++            continue;
++        }
++        /* place_above(parent-or-sibling) is always protocol-valid here */
++        wl_subsurface_place_above(cs_of[i]->wl_subsurface, prev);
++        prev = cs_of[i]->wl_surface;
++    }
++    /* subsurface z-order applies on parent commit */
++    wl_surface_commit(tsurf->wl_surface);
++    neutron_stack_applies++;
++
++    zc->parent = tsurf->wl_surface;
++    zc->count = n;
++    memcpy(zc->applied, applied, n * sizeof(*applied));
++    memcpy(zc->below, below, n * sizeof(*below));
++
++    {
++        static unsigned logn;
++        if (neutron_trace() || logn < 40)
++        {
++            char buf[512]; int off = 0;
++            logn++;
++            for (i = 0; i < n && off < (int)sizeof(buf) - 24; i++)
++                off += snprintf(buf + off, sizeof(buf) - off, "%p%s ", applied[i], below[i] ? "(below)" : "");
++            ERR("NT-EV restack toplevel=%p t=%u order-bottom-to-top: %s\n",
++                toplevel, (unsigned)NtGetTickCount(), buf);
++        }
++    }
++}
++/* =================== end NEUTRON native stacking =================== */
++
++/* NEUTRON: do NOT destroy a client subsurface for a TRANSIENTLY invisible window
++ * (env NEUTRON_WL_KEEPCLIENT=1).
++ *
++ * MEASURED (After Effects 2025 composition viewer, 2026-07-31): that window presents 630 times
++ * in a session and its OWN WS_VISIBLE bit toggles constantly --
++ *      371 presents  vis=0 selfvis=0 parentvis=1     <- itself hidden, parent visible
++ *      259 presents  vis=1 selfvis=1 parentvis=1
++ * Every vis=0 present took the `else` branch below, i.e. attach_rect(NULL, NULL), which per the
++ * STEP 1 comment DESTROYS the subsurface and ORPHANS the wl_surface -- it is never mapped again,
++ * so the swapchain keeps presenting into a surface that can never be shown. One toggle is
++ * therefore permanent: the 259 later visible presents are all delivered into a dead surface.
++ * That is why AE's composition panel stays black while AE renders it perfectly.
++ *
++ * The discriminator is in the data: a TRANSIENTLY hidden child has a VISIBLE parent, whereas a
++ * genuinely hidden window (AE's inactive Layer/Footage viewers) has parentvis=0 as well. So keep
++ * the surface for the former and keep destroying it for the latter -- genuinely hidden windows
++ * must still stop compositing. */
++static int neutron_keepclient(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char *e = getenv("NEUTRON_WL_KEEPCLIENT");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
+ static void wayland_client_surface_update(struct client_surface *client)
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+     struct wayland_win_data *data;
+-
+-    if (!(data = wayland_win_data_get(hwnd))) return;
++    RECT client_rect = {0};
++    struct neutron_zlist zl = {0}; /* round-35 native stacking (phase A result) */
++    BOOL visible, parent_visible;
++    HWND parent;
++
++    /* NEUTRON round-34 LOCK-ORDER FIX (ABBA deadlock, toy-repro'd + eu-stack-proven):
++     * this function runs on EVERY vkQueuePresentKHR (win32u client_surface_update)
++     * and takes win_data_mutex; the STOCK code then called NtUserIsWindowVisible
++     * (user lock) INSIDE it. Meanwhile NtUserSetWindowPos holds the user lock and
++     * flushes the window surface -> wayland_window_surface_flush ->
++     * wayland_win_data_get (win_data_mutex): classic lock-order inversion; a
++     * present racing a SetParent/SetWindowPos wedges both threads (observed:
++     * main thread in set_window_pos waiting win_data_mutex, CS thread in
++     * vkQueuePresentKHR holding it and waiting user_lock). FIX: perform ALL
++     * user-lock queries (visibility, props, style diag) BEFORE taking
++     * win_data_mutex; never call user-lock-taking functions inside it.
++     * (The inversion exists in STOCK upstream winewayland; games don't hit it —
++     * one swapchain, no window churn during presents.) */
++    visible = NtUserIsWindowVisible(hwnd);
++    /* NEUTRON: sampled HERE with the other user-lock queries -- the round-34 lock-order
++     * fix forbids user-lock calls once win_data_mutex is held. */
++    parent_visible = (parent = NtUserGetAncestor(hwnd, GA_PARENT))
++            && (NtUserGetWindowLongW(parent, GWL_STYLE) & WS_VISIBLE);
++    surface->last_present_ms = NtGetTickCount(); /* round-36 temporal rule: this IS the per-present hook */
++    /* round-37 broad trace: one line per present per window.
++     * NEUTRON: log the window's OWN style and its parent's, sampled RIGHT HERE next to the
++     * visibility answer. The once-per-window CLIENT-SURFACE diag reads style in a later block,
++     * so style and `visible` there come from different instants and can disagree (observed:
++     * vis=1 logged against a style with no WS_VISIBLE). Same-instant sampling is the only way
++     * to tell "this window genuinely has no WS_VISIBLE" from "an ancestor is hiding it" from
++     * "visibility is flapping under us". */
++    if (neutron_trace())
++    {
++        DWORD st = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++        HWND parent = NtUserGetAncestor(hwnd, GA_PARENT);
++        DWORD pst = parent ? NtUserGetWindowLongW(parent, GWL_STYLE) : 0;
++        ERR("NT-EV present hwnd=%p toplevel=%p t=%u vis=%d style=%08x selfvis=%d parent=%p pstyle=%08x parentvis=%d\n",
++            hwnd, toplevel, (unsigned)NtGetTickCount(), visible,
++            (unsigned)st, !!(st & WS_VISIBLE), parent, (unsigned)pst, !!(pst & WS_VISIBLE));
++    }
++    if (toplevel && visible)
++    {
++        NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++        NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++    }
++
++    /* NEUTRON round-35 native stacking, phase A (user-lock queries, PRE-lock):
++     * collect the toplevel's win32 z-order so phase B can mirror it in the
++     * wl_subsurface stack without any user-lock call under win_data_mutex. */
++    if (neutron_native_stack() && toplevel && visible)
++        neutron_zorder_collect(toplevel, &zl);
+ 
+     if (((neutron_dbg_n++) & 0xFF) == 0)
+-        ERR("NEUTRON-UPD hwnd=%p toplevel=%p visible=%d\n", hwnd, toplevel, NtUserIsWindowVisible(hwnd));
++        ERR("NEUTRON-UPD hwnd=%p toplevel=%p visible=%d\n", hwnd, toplevel, visible);
++
++    /* NEUTRON GPU-D2D-UI (milestone 3): if this window's swapchain is being delivered
++     * to screen by the dcomp GDI-blit bridge (marked __wine_dcomp_blit), SUPPRESS its
++     * Vulkan client subsurface -- otherwise that subsurface sits ABOVE the GDI
++     * window_surface and occludes the bridge's blitted content (the toplevel's own
++     * black full-size swapchain surface hides the entire UI). Env-gated so we can A/B. */
++    {
++        static const WCHAR dcomp_blit_prop[] =
++            {'_','_','w','i','n','e','_','d','c','o','m','p','_','b','l','i','t',0};
++        static int suppress = -1;
++        if (suppress < 0)
++        {
++            const char *e = getenv("NEUTRON_DCOMP_SUPPRESS_CLIENT");
++            suppress = (e && e[0] == '1') ? 1 : 0;
++        }
++        /* MILESTONE 4 REGRESSION LESSON: gate on the __wine_dcomp_blit MARK ONLY.
++         * A round-18 attempt to additionally exclude "transients" (WS_POPUP /
++         * WS_EX_LAYERED / WS_EX_TOOLWINDOW / owned-non-child) ALSO excluded the
++         * toplevel 0x10120 (owned non-child, chain 0x10120 <- 0x10020 #32769) —
++         * the ONE window whose black full-size surface MUST be suppressed — and
++         * the UI went fully black again. Popups are never bridge-marked, so the
++         * mark alone already leaves them untouched; no extra style filter needed. */
++        static const WCHAR dcomp_sticky_prop[] =
++            {'_','_','w','i','n','e','_','d','c','o','m','p','_','s','u','p','p',0};
++        BOOL marked = !!NtUserGetProp(hwnd, dcomp_blit_prop);
++        BOOL sticky = !!NtUserGetProp(hwnd, dcomp_sticky_prop);
++        /* NEUTRON M4 STABLE (STICKY) SUPPRESS: the __wine_dcomp_blit mark is set by the
++         * dcomp thread on swapchain register, which RACES the first
++         * wayland_client_surface_update (observed: marked=0 at every first-update). So a
++         * window's client subsurface was ATTACHED (black surface shown) for the early
++         * frames, then suppressed once the mark landed — an unstable toggle that (with
++         * the readback storm) flickered continuously. Fix: once a window is EVER seen
++         * marked, latch a sticky prop and suppress it for good — the decision is now
++         * MONOTONIC, so the black Vulkan surface never re-appears over the GDI content. */
++        if (marked && !sticky)
++        {
++            NtUserSetProp(hwnd, dcomp_sticky_prop, (HANDLE)(ULONG_PTR)1);
++            sticky = TRUE;
++        }
++        /* diag: log EVERY client-surface window ONCE with its state */
++        {
++            static HWND seen[128]; static int nseen;
++            int i; BOOL s = FALSE;
++            for (i = 0; i < nseen; i++) if (seen[i] == hwnd) { s = TRUE; break; }
++            if (!s && nseen < 128)
++            {
++                DWORD style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++                seen[nseen++] = hwnd;
++                ERR("neutron-wl: CLIENT-SURFACE hwnd=%p toplevel=%p marked=%d sticky=%d suppress=%d style=%08x vis=%d\n",
++                    hwnd, toplevel, marked, sticky, suppress, (unsigned)style, visible);
++            }
++        }
++        /* NEUTRON STEP 1 (place_below suppress): instead of attach(NULL) — which DESTROYS
++         * the subsurface and orphans the wl_surface (never mapped again; the swapchain
++         * keeps presenting into it but gets no frame callbacks / no buffer releases, so
++         * VK_KHR_present_wait blocks forever -> DXVK CS queue backs up -> main thread
++         * deadlocks mid-D2D) — keep the subsurface MAPPED but z-order it BELOW the
++         * toplevel GDI content surface. A below-placed black surface can't occlude the
++         * GDI content and can't flicker on top (independent of mark-race timing), while
++         * the swapchain's Wayland WSI stays healthy so present-wait never wedges. */
++        /* NEUTRON round-35 NATIVE MODE: content surfaces present natively -- do NOT
++         * suppress them. The narrowed round-17-proven suppress set (CEF hosts +
++         * black-container toplevels-with-child-surfaces) is applied by
++         * neutron_restack_apply; here only seed the initial placement for CEF
++         * hosts (rule b). The legacy mark-based rule stays for non-native mode. */
++        if (neutron_native_stack())
++        {
++            static const WCHAR dcomp_present_prop[] =
++                {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','r','e','s','e','n','t',0};
++            surface->place_below = !!NtUserGetProp(hwnd, dcomp_present_prop);
++        }
++        else
++            surface->place_below = (suppress && (marked || sticky));
++    }
++
++    /* NEUTRON round-34 lock-order fix: win_data_mutex is taken ONLY here, AFTER
++     * all user-lock queries above; nothing inside this region may re-enter
++     * win32u user-lock-taking calls. */
++    if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+-    if (toplevel && NtUserIsWindowVisible(hwnd))
+-        wayland_client_surface_attach(surface, toplevel);
++    if (toplevel && visible)
++    {
++        wayland_client_surface_attach_rect(surface, toplevel, &client_rect);
++        /* NEUTRON round-35 native stacking, phase B (under win_data_mutex, NO
++         * user-lock calls): mirror the collected win32 z-order in the
++         * wl_subsurface stack (order cache no-ops when unchanged). */
++        if (neutron_native_stack() && zl.count)
++            neutron_restack_apply(toplevel, &zl);
++    }
++    else if (neutron_keepclient() && toplevel && parent_visible)
++    {
++        /* Transiently hidden under a VISIBLE parent: leave the subsurface mapped. Destroying it
++         * here orphans the wl_surface permanently (see neutron_keepclient()). */
++        static HWND kept[64]; static int nkept; int k; BOOL seen_k = FALSE;
++        for (k = 0; k < nkept && k < 64; k++) if (kept[k] == hwnd) { seen_k = TRUE; break; }
++        if (!seen_k && nkept < 64)
++        {
++            kept[nkept++] = hwnd;
++            ERR("neutron-wl: KEEPCLIENT hwnd=%p -- invisible under a visible parent, subsurface KEPT (not destroyed)\n", hwnd);
++        }
++    }
+     else
+-        wayland_client_surface_attach(surface, NULL);
++        wayland_client_surface_attach_rect(surface, NULL, NULL); /* detach: no user calls */
+ 
+     wayland_win_data_release(data);
+ }
+@@ -1574,7 +2525,12 @@
+     return NULL;
+ }
+ 
+-void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
++/* NEUTRON round-34 lock-order fix: variant taking a PRE-COMPUTED client rect so
++ * the vkQueuePresent-thread caller (wayland_client_surface_update) can perform
++ * all user-lock queries BEFORE taking win_data_mutex. rect==NULL keeps the
++ * original behavior (query here) for the window-manager (window.c) callers,
++ * which already run on threads where the user-lock nesting is safe. */
++static void wayland_client_surface_attach_rect(struct wayland_client_surface *client, HWND toplevel, const RECT *rect)
+ {
+     struct wayland_win_data *toplevel_data;
+     struct wayland_surface *surface;
+@@ -1627,16 +2583,37 @@
+ 
+         client->toplevel = toplevel;
+         client->toplevel_wl_surface = surface->wl_surface;
++
++        /* NEUTRON round-35: fresh wl_subsurface = default top-of-stack;
++         * force the native stacker to reapply the win32 order. */
++        neutron_zcache_invalidate(toplevel);
++        if (neutron_trace())
++            ERR("NT-EV subsurface-create hwnd=%p toplevel=%p t=%u\n",
++                hwnd, toplevel, (unsigned)NtGetTickCount());
+     }
+ 
+-    NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+-    NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++    if (rect)
++    {
++        /* neutron lock-order fix: caller pre-computed the rect before taking
++         * win_data_mutex; do NOT re-enter user-lock functions here. */
++        client_rect = *rect;
++    }
++    else
++    {
++        NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++        NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++    }
+ 
+     wayland_surface_reconfigure_client(surface, client, &client_rect);
+     /* Commit to apply subsurface positioning. */
+     wl_surface_commit(surface->wl_surface);
+ }
+ 
++void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
++{
++    wayland_client_surface_attach_rect(client, toplevel, NULL);
++}
++
+ static void dummy_buffer_release(void *data, struct wl_buffer *buffer)
+ {
+     struct wayland_shm_buffer *shm_buffer = data;
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -198,22 +198,37 @@
+      * on a 96-dpi 1080p a 163-dpi buffer was shown 1:1 = 1.7x too large. */
+     {
+         UINT raw_dpi = NtUserGetWinMonitorDpi(data->hwnd, MDT_RAW_DPI);
++        double precise = 0.0;
+         if (!raw_dpi) raw_dpi = NtUserGetSystemDpiForProcess(0);
+         conf->scale = raw_dpi / 96.0;
+-        /* Only when the compositor's precise fractional scale AGREES with win32u's monitor dpi
+-         * (within ~1 dpi) prefer the exact fraction (1.70 vs DPI-derived 1.6979), so a matching-
+-         * monitor buffer maps 1:1 with no fractional resample. If they disagree the surface is on a
+-         * different-dpi output than win32u believes — trust the render dpi, not the output scale. */
++        /* Prefer the exact compositor fraction over the DPI-derived value (1.70 vs 1.6979) so a
++         * matching-monitor buffer maps 1:1 with no fractional resample. The surface's OWN
++         * preferred_scale wins when present; otherwise (KWin only sends the preferred event to
++         * SOME surfaces) fall back to the last precise scale delivered to ANY surface this process
++         * (NEUTRON scalefix#2). Either way the value is only adopted when its derived dpi AGREES
++         * with win32u's monitor dpi (within ~2 dpi): if they disagree the surface is on a
++         * different-dpi output than win32u believes, so we trust the render dpi. That agreement
++         * gate keeps the global fallback multi-monitor safe (a cached 163-dpi scale is rejected on
++         * a 96-dpi output) and it never touches win32u monitor state, so it cannot reintroduce the
++         * 163<->96 flip-flop. */
+         if (data->wayland_surface && data->wayland_surface->preferred_scale > 0.0)
++            precise = data->wayland_surface->preferred_scale;
++        else
++        {
++            LONG s120 = InterlockedCompareExchange(&neutron_last_precise_scale120, 0, 0);
++            if (s120 > 0) precise = s120 / 120.0;
++        }
++        if (precise > 0.0)
+         {
+-            double pref_dpi = data->wayland_surface->preferred_scale * 96.0;
++            double pref_dpi = precise * 96.0;
+             if (pref_dpi >= raw_dpi - 2.0 && pref_dpi <= raw_dpi + 2.0)
+-                conf->scale = data->wayland_surface->preferred_scale;
++                conf->scale = precise;
+         }
+         if (neutron_wl_diag())
+-            ERR("neutron-scale: hwnd=%p raw_dpi=%u preferred_scale=%.4f -> conf->scale=%.4f\n",
++            ERR("neutron-scale: hwnd=%p raw_dpi=%u preferred_scale=%.4f cached120=%d -> conf->scale=%.4f\n",
+                 data->hwnd, raw_dpi,
+-                data->wayland_surface ? data->wayland_surface->preferred_scale : 0.0, conf->scale);
++                data->wayland_surface ? data->wayland_surface->preferred_scale : 0.0,
++                (int)InterlockedCompareExchange(&neutron_last_precise_scale120, 0, 0), conf->scale);
+     }
+     conf->visible = (style & WS_VISIBLE) == WS_VISIBLE;
+     conf->managed = data->managed;
+@@ -567,6 +582,16 @@
+ 
+     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
+ 
++    /* NEUTRON round-37 broad trace: z-order / geometry change events */
++    {
++        static int trace = -1;
++        if (trace < 0) { const char *e = getenv("NEUTRON_TRACE"); trace = (e && e[0]=='1') ? 1 : 0; }
++        if (trace)
++            ERR("NT-EV wpc hwnd=%p after=%p flags=%08x rect=%s t=%u\n",
++                hwnd, insert_after, swp_flags, debugstr_window_rects(new_rects),
++                (unsigned)NtGetTickCount());
++    }
++
+     /* Get the managed state with win_data unlocked, as is_window_managed
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+@@ -988,6 +1013,49 @@
+ }
+ 
+ /**********************************************************************
++ *           wayland_window_scale_refresh
++ *
++ * NEUTRON scalefix: the compositor delivered a new precise fractional scale for this window's
++ * surface but the derived integer dpi did not change, so no win32u-driven reconfig will fire
++ * (wayland_window_output_change no-ops at equal dpi, and an idle maximized window gets no
++ * further WindowPosChanged to re-run wayland_win_data_get_config). Re-derive conf->scale via
++ * wayland_win_data_get_config (the single source of scale policy) and, only if the scale
++ * actually changed, re-run wayland_surface_reconfigure + commit so the wp_viewport destination
++ * is recomputed at the exact scale (1.7000 instead of the dpi fallback 163/96=1.6979 that made
++ * the maximized window ~0.12% too big). Purely wayland-side: no window rects, styles, monitor
++ * or dpi state in win32u are modified, so this can NOT trigger WM_DPICHANGED, relayout, or feed
++ * back into another preferred-scale event. Always-on (not gated by NEUTRON_DPI_34): it is part
++ * of the always-on sizing correctness path in wayland_win_data_get_config.
++ */
++static void wayland_window_scale_refresh(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++    double old_scale, scale_delta;
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++
++    if ((surface = data->wayland_surface) && surface->wl_surface &&
++        wayland_surface_is_toplevel(surface))
++    {
++        old_scale = surface->window.scale;
++        wayland_win_data_get_config(data, &surface->window);
++        scale_delta = surface->window.scale - old_scale;
++        if (scale_delta < 0.0) scale_delta = -scale_delta;
++        if (scale_delta > 0.001 && wayland_surface_reconfigure(surface))
++        {
++            wl_surface_commit(surface->wl_surface);
++            wl_display_flush(process_wayland.wl_display);
++            if (neutron_wl_diag())
++                ERR("neutron-scalefix: hwnd=%p viewport recommitted at scale %.4f (was %.4f)\n",
++                    hwnd, surface->window.scale, old_scale);
++        }
++    }
++
++    wayland_win_data_release(data);
++}
++
++/**********************************************************************
+  *           WAYLAND_WindowMessage
+  */
+ LRESULT WAYLAND_WindowMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+@@ -1003,6 +1071,9 @@
+     case WM_WAYLAND_OUTPUT_CHANGE:
+         wayland_window_output_change(hwnd, (UINT)wp);
+         return 0;
++    case WM_WAYLAND_SCALE_REFRESH:
++        wayland_window_scale_refresh(hwnd);
++        return 0;
+     case WM_WAYLAND_SET_FOREGROUND:
+         ERR( "neutron-wlsetfg: winewayland foregrounding hwnd=%p\n", hwnd );
+         NtUserSetForegroundWindowInternal(hwnd);
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -385,17 +385,9 @@
+     copy_pixel_region(bits, rect, buffer->map_data, &buffer_rect, region, alpha_bits, sanitize);
+ }
+ 
+-static void wayland_shm_buffer_copy(struct wayland_shm_buffer *src,
+-                                    struct wayland_shm_buffer *dst,
+-                                    HRGN region)
+-{
+-    RECT src_rect = {0, 0, src->width, src->height};
+-    RECT dst_rect = {0, 0, dst->width, dst->height};
+-    TRACE("src=%p dst=%p\n", src, dst);
+-    copy_pixel_region(src->map_data, &src_rect, dst->map_data, &dst_rect, region,
+-                      (src->format == WL_SHM_FORMAT_XRGB8888 && dst->format == WL_SHM_FORMAT_ARGB8888)
+-                          ? 0xff000000 : 0, FALSE);
+-}
++/* NEUTRON PM-TRAILS FIX: wayland_shm_buffer_copy (buffer->buffer copy from the
++ * "latest" committed buffer) removed — the flush now sources every accumulated-
++ * damage pixel from the always-current window_surface backing bitmap instead. */
+ 
+ /**********************************************************************
+  *          wayland_shm_buffer_copy_shape
+@@ -434,12 +426,22 @@
+ {
+     RECT surface_rect = {.right = color_info->bmiHeader.biWidth, .bottom = abs(color_info->bmiHeader.biHeight)};
+     struct wayland_window_surface *wws = wayland_window_surface_cast(window_surface);
+-    struct wayland_shm_buffer *shm_buffer = NULL, *latest_buffer;
++    struct wayland_shm_buffer *shm_buffer = NULL;
+     BOOL flushed = FALSE;
+     HRGN surface_damage_region = NULL;
+     HRGN copy_from_window_region;
+     uint32_t buffer_format;
+ 
++    /* NEUTRON round-43 A1/A2/B PROBE (env NEUTRON_PROBE_X/Y = victim surface point):
++     * sample the victim pixel at flush ENTER / after repair / in the COMMITTED shm
++     * buffer, plus damage coverage + can_commit bails, to name the case. */
++    { static int px=-2, py; static LONG cbail;
++      if (px==-2){ const char *ex=getenv("NEUTRON_PROBE_X"), *ey=getenv("NEUTRON_PROBE_Y");
++                   px = ex? atoi(ex): -1; py = ey? atoi(ey): 0; }
++      if (px>=0 && !wayland_window_can_commit(window_surface->hwnd))
++      { cbail++; if(cbail<20 || cbail%200==0) ERR("NT-PROBE can_commit BAIL n=%ld (victim never commits)\n", cbail); }
++    }
++
+     /* NEUTRON M2: bail before copying tens of MB (at 4K) that the commit would only discard while
+      * the xdg config is incompatible (the maximize/un-maximize transition). win32u keeps the bounds
+      * dirty and retries once a compatible configure lands. Output-neutral. */
+@@ -454,6 +456,67 @@
+         goto done;
+     }
+ 
++    /* NEUTRON round-36 temporal suppression: remember GDI damage on this
++     * toplevel so idle black subsurfaces covering fresh GDI content (CEP
++     * shared-mem blits / GDI-hybrid paints) can be placed below. */
++    {
++        RECT dmg = { rect->left + dirty->left, rect->top + dirty->top,
++                     rect->left + dirty->right, rect->top + dirty->bottom };
++        neutron_gdi_damage_record(window_surface->hwnd, &dmg);
++
++        /* NEUTRON round-44 GDIPATH (env NEUTRON_GDIPATH=1): flush RATE + flushed
++         * PIXEL VOLUME per 5s = the readback/blit storm each GDI-damage triggers
++         * (lag component b, our side). Read-only. */
++        {
++            static int gp = -1;
++            if (gp < 0) { const char *e = getenv("NEUTRON_GDIPATH"); gp = (e && e[0]=='1') ? 1 : 0; }
++            if (gp)
++            {
++                static LONG flushes; static ULONGLONG px, t0; ULONGLONG now;
++                flushes++;
++                px += (ULONGLONG)(dirty->right - dirty->left) * (dirty->bottom - dirty->top);
++                now = NtGetTickCount(); if (!t0) t0 = now;
++                if (now - t0 >= 5000)
++                {
++                    ERR("neutron-gdipath: 5s flushes=%ld flushedMPx=%llu (~%lluMB shm copy) surf=%dx%d\n",
++                        flushes, (unsigned long long)(px/1000000), (unsigned long long)(px*4/1000000),
++                        (int)color_info->bmiHeader.biWidth, (int)abs(color_info->bmiHeader.biHeight));
++                    flushes = 0; px = 0; t0 = now;
++                }
++            }
++        }
++
++        /* NEUTRON round-41 WIPE DETECTOR (read-only, trace-gated): sample an
++         * 8x6 grid of the flushed surface bits; a panel pixel flipping
++         * content->black across flushes, correlated with the damage rect +
++         * flushing tid (wine prefixes ERR with the tid) + our tagged
++         * neutron-blit lines, NAMES the writer that wipes panels. */
++        {
++            static int trace = -1;
++            if (trace < 0) { const char *e = getenv("NEUTRON_TRACE"); trace = (e && e[0]=='1') ? 1 : 0; }
++            if (trace && color_bits && color_info->bmiHeader.biWidth >= 1000)
++            {
++                const unsigned int *px = color_bits;
++                int W = color_info->bmiHeader.biWidth;
++                int H = abs(color_info->bmiHeader.biHeight);
++                char grid[8*6 + 6 + 1]; int gi = 0, gx, gy;
++                for (gy = 0; gy < 6; gy++)
++                {
++                    for (gx = 0; gx < 8; gx++)
++                    {
++                        unsigned int v = px[(size_t)(H*(2*gy+1)/12) * W + W*(2*gx+1)/16];
++                        grid[gi++] = ((v & 0xf0f0f0) == 0) ? '0' : '1';
++                    }
++                    grid[gi++] = ' ';
++                }
++                grid[gi] = 0;
++                ERR("NT-EV surfpix hwnd=%p t=%u dmg=%ld,%ld-%ld,%ld grid=%s\n",
++                    window_surface->hwnd, (unsigned)NtGetTickCount(),
++                    dmg.left, dmg.top, dmg.right, dmg.bottom, grid);
++            }
++        }
++    }
++
+     buffer_format = (shape_bits || wws->layered) ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+     if (wws->wayland_buffer_queue->format != buffer_format)
+     {
+@@ -473,38 +536,43 @@
+         goto done;
+     }
+ 
+-    if ((latest_buffer = get_window_surface_contents(window_surface->hwnd)))
++    /* NEUTRON PM-TRAILS FIX (2026-07-23, Premiere program-monitor scrubber trails):
++     * Source the pixels for the ENTIRE accumulated damage region of the recycled
++     * buffer (everything flushed since this buffer was last committed, which
++     * includes the current dirty rect added via wayland_buffer_queue_add_damage
++     * above) directly from the window_surface backing bitmap (color_bits), which
++     * is always authoritative. Upstream instead copied the accumulated-minus-
++     * current-dirty part from the last committed buffer ("copy_from_latest"),
++     * trusting that chain of buffer->buffer copies to carry every earlier update
++     * forward; under Premiere's multi-threaded, high-rate scrub flushes stale
++     * playhead-marker pixels survived buffer recycling and only a full-window
++     * repaint cleared them. Copying the same region from color_bits moves the
++     * SAME number of bytes (the region is identical), so there is no perf cost,
++     * and removes the only non-authoritative pixel source in this path.
++     * Additionally the commit now carries this accumulated region as wayland
++     * damage (see set_window_surface_contents call below) instead of only the
++     * current dirty rect, so the compositor's cached window texture is refreshed
++     * everywhere the newly committed buffer may differ from what is on screen —
++     * stale content cannot survive a buffer-pool cycle even if it sneaks in. */
++    /* NEUTRON PM-TRAILS DIAGNOSTIC (NEUTRON_PM_FULLCOPY=1): force a full-surface
++     * authoritative refresh — copy AND commit the ENTIRE surface from color_bits
++     * every flush. This is a bisection probe, NOT a shipping fix (too heavy). If
++     * the scrubber trails VANISH under this, the residual lives in winewayland's
++     * partial damage tracking (the app under-reports damage over the old marker,
++     * so it stays outside every buffer's accumulated damage_region). If the trails
++     * PERSIST even here, the stale marker pixels are already present in color_bits
++     * (the win32u/GDI backing bitmap) and winewayland is faithfully presenting
++     * them — i.e. the bug is upstream in win32u/app paint, not this path. */
+     {
+-        TRACE("latest_window_buffer=%p\n", latest_buffer);
+-        /* If we have a latest buffer, use it as the source of all pixel
+-         * data that are not contained in the bounds of the flush... */
+-        if (latest_buffer != shm_buffer)
+-        {
+-            HRGN copy_from_latest_region = NtGdiCreateRectRgn(0, 0, 0, 0);
+-            if (!copy_from_latest_region)
+-            {
+-                ERR("failed to create copy_from_latest region\n");
+-                goto done;
+-            }
+-            NtGdiCombineRgn(copy_from_latest_region, shm_buffer->damage_region,
+-                            surface_damage_region, RGN_DIFF);
+-            wayland_shm_buffer_copy(latest_buffer,
+-                                    shm_buffer, copy_from_latest_region);
+-            NtGdiDeleteObjectApp(copy_from_latest_region);
+-        }
+-        /* ... and use the window_surface as the source of pixel data contained
+-         * in the flush bounds. */
+-        copy_from_window_region = surface_damage_region;
+-        wayland_shm_buffer_unref(latest_buffer);
+-    }
+-    else
+-    {
+-        TRACE("latest_window_buffer=NULL\n");
+-        /* If we don't have a latest buffer, use the window_surface as
+-         * the source of all pixel data. */
+-        copy_from_window_region = shm_buffer->damage_region;
++        static int fc = -1;
++        if (fc < 0) { const char *e = getenv("NEUTRON_PM_FULLCOPY"); fc = (e && e[0]=='1') ? 1 : 0; }
++        if (fc)
++            NtGdiSetRectRgn(shm_buffer->damage_region, surface_rect.left, surface_rect.top,
++                            surface_rect.right, surface_rect.bottom);
+     }
+ 
++    copy_from_window_region = shm_buffer->damage_region;
++
+     /* NEUTRON: layered-surface alpha policy (root-caused 2026-07-18):
+      * - SetLayeredWindowAttributes LWA_ALPHA constant (window_surface->alpha_bits = alpha<<24):
+      *   OR it into every pixel, mirroring winex11's layered path.
+@@ -568,14 +636,51 @@
+                 }
+             }
+         }
++        /* NEUTRON round-43 RPC: give the shared surface memory + correct assembly.
++         * Fill this present's shadow FROM color_bits (DXVK already StretchDIBits'd
++         * the band here) and REPAIR chain-owned regions wiped by relayout cascades
++         * / app GDI, all as pure memcpy into color_bits BEFORE this copy -> atomic
++         * per frame. color_bits is the writable DIB backing; cast away const. */
++        /* NT-PROBE: victim pixel BEFORE repair (color_bits) */
++        int _px=-2,_py; unsigned _pE=0,_pR=0,_pC=0; int _cbW = color_info->bmiHeader.biWidth;
++        { const char *ex=getenv("NEUTRON_PROBE_X"), *ey=getenv("NEUTRON_PROBE_Y");
++          _px = ex? atoi(ex): -1; _py = ey? atoi(ey): 0;
++          if (_px>=0 && _px<_cbW && _py<surface_rect.bottom)
++              _pE = ((const UINT32*)color_bits)[(size_t)_py*_cbW + _px] & 0xffffff; }
++
++        neutron_rpc_flush(window_surface->hwnd, (void *)color_bits,
++                          color_info->bmiHeader.biWidth, surface_rect.right, surface_rect.bottom,
++                          (RECT){ rect->left + dirty->left, rect->top + dirty->top,
++                                  rect->left + dirty->right, rect->top + dirty->bottom });
++
++        if (_px>=0 && _px<_cbW && _py<surface_rect.bottom)
++            _pR = ((const UINT32*)color_bits)[(size_t)_py*_cbW + _px] & 0xffffff;
++
+         wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+                                      alpha_bits, sanitize);
++
++        /* NT-PROBE: victim pixel in the COMMITTED shm buffer (== what the compositor
++         * shows) + running black-vs-content tally = the VALID committed-level judge. */
++        if (_px>=0 && _px<shm_buffer->width && _py<shm_buffer->height)
++        {
++            static LONG cblk=0, ctot=0; static ULONGLONG t0=0; ULONGLONG now;
++            _pC = ((const UINT32*)shm_buffer->map_data)[(size_t)_py*shm_buffer->width + _px] & 0xffffff;
++            (void)_pE; (void)_pR;
++            ctot++; if ((_pC & 0xf0f0f0)==0) cblk++;
++            now = NtGetTickCount(); if(!t0) t0=now;
++            if (now - t0 >= 2000)
++            { ERR("NT-COMMITTED victim(%d,%d) blackSamples=%ld / %ld committedVal=%06x  (black=wipe; check color)\n",
++                  _px,_py, cblk, ctot, _pC); t0=now; }
++        }
+     }
+     if (shape_bits) wayland_shm_buffer_copy_shape(shm_buffer, rect, shape_info, shape_bits);
+ 
++    /* NEUTRON PM-TRAILS FIX: commit the buffer's full accumulated damage (== the
++     * region just copied fresh from color_bits) rather than only the current
++     * dirty rect. attach_shm reads the region synchronously, so it is safe to
++     * reset it right after. */
++    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, shm_buffer->damage_region);
+     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
+-
+-    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, surface_damage_region);
+     wl_display_flush(process_wayland.wl_display);
+ 
+ done:
