@@ -407,11 +407,31 @@ this one.
 Registers `CLSID_D2D1UnPremultiply` and `CLSID_D2D1Premultiply` in the same stub form as the other
 built-ins, and adds `d2d_effect_image_get_source()` so a stub effect's output image can be resolved
 to its source input.
-⚠️ **INCOMPLETE CAPTURE**: the matching `d2d_device_context_DrawImage()` hunk (follow
-`d2d_effect_image_get_source` before drawing, so the effect's output actually renders) is NOT in
-this file — it sits inside the heavily-patched `device.c` and must be folded into the existing
-device.c patch. Without it `CreateEffect` succeeds and nothing throws, but the effect draws nothing.
+✅ **CAPTURE NOW COMPLETE (2026-08-03).** The matching `d2d_device_context_DrawImage()` hunk is
+included, so the patch matches the binary that was actually tested. The patch was also
+**regenerated against the staging base** — the original was a `git diff` against the dev tree, and
+its context carried `NEUTRON_API_TIME()` lines that `neutron-d2d1-layer-clip-dcdirect` already
+adds, so hunk 3 FAILED to apply. That hunk was the one *defining* `d2d_effect_image_get_source`,
+which the header declares and `device.c` calls ⇒ the build would not have linked, and this fix
+would have been silently lost. **Cut patches against the patched tree, never the dev tree.**
 ✅ Verified with it: the whole D2D half of AE's blit succeeds — `CreateEffect(unpremultiply) hr=0`,
 `SetTarget(dxgi-backed) 2734x1174`, `DrawImage(effect->source)`, `EndDraw(bitmap-target,drew,OK)`.
-❌ Does NOT by itself make the composition appear: AE's Direct2D UI-overlay draw then
-fails on its own (command-list overlay draw) and throws the same generic code. Second, separate bug.
+❌ Does NOT by itself make the composition appear — and the "second bug" named here was
+**misdiagnosed**. AE's UI-overlay draw does not fail on D2D command lists: it fails because
+`cuGraphicsD3D11RegisterResource` returns `CUDA_ERROR_UNKNOWN` (161 failures = 161 latches, 1:1).
+Fixed outside Wine, in nvcuda + DXVK — see
+`~/neutron/preserved-fixes/patches/README-cuda-d3d11-interop.md`. ✅ With both, the composition
+renders **and** the UI overlay draws (user-confirmed 2026-08-03).
+
+**`neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen:**
+A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
+no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
+all. AE shows its splash (an owned `#32770`, 1301x877) ~22,000 log lines before the main window
+that owns it is mapped (`SHOW @ line 940` vs `configure_window hwnd=0x20064 @ line 22771`).
+Promotes such a window to its own toplevel — but **only the outermost orphan**: the owner must be a
+genuine root with no owner of its own. Without that test, a 503x764 dialog owned by the splash was
+promoted too and appeared as a **ghost window behind it** (the failure the surrounding code's own
+comment warns about). Ownership *depth* separates them; owner *visibility* does not, because both
+are seen while their owner is still unmapped. Env `NEUTRON_WL_ORPHAN_TOPLEVEL=0` disables.
+⚠️ Named `zzzz-` deliberately: it must collate AFTER the four other patches touching
+`dlls/winewayland.drv/window.c`, or both hunks fail.
