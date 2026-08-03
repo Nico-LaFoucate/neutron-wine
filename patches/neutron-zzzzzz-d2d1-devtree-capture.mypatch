@@ -1,0 +1,770 @@
+--- a/dlls/d2d1/command_list.c
++++ b/dlls/d2d1/command_list.c
+@@ -285,6 +285,20 @@
+ 
+     TRACE("iface %p, sink %p.\n", iface, sink);
+ 
++    /* NEUTRON: who streams, and does the list survive to be streamable? Stream()
++     * returns S_OK and does NOTHING for a non-CLOSED list, so a list that hit a
++     * recording error (state=ERROR) is discarded in total silence. */
++    if (neutron_optrace())
++    {
++        static LONG seq;
++        LONG i = InterlockedIncrement(&seq);
++
++        if (i <= 48 || !(i % 512))
++            ERR("neutron-cl: STREAM #%ld list=%p sink=%p state=%u bytes=%Iu%s\n", i, command_list,
++                    sink, command_list->state, command_list->size,
++                    command_list->state == D2D_COMMAND_LIST_STATE_CLOSED ? "" : " -> SKIPPED (not closed)");
++    }
++
+     if (command_list->state != D2D_COMMAND_LIST_STATE_CLOSED) return S_OK;
+ 
+     if (FAILED(hr = ID2D1CommandSink_BeginDraw(sink)))
+@@ -478,7 +492,21 @@
+     NEUTRON_API_TIME();
+     struct d2d_command_list *command_list = impl_from_ID2D1CommandList(iface);
+ 
+-    FIXME("iface %p stub.\n", iface);
++    TRACE("iface %p.\n", iface);
++
++    /* NEUTRON: state at Close is the tell. OPEN(1) = healthy recording; ERROR(3) =
++     * something failed while recording and this list will never draw anything, no
++     * matter what the playback path does. */
++    if (neutron_optrace())
++    {
++        static LONG seq;
++        LONG i = InterlockedIncrement(&seq);
++
++        if (i <= 48 || !(i % 512))
++            ERR("neutron-cl: CLOSE #%ld list=%p state=%u bytes=%Iu objs=%Iu%s\n", i, command_list,
++                    command_list->state, command_list->size, command_list->objects_count,
++                    command_list->state == D2D_COMMAND_LIST_STATE_OPEN ? "" : " -> WRONG_STATE (list is dead)");
++    }
+ 
+     if (command_list->state != D2D_COMMAND_LIST_STATE_OPEN)
+         return D2DERR_WRONG_STATE;
+@@ -1104,3 +1132,440 @@
+     d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+     d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
+ }
++
++/* ---------------------------------------------------------------------------
++ * NEUTRON: COMMAND-LIST PLAYBACK
++ *
++ * WHY THIS EXISTS. d2d1 could RECORD a command list faithfully (all 22 ops
++ * above) and Stream() it to a caller-supplied ID2D1CommandSink -- but it had no
++ * sink of its OWN, so nothing could replay a list into a device context. The two
++ * ends of that gap were:
++ *
++ *   - d2d_device_context_EndDraw() returned E_NOTIMPL outright for a
++ *     command-list target, so recording could never even be finished;
++ *   - d2d_device_context_DrawImage() only understood ID2D1Bitmap, so a command
++ *     list handed to it fell through to "Unhandled image" and drew NOTHING.
++ *
++ * After Effects 2025 draws its composition viewer exactly this way (record into
++ * a list, Close it, DrawImage it onto the panel). Its first draw therefore
++ * failed with 0x80004001 and the panel stayed blank -- the app surfaced it as
++ * "direct2d drawbot error. HRESULT: -2147467263".
++ *
++ * The sink below forwards every op onto a real ID2D1DeviceContext, which already
++ * implements all of them. Transform handling is the only subtle part: ops in a
++ * list are recorded in the LIST's own coordinate space, so the effective
++ * transform is
++ *
++ *     recorded * translate(target_offset) * <caller's transform at DrawImage>
++ *
++ * which is what `base` holds and what SetTransform composes against.
++ *
++ * NOT handled (deliberate, and each degrades rather than fails):
++ *   - ID2D1CommandSink1/4 (SetPrimitiveBlend1/2). Stream() already falls back to
++ *     SOURCE_OVER for the blends those cover, which is the pre-existing
++ *     behaviour, so QI'ing E_NOINTERFACE loses nothing.
++ *   - A Clear inside a list with no image_rect clips to the whole target rather
++ *     than the list's extent. D2D command lists have infinite extent, so there
++ *     is no bound to clip to; callers that pass image_rect get the right thing.
++ */
++
++struct d2d_playback_sink
++{
++    ID2D1CommandSink ID2D1CommandSink_iface;
++    LONG refcount;
++    ID2D1DeviceContext *context;
++    D2D1_MATRIX_3X2_F base;
++    /* NEUTRON diagnostic counters (NEUTRON_D2D_OPTRACE=1). "replayed nothing" and
++     * "replayed into the wrong place" look identical on screen; these separate them. */
++    unsigned int ops, clears, draws;
++    D2D1_RECT_F first_draw;
++    BOOL have_first_draw;
++};
++
++/* Record where the first geometric op actually landed, in the LIST's own space. */
++static void d2d_playback_sink_note_draw(struct d2d_playback_sink *sink, const D2D1_RECT_F *rect)
++{
++    ++sink->draws;
++    if (!sink->have_first_draw && rect)
++    {
++        sink->first_draw = *rect;
++        sink->have_first_draw = TRUE;
++    }
++}
++
++static inline struct d2d_playback_sink *impl_from_ID2D1CommandSink(ID2D1CommandSink *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_playback_sink, ID2D1CommandSink_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_QueryInterface(ID2D1CommandSink *iface,
++        REFIID iid, void **out)
++{
++    if (IsEqualGUID(iid, &IID_ID2D1CommandSink) || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        ID2D1CommandSink_AddRef(iface);
++        *out = iface;
++        return S_OK;
++    }
++
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++/* The sink is a STACK object owned by d2d_command_list_playback() and never
++ * outlives it, so Release must not free. Stream() only ever QIs it for the
++ * CommandSink1/4 interfaces we decline, so no reference escapes. */
++static ULONG STDMETHODCALLTYPE d2d_playback_sink_AddRef(ID2D1CommandSink *iface)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++    return InterlockedIncrement(&sink->refcount);
++}
++
++static ULONG STDMETHODCALLTYPE d2d_playback_sink_Release(ID2D1CommandSink *iface)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++    return InterlockedDecrement(&sink->refcount);
++}
++
++/* Replay begins in the list's own space: identity there maps to `base`. */
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_BeginDraw(ID2D1CommandSink *iface)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++
++    ID2D1DeviceContext_SetTransform(sink->context, &sink->base);
++    return S_OK;
++}
++
++/* No-op: we are replaying INSIDE the caller's BeginDraw/EndDraw pair. Ending the
++ * caller's draw here would present a half-finished frame. */
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_EndDraw(ID2D1CommandSink *iface)
++{
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetAntialiasMode(ID2D1CommandSink *iface,
++        D2D1_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext_SetAntialiasMode(impl_from_ID2D1CommandSink(iface)->context, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetTags(ID2D1CommandSink *iface,
++        D2D1_TAG tag1, D2D1_TAG tag2)
++{
++    ID2D1DeviceContext_SetTags(impl_from_ID2D1CommandSink(iface)->context, tag1, tag2);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetTextAntialiasMode(ID2D1CommandSink *iface,
++        D2D1_TEXT_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext_SetTextAntialiasMode(impl_from_ID2D1CommandSink(iface)->context, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetTextRenderingParams(ID2D1CommandSink *iface,
++        IDWriteRenderingParams *params)
++{
++    ID2D1DeviceContext_SetTextRenderingParams(impl_from_ID2D1CommandSink(iface)->context, params);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetTransform(ID2D1CommandSink *iface,
++        const D2D1_MATRIX_3X2_F *transform)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++    D2D1_MATRIX_3X2_F m = *transform;
++
++    d2d_matrix_multiply(&m, &sink->base);
++    ID2D1DeviceContext_SetTransform(sink->context, &m);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetPrimitiveBlend(ID2D1CommandSink *iface,
++        D2D1_PRIMITIVE_BLEND blend)
++{
++    ID2D1DeviceContext_SetPrimitiveBlend(impl_from_ID2D1CommandSink(iface)->context, blend);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_SetUnitMode(ID2D1CommandSink *iface,
++        D2D1_UNIT_MODE mode)
++{
++    ID2D1DeviceContext_SetUnitMode(impl_from_ID2D1CommandSink(iface)->context, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_Clear(ID2D1CommandSink *iface,
++        const D2D1_COLOR_F *colour)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++
++    ++sink->ops; ++sink->clears;
++    ID2D1DeviceContext_Clear(sink->context, colour);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawGlyphRun(ID2D1CommandSink *iface,
++        D2D1_POINT_2F origin, const DWRITE_GLYPH_RUN *run, const DWRITE_GLYPH_RUN_DESCRIPTION *desc,
++        ID2D1Brush *brush, DWRITE_MEASURING_MODE measuring_mode)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++
++    ++sink->ops; ++sink->draws;
++    ID2D1DeviceContext_DrawGlyphRun(sink->context, origin, run, desc, brush, measuring_mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawLine(ID2D1CommandSink *iface,
++        D2D1_POINT_2F p0, D2D1_POINT_2F p1, ID2D1Brush *brush, float stroke_width,
++        ID2D1StrokeStyle *stroke_style)
++{
++    ID2D1DeviceContext_DrawLine(impl_from_ID2D1CommandSink(iface)->context, p0, p1, brush,
++            stroke_width, stroke_style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawGeometry(ID2D1CommandSink *iface,
++        ID2D1Geometry *geometry, ID2D1Brush *brush, float stroke_width,
++        ID2D1StrokeStyle *stroke_style)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++    D2D1_RECT_F bounds;
++
++    ++sink->ops;
++    if (SUCCEEDED(ID2D1Geometry_GetBounds(geometry, NULL, &bounds)))
++        d2d_playback_sink_note_draw(sink, &bounds);
++    else
++        d2d_playback_sink_note_draw(sink, NULL);
++    ID2D1DeviceContext_DrawGeometry(sink->context, geometry, brush, stroke_width, stroke_style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawRectangle(ID2D1CommandSink *iface,
++        const D2D1_RECT_F *rect, ID2D1Brush *brush, float stroke_width,
++        ID2D1StrokeStyle *stroke_style)
++{
++    ID2D1DeviceContext_DrawRectangle(impl_from_ID2D1CommandSink(iface)->context, rect, brush,
++            stroke_width, stroke_style);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawBitmap(ID2D1CommandSink *iface,
++        ID2D1Bitmap *bitmap, const D2D1_RECT_F *dst_rect, float opacity,
++        D2D1_INTERPOLATION_MODE interpolation_mode, const D2D1_RECT_F *src_rect,
++        const D2D1_MATRIX_4X4_F *perspective_transform)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++
++    ++sink->ops; d2d_playback_sink_note_draw(sink, dst_rect);
++    ID2D1DeviceContext_DrawBitmap(sink->context, bitmap, dst_rect, opacity, interpolation_mode,
++            src_rect, perspective_transform);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawImage(ID2D1CommandSink *iface,
++        ID2D1Image *image, const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect,
++        D2D1_INTERPOLATION_MODE interpolation_mode, D2D1_COMPOSITE_MODE composite_mode)
++{
++    /* Nested lists recurse through DrawImage, which resolves them the same way. */
++    ID2D1DeviceContext_DrawImage(impl_from_ID2D1CommandSink(iface)->context, image, target_offset,
++            image_rect, interpolation_mode, composite_mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_DrawGdiMetafile(ID2D1CommandSink *iface,
++        ID2D1GdiMetafile *metafile, const D2D1_POINT_2F *target_offset)
++{
++    ID2D1DeviceContext_DrawGdiMetafile(impl_from_ID2D1CommandSink(iface)->context, metafile,
++            target_offset);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_FillMesh(ID2D1CommandSink *iface,
++        ID2D1Mesh *mesh, ID2D1Brush *brush)
++{
++    ID2D1DeviceContext_FillMesh(impl_from_ID2D1CommandSink(iface)->context, mesh, brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_FillOpacityMask(ID2D1CommandSink *iface,
++        ID2D1Bitmap *bitmap, ID2D1Brush *brush, const D2D1_RECT_F *dst_rect,
++        const D2D1_RECT_F *src_rect)
++{
++    ID2D1DeviceContext_FillOpacityMask(impl_from_ID2D1CommandSink(iface)->context, bitmap, brush,
++            dst_rect, src_rect);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_FillGeometry(ID2D1CommandSink *iface,
++        ID2D1Geometry *geometry, ID2D1Brush *brush, ID2D1Brush *opacity_brush)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++    D2D1_RECT_F bounds;
++
++    ++sink->ops;
++    if (SUCCEEDED(ID2D1Geometry_GetBounds(geometry, NULL, &bounds)))
++        d2d_playback_sink_note_draw(sink, &bounds);
++    else
++        d2d_playback_sink_note_draw(sink, NULL);
++    ID2D1DeviceContext_FillGeometry(sink->context, geometry, brush, opacity_brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_FillRectangle(ID2D1CommandSink *iface,
++        const D2D1_RECT_F *rect, ID2D1Brush *brush)
++{
++    struct d2d_playback_sink *sink = impl_from_ID2D1CommandSink(iface);
++
++    ++sink->ops; d2d_playback_sink_note_draw(sink, rect);
++    ID2D1DeviceContext_FillRectangle(sink->context, rect, brush);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_PushAxisAlignedClip(ID2D1CommandSink *iface,
++        const D2D1_RECT_F *clip_rect, D2D1_ANTIALIAS_MODE mode)
++{
++    ID2D1DeviceContext_PushAxisAlignedClip(impl_from_ID2D1CommandSink(iface)->context, clip_rect, mode);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_PushLayer(ID2D1CommandSink *iface,
++        const D2D1_LAYER_PARAMETERS1 *parameters, ID2D1Layer *layer)
++{
++    ID2D1DeviceContext_PushLayer(impl_from_ID2D1CommandSink(iface)->context, parameters, layer);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_PopAxisAlignedClip(ID2D1CommandSink *iface)
++{
++    ID2D1DeviceContext_PopAxisAlignedClip(impl_from_ID2D1CommandSink(iface)->context);
++    return S_OK;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_playback_sink_PopLayer(ID2D1CommandSink *iface)
++{
++    ID2D1DeviceContext_PopLayer(impl_from_ID2D1CommandSink(iface)->context);
++    return S_OK;
++}
++
++static const ID2D1CommandSinkVtbl d2d_playback_sink_vtbl =
++{
++    d2d_playback_sink_QueryInterface,
++    d2d_playback_sink_AddRef,
++    d2d_playback_sink_Release,
++    d2d_playback_sink_BeginDraw,
++    d2d_playback_sink_EndDraw,
++    d2d_playback_sink_SetAntialiasMode,
++    d2d_playback_sink_SetTags,
++    d2d_playback_sink_SetTextAntialiasMode,
++    d2d_playback_sink_SetTextRenderingParams,
++    d2d_playback_sink_SetTransform,
++    d2d_playback_sink_SetPrimitiveBlend,
++    d2d_playback_sink_SetUnitMode,
++    d2d_playback_sink_Clear,
++    d2d_playback_sink_DrawGlyphRun,
++    d2d_playback_sink_DrawLine,
++    d2d_playback_sink_DrawGeometry,
++    d2d_playback_sink_DrawRectangle,
++    d2d_playback_sink_DrawBitmap,
++    d2d_playback_sink_DrawImage,
++    d2d_playback_sink_DrawGdiMetafile,
++    d2d_playback_sink_FillMesh,
++    d2d_playback_sink_FillOpacityMask,
++    d2d_playback_sink_FillGeometry,
++    d2d_playback_sink_FillRectangle,
++    d2d_playback_sink_PushAxisAlignedClip,
++    d2d_playback_sink_PushLayer,
++    d2d_playback_sink_PopAxisAlignedClip,
++    d2d_playback_sink_PopLayer,
++};
++
++/* Replay `command_list` into `context`. Called from DrawImage when the image is
++ * a command list. The context's drawing state is saved and restored, so a
++ * replay cannot leak the list's transform/antialias/blend state into whatever
++ * the caller draws next. */
++HRESULT d2d_command_list_playback(struct d2d_command_list *command_list, ID2D1DeviceContext *context,
++        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect)
++{
++    IDWriteRenderingParams *saved_text_params = NULL;
++    D2D1_MATRIX_3X2_F saved_transform;
++    D2D1_ANTIALIAS_MODE saved_aa;
++    D2D1_TEXT_ANTIALIAS_MODE saved_text_aa;
++    D2D1_PRIMITIVE_BLEND saved_blend;
++    D2D1_UNIT_MODE saved_unit;
++    struct d2d_playback_sink sink;
++    D2D1_TAG saved_tag1, saved_tag2;
++    BOOL clipped = FALSE;
++    HRESULT hr;
++
++    ID2D1DeviceContext_GetTransform(context, &saved_transform);
++    saved_aa = ID2D1DeviceContext_GetAntialiasMode(context);
++    saved_text_aa = ID2D1DeviceContext_GetTextAntialiasMode(context);
++    saved_blend = ID2D1DeviceContext_GetPrimitiveBlend(context);
++    saved_unit = ID2D1DeviceContext_GetUnitMode(context);
++    ID2D1DeviceContext_GetTextRenderingParams(context, &saved_text_params);
++    ID2D1DeviceContext_GetTags(context, &saved_tag1, &saved_tag2);
++
++    memset(&sink, 0, sizeof(sink));
++    sink.ID2D1CommandSink_iface.lpVtbl = &d2d_playback_sink_vtbl;
++    sink.refcount = 1;
++    sink.context = context;
++    sink.base = saved_transform;
++    if (target_offset)
++    {
++        D2D1_MATRIX_3X2_F t;
++
++        t._11 = 1.0f; t._12 = 0.0f;
++        t._21 = 0.0f; t._22 = 1.0f;
++        t._31 = target_offset->x; t._32 = target_offset->y;
++        d2d_matrix_multiply(&t, &saved_transform);
++        sink.base = t;
++    }
++
++    if (image_rect)
++    {
++        ID2D1DeviceContext_SetTransform(context, &sink.base);
++        ID2D1DeviceContext_PushAxisAlignedClip(context, image_rect, D2D1_ANTIALIAS_MODE_ALIASED);
++        clipped = TRUE;
++    }
++
++    hr = ID2D1CommandList_Stream(&command_list->ID2D1CommandList_iface, &sink.ID2D1CommandSink_iface);
++
++    /* NEUTRON diagnostic. THE decisive line: `state` says whether the list was even
++     * eligible to replay (Stream() returns S_OK and does NOTHING unless it is CLOSED
++     * (=2); a list that hit any recording error is ERROR (=3) and is silently
++     * discarded), `bytes` says whether anything was recorded, and ops/draws say
++     * whether it reached the target. All-zero ops with state=2 means an empty list;
++     * healthy ops with nothing on screen means the geometry is landing off-target,
++     * which `base` and `first draw` then locate. */
++    if (neutron_optrace())
++    {
++        static LONG seq;
++        LONG i = InterlockedIncrement(&seq);
++
++        if (i <= 48 || !(i % 512))
++            ERR("neutron-cl: #%ld list=%p state=%u bytes=%Iu objs=%Iu hr=%#lx ops=%u clears=%u "
++                    "draws=%u base=[%.2f %.2f %.2f %.2f %.1f %.1f] first draw=%s\n",
++                    i, command_list, command_list->state, command_list->size,
++                    command_list->objects_count, hr, sink.ops, sink.clears, sink.draws,
++                    sink.base._11, sink.base._12, sink.base._21, sink.base._22,
++                    sink.base._31, sink.base._32,
++                    sink.have_first_draw ? debug_d2d_rect_f(&sink.first_draw) : "(none)");
++    }
++
++    if (clipped)
++        ID2D1DeviceContext_PopAxisAlignedClip(context);
++
++    ID2D1DeviceContext_SetTransform(context, &saved_transform);
++    ID2D1DeviceContext_SetAntialiasMode(context, saved_aa);
++    ID2D1DeviceContext_SetTextAntialiasMode(context, saved_text_aa);
++    ID2D1DeviceContext_SetPrimitiveBlend(context, saved_blend);
++    ID2D1DeviceContext_SetUnitMode(context, saved_unit);
++    ID2D1DeviceContext_SetTextRenderingParams(context, saved_text_params);
++    ID2D1DeviceContext_SetTags(context, saved_tag1, saved_tag2);
++    if (saved_text_params)
++        IDWriteRenderingParams_Release(saved_text_params);
++
++    return hr;
++}
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1309,6 +1309,47 @@
+     return hr;
+ }
+ 
++
++/* NEUTRON round-45 D3D->D2D BRIDGE TRACE (NEUTRON_D2D_DXTRACE=1).
++ *
++ * The composition viewer is blank and every present-path theory has been eliminated. What has
++ * NOT been examined is the DirectX path, which for After Effects 25.x means DIRECT2D: Adobe
++ * moved AE to the Direct2D drawbot in 25.0, and Adobe's own docs say the comp/layer/footage
++ * panels are drawn with "DirectX on Windows". Our own OPTRACE already measured ops=0 clears=0
++ * on that window across 91 frames -- AE opens a D2D draw there and issues NOTHING.
++ *
++ * If AE renders the composition with D3D11/D3D12 (DXVK logs a D3D11On12 device) and then hands
++ * the result to D2D for display, it must cross the bridge via CreateBitmapFromDxgiSurface or
++ * CreateSharedBitmap, then draw it with DrawBitmap/DrawImage. This traces exactly those four
++ * points:
++ *   no bridge calls at all      -> D2D is not how the frame reaches the screen; look elsewhere
++ *                                  in the DirectX stack (D3D11On12 / vkd3d-proton).
++ *   bridge called, then FAILS   -> the failing HRESULT is the bug, and it is in code we own.
++ *   bridge OK but no DrawBitmap -> AE gets a bitmap and never draws it; the decision not to
++ *                                  draw is upstream.
++ * All four log first-occurrence plus a count, so a per-frame caller cannot flood the log. */
++static int neutron_dxtrace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_D2D_DXTRACE"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static void neutron_dxtrace_log(const char *what, HRESULT hr, unsigned int w, unsigned int h)
++{
++    static char seen[24][64];
++    static int nseen;
++    static LONG counts[24];
++    int i;
++    char key[64];
++
++    if (!neutron_dxtrace()) return;
++    snprintf(key, sizeof(key), "%s/%ux%u/%08x", what, w, h, (unsigned)hr);
++    for (i = 0; i < nseen; i++) if (!strcmp(seen[i], key)) { InterlockedIncrement(&counts[i]); return; }
++    if (nseen < 24) { lstrcpynA(seen[nseen], key, sizeof(seen[0])); InterlockedIncrement(&counts[nseen]); nseen++; }
++    ERR("NT-DX %s size=%ux%u hr=%#lx\n", what, w, h, hr);
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateSharedBitmap(ID2D1DeviceContext6 *iface,
+         REFIID iid, void *data, const D2D1_BITMAP_PROPERTIES *desc, ID2D1Bitmap **bitmap)
+ {
+@@ -1331,8 +1372,12 @@
+         bitmap_desc.colorContext = NULL;
+     }
+ 
+-    if (SUCCEEDED(hr = d2d_bitmap_create_shared(context, iid, data, desc ? &bitmap_desc : NULL, &object)))
++    hr = d2d_bitmap_create_shared(context, iid, data, desc ? &bitmap_desc : NULL, &object);
++    if (SUCCEEDED(hr))
+         *bitmap = (ID2D1Bitmap *)&object->ID2D1Bitmap1_iface;
++    neutron_dxtrace_log("CreateSharedBitmap", hr,
++            SUCCEEDED(hr) ? object->pixel_size.width : 0,
++            SUCCEEDED(hr) ? object->pixel_size.height : 0);
+ 
+     return hr;
+ }
+@@ -2222,6 +2267,21 @@
+ {
+     NEUTRON_API_TIME();
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    /* NEUTRON round-56: log the bitmap's REAL pixel size and where it came from. This used to
++     * pass 0x0, which collapsed every DrawBitmap in the session into one deduped line and made
++     * the interesting question unanswerable. The composition viewer's panel issues 1-13
++     * DrawBitmaps per frame while showing nothing, so the question is whether any of them is
++     * the composition frame -- i.e. a bitmap at composition size rather than a UI icon -- and
++     * whether it is backed by a D3D surface (the D3D12/D3D11On12 hand-off) or plain memory. */
++    if (bitmap)
++    {
++        struct d2d_bitmap *b = unsafe_impl_from_ID2D1Bitmap(bitmap);
++        if (b)
++            neutron_dxtrace_log(b->surface ? "DrawBitmap(dxgi-backed)" : "DrawBitmap(memory)",
++                    S_OK, b->pixel_size.width, b->pixel_size.height);
++        else
++            neutron_dxtrace_log("DrawBitmap(foreign)", S_OK, 0, 0);
++    }
+     neutron_op(context, NEUTRON_OP_DRAWBITMAP);
+ 
+     TRACE("iface %p, bitmap %p, dst_rect %s, opacity %.8e, interpolation_mode %#x, src_rect %s.\n",
+@@ -3162,6 +3222,24 @@
+             context->error.code = hr;
+     }
+ 
++    /* NEUTRON round-57: did anything actually get drawn into a big offscreen target, and did
++     * the draw succeed? A bitmap target is not an HwndRenderTarget, so the per-window present
++     * trace (neutron-dr) never covers it -- which is why AE's real rendering, if it happens
++     * here, has been invisible to every measurement so far. An error code returned from EndDraw
++     * makes an application throw its frame away, which looks exactly like never drawing it. */
++    /* Requires OPTRACE too: nb_hist is only maintained when it is on, so without it every
++     * target would report EMPTY -- a confident wrong answer instead of no answer. */
++    if (neutron_dxtrace() && neutron_optrace() && context->target.type == D2D_TARGET_BITMAP
++            && context->pixel_size.width >= 512 && context->pixel_size.height >= 512)
++    {
++        unsigned int i, total = 0;
++        for (i = 0; i < NEUTRON_OP_COUNT; i++) total += context->nb_hist[i];
++        neutron_dxtrace_log(total ? (SUCCEEDED(context->error.code) ? "EndDraw(bitmap-target,drew,OK)"
++                                                                   : "EndDraw(bitmap-target,drew,FAILED)")
++                                  : "EndDraw(bitmap-target,EMPTY)",
++                context->error.code, context->pixel_size.width, context->pixel_size.height);
++    }
++
+     return context->error.code;
+ }
+ 
+@@ -3365,6 +3443,20 @@
+ 
+     surface_options = d2d_get_bitmap_options_for_surface(surface);
+ 
++    /* NEUTRON round-56: this is the door a D3D12/D3D11On12-rendered frame must come through to
++     * become something Direct2D can draw. The old trace fired on ENTRY with a hardcoded 0x0 and
++     * no result, so it could tell us the door was used but nothing about what came through it
++     * or whether it opened. Report the surface's real dimensions and the actual HRESULT. */
++    if (neutron_dxtrace())
++    {
++        DXGI_SURFACE_DESC surface_desc;
++        if (SUCCEEDED(IDXGISurface_GetDesc(surface, &surface_desc)))
++            neutron_dxtrace_log("CreateBitmapFromDxgiSurface-enter", S_OK,
++                    surface_desc.Width, surface_desc.Height);
++        else
++            neutron_dxtrace_log("CreateBitmapFromDxgiSurface-enter(GetDesc failed)", S_OK, 0, 0);
++    }
++
+     if (desc)
+     {
+         if (!d2d_bitmap_check_options_with_surface(desc->bitmapOptions, surface_options))
+@@ -3394,6 +3486,11 @@
+     if (SUCCEEDED(hr = d2d_bitmap_create_shared(context, &IID_IDXGISurface, surface, desc, &object)))
+         *bitmap = &object->ID2D1Bitmap1_iface;
+ 
++    /* NEUTRON round-56: the RESULT, which the enter-only trace never showed. A failure here
++     * means a frame rendered on the D3D side never becomes drawable by Direct2D. */
++    neutron_dxtrace_log(SUCCEEDED(hr) ? "CreateBitmapFromDxgiSurface-OK" : "CreateBitmapFromDxgiSurface-FAILED",
++            hr, SUCCEEDED(hr) ? object->pixel_size.width : 0, SUCCEEDED(hr) ? object->pixel_size.height : 0);
++
+     return hr;
+ }
+ 
+@@ -3402,10 +3499,17 @@
+ {
+     NEUTRON_API_TIME();
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    HRESULT hr;
+ 
+     TRACE("iface %p, effect_id %s, effect %p.\n", iface, debugstr_guid(effect_id), effect);
+ 
+-    return d2d_effect_create(context, effect_id, effect);
++    hr = d2d_effect_create(context, effect_id, effect);
++    /* NEUTRON round-58: After Effects' hardware blit creates exactly one effect,
++     * CLSID_D2D1UnPremultiply, and turns any failure here into a thrown 0xA00F0001 that latches
++     * its hardware blit off for the whole process. Name the outcome. */
++    neutron_dxtrace_log(IsEqualGUID(effect_id, &CLSID_D2D1UnPremultiply)
++            ? "CreateEffect(unpremultiply)" : "CreateEffect(other)", hr, 0, 0);
++    return hr;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_ID2D1DeviceContext_CreateGradientStopCollection(
+@@ -3685,6 +3789,16 @@
+             return;
+         }
+ 
++        /* NEUTRON round-57: name the target After Effects renders into.
++         *
++         * Measured in round 56: AE creates a Direct2D bitmap from a DXGI surface at EXACTLY the
++         * composition canvas size, 2734x1174, 61 times in one session, and every one succeeds --
++         * and it NEVER draws that bitmap (zero DrawBitmap(dxgi-backed) in 3232 DrawBitmaps).
++         * A bitmap you create from a D3D surface, succeed at, and never draw is a bitmap you are
++         * rendering INTO. This confirms or refutes that in one line. */
++        neutron_dxtrace_log(bitmap_impl->surface ? "SetTarget(dxgi-backed)" : "SetTarget(memory)",
++                S_OK, bitmap_impl->pixel_size.width, bitmap_impl->pixel_size.height);
++
+         d2d_device_context_reset_target(context);
+ 
+         /* Set sizes and pixel format. */
+@@ -3828,12 +3942,14 @@
+     NEUTRON_API_TIME();
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+     neutron_op(context, NEUTRON_OP_DRAWIMAGE);
++    ID2D1CommandList *command_list_iface;
+     ID2D1Bitmap *bitmap;
+     unsigned int i;
+ 
+     TRACE("iface %p, image %p, target_offset %s, image_rect %s, interpolation_mode %#x, composite_mode %#x.\n",
+             iface, image, debug_d2d_point_2f(target_offset), debug_d2d_rect_f(image_rect),
+             interpolation_mode, composite_mode);
++    neutron_dxtrace_log("DrawImage", S_OK, context->pixel_size.width, context->pixel_size.height);
+ 
+     if (FAILED(context->error.code))
+         return;
+@@ -3854,6 +3970,9 @@
+             break;
+         image = source;
+     }
++    if (i)
++        neutron_dxtrace_log("DrawImage(effect->source)", S_OK, context->pixel_size.width,
++                context->pixel_size.height);
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+@@ -3873,6 +3992,21 @@
+         return;
+     }
+ 
++    /* NEUTRON: replay a command list onto this target. Recording a list always
++     * worked; nothing could ever play one back, so a list drawn here silently
++     * produced no pixels (the "Unhandled image" path below). */
++    if (SUCCEEDED(ID2D1Image_QueryInterface(image, &IID_ID2D1CommandList, (void **)&command_list_iface)))
++    {
++        struct d2d_command_list *command_list = unsafe_impl_from_ID2D1CommandList(command_list_iface);
++
++        if (command_list)
++            d2d_command_list_playback(command_list, (ID2D1DeviceContext *)iface, target_offset, image_rect);
++        else
++            FIXME("Foreign command list %p.\n", command_list_iface);
++        ID2D1CommandList_Release(command_list_iface);
++        return;
++    }
++
+     FIXME("Unhandled image %p.\n", image);
+ }
+ 
+--- a/dlls/d2d1/hwnd_render_target.c
++++ b/dlls/d2d1/hwnd_render_target.c
+@@ -448,8 +448,9 @@
+          * frame. A frame that CLEARS the panel and then draws a handful of ops is the app
+          * wiping its own content (upstream of us). Capped so the log stays readable. */
+         if (neutron_optrace() && render_target->pres_n < 400
+-                && (render_target->dst_rect.right - render_target->dst_rect.left) >= 3000
+-                && (render_target->dst_rect.bottom - render_target->dst_rect.top) <= 700)
++                && (neutron_optrace_all()
++                    || ((render_target->dst_rect.right - render_target->dst_rect.left) >= 3000
++                        && (render_target->dst_rect.bottom - render_target->dst_rect.top) <= 700)))
+         {
+             unsigned ops = 0, clears = 0;
+             char hist[512];
+@@ -478,6 +479,29 @@
+             render_target->client_px += (unsigned long long)(render_target->dst_rect.right - render_target->dst_rect.left)
+                     * (render_target->dst_rect.bottom - render_target->dst_rect.top);
+         }
++        /* NEUTRON: a frame that drew NOTHING has nothing to composite -- blitting back the
++         * pixels we captured at BeginDraw can only restore stale content over whatever else
++         * painted the window meanwhile. See neutron_skipempty() for the measurement. */
++        if (uv && neutron_skipempty())
++        {
++            unsigned se_ops = 0, se_clears = 0;
++            RECT se_cr;
++
++            neutron_dr_get_frame_stats(render_target->dxgi_target, &se_ops, &se_clears, &se_cr);
++            if (!se_ops && !se_clears)
++            {
++                if (!render_target->skipempty_logged)
++                {
++                    render_target->skipempty_logged = 1;
++                    ERR("neutron-dr: SKIPEMPTY hwnd=%p %dx%d -- first empty frame, blit-back suppressed\n",
++                            render_target->hwnd,
++                            (int)(render_target->dst_rect.right - render_target->dst_rect.left),
++                            (int)(render_target->dst_rect.bottom - render_target->dst_rect.top));
++                }
++                uv = FALSE;
++            }
++        }
++
+         /* DECISIVE TEST: suppress the blit-back for the timeline rows only. */
+         if (uv && neutron_skipblit()
+                 && (render_target->dst_rect.right - render_target->dst_rect.left) >= 3000
+@@ -542,8 +566,9 @@
+                  * point whose colour changed names the primitive that repainted it -- that is
+                  * how we identify the call that blanks a UI element. */
+                 if (neutron_optrace()
+-                        && (render_target->dst_rect.right - render_target->dst_rect.left) >= 3000
+-                        && (render_target->dst_rect.bottom - render_target->dst_rect.top) <= 700)
++                        && (neutron_optrace_all()
++                            || ((render_target->dst_rect.right - render_target->dst_rect.left) >= 3000
++                                && (render_target->dst_rect.bottom - render_target->dst_rect.top) <= 700)))
+                 {
+                     unsigned i;
+ 

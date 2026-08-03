@@ -1,0 +1,21 @@
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -386,12 +386,18 @@
+  * and already logged as "dropping frame". Note this is not a NEW race: the producer
+  * already overwrote the shared buffer while the consumer might be blitting from it.
+  * Gated off by default so it can be A/B'd against exactly this. */
++/* ON BY DEFAULT since 11.10-19; NEUTRON_DCOMP_DIRECT=0 disables.
++ * Soaked with the read-through in the same sessions: zero direct-readback faults, and the
++ * shared pixel buffer is double-buffered (neutron-zzz8-winewayland-pxdouble), so a reader
++ * can no longer catch a half-written frame -- a race that existed BEFORE this patch too.
++ * The escape hatch stays for one-step bisection if a panel ever looks wrong. */
+ static int neutron_dcomp_direct(void)
+ {
+     static int v = -1;
+     if (v < 0)
+     {
+         char b[8];
++        /* absent -> ON; "0" -> OFF */
+         v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DIRECT", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
+     }
+     return v;

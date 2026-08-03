@@ -1,0 +1,377 @@
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -47,6 +47,13 @@
+ 
+ static struct list dce_list = LIST_INIT(dce_list);
+ 
++/* NEUTRON PM-TRAILS DIAG: expose the dce's hwnd to the GDI-side draw-op probe
++ * (clipping.c neutron-blt) without widening the dce interface. */
++HWND neutron_dce_hwnd( struct dce *dce )
++{
++    return dce ? dce->hwnd : 0;
++}
++
+ #define DCE_CACHE_SIZE 64
+ 
+ static struct list window_surfaces = LIST_INIT( window_surfaces );
+@@ -641,6 +648,65 @@
+         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
+                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+ 
++        /* NEUTRON PM-TRAILS DIAG (NEUTRON_PIXPROBE="l:t:r:b", surface coords):
++         * objectively answer "is the stale playhead marker in color_bits at flush
++         * time?" without any eyeball judgment. At each flush of a wide surface,
++         * RLE-scan two rows of the given band in color_bits and log the non-
++         * background segments: the current marker appears as 1-2 blobs; any
++         * additional blobs at older x positions == stale pixels in color_bits. */
++        {
++            static int pp = -1;
++            static int band[4];
++            if (pp < 0)
++            {
++                const char *e = getenv("NEUTRON_PIXPROBE");
++                pp = (e && sscanf( e, "%d:%d:%d:%d", &band[0], &band[1], &band[2], &band[3] ) == 4) ? 1 : 0;
++            }
++            if (pp && color_info->bmiHeader.biBitCount == 32 &&
++                color_info->bmiHeader.biWidth > 2000 &&
++                dirty.bottom > band[1] && dirty.top < band[3])
++            {
++                int width = color_info->bmiHeader.biWidth;
++                int height = abs( color_info->bmiHeader.biHeight );
++                int bottom_up = color_info->bmiHeader.biHeight > 0;
++                int rows[2] = { band[1] + (band[3] - band[1]) / 3, band[1] + 2 * (band[3] - band[1]) / 3 };
++                int r;
++                for (r = 0; r < 2; r++)
++                {
++                    int y = rows[r], x, l = band[0], rt = min( band[2], width );
++                    const UINT *px;
++                    UINT bg;
++                    char buf[360]; int n = 0, nseg = 0, sx = -1;
++                    UINT scol = 0;
++                    if (y < 0 || y >= height || l < 0 || l >= rt) continue;
++                    px = (const UINT *)color_bits + (bottom_up ? (height - 1 - y) : y) * (SIZE_T)width;
++                    bg = px[l] & 0xffffff;
++                    buf[0] = 0;
++                    /* runs of identical color != bg, min width 4 (skips antialias dust);
++                     * splits on any color change so a marker blob inside a progress
++                     * fill still shows as its own run */
++                    for (x = l; x <= rt; x++)
++                    {
++                        UINT c = (x < rt) ? (px[x] & 0xffffff) : (bg ^ 1); /* sentinel closes last run */
++                        if (sx >= 0 && c == scol) continue;
++                        if (sx >= 0)
++                        {
++                            if (scol != bg && x - sx >= 4)
++                            {
++                                nseg++;
++                                if (nseg <= 10 && n < (int)sizeof(buf) - 32)
++                                    n += snprintf( buf + n, sizeof(buf) - n, " %d-%d:%06x", sx, x - 1, scol );
++                            }
++                        }
++                        sx = x; scol = c;
++                    }
++                    ERR( "neutron-pix: hwnd=%p y=%d bg=%06x dirty=(%d,%d)-(%d,%d) nseg=%d%s\n",
++                         surface->hwnd, y, bg, (int)dirty.left, (int)dirty.top, (int)dirty.right, (int)dirty.bottom,
++                         nseg, buf );
++                }
++            }
++        }
++
+         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
+                                    shape_changed, shape_info, shape_bits ))
+             reset_bounds( &surface->bounds );
+@@ -1417,6 +1483,20 @@
+ 
+     TRACE( "(%p,%p,0x%x): returning %p%s\n", hwnd, clip_rgn, flags, dce->hdc,
+            update_vis_rgn ? " (updated)" : "" );
++
++    /* NEUTRON PM-TRAILS DIAG (NEUTRON_PAINT_TRACE=1): log GetDCEx handouts so the
++     * capture shows any direct-draw (GetDC outside WM_PAINT) protocol per frame. */
++    {
++        static int npt = -1;
++        if (npt < 0) { const char *e = getenv("NEUTRON_PAINT_TRACE"); npt = (e && e[0]=='1') ? 1 : 0; }
++        if (npt)
++        {
++            RECT cb = {0};
++            if (dce->clip_rgn) NtGdiGetRgnBox( dce->clip_rgn, &cb );
++            ERR( "neutron-paint: GetDCEx hwnd=%p flags=%08x hdc=%p cliprgn=%s upd=%d\n",
++                 hwnd, (int)flags, dce->hdc, wine_dbgstr_rect(&cb), update_vis_rgn );
++        }
++    }
+     return dce->hdc;
+ }
+ 
+@@ -1741,6 +1821,73 @@
+ 
+     TRACE( "hdc = %p box = (%s), fErase = %d\n", hdc, wine_dbgstr_rect(&rect), erase );
+ 
++    /* NEUTRON PM-TRAILS DIAG (NEUTRON_PAINT_TRACE=1): dump the FULL update region the
++     * app receives at BeginPaint, plus the window's screen rect. Pairs with the
++     * RedrawWindow logging below: lets us check whether, during a scrub, the old
++     * playhead-marker column is ever delivered to the app as part of an update
++     * region. If the invalidation covered it but BeginPaint's region does not, the
++     * region is being lost between invalidate and paint (win32u/server bug); if the
++     * app never invalidates the old position at all, the erase strategy is different. */
++    {
++        static int npt = -1;
++        if (npt < 0) { const char *e = getenv("NEUTRON_PAINT_TRACE"); npt = (e && e[0]=='1') ? 1 : 0; }
++        if (npt)
++        {
++            struct window_rects wr = {0};
++            DWORD sz; RGNDATA *rd = NULL; char buf[900]; int n = 0; unsigned cnt = 0;
++            buf[0] = 0;
++            neutron_diag_busy = 1;   /* don't confound the round-8 read-trace */
++            get_window_rects( hwnd, COORDS_SCREEN, &wr, get_thread_dpi() );
++            if (hrgn && (sz = NtGdiGetRegionData( hrgn, 0, NULL )) && (rd = malloc( sz )))
++            {
++                RECT *rr;
++                NtGdiGetRegionData( hrgn, sz, rd );
++                cnt = rd->rdh.nCount;
++                rr = (RECT *)rd->Buffer;
++                /* NOTE: cap raised from 5 — the old 5-rect cap silently hid the 6th
++                 * (old-marker) rect and produced a false "old rect not delivered" read */
++                for (unsigned i = 0; i < cnt && i < 20 && n < (int)sizeof(buf) - 48; i++)
++                    n += snprintf( buf + n, sizeof(buf) - n, "(%d,%d,%d,%d)",
++                                   (int)rr[i].left, (int)rr[i].top, (int)rr[i].right, (int)rr[i].bottom );
++                free( rd );
++            }
++            neutron_diag_busy = 0;
++            ERR( "neutron-paint: BeginPaint hwnd=%p win=%s fErase=%d clip=%s update[n=%u %s]\n",
++                 hwnd, wine_dbgstr_rect(&wr.window), erase, wine_dbgstr_rect(&rect), cnt, buf );
++        }
++    }
++
++    /* NEUTRON round-44 GDIPATH (env NEUTRON_GDIPATH=1): per-hwnd GDI-paint
++     * population + cost. Counts BeginPaint per hwnd + summed paint AREA + a 5s
++     * rate summary. This is the GDI-render population (which UI paints via GDI,
++     * how much area, how often) and lag component (a) = Premiere's own repaint
++     * cost. Pairs with the swapchain-content population (rootdump RAW) and the
++     * flush/present rates. Read-only. */
++    {
++        static int gp = -1;
++        if (gp < 0) { const char *e = getenv("NEUTRON_GDIPATH"); gp = (e && e[0]=='1') ? 1 : 0; }
++        if (gp)
++        {
++            static struct { HWND h; unsigned n; ULONG64 area; } tab[128];
++            static unsigned ntab; static ULONGLONG t0; ULONGLONG now;
++            ULONG64 a = (ULONG64)(rect.right - rect.left) * (rect.bottom - rect.top);
++            unsigned i;
++            for (i = 0; i < ntab; i++) if (tab[i].h == hwnd) break;
++            if (i == ntab && ntab < 128) { tab[ntab].h = hwnd; tab[ntab].n = 0; tab[ntab].area = 0; ntab++; }
++            if (i < 128) { tab[i].n++; tab[i].area += a; }
++            now = NtGetTickCount(); if (!t0) t0 = now;
++            if (now - t0 >= 5000)
++            {
++                unsigned j;
++                for (j = 0; j < ntab; j++) if (tab[j].n)
++                    ERR("neutron-gdipath: BeginPaint hwnd=%p paints=%u totalAreaMPx=%llu (GDI-render window)\n",
++                        tab[j].h, tab[j].n, (unsigned long long)(tab[j].area / 1000000));
++                for (j = 0; j < ntab; j++) { tab[j].n = 0; tab[j].area = 0; }
++                t0 = now;
++            }
++        }
++    }
++
+     if (!ps)
+     {
+         release_dc( hwnd, hdc, TRUE );
+@@ -1844,6 +1991,21 @@
+         dump_rdw_flags(flags);
+     }
+ 
++    /* NEUTRON PM-TRAILS DIAG (NEUTRON_PAINT_TRACE=1): log invalidations on the ERR
++     * channel (no +win firehose) so we can pair invalidate vs BeginPaint update. */
++    {
++        static int npt = -1;
++        if (npt < 0) { const char *e = getenv("NEUTRON_PAINT_TRACE"); npt = (e && e[0]=='1') ? 1 : 0; }
++        if (npt && (flags & (RDW_INVALIDATE | RDW_UPDATENOW)))
++        {
++            RECT r = {0};
++            if (hrgn) NtGdiGetRgnBox( hrgn, &r );
++            else if (rect) r = *rect;
++            ERR( "neutron-paint: Redraw hwnd=%p %s box=%s flags=%08x\n", hwnd,
++                 hrgn ? "rgn" : rect ? "rect" : "whole", wine_dbgstr_rect(&r), flags );
++        }
++    }
++
+     /* process pending expose events before painting */
+     if (flags & RDW_UPDATENOW) check_for_events( QS_PAINT );
+ 
+@@ -1937,6 +2099,40 @@
+         map_window_region( 0, hwnd, hrgn );
+     }
+     set_thread_dpi_awareness_context( context );
++
++    /* NEUTRON PM-TRAILS DIAG (NEUTRON_PAINT_TRACE=1): does the app query the update
++     * region itself (and what does it get, in CLIENT coords)? */
++    {
++        static int npt = -1;
++        if (npt < 0) { const char *e = getenv("NEUTRON_PAINT_TRACE"); npt = (e && e[0]=='1') ? 1 : 0; }
++        if (npt)
++        {
++            RECT rb = {0};
++            DWORD sz; RGNDATA *rd = NULL; char buf[900]; int n = 0; unsigned cnt = 0;
++            buf[0] = 0;
++            neutron_diag_busy = 1;   /* don't confound the round-8 read-trace */
++            if (retval != ERROR)
++            {
++                NtGdiGetRgnBox( hrgn, &rb );
++                /* full rect list: the app may drive its internal back-buffer
++                 * re-render from exactly these rects */
++                if ((sz = NtGdiGetRegionData( hrgn, 0, NULL )) && (rd = malloc( sz )))
++                {
++                    RECT *rr;
++                    NtGdiGetRegionData( hrgn, sz, rd );
++                    cnt = rd->rdh.nCount;
++                    rr = (RECT *)rd->Buffer;
++                    for (unsigned i = 0; i < cnt && i < 20 && n < (int)sizeof(buf) - 48; i++)
++                        n += snprintf( buf + n, sizeof(buf) - n, "(%d,%d,%d,%d)",
++                                       (int)rr[i].left, (int)rr[i].top, (int)rr[i].right, (int)rr[i].bottom );
++                    free( rd );
++                }
++            }
++            neutron_diag_busy = 0;
++            ERR( "neutron-paint: GetUpdateRgn hwnd=%p erase=%d ret=%d box=%s rects[n=%u %s]\n",
++                 hwnd, erase, retval, wine_dbgstr_rect(&rb), cnt, buf );
++        }
++    }
+     return retval;
+ }
+ 
+@@ -1966,6 +2162,15 @@
+     }
+     need_erase = send_erase( hwnd, flags, update_rgn, NULL, NULL );
+ 
++    /* NEUTRON PM-TRAILS DIAG (NEUTRON_PAINT_TRACE=1) */
++    {
++        static int npt = -1;
++        if (npt < 0) { const char *e = getenv("NEUTRON_PAINT_TRACE"); npt = (e && e[0]=='1') ? 1 : 0; }
++        if (npt)
++            ERR( "neutron-paint: GetUpdateRect hwnd=%p erase=%d rect=%s\n",
++                 hwnd, erase, rect ? wine_dbgstr_rect(rect) : "(null)" );
++    }
++
+     /* check if we still have an update region */
+     flags = UPDATE_PAINT | UPDATE_NOCHILDREN;
+     if (need_erase) flags |= UPDATE_DELAYED_ERASE;
+@@ -2117,6 +2322,11 @@
+     TRACE( "%p, %d,%d update_rgn=%p update_rect = %p %s %04x\n",
+            hwnd, dx, dy, update_rgn, update_rect, wine_dbgstr_rect(rect), flags );
+     TRACE( "clip_rect = %s\n", wine_dbgstr_rect(clip_rect) );
++
++    /* NEUTRON READ-TRACE: any window scroll at all is significant for pm-trails */
++    if (neutron_read_trace())
++        ERR( "neutron-read: ScrollWindowEx hwnd=%p d=(%d,%d) rect=%s clip=%s flags=%04x\n",
++             hwnd, dx, dy, wine_dbgstr_rect(rect), wine_dbgstr_rect(clip_rect), flags );
+     if (flags & ~(SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE | SW_NODCCACHE))
+         FIXME( "some flags (%04x) are unhandled\n", flags );
+ 
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3240,9 +3240,15 @@
+         /* if we get here, we have a sent message; call the window procedure */
+         info.prev = thread_info->receive_info;
+         thread_info->receive_info = &info;
++        if (info.msg.message == 0x52f)  /* NEUTRON diag: Adobe Core.dll WM_USER+303 marshalling */
++            ERR("NEUTRON-DISPATCH msg %04x hwnd %p type %d info %p prev %p\n",
++                info.msg.message, info.msg.hwnd, info.type, &info, info.prev);
+         result = call_window_proc( info.msg.hwnd, info.msg.message, info.msg.wParam,
+                                    info.msg.lParam, info.type, FALSE, WMCHAR_MAP_RECVMESSAGE,
+                                    info.type == MSG_ASCII );
++        if (info.msg.message == 0x52f)  /* NEUTRON diag: did wndproc return? is reply sent or skipped? */
++            ERR("NEUTRON-REPLY msg %04x returned recv_info_ok=%d result=%lx\n",
++                info.msg.message, thread_info->receive_info == &info, (long)result);
+         if (thread_info->receive_info == &info)
+             reply_winproc_result( result, info.msg.hwnd, info.msg.message,
+                                   info.msg.wParam, info.msg.lParam );
+@@ -3779,7 +3785,16 @@
+             continue;
+         }
+ 
+-        wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
++        {   /* NEUTRON diag: log around the ntsync wait to catch a lost QS_SMRESULT wakeup */
++            static FILE *neutron_c;
++            unsigned int tid = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
++            DWORD r;
++            if (!neutron_c) neutron_c = fopen( "~/neutron-cli.log", "a" );
++            if (neutron_c) { fprintf( neutron_c, "WMR tid %04x WAIT wake_bits=%08x mask=%08x\n",
++                                      tid, wake_bits, wake_mask ); fflush( neutron_c ); }
++            r = wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
++            if (neutron_c) { fprintf( neutron_c, "WMR tid %04x WOKE ret=%08x\n", tid, (unsigned)r ); fflush( neutron_c ); }
++        }
+     }
+ }
+ 
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -5826,37 +5826,37 @@
+ static struct sysparam_rgb_entry system_colors[] =
+ {
+ #define RGB_ENTRY(name,val,reg) { { get_rgb_entry, set_rgb_entry, init_rgb_entry, COLORS_KEY, reg }, (val) }
+-    RGB_ENTRY( COLOR_SCROLLBAR, RGB(212, 208, 200), "Scrollbar" ),
+-    RGB_ENTRY( COLOR_BACKGROUND, RGB(58, 110, 165), "Background" ),
+-    RGB_ENTRY( COLOR_ACTIVECAPTION, RGB(10, 36, 106), "ActiveTitle" ),
+-    RGB_ENTRY( COLOR_INACTIVECAPTION, RGB(128, 128, 128), "InactiveTitle" ),
+-    RGB_ENTRY( COLOR_MENU, RGB(212, 208, 200), "Menu" ),
++    RGB_ENTRY( COLOR_SCROLLBAR, RGB(200, 200, 200), "Scrollbar" ),
++    RGB_ENTRY( COLOR_BACKGROUND, RGB(0, 0, 0), "Background" ),
++    RGB_ENTRY( COLOR_ACTIVECAPTION, RGB(153, 180, 209), "ActiveTitle" ),
++    RGB_ENTRY( COLOR_INACTIVECAPTION, RGB(191, 205, 219), "InactiveTitle" ),
++    RGB_ENTRY( COLOR_MENU, RGB(240, 240, 240), "Menu" ),
+     RGB_ENTRY( COLOR_WINDOW, RGB(255, 255, 255), "Window" ),
+-    RGB_ENTRY( COLOR_WINDOWFRAME, RGB(0, 0, 0), "WindowFrame" ),
++    RGB_ENTRY( COLOR_WINDOWFRAME, RGB(100, 100, 100), "WindowFrame" ),
+     RGB_ENTRY( COLOR_MENUTEXT, RGB(0, 0, 0), "MenuText" ),
+     RGB_ENTRY( COLOR_WINDOWTEXT, RGB(0, 0, 0), "WindowText" ),
+-    RGB_ENTRY( COLOR_CAPTIONTEXT, RGB(255, 255, 255), "TitleText" ),
+-    RGB_ENTRY( COLOR_ACTIVEBORDER, RGB(212, 208, 200), "ActiveBorder" ),
+-    RGB_ENTRY( COLOR_INACTIVEBORDER, RGB(212, 208, 200), "InactiveBorder" ),
+-    RGB_ENTRY( COLOR_APPWORKSPACE, RGB(128, 128, 128), "AppWorkSpace" ),
+-    RGB_ENTRY( COLOR_HIGHLIGHT, RGB(10, 36, 106), "Hilight" ),
++    RGB_ENTRY( COLOR_CAPTIONTEXT, RGB(0, 0, 0), "TitleText" ),
++    RGB_ENTRY( COLOR_ACTIVEBORDER, RGB(180, 180, 180), "ActiveBorder" ),
++    RGB_ENTRY( COLOR_INACTIVEBORDER, RGB(244, 247, 252), "InactiveBorder" ),
++    RGB_ENTRY( COLOR_APPWORKSPACE, RGB(171, 171, 171), "AppWorkSpace" ),
++    RGB_ENTRY( COLOR_HIGHLIGHT, RGB(0, 120, 215), "Hilight" ),
+     RGB_ENTRY( COLOR_HIGHLIGHTTEXT, RGB(255, 255, 255), "HilightText" ),
+-    RGB_ENTRY( COLOR_BTNFACE, RGB(212, 208, 200), "ButtonFace" ),
+-    RGB_ENTRY( COLOR_BTNSHADOW, RGB(128, 128, 128), "ButtonShadow" ),
+-    RGB_ENTRY( COLOR_GRAYTEXT, RGB(128, 128, 128), "GrayText" ),
++    RGB_ENTRY( COLOR_BTNFACE, RGB(240, 240, 240), "ButtonFace" ),
++    RGB_ENTRY( COLOR_BTNSHADOW, RGB(160, 160, 160), "ButtonShadow" ),
++    RGB_ENTRY( COLOR_GRAYTEXT, RGB(109, 109, 109), "GrayText" ),
+     RGB_ENTRY( COLOR_BTNTEXT, RGB(0, 0, 0), "ButtonText" ),
+-    RGB_ENTRY( COLOR_INACTIVECAPTIONTEXT, RGB(212, 208, 200), "InactiveTitleText" ),
++    RGB_ENTRY( COLOR_INACTIVECAPTIONTEXT, RGB(0, 0, 0), "InactiveTitleText" ),
+     RGB_ENTRY( COLOR_BTNHIGHLIGHT, RGB(255, 255, 255), "ButtonHilight" ),
+-    RGB_ENTRY( COLOR_3DDKSHADOW, RGB(64, 64, 64), "ButtonDkShadow" ),
+-    RGB_ENTRY( COLOR_3DLIGHT, RGB(212, 208, 200), "ButtonLight" ),
++    RGB_ENTRY( COLOR_3DDKSHADOW, RGB(105, 105, 105), "ButtonDkShadow" ),
++    RGB_ENTRY( COLOR_3DLIGHT, RGB(227, 227, 227), "ButtonLight" ),
+     RGB_ENTRY( COLOR_INFOTEXT, RGB(0, 0, 0), "InfoText" ),
+     RGB_ENTRY( COLOR_INFOBK, RGB(255, 255, 225), "InfoWindow" ),
+-    RGB_ENTRY( COLOR_ALTERNATEBTNFACE, RGB(181, 181, 181), "ButtonAlternateFace" ),
+-    RGB_ENTRY( COLOR_HOTLIGHT, RGB(0, 0, 200), "HotTrackingColor" ),
+-    RGB_ENTRY( COLOR_GRADIENTACTIVECAPTION, RGB(166, 202, 240), "GradientActiveTitle" ),
+-    RGB_ENTRY( COLOR_GRADIENTINACTIVECAPTION, RGB(192, 192, 192), "GradientInactiveTitle" ),
+-    RGB_ENTRY( COLOR_MENUHILIGHT, RGB(10, 36, 106), "MenuHilight" ),
+-    RGB_ENTRY( COLOR_MENUBAR, RGB(212, 208, 200), "MenuBar" )
++    RGB_ENTRY( COLOR_ALTERNATEBTNFACE, RGB(240, 240, 240), "ButtonAlternateFace" ),
++    RGB_ENTRY( COLOR_HOTLIGHT, RGB(0, 102, 204), "HotTrackingColor" ),
++    RGB_ENTRY( COLOR_GRADIENTACTIVECAPTION, RGB(185, 209, 234), "GradientActiveTitle" ),
++    RGB_ENTRY( COLOR_GRADIENTINACTIVECAPTION, RGB(215, 228, 242), "GradientInactiveTitle" ),
++    RGB_ENTRY( COLOR_MENUHILIGHT, RGB(51, 153, 255), "MenuHilight" ),
++    RGB_ENTRY( COLOR_MENUBAR, RGB(240, 240, 240), "MenuBar" )
+ #undef RGB_ENTRY
+ };
+ 
+--- a/server/user.h
++++ b/server/user.h
+@@ -151,6 +151,7 @@
+ extern int is_region_empty( const struct region *region );
+ extern int is_region_equal( const struct region *region1, const struct region *region2 );
+ extern void get_region_extents( const struct region *region, struct rectangle *rect );
++extern int get_region_num_rects( const struct region *region );
+ extern void offset_region( struct region *region, int x, int y );
+ extern void mirror_region( const struct rectangle *client_rect, struct region *region );
+ extern void scale_region( struct region *region, unsigned int dpi_from, unsigned int dpi_to );

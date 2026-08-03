@@ -1,0 +1,174 @@
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -115,6 +115,11 @@
+     free(entry);
+ }
+ 
++/* NEUTRON: forward declaration -- it is called here and defined further down. The release
++ * build tolerates the implicit declaration via -Wno-error=implicit-function-declaration; a
++ * plain build does not. */
++void neutron_glyph_report(void);
++
+ static struct cache_entry * fontface_get_cache_entry(struct dwrite_fontface *fontface, size_t size,
+         const struct cache_key *key)
+ {
+@@ -2438,6 +2443,66 @@
+     return font->data->simulations;
+ }
+ 
++/* NEUTRON FONT-METRICS DIAG (env NEUTRON_DWRITE_FONTMETRICS=1) -----------------
++ * Premiere's Effect Controls panel overlaps its title with the first control row, in GPU
++ * mode only. The working model: the row height an Adobe drawbot uses is
++ *
++ *     the font's ascent + descent, read through THIS function
++ *     (IDWriteFont::GetMetrics)
++ *
++ * -- not IDWriteTextLayout, which is why four earlier theories all died while being
++ * consistent with the symptom.
++ *
++ * What is NOT known is WHICH FONT FAMILY Premiere asks for. Assuming "Segoe UI" and testing
++ * that assumption instead of the app is exactly the mistake that produced a retracted
++ * "root cause" on 2026-07-31: for Segoe UI, Wine's builtin dwrite and gdi32 agree
++ * (15.024 DIPs vs 15 px), so that font is not the culprit.
++ *
++ * So log what the app ACTUALLY asks for. DISTINCT combinations only -- Premiere calls this
++ * constantly and per-call logging would bury the answer and skew timing. */
++static void neutron_fontmetrics_note(struct dwrite_font *font, const DWRITE_FONT_METRICS *m)
++{
++    static int enabled = -1;
++    static struct { UINT16 upem, asc, desc; WCHAR name[64]; } seen[48];
++    static LONG nseen;
++    WCHAR name[64] = L"?";
++    LONG i, n;
++
++    if (enabled < 0)
++    {
++        char b[8];
++        enabled = (GetEnvironmentVariableA("NEUTRON_DWRITE_FONTMETRICS", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++    }
++    if (!enabled) return;
++
++    if (font->family && font->family->data && font->family->data->familyname)
++    {
++        UINT32 len = 0;
++        IDWriteLocalizedStrings_GetStringLength(font->family->data->familyname, 0, &len);
++        if (len < 63)
++            IDWriteLocalizedStrings_GetString(font->family->data->familyname, 0, name, len + 1);
++    }
++
++    n = nseen;
++    for (i = 0; i < n && i < 48; i++)
++        if (seen[i].upem == m->designUnitsPerEm && seen[i].asc == m->ascent
++                && seen[i].desc == m->descent && !wcscmp(seen[i].name, name))
++            return;
++    if (n < 48)
++    {
++        seen[n].upem = m->designUnitsPerEm; seen[n].asc = m->ascent; seen[n].desc = m->descent;
++        lstrcpynW(seen[n].name, name, 64);
++        InterlockedIncrement(&nseen);
++        /* ascent+descent in DIPs at em 12 and 15 -- the sizes Premiere's panels use -- so the
++         * numbers can be compared straight against the gdi32 side without arithmetic. */
++        ERR("neutron-fontmetrics: family=%s upem=%u ascent=%u descent=%u lineGap=%d "
++            "=> ascent+descent @em12=%.3f @em15=%.3f\n", debugstr_w(name),
++            m->designUnitsPerEm, m->ascent, m->descent, m->lineGap,
++            (m->ascent + m->descent) * 12.0 / (double)m->designUnitsPerEm,
++            (m->ascent + m->descent) * 15.0 / (double)m->designUnitsPerEm);
++    }
++}
++
+ static void WINAPI dwritefont_GetMetrics(IDWriteFont3 *iface, DWRITE_FONT_METRICS *metrics)
+ {
+     struct dwrite_font *font = impl_from_IDWriteFont3(iface);
+@@ -2445,6 +2510,7 @@
+     TRACE("%p, %p.\n", iface, metrics);
+ 
+     memcpy(metrics, &font->data->metrics, sizeof(*metrics));
++    neutron_fontmetrics_note(font, metrics);
+ }
+ 
+ static BOOL dwritefont_has_character(struct dwrite_font *font, UINT32 ch)
+--- a/dlls/dwrite/dwrite_private.h
++++ b/dlls/dwrite/dwrite_private.h
+@@ -32,6 +32,82 @@
+ #define MS_GSUB_TAG DWRITE_MAKE_OPENTYPE_TAG('G','S','U','B')
+ #define MS_GPOS_TAG DWRITE_MAKE_OPENTYPE_TAG('G','P','O','S')
+ 
++/* NEUTRON DWRITE LAYOUT TRACE (env NEUTRON_DWRITE_LAYOUTTRACE=1|2) ---------------------------
++ * AME/AE multi-word titles wrap onto several rows. The working model: the D2D drawbot
++ * (a) measures natural width with CreateTextLayout(maxW=maxH=10000) + GetMetrics().width and
++ * (b) draws with CreateTextLayout(maxW=<that width>) leaving word wrapping at the default
++ * WRAP mode. An offline harness proved Wine upholds the required invariant (relayout at own
++ * natural width never wraps), so the decisive unknown is WHAT maxWidth the app passes for
++ * the strings that wrap, and who computed it. These helpers log exactly that, with the
++ * CALLER MODULE so dvaui/UIFramework/dvaworkspace paths can be told apart.
++ *   level 1: multi-word strings only (contains a space, no newline), deduplicated
++ *   level 2: everything, no dedup
++ * Uses ERR so no WINEDEBUG channel setup is needed; OFF (zero overhead) without the env var. */
++static inline int neutron_ltrace_level(void)
++{
++    static int level = -1;
++    if (level < 0)
++    {
++        char b[8];
++        if (GetEnvironmentVariableA("NEUTRON_DWRITE_LAYOUTTRACE", b, sizeof(b)))
++            level = b[0] == '2' ? 2 : (b[0] == '1' ? 1 : 0);
++        else
++            level = 0;
++    }
++    return level;
++}
++
++static inline BOOL neutron_ltrace_want(const WCHAR *text, UINT32 len, BOOL need_space)
++{
++    UINT32 i;
++    BOOL space = FALSE;
++    if (neutron_ltrace_level() >= 2) return TRUE;
++    if (neutron_ltrace_level() < 1) return FALSE;
++    if (!text || !len || len > 200) return FALSE;
++    for (i = 0; i < len; ++i)
++    {
++        if (text[i] == ' ') space = TRUE;
++        else if (text[i] == '\n' || text[i] == '\r') return FALSE;
++    }
++    return need_space ? space : TRUE;
++}
++
++/* TRUE = already reported (suppress). Racy by design; a lost update only repeats a line. */
++static inline BOOL neutron_ltrace_dedup(unsigned int site, const WCHAR *text, UINT32 len, float w)
++{
++    static unsigned int seen[512];
++    unsigned int h = 2166136261u, i;
++    union { float f; unsigned int u; } uw;
++    if (neutron_ltrace_level() >= 2) return FALSE;
++    uw.f = w;
++    for (i = 0; i < len; ++i) h = (h ^ text[i]) * 16777619u;
++    h = (h ^ site) * 16777619u;
++    h = (h ^ uw.u) * 16777619u;
++    if (!h) h = 1;
++    i = h & 511;
++    if (seen[i] == h) return TRUE;
++    seen[i] = h;
++    return FALSE;
++}
++
++/* Resolve a return address to "module.dll"+offset; namebuf gets the basename. */
++static inline void neutron_ltrace_modname(void *ret, char *namebuf, DWORD n, ULONG_PTR *off)
++{
++    void *base = NULL;
++    char path[MAX_PATH];
++    const char *name = "?";
++    *off = 0;
++    RtlPcToFileHeader(ret, &base);
++    if (base && GetModuleFileNameA((HMODULE)base, path, sizeof(path)))
++    {
++        char *p = strrchr(path, '\\');
++        name = p ? p + 1 : path;
++        *off = (ULONG_PTR)ret - (ULONG_PTR)base;
++    }
++    lstrcpynA(namebuf, name, n);
++}
++/* ------------------------------------------------------------------------------------------- */
++
+ typedef struct MATRIX_2X2
+ {
+     float m11;
