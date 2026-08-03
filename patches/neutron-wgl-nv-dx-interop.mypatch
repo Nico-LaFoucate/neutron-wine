@@ -2699,3 +2699,19 @@ index 3b46ee51b87..c40df56248c 100644
      USE_GL_FUNC(wglDestroyPbufferARB) \
      USE_GL_FUNC(wglFreeMemoryNV) \
      USE_GL_FUNC(wglGetCurrentReadDCARB) \
+--- a/dlls/opengl32/Makefile.in
++++ b/dlls/opengl32/Makefile.in
+@@ -2,7 +2,12 @@
+ UNIXLIB   = opengl32.so
+ EXTRADEFS = -D_OPENGL32_
+ IMPORTLIB = opengl32
+-IMPORTS   = user32 gdi32 advapi32 win32u
++# NEUTRON: dxguid supplies IID_ID3D11Device / IID_ID3D11Texture2D / IID_IDXGIResource(1),
++# needed by the hand-written WGL_NV_DX_interop implementation in wgl.c to QueryInterface the
++# app's D3D objects. dxguid is a static import library of GUID constants -- no runtime
++# dependency is added, and it is what every other module that touches these interfaces uses
++# (d3d11, d3d12, d2d1, ...). Preferred over hand-copying GUID values into wgl.c.
++IMPORTS   = user32 gdi32 advapi32 win32u dxguid
+ DELAYIMPORTS = glu32
+ UNIX_LIBS    = -lwin32u $(PTHREAD_LIBS)
+ 

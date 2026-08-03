@@ -1693,3 +1693,34 @@
  };
  
  C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+--- a/dlls/winewayland.drv/unixlib.h
++++ b/dlls/winewayland.drv/unixlib.h
+@@ -28,7 +28,28 @@
+     waylanddrv_unix_func_init,
+     waylanddrv_unix_func_read_events,
+     waylanddrv_unix_func_init_clipboard,
++    /* NEUTRON round-43: PE hands the mapped __neutron_rpc_epoch VA to unix
++     * (same address space); unix flush reads it Interlocked. arg = &(void*). */
++    waylanddrv_unix_func_rpc_epoch,
+     waylanddrv_unix_func_count,
+ };
+ 
++/* NEUTRON round-43 RPC transport (verified cross-module, in-tree precedent =
++ * the CEF __neutron_dcomp_px section): winewayland.drv exports nothing and is a
++ * USER driver (GDI ExtEscape does not reach it), so DXVK cannot call its unixlib
++ * directly. Instead DXVK's PresentImageGdi already StretchDIBits the panel band
++ * INTO the toplevel window surface (color_bits); winewayland fills each shadow
++ * FROM color_bits at flush time. DXVK only signals WHICH flush is a chain
++ * present via this tiny shared control section (named __neutron_rpc_epoch),
++ * mapped R/W by DXVK and R/O by winewayland. Interlocked-only; no lock crosses. */
++#define NEUTRON_RPC_EPOCH_NAME L"__neutron_rpc_epoch"
++#define NEUTRON_RPC_RING 512
++struct neutron_rpc_entry { LONG hwnd, bl, bt, br, bb; }; /* band in TOPLEVEL client coords */
++struct neutron_rpc_epoch
++{
++    volatile LONG head;       /* DXVK appends here (monotonic); winewayland drains */
++    volatile LONG video_l, video_t, video_r, video_b; /* canary: non-chain video rect */
++    struct neutron_rpc_entry ring[NEUTRON_RPC_RING];
++};
++
+ #endif /* __WINE_WAYLANDDRV_UNIXLIB_H */
