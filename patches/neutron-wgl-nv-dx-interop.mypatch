@@ -1,0 +1,2701 @@
+diff --git a/dlls/opengl32/make_opengl b/dlls/opengl32/make_opengl
+index 3dec39cc0f0..0bb3c91f0d7 100755
+--- a/dlls/opengl32/make_opengl
++++ b/dlls/opengl32/make_opengl
+@@ -99,6 +99,12 @@ my %arg_types =
+      "GLDEBUGPROCAMD" =>       [ "ptr",    "%p" ],
+      "GLDEBUGPROCKHR" =>       [ "ptr",    "%p" ],
+      "GLVULKANPROCNV" =>       [ "ptr",    "%p" ],
++     # NEUTRON: WGL_NV_DX_interop passes plain HANDLEs (the interop device and each
++     # registered object). Same shape as the other opaque WGL handles above -- a
++     # pointer-sized value marshalled as "long" and printed with %p. Without this the
++     # generator emits "Unknown type HANDLE in wglDXOpenDeviceNV" and silently skips
++     # every parameter, producing thunks with the wrong signature.
++     "HANDLE" =>               [ "long",   "%p" ],
+      "HDC" =>                  [ "long",   "%p" ],
+      "HGLRC" =>                [ "long",   "%p" ],
+      "HPBUFFERARB" =>          [ "long",   "%p" ],
+@@ -131,6 +137,22 @@ my %khronos_types =
+ my %manual_win_functions =
+     (
+      "glDebugEntry" => 1,
++     # NEUTRON: WGL_NV_DX_interop is implemented BY HAND on the PE side (dlls/opengl32/wgl.c).
++     # It has to be: wglDXOpenDeviceNV/wglDXRegisterObjectNV receive PE-side COM pointers
++     # (ID3D11Device, ID3D11Texture2D) and must QueryInterface them for IDXGIResource and read
++     # D3D11_TEXTURE2D_DESC. win32u is the UNIX side and cannot call COM, so the generated
++     # marshalling thunk would hand it a pointer it can do nothing with. Keeping all 8 together
++     # PE-side also keeps the device/object registry in one place, and lets the GL work go
++     # through the existing GL_EXT_memory_object_win32 entry points that Wine already
++     # implements (win32u's import_memory(): D3D shared handle -> d3dkmt fd -> glImportMemoryFdEXT).
++     "wglDXCloseDeviceNV" => 1,
++     "wglDXLockObjectsNV" => 1,
++     "wglDXObjectAccessNV" => 1,
++     "wglDXOpenDeviceNV" => 1,
++     "wglDXRegisterObjectNV" => 1,
++     "wglDXSetResourceShareHandleNV" => 1,
++     "wglDXUnlockObjectsNV" => 1,
++     "wglDXUnregisterObjectNV" => 1,
+      "wglChoosePixelFormat" => 1,
+      "wglCreateContext" => 1,
+      "wglCreateLayerContext" => 1,
+@@ -155,6 +177,56 @@ my %manual_win_functions =
+     );
+ my %manual_win_thunks =
+     (
++     # NEUTRON round-43: hand-written so it can log. The composition viewer's GL viewport is
++     # stuck at 1x1 while its client area is 2734x1174 -- AE renders the comp into a single
++     # pixel. We need to know whether AE ever CALLS glViewport, and with what: never called
++     # means it inherited the creation-time default (we hand it a 1x1 drawable during the
++     # placeholder phase); called with 1x1 means AE believes the window is tiny; called with
++     # the real size means something resets it afterwards. Three different bugs.
++     "glViewport" => 1,
++     # NEUTRON round-47: hand-written so each can be counted. Round-42 only sampled the
++     # framebuffer binding at swap time, which an app that binds-draws-unbinds-swaps always
++     # reads back as 0 -- so it never actually established whether After Effects renders into
++     # an FBO. These twelve make the whole frame visible: did anything draw, where did it land,
++     # and was it ever blitted back to the default framebuffer. See wgl.c neutron_glcounters.
++     "glClear" => 1,
++     "glDrawArrays" => 1,
++     "glDrawElements" => 1,
++     "glDrawArraysInstanced" => 1,
++     "glDrawElementsInstanced" => 1,
++     "glDrawRangeElements" => 1,
++     "glBindFramebuffer" => 1,
++     "glBindFramebufferEXT" => 1,
++     "glBlitFramebuffer" => 1,
++     "glBlitFramebufferEXT" => 1,
++     "glFramebufferTexture2D" => 1,
++     "glFramebufferTexture2DEXT" => 1,
++     # NEUTRON round-48: report what After Effects' startup GL self-test is actually told.
++     # Round 47 showed all 44 of its draw calls happen there and none anywhere else, so this
++     # small sequence is where the decision to abandon the GL display path is made.
++     "glCheckFramebufferStatus" => 1,
++     "glCheckFramebufferStatusEXT" => 1,
++     "glGetError" => 1,
++     "glReadPixels" => 1,
++     "glTexImage2D" => 1,
++     # NEUTRON round-49: which buffer is that one-pixel probe reading? A GL_FRONT read on an
++     # EGL window surface can never return anything under Wayland.
++     "glReadBuffer" => 1,
++     "glDrawBuffer" => 1,
++     # NEUTRON round-50: an app that sets up a glyph atlas and then issues no draw calls looks
++     # exactly like one whose shader pipeline never came up. Query compile/link status ourselves
++     # and print the driver's own info log on failure. The four getters are listed only so they
++     # stop being static and can be called from wgl.c.
++     "glShaderSource" => 1,
++     "glCompileShader" => 1,
++     "glLinkProgram" => 1,
++     "glUseProgram" => 1,
++     "glGetShaderiv" => 1,
++     "glGetShaderInfoLog" => 1,
++     "glGetProgramiv" => 1,
++     "glGetProgramInfoLog" => 1,
++     "glCompileShaderARB" => 1,
++     "glLinkProgramARB" => 1,
+      "glCreateSyncFromCLeventARB" => 1,
+      "glDeleteSync" => 1,
+      "glFenceSync" => 1,
+@@ -710,6 +782,25 @@ sub generate_win_thunk($$)
+     $ret .= ";\n";
+     $ret .= "    NTSTATUS status;\n";
+     $ret .= "    int integer;\n" if $get_integer;
++    # NEUTRON round-51: count EVERY draw command, not just the handful worth hand-writing.
++    # Round 47 counted five draw entry points and concluded After Effects issues no drawing at
++    # all -- but modern GLSL 150 code can just as well use glDrawElementsBaseVertex or a
++    # MultiDraw, and those would have gone unseen. That is the same shape of mistake round 42
++    # made (measuring only what the instrument happened to cover), so close it generically:
++    # anything that submits geometry gets counted here, automatically, forever.
++    # Excluded: glDrawBuffer(s)/glDrawBufferRegion, which select a target and draw nothing.
++    #
++    # round-52 CORRECTION: the rule above still missed IMMEDIATE MODE. After Effects'
++    # DisplaySurface.dll uses OpenGL entry points that are nearly all OpenGL 1.x --
++    # glBegin, glEnd, glVertex2f/3f, glTexCoord2f, glMatrixMode, glLoadIdentity, glOrtho,
++    # glTexEnvf, glAlphaFunc, glShadeModel. Geometry submitted between glBegin and glEnd goes
++    # through NONE of the glDraw* commands, so a legacy renderer would have counted as zero
++    # draws no matter how much it drew. glBegin is the batch, so count that; display lists can
++    # replay drawing too, so count those as well.
++    $ret .= "    neutron_count_draw();\n"
++        if ($name =~ /^gl(Draw|MultiDraw|Rect)/ && $name !~ /^glDrawBuffer/)
++        || $name =~ /^glBegin$/
++        || $name =~ /^glCallLists?$/;
+     $ret .= "    " . get_func_trace( $name, $func, 1 );
+     $ret .= $checks;
+     $ret .= $get_integer ? "    $get_integer\n    else " : "    ";
+@@ -902,8 +993,21 @@ my %unsupported_extensions =
+     "WGL_EXT_pixel_format" => 1,
+     "WGL_NV_copy_image" => 1,
+     "WGL_NV_delay_before_swap" => 1,
+-    "WGL_NV_DX_interop" => 1,
+-    "WGL_NV_DX_interop2" => 1,
++    # NEUTRON: WGL_NV_DX_interop / _interop2 enabled 2026-07-31. These were on the
++    # unsupported list, so make_opengl emitted no entry points and opengl32 never
++    # advertised the extension -- and After Effects gates wgl* resolution on the
++    # ADVERTISED EXTENSION STRING, so it never even asked for them. Proven by a
++    # controlled A/B: advertise the two names with NO implementation and AE
++    # immediately requests all 8 wglDX* functions; leave them out and it requests
++    # none (23 vs 31 distinct wgl*). That is why AE's composition viewer is blank --
++    # it renders the comp into a D3D texture and bridges it into its GL display
++    # surface via this extension, and on Wine the bridge does not exist, so it
++    # presents an empty GL surface (~350x/session; native AE calls SwapBuffers ZERO
++    # times -- it presents through D3D/DXGI instead).
++    # See memory neutron-ae-composition-content-blank + ~/Downloads/HANDOFF-LINUX-ae-comp-viewer.md.
++    # NOTE the other two entries above account for the rest of the measured 10-function
++    # gap vs Windows (wglCopyImageSubDataNV, wglDelayBeforeSwapNV); they are NOT needed
++    # for the composition viewer and stay unsupported for now.
+     "WGL_NV_gpu_affinity" => 1,
+     "WGL_NV_present_video" => 1,
+     "WGL_NV_swap_group" => 1,
+diff --git a/dlls/opengl32/private.h b/dlls/opengl32/private.h
+index aa14924d1a8..af87f182782 100644
+--- a/dlls/opengl32/private.h
++++ b/dlls/opengl32/private.h
+@@ -29,6 +29,10 @@
+ #include "wine/opengl_driver.h"
+ #include "thunks.h"
+ 
++/* NEUTRON round-51: implemented in wgl.c, called from every generated draw thunk so that no
++ * draw command can go uncounted. No-op unless NEUTRON_GL_FBOTRACE=1. */
++extern void neutron_count_draw(void);
++
+ struct registry_entry
+ {
+     const char *name;      /* name of the extension */
+diff --git a/dlls/opengl32/thunks.c b/dlls/opengl32/thunks.c
+index c62a6fdaa9f..8155a7d2f66 100644
+--- a/dlls/opengl32/thunks.c
++++ b/dlls/opengl32/thunks.c
+@@ -84,6 +84,7 @@ void WINAPI glBegin( GLenum mode )
+ {
+     struct glBegin_params args = { .teb = NtCurrentTeb(), .mode = mode };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d\n", mode );
+     if ((status = UNIX_CALL( glBegin, &args ))) WARN( "glBegin returned %#lx\n", status );
+ }
+@@ -116,6 +117,7 @@ void WINAPI glCallList( GLuint list )
+ {
+     struct glCallList_params args = { .teb = NtCurrentTeb(), .list = list };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "list %d\n", list );
+     if ((status = UNIX_CALL( glCallList, &args ))) WARN( "glCallList returned %#lx\n", status );
+ }
+@@ -124,18 +126,11 @@ void WINAPI glCallLists( GLsizei n, GLenum type, const void *lists )
+ {
+     struct glCallLists_params args = { .teb = NtCurrentTeb(), .n = n, .type = type, .lists = lists };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "n %d, type %d, lists %p\n", n, type, lists );
+     if ((status = UNIX_CALL( glCallLists, &args ))) WARN( "glCallLists returned %#lx\n", status );
+ }
+ 
+-void WINAPI glClear( GLbitfield mask )
+-{
+-    struct glClear_params args = { .teb = NtCurrentTeb(), .mask = mask };
+-    NTSTATUS status;
+-    TRACE( "mask %d\n", mask );
+-    if ((status = UNIX_CALL( glClear, &args ))) WARN( "glClear returned %#lx\n", status );
+-}
+-
+ void WINAPI glClearAccum( GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha )
+ {
+     struct glClearAccum_params args = { .teb = NtCurrentTeb(), .red = red, .green = green, .blue = blue, .alpha = alpha };
+@@ -568,34 +563,11 @@ void WINAPI glDisableClientState( GLenum array )
+     if ((status = UNIX_CALL( glDisableClientState, &args ))) WARN( "glDisableClientState returned %#lx\n", status );
+ }
+ 
+-void WINAPI glDrawArrays( GLenum mode, GLint first, GLsizei count )
+-{
+-    struct glDrawArrays_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count };
+-    NTSTATUS status;
+-    TRACE( "mode %d, first %d, count %d\n", mode, first, count );
+-    if ((status = UNIX_CALL( glDrawArrays, &args ))) WARN( "glDrawArrays returned %#lx\n", status );
+-}
+-
+-void WINAPI glDrawBuffer( GLenum buf )
+-{
+-    struct glDrawBuffer_params args = { .teb = NtCurrentTeb(), .buf = buf };
+-    NTSTATUS status;
+-    TRACE( "buf %d\n", buf );
+-    if ((status = UNIX_CALL( glDrawBuffer, &args ))) WARN( "glDrawBuffer returned %#lx\n", status );
+-}
+-
+-void WINAPI glDrawElements( GLenum mode, GLsizei count, GLenum type, const void *indices )
+-{
+-    struct glDrawElements_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices };
+-    NTSTATUS status;
+-    TRACE( "mode %d, count %d, type %d, indices %p\n", mode, count, type, indices );
+-    if ((status = UNIX_CALL( glDrawElements, &args ))) WARN( "glDrawElements returned %#lx\n", status );
+-}
+-
+ void WINAPI glDrawPixels( GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels )
+ {
+     struct glDrawPixels_params args = { .teb = NtCurrentTeb(), .width = width, .height = height, .format = format, .type = type, .pixels = pixels };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "width %d, height %d, format %d, type %d, pixels %p\n", width, height, format, type, pixels );
+     if ((status = UNIX_CALL( glDrawPixels, &args ))) WARN( "glDrawPixels returned %#lx\n", status );
+ }
+@@ -869,15 +841,6 @@ void WINAPI glGetDoublev( GLenum pname, GLdouble *data )
+     else if ((status = UNIX_CALL( glGetDoublev, &args ))) WARN( "glGetDoublev returned %#lx\n", status );
+ }
+ 
+-GLenum WINAPI glGetError(void)
+-{
+-    struct glGetError_params args = { .teb = NtCurrentTeb() };
+-    NTSTATUS status;
+-    TRACE( "\n" );
+-    if ((status = UNIX_CALL( glGetError, &args ))) WARN( "glGetError returned %#lx\n", status );
+-    return args.ret;
+-}
+-
+ void WINAPI glGetFloatv( GLenum pname, GLfloat *data )
+ {
+     struct glGetFloatv_params args = { .teb = NtCurrentTeb(), .pname = pname, .data = data };
+@@ -1941,26 +1904,11 @@ void WINAPI glRasterPos4sv( const GLshort *v )
+     if ((status = UNIX_CALL( glRasterPos4sv, &args ))) WARN( "glRasterPos4sv returned %#lx\n", status );
+ }
+ 
+-void WINAPI glReadBuffer( GLenum src )
+-{
+-    struct glReadBuffer_params args = { .teb = NtCurrentTeb(), .src = src };
+-    NTSTATUS status;
+-    TRACE( "src %d\n", src );
+-    if ((status = UNIX_CALL( glReadBuffer, &args ))) WARN( "glReadBuffer returned %#lx\n", status );
+-}
+-
+-void WINAPI glReadPixels( GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels )
+-{
+-    struct glReadPixels_params args = { .teb = NtCurrentTeb(), .x = x, .y = y, .width = width, .height = height, .format = format, .type = type, .pixels = pixels };
+-    NTSTATUS status;
+-    TRACE( "x %d, y %d, width %d, height %d, format %d, type %d, pixels %p\n", x, y, width, height, format, type, pixels );
+-    if ((status = UNIX_CALL( glReadPixels, &args ))) WARN( "glReadPixels returned %#lx\n", status );
+-}
+-
+ void WINAPI glRectd( GLdouble x1, GLdouble y1, GLdouble x2, GLdouble y2 )
+ {
+     struct glRectd_params args = { .teb = NtCurrentTeb(), .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "x1 %f, y1 %f, x2 %f, y2 %f\n", x1, y1, x2, y2 );
+     if ((status = UNIX_CALL( glRectd, &args ))) WARN( "glRectd returned %#lx\n", status );
+ }
+@@ -1969,6 +1917,7 @@ void WINAPI glRectdv( const GLdouble *v1, const GLdouble *v2 )
+ {
+     struct glRectdv_params args = { .teb = NtCurrentTeb(), .v1 = v1, .v2 = v2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "v1 %p, v2 %p\n", v1, v2 );
+     if ((status = UNIX_CALL( glRectdv, &args ))) WARN( "glRectdv returned %#lx\n", status );
+ }
+@@ -1977,6 +1926,7 @@ void WINAPI glRectf( GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2 )
+ {
+     struct glRectf_params args = { .teb = NtCurrentTeb(), .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "x1 %f, y1 %f, x2 %f, y2 %f\n", x1, y1, x2, y2 );
+     if ((status = UNIX_CALL( glRectf, &args ))) WARN( "glRectf returned %#lx\n", status );
+ }
+@@ -1985,6 +1935,7 @@ void WINAPI glRectfv( const GLfloat *v1, const GLfloat *v2 )
+ {
+     struct glRectfv_params args = { .teb = NtCurrentTeb(), .v1 = v1, .v2 = v2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "v1 %p, v2 %p\n", v1, v2 );
+     if ((status = UNIX_CALL( glRectfv, &args ))) WARN( "glRectfv returned %#lx\n", status );
+ }
+@@ -1993,6 +1944,7 @@ void WINAPI glRecti( GLint x1, GLint y1, GLint x2, GLint y2 )
+ {
+     struct glRecti_params args = { .teb = NtCurrentTeb(), .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "x1 %d, y1 %d, x2 %d, y2 %d\n", x1, y1, x2, y2 );
+     if ((status = UNIX_CALL( glRecti, &args ))) WARN( "glRecti returned %#lx\n", status );
+ }
+@@ -2001,6 +1953,7 @@ void WINAPI glRectiv( const GLint *v1, const GLint *v2 )
+ {
+     struct glRectiv_params args = { .teb = NtCurrentTeb(), .v1 = v1, .v2 = v2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "v1 %p, v2 %p\n", v1, v2 );
+     if ((status = UNIX_CALL( glRectiv, &args ))) WARN( "glRectiv returned %#lx\n", status );
+ }
+@@ -2009,6 +1962,7 @@ void WINAPI glRects( GLshort x1, GLshort y1, GLshort x2, GLshort y2 )
+ {
+     struct glRects_params args = { .teb = NtCurrentTeb(), .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "x1 %d, y1 %d, x2 %d, y2 %d\n", x1, y1, x2, y2 );
+     if ((status = UNIX_CALL( glRects, &args ))) WARN( "glRects returned %#lx\n", status );
+ }
+@@ -2017,6 +1971,7 @@ void WINAPI glRectsv( const GLshort *v1, const GLshort *v2 )
+ {
+     struct glRectsv_params args = { .teb = NtCurrentTeb(), .v1 = v1, .v2 = v2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "v1 %p, v2 %p\n", v1, v2 );
+     if ((status = UNIX_CALL( glRectsv, &args ))) WARN( "glRectsv returned %#lx\n", status );
+ }
+@@ -2462,14 +2417,6 @@ void WINAPI glTexImage1D( GLenum target, GLint level, GLint internalformat, GLsi
+     if ((status = UNIX_CALL( glTexImage1D, &args ))) WARN( "glTexImage1D returned %#lx\n", status );
+ }
+ 
+-void WINAPI glTexImage2D( GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels )
+-{
+-    struct glTexImage2D_params args = { .teb = NtCurrentTeb(), .target = target, .level = level, .internalformat = internalformat, .width = width, .height = height, .border = border, .format = format, .type = type, .pixels = pixels };
+-    NTSTATUS status;
+-    TRACE( "target %d, level %d, internalformat %d, width %d, height %d, border %d, format %d, type %d, pixels %p\n", target, level, internalformat, width, height, border, format, type, pixels );
+-    if ((status = UNIX_CALL( glTexImage2D, &args ))) WARN( "glTexImage2D returned %#lx\n", status );
+-}
+-
+ void WINAPI glTexParameterf( GLenum target, GLenum pname, GLfloat param )
+ {
+     struct glTexParameterf_params args = { .teb = NtCurrentTeb(), .target = target, .pname = pname, .param = param };
+@@ -2734,14 +2681,6 @@ void WINAPI glVertexPointer( GLint size, GLenum type, GLsizei stride, const void
+     if ((status = UNIX_CALL( glVertexPointer, &args ))) WARN( "glVertexPointer returned %#lx\n", status );
+ }
+ 
+-void WINAPI glViewport( GLint x, GLint y, GLsizei width, GLsizei height )
+-{
+-    struct glViewport_params args = { .teb = NtCurrentTeb(), .x = x, .y = y, .width = width, .height = height };
+-    NTSTATUS status;
+-    TRACE( "x %d, y %d, width %d, height %d\n", x, y, width, height );
+-    if ((status = UNIX_CALL( glViewport, &args ))) WARN( "glViewport returned %#lx\n", status );
+-}
+-
+ static void WINAPI glAccumxOES( GLenum op, GLfixed value )
+ {
+     struct glAccumxOES_params args = { .teb = NtCurrentTeb(), .op = op, .value = value };
+@@ -3211,22 +3150,6 @@ static void WINAPI glBindFragmentShaderATI( GLuint id )
+     if ((status = UNIX_CALL( glBindFragmentShaderATI, &args ))) WARN( "glBindFragmentShaderATI returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glBindFramebuffer( GLenum target, GLuint framebuffer )
+-{
+-    struct glBindFramebuffer_params args = { .teb = NtCurrentTeb(), .target = target, .framebuffer = framebuffer };
+-    NTSTATUS status;
+-    TRACE( "target %d, framebuffer %d\n", target, framebuffer );
+-    if ((status = UNIX_CALL( glBindFramebuffer, &args ))) WARN( "glBindFramebuffer returned %#lx\n", status );
+-}
+-
+-static void WINAPI glBindFramebufferEXT( GLenum target, GLuint framebuffer )
+-{
+-    struct glBindFramebufferEXT_params args = { .teb = NtCurrentTeb(), .target = target, .framebuffer = framebuffer };
+-    NTSTATUS status;
+-    TRACE( "target %d, framebuffer %d\n", target, framebuffer );
+-    if ((status = UNIX_CALL( glBindFramebufferEXT, &args ))) WARN( "glBindFramebufferEXT returned %#lx\n", status );
+-}
+-
+ static void WINAPI glBindImageTexture( GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum format )
+ {
+     struct glBindImageTexture_params args = { .teb = NtCurrentTeb(), .unit = unit, .texture = texture, .level = level, .layered = layered, .layer = layer, .access = access, .format = format };
+@@ -3768,22 +3691,6 @@ static void WINAPI glBlendParameteriNV( GLenum pname, GLint value )
+     if ((status = UNIX_CALL( glBlendParameteriNV, &args ))) WARN( "glBlendParameteriNV returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glBlitFramebuffer( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter )
+-{
+-    struct glBlitFramebuffer_params args = { .teb = NtCurrentTeb(), .srcX0 = srcX0, .srcY0 = srcY0, .srcX1 = srcX1, .srcY1 = srcY1, .dstX0 = dstX0, .dstY0 = dstY0, .dstX1 = dstX1, .dstY1 = dstY1, .mask = mask, .filter = filter };
+-    NTSTATUS status;
+-    TRACE( "srcX0 %d, srcY0 %d, srcX1 %d, srcY1 %d, dstX0 %d, dstY0 %d, dstX1 %d, dstY1 %d, mask %d, filter %d\n", srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter );
+-    if ((status = UNIX_CALL( glBlitFramebuffer, &args ))) WARN( "glBlitFramebuffer returned %#lx\n", status );
+-}
+-
+-static void WINAPI glBlitFramebufferEXT( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter )
+-{
+-    struct glBlitFramebufferEXT_params args = { .teb = NtCurrentTeb(), .srcX0 = srcX0, .srcY0 = srcY0, .srcX1 = srcX1, .srcY1 = srcY1, .dstX0 = dstX0, .dstY0 = dstY0, .dstX1 = dstX1, .dstY1 = dstY1, .mask = mask, .filter = filter };
+-    NTSTATUS status;
+-    TRACE( "srcX0 %d, srcY0 %d, srcX1 %d, srcY1 %d, dstX0 %d, dstY0 %d, dstX1 %d, dstY1 %d, mask %d, filter %d\n", srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter );
+-    if ((status = UNIX_CALL( glBlitFramebufferEXT, &args ))) WARN( "glBlitFramebufferEXT returned %#lx\n", status );
+-}
+-
+ static void WINAPI glBlitFramebufferLayerEXT( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint srcLayer, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLint dstLayer, GLbitfield mask, GLenum filter )
+ {
+     struct glBlitFramebufferLayerEXT_params args = { .teb = NtCurrentTeb(), .srcX0 = srcX0, .srcY0 = srcY0, .srcX1 = srcX1, .srcY1 = srcY1, .srcLayer = srcLayer, .dstX0 = dstX0, .dstY0 = dstY0, .dstX1 = dstX1, .dstY1 = dstY1, .dstLayer = dstLayer, .mask = mask, .filter = filter };
+@@ -3921,24 +3828,6 @@ static void WINAPI glCallCommandListNV( GLuint list )
+     if ((status = UNIX_CALL( glCallCommandListNV, &args ))) WARN( "glCallCommandListNV returned %#lx\n", status );
+ }
+ 
+-static GLenum WINAPI glCheckFramebufferStatus( GLenum target )
+-{
+-    struct glCheckFramebufferStatus_params args = { .teb = NtCurrentTeb(), .target = target };
+-    NTSTATUS status;
+-    TRACE( "target %d\n", target );
+-    if ((status = UNIX_CALL( glCheckFramebufferStatus, &args ))) WARN( "glCheckFramebufferStatus returned %#lx\n", status );
+-    return args.ret;
+-}
+-
+-static GLenum WINAPI glCheckFramebufferStatusEXT( GLenum target )
+-{
+-    struct glCheckFramebufferStatusEXT_params args = { .teb = NtCurrentTeb(), .target = target };
+-    NTSTATUS status;
+-    TRACE( "target %d\n", target );
+-    if ((status = UNIX_CALL( glCheckFramebufferStatusEXT, &args ))) WARN( "glCheckFramebufferStatusEXT returned %#lx\n", status );
+-    return args.ret;
+-}
+-
+ static GLenum WINAPI glCheckNamedFramebufferStatus( GLuint framebuffer, GLenum target )
+ {
+     struct glCheckNamedFramebufferStatus_params args = { .teb = NtCurrentTeb(), .framebuffer = framebuffer, .target = target };
+@@ -4655,22 +4544,6 @@ static void WINAPI glCompileCommandListNV( GLuint list )
+     if ((status = UNIX_CALL( glCompileCommandListNV, &args ))) WARN( "glCompileCommandListNV returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glCompileShader( GLuint shader )
+-{
+-    struct glCompileShader_params args = { .teb = NtCurrentTeb(), .shader = shader };
+-    NTSTATUS status;
+-    TRACE( "shader %d\n", shader );
+-    if ((status = UNIX_CALL( glCompileShader, &args ))) WARN( "glCompileShader returned %#lx\n", status );
+-}
+-
+-static void WINAPI glCompileShaderARB( GLhandleARB shaderObj )
+-{
+-    struct glCompileShaderARB_params args = { .teb = NtCurrentTeb(), .shaderObj = shaderObj };
+-    NTSTATUS status;
+-    TRACE( "shaderObj %d\n", shaderObj );
+-    if ((status = UNIX_CALL( glCompileShaderARB, &args ))) WARN( "glCompileShaderARB returned %#lx\n", status );
+-}
+-
+ static void WINAPI glCompileShaderIncludeARB( GLuint shader, GLsizei count, const GLchar *const*path, const GLint *length )
+ {
+     struct glCompileShaderIncludeARB_params args = { .teb = NtCurrentTeb(), .shader = shader, .count = count, .path = path, .length = length };
+@@ -6154,6 +6027,7 @@ static void WINAPI glDrawArraysEXT( GLenum mode, GLint first, GLsizei count )
+ {
+     struct glDrawArraysEXT_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %d, count %d\n", mode, first, count );
+     if ((status = UNIX_CALL( glDrawArraysEXT, &args ))) WARN( "glDrawArraysEXT returned %#lx\n", status );
+ }
+@@ -6162,22 +6036,16 @@ static void WINAPI glDrawArraysIndirect( GLenum mode, const void *indirect )
+ {
+     struct glDrawArraysIndirect_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p\n", mode, indirect );
+     if ((status = UNIX_CALL( glDrawArraysIndirect, &args ))) WARN( "glDrawArraysIndirect returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glDrawArraysInstanced( GLenum mode, GLint first, GLsizei count, GLsizei instancecount )
+-{
+-    struct glDrawArraysInstanced_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .instancecount = instancecount };
+-    NTSTATUS status;
+-    TRACE( "mode %d, first %d, count %d, instancecount %d\n", mode, first, count, instancecount );
+-    if ((status = UNIX_CALL( glDrawArraysInstanced, &args ))) WARN( "glDrawArraysInstanced returned %#lx\n", status );
+-}
+-
+ static void WINAPI glDrawArraysInstancedARB( GLenum mode, GLint first, GLsizei count, GLsizei primcount )
+ {
+     struct glDrawArraysInstancedARB_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %d, count %d, primcount %d\n", mode, first, count, primcount );
+     if ((status = UNIX_CALL( glDrawArraysInstancedARB, &args ))) WARN( "glDrawArraysInstancedARB returned %#lx\n", status );
+ }
+@@ -6186,6 +6054,7 @@ static void WINAPI glDrawArraysInstancedBaseInstance( GLenum mode, GLint first,
+ {
+     struct glDrawArraysInstancedBaseInstance_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .instancecount = instancecount, .baseinstance = baseinstance };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %d, count %d, instancecount %d, baseinstance %d\n", mode, first, count, instancecount, baseinstance );
+     if ((status = UNIX_CALL( glDrawArraysInstancedBaseInstance, &args ))) WARN( "glDrawArraysInstancedBaseInstance returned %#lx\n", status );
+ }
+@@ -6194,6 +6063,7 @@ static void WINAPI glDrawArraysInstancedEXT( GLenum mode, GLint start, GLsizei c
+ {
+     struct glDrawArraysInstancedEXT_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .count = count, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, start %d, count %d, primcount %d\n", mode, start, count, primcount );
+     if ((status = UNIX_CALL( glDrawArraysInstancedEXT, &args ))) WARN( "glDrawArraysInstancedEXT returned %#lx\n", status );
+ }
+@@ -6234,6 +6104,7 @@ static void WINAPI glDrawCommandsAddressNV( GLenum primitiveMode, const GLuint64
+ {
+     struct glDrawCommandsAddressNV_params args = { .teb = NtCurrentTeb(), .primitiveMode = primitiveMode, .indirects = indirects, .sizes = sizes, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "primitiveMode %d, indirects %p, sizes %p, count %d\n", primitiveMode, indirects, sizes, count );
+     if ((status = UNIX_CALL( glDrawCommandsAddressNV, &args ))) WARN( "glDrawCommandsAddressNV returned %#lx\n", status );
+ }
+@@ -6242,6 +6113,7 @@ static void WINAPI glDrawCommandsNV( GLenum primitiveMode, GLuint buffer, const
+ {
+     struct glDrawCommandsNV_params args = { .teb = NtCurrentTeb(), .primitiveMode = primitiveMode, .buffer = buffer, .indirects = indirects, .sizes = sizes, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "primitiveMode %d, buffer %d, indirects %p, sizes %p, count %d\n", primitiveMode, buffer, indirects, sizes, count );
+     if ((status = UNIX_CALL( glDrawCommandsNV, &args ))) WARN( "glDrawCommandsNV returned %#lx\n", status );
+ }
+@@ -6250,6 +6122,7 @@ static void WINAPI glDrawCommandsStatesAddressNV( const GLuint64 *indirects, con
+ {
+     struct glDrawCommandsStatesAddressNV_params args = { .teb = NtCurrentTeb(), .indirects = indirects, .sizes = sizes, .states = states, .fbos = fbos, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirects %p, sizes %p, states %p, fbos %p, count %d\n", indirects, sizes, states, fbos, count );
+     if ((status = UNIX_CALL( glDrawCommandsStatesAddressNV, &args ))) WARN( "glDrawCommandsStatesAddressNV returned %#lx\n", status );
+ }
+@@ -6258,6 +6131,7 @@ static void WINAPI glDrawCommandsStatesNV( GLuint buffer, const GLintptr *indire
+ {
+     struct glDrawCommandsStatesNV_params args = { .teb = NtCurrentTeb(), .buffer = buffer, .indirects = indirects, .sizes = sizes, .states = states, .fbos = fbos, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "buffer %d, indirects %p, sizes %p, states %p, fbos %p, count %d\n", buffer, indirects, sizes, states, fbos, count );
+     if ((status = UNIX_CALL( glDrawCommandsStatesNV, &args ))) WARN( "glDrawCommandsStatesNV returned %#lx\n", status );
+ }
+@@ -6266,6 +6140,7 @@ static void WINAPI glDrawElementArrayAPPLE( GLenum mode, GLint first, GLsizei co
+ {
+     struct glDrawElementArrayAPPLE_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %d, count %d\n", mode, first, count );
+     if ((status = UNIX_CALL( glDrawElementArrayAPPLE, &args ))) WARN( "glDrawElementArrayAPPLE returned %#lx\n", status );
+ }
+@@ -6274,6 +6149,7 @@ static void WINAPI glDrawElementArrayATI( GLenum mode, GLsizei count )
+ {
+     struct glDrawElementArrayATI_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d\n", mode, count );
+     if ((status = UNIX_CALL( glDrawElementArrayATI, &args ))) WARN( "glDrawElementArrayATI returned %#lx\n", status );
+ }
+@@ -6282,6 +6158,7 @@ static void WINAPI glDrawElementsBaseVertex( GLenum mode, GLsizei count, GLenum
+ {
+     struct glDrawElementsBaseVertex_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .basevertex = basevertex };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d, type %d, indices %p, basevertex %d\n", mode, count, type, indices, basevertex );
+     if ((status = UNIX_CALL( glDrawElementsBaseVertex, &args ))) WARN( "glDrawElementsBaseVertex returned %#lx\n", status );
+ }
+@@ -6290,22 +6167,16 @@ static void WINAPI glDrawElementsIndirect( GLenum mode, GLenum type, const void
+ {
+     struct glDrawElementsIndirect_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p\n", mode, type, indirect );
+     if ((status = UNIX_CALL( glDrawElementsIndirect, &args ))) WARN( "glDrawElementsIndirect returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glDrawElementsInstanced( GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount )
+-{
+-    struct glDrawElementsInstanced_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .instancecount = instancecount };
+-    NTSTATUS status;
+-    TRACE( "mode %d, count %d, type %d, indices %p, instancecount %d\n", mode, count, type, indices, instancecount );
+-    if ((status = UNIX_CALL( glDrawElementsInstanced, &args ))) WARN( "glDrawElementsInstanced returned %#lx\n", status );
+-}
+-
+ static void WINAPI glDrawElementsInstancedARB( GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei primcount )
+ {
+     struct glDrawElementsInstancedARB_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d, type %d, indices %p, primcount %d\n", mode, count, type, indices, primcount );
+     if ((status = UNIX_CALL( glDrawElementsInstancedARB, &args ))) WARN( "glDrawElementsInstancedARB returned %#lx\n", status );
+ }
+@@ -6314,6 +6185,7 @@ static void WINAPI glDrawElementsInstancedBaseInstance( GLenum mode, GLsizei cou
+ {
+     struct glDrawElementsInstancedBaseInstance_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .instancecount = instancecount, .baseinstance = baseinstance };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d, type %d, indices %p, instancecount %d, baseinstance %d\n", mode, count, type, indices, instancecount, baseinstance );
+     if ((status = UNIX_CALL( glDrawElementsInstancedBaseInstance, &args ))) WARN( "glDrawElementsInstancedBaseInstance returned %#lx\n", status );
+ }
+@@ -6322,6 +6194,7 @@ static void WINAPI glDrawElementsInstancedBaseVertex( GLenum mode, GLsizei count
+ {
+     struct glDrawElementsInstancedBaseVertex_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .instancecount = instancecount, .basevertex = basevertex };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d, type %d, indices %p, instancecount %d, basevertex %d\n", mode, count, type, indices, instancecount, basevertex );
+     if ((status = UNIX_CALL( glDrawElementsInstancedBaseVertex, &args ))) WARN( "glDrawElementsInstancedBaseVertex returned %#lx\n", status );
+ }
+@@ -6330,6 +6203,7 @@ static void WINAPI glDrawElementsInstancedBaseVertexBaseInstance( GLenum mode, G
+ {
+     struct glDrawElementsInstancedBaseVertexBaseInstance_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .instancecount = instancecount, .basevertex = basevertex, .baseinstance = baseinstance };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d, type %d, indices %p, instancecount %d, basevertex %d, baseinstance %d\n", mode, count, type, indices, instancecount, basevertex, baseinstance );
+     if ((status = UNIX_CALL( glDrawElementsInstancedBaseVertexBaseInstance, &args ))) WARN( "glDrawElementsInstancedBaseVertexBaseInstance returned %#lx\n", status );
+ }
+@@ -6338,6 +6212,7 @@ static void WINAPI glDrawElementsInstancedEXT( GLenum mode, GLsizei count, GLenu
+ {
+     struct glDrawElementsInstancedEXT_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %d, type %d, indices %p, primcount %d\n", mode, count, type, indices, primcount );
+     if ((status = UNIX_CALL( glDrawElementsInstancedEXT, &args ))) WARN( "glDrawElementsInstancedEXT returned %#lx\n", status );
+ }
+@@ -6346,6 +6221,7 @@ static void WINAPI glDrawMeshArraysSUN( GLenum mode, GLint first, GLsizei count,
+ {
+     struct glDrawMeshArraysSUN_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .width = width };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %d, count %d, width %d\n", mode, first, count, width );
+     if ((status = UNIX_CALL( glDrawMeshArraysSUN, &args ))) WARN( "glDrawMeshArraysSUN returned %#lx\n", status );
+ }
+@@ -6354,6 +6230,7 @@ static void WINAPI glDrawMeshTasksEXT( GLuint num_groups_x, GLuint num_groups_y,
+ {
+     struct glDrawMeshTasksEXT_params args = { .teb = NtCurrentTeb(), .num_groups_x = num_groups_x, .num_groups_y = num_groups_y, .num_groups_z = num_groups_z };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "num_groups_x %d, num_groups_y %d, num_groups_z %d\n", num_groups_x, num_groups_y, num_groups_z );
+     if ((status = UNIX_CALL( glDrawMeshTasksEXT, &args ))) WARN( "glDrawMeshTasksEXT returned %#lx\n", status );
+ }
+@@ -6362,6 +6239,7 @@ static void WINAPI glDrawMeshTasksIndirectEXT( GLintptr indirect )
+ {
+     struct glDrawMeshTasksIndirectEXT_params args = { .teb = NtCurrentTeb(), .indirect = indirect };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirect %Id\n", indirect );
+     if ((status = UNIX_CALL( glDrawMeshTasksIndirectEXT, &args ))) WARN( "glDrawMeshTasksIndirectEXT returned %#lx\n", status );
+ }
+@@ -6370,6 +6248,7 @@ static void WINAPI glDrawMeshTasksIndirectNV( GLintptr indirect )
+ {
+     struct glDrawMeshTasksIndirectNV_params args = { .teb = NtCurrentTeb(), .indirect = indirect };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirect %Id\n", indirect );
+     if ((status = UNIX_CALL( glDrawMeshTasksIndirectNV, &args ))) WARN( "glDrawMeshTasksIndirectNV returned %#lx\n", status );
+ }
+@@ -6378,6 +6257,7 @@ static void WINAPI glDrawMeshTasksNV( GLuint first, GLuint count )
+ {
+     struct glDrawMeshTasksNV_params args = { .teb = NtCurrentTeb(), .first = first, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "first %d, count %d\n", first, count );
+     if ((status = UNIX_CALL( glDrawMeshTasksNV, &args ))) WARN( "glDrawMeshTasksNV returned %#lx\n", status );
+ }
+@@ -6386,6 +6266,7 @@ static void WINAPI glDrawRangeElementArrayAPPLE( GLenum mode, GLuint start, GLui
+ {
+     struct glDrawRangeElementArrayAPPLE_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .first = first, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, start %d, end %d, first %d, count %d\n", mode, start, end, first, count );
+     if ((status = UNIX_CALL( glDrawRangeElementArrayAPPLE, &args ))) WARN( "glDrawRangeElementArrayAPPLE returned %#lx\n", status );
+ }
+@@ -6394,22 +6275,16 @@ static void WINAPI glDrawRangeElementArrayATI( GLenum mode, GLuint start, GLuint
+ {
+     struct glDrawRangeElementArrayATI_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .count = count };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, start %d, end %d, count %d\n", mode, start, end, count );
+     if ((status = UNIX_CALL( glDrawRangeElementArrayATI, &args ))) WARN( "glDrawRangeElementArrayATI returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glDrawRangeElements( GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices )
+-{
+-    struct glDrawRangeElements_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .count = count, .type = type, .indices = indices };
+-    NTSTATUS status;
+-    TRACE( "mode %d, start %d, end %d, count %d, type %d, indices %p\n", mode, start, end, count, type, indices );
+-    if ((status = UNIX_CALL( glDrawRangeElements, &args ))) WARN( "glDrawRangeElements returned %#lx\n", status );
+-}
+-
+ static void WINAPI glDrawRangeElementsBaseVertex( GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices, GLint basevertex )
+ {
+     struct glDrawRangeElementsBaseVertex_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .count = count, .type = type, .indices = indices, .basevertex = basevertex };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, start %d, end %d, count %d, type %d, indices %p, basevertex %d\n", mode, start, end, count, type, indices, basevertex );
+     if ((status = UNIX_CALL( glDrawRangeElementsBaseVertex, &args ))) WARN( "glDrawRangeElementsBaseVertex returned %#lx\n", status );
+ }
+@@ -6418,6 +6293,7 @@ static void WINAPI glDrawRangeElementsEXT( GLenum mode, GLuint start, GLuint end
+ {
+     struct glDrawRangeElementsEXT_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .count = count, .type = type, .indices = indices };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, start %d, end %d, count %d, type %d, indices %p\n", mode, start, end, count, type, indices );
+     if ((status = UNIX_CALL( glDrawRangeElementsEXT, &args ))) WARN( "glDrawRangeElementsEXT returned %#lx\n", status );
+ }
+@@ -6426,6 +6302,7 @@ static void WINAPI glDrawTextureNV( GLuint texture, GLuint sampler, GLfloat x0,
+ {
+     struct glDrawTextureNV_params args = { .teb = NtCurrentTeb(), .texture = texture, .sampler = sampler, .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1, .z = z, .s0 = s0, .t0 = t0, .s1 = s1, .t1 = t1 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "texture %d, sampler %d, x0 %f, y0 %f, x1 %f, y1 %f, z %f, s0 %f, t0 %f, s1 %f, t1 %f\n", texture, sampler, x0, y0, x1, y1, z, s0, t0, s1, t1 );
+     if ((status = UNIX_CALL( glDrawTextureNV, &args ))) WARN( "glDrawTextureNV returned %#lx\n", status );
+ }
+@@ -6434,6 +6311,7 @@ static void WINAPI glDrawTransformFeedback( GLenum mode, GLuint id )
+ {
+     struct glDrawTransformFeedback_params args = { .teb = NtCurrentTeb(), .mode = mode, .id = id };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, id %d\n", mode, id );
+     if ((status = UNIX_CALL( glDrawTransformFeedback, &args ))) WARN( "glDrawTransformFeedback returned %#lx\n", status );
+ }
+@@ -6442,6 +6320,7 @@ static void WINAPI glDrawTransformFeedbackInstanced( GLenum mode, GLuint id, GLs
+ {
+     struct glDrawTransformFeedbackInstanced_params args = { .teb = NtCurrentTeb(), .mode = mode, .id = id, .instancecount = instancecount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, id %d, instancecount %d\n", mode, id, instancecount );
+     if ((status = UNIX_CALL( glDrawTransformFeedbackInstanced, &args ))) WARN( "glDrawTransformFeedbackInstanced returned %#lx\n", status );
+ }
+@@ -6450,6 +6329,7 @@ static void WINAPI glDrawTransformFeedbackNV( GLenum mode, GLuint id )
+ {
+     struct glDrawTransformFeedbackNV_params args = { .teb = NtCurrentTeb(), .mode = mode, .id = id };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, id %d\n", mode, id );
+     if ((status = UNIX_CALL( glDrawTransformFeedbackNV, &args ))) WARN( "glDrawTransformFeedbackNV returned %#lx\n", status );
+ }
+@@ -6458,6 +6338,7 @@ static void WINAPI glDrawTransformFeedbackStream( GLenum mode, GLuint id, GLuint
+ {
+     struct glDrawTransformFeedbackStream_params args = { .teb = NtCurrentTeb(), .mode = mode, .id = id, .stream = stream };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, id %d, stream %d\n", mode, id, stream );
+     if ((status = UNIX_CALL( glDrawTransformFeedbackStream, &args ))) WARN( "glDrawTransformFeedbackStream returned %#lx\n", status );
+ }
+@@ -6466,6 +6347,7 @@ static void WINAPI glDrawTransformFeedbackStreamInstanced( GLenum mode, GLuint i
+ {
+     struct glDrawTransformFeedbackStreamInstanced_params args = { .teb = NtCurrentTeb(), .mode = mode, .id = id, .stream = stream, .instancecount = instancecount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, id %d, stream %d, instancecount %d\n", mode, id, stream, instancecount );
+     if ((status = UNIX_CALL( glDrawTransformFeedbackStreamInstanced, &args ))) WARN( "glDrawTransformFeedbackStreamInstanced returned %#lx\n", status );
+ }
+@@ -6474,6 +6356,7 @@ static void WINAPI glDrawVkImageNV( GLuint64 vkImage, GLuint sampler, GLfloat x0
+ {
+     struct glDrawVkImageNV_params args = { .teb = NtCurrentTeb(), .vkImage = vkImage, .sampler = sampler, .x0 = x0, .y0 = y0, .x1 = x1, .y1 = y1, .z = z, .s0 = s0, .t0 = t0, .s1 = s1, .t1 = t1 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "vkImage %s, sampler %d, x0 %f, y0 %f, x1 %f, y1 %f, z %f, s0 %f, t0 %f, s1 %f, t1 %f\n", wine_dbgstr_longlong(vkImage), sampler, x0, y0, x1, y1, z, s0, t0, s1, t1 );
+     if ((status = UNIX_CALL( glDrawVkImageNV, &args ))) WARN( "glDrawVkImageNV returned %#lx\n", status );
+ }
+@@ -7335,22 +7218,6 @@ static void WINAPI glFramebufferTexture1DEXT( GLenum target, GLenum attachment,
+     if ((status = UNIX_CALL( glFramebufferTexture1DEXT, &args ))) WARN( "glFramebufferTexture1DEXT returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glFramebufferTexture2D( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level )
+-{
+-    struct glFramebufferTexture2D_params args = { .teb = NtCurrentTeb(), .target = target, .attachment = attachment, .textarget = textarget, .texture = texture, .level = level };
+-    NTSTATUS status;
+-    TRACE( "target %d, attachment %d, textarget %d, texture %d, level %d\n", target, attachment, textarget, texture, level );
+-    if ((status = UNIX_CALL( glFramebufferTexture2D, &args ))) WARN( "glFramebufferTexture2D returned %#lx\n", status );
+-}
+-
+-static void WINAPI glFramebufferTexture2DEXT( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level )
+-{
+-    struct glFramebufferTexture2DEXT_params args = { .teb = NtCurrentTeb(), .target = target, .attachment = attachment, .textarget = textarget, .texture = texture, .level = level };
+-    NTSTATUS status;
+-    TRACE( "target %d, attachment %d, textarget %d, texture %d, level %d\n", target, attachment, textarget, texture, level );
+-    if ((status = UNIX_CALL( glFramebufferTexture2DEXT, &args ))) WARN( "glFramebufferTexture2DEXT returned %#lx\n", status );
+-}
+-
+ static void WINAPI glFramebufferTexture3D( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level, GLint zoffset )
+ {
+     struct glFramebufferTexture3D_params args = { .teb = NtCurrentTeb(), .target = target, .attachment = attachment, .textarget = textarget, .texture = texture, .level = level, .zoffset = zoffset };
+@@ -9590,14 +9457,6 @@ static void WINAPI glGetProgramEnvParameterfvARB( GLenum target, GLuint index, G
+     if ((status = UNIX_CALL( glGetProgramEnvParameterfvARB, &args ))) WARN( "glGetProgramEnvParameterfvARB returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glGetProgramInfoLog( GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog )
+-{
+-    struct glGetProgramInfoLog_params args = { .teb = NtCurrentTeb(), .program = program, .bufSize = bufSize, .length = length, .infoLog = infoLog };
+-    NTSTATUS status;
+-    TRACE( "program %d, bufSize %d, length %p, infoLog %p\n", program, bufSize, length, infoLog );
+-    if ((status = UNIX_CALL( glGetProgramInfoLog, &args ))) WARN( "glGetProgramInfoLog returned %#lx\n", status );
+-}
+-
+ static void WINAPI glGetProgramInterfaceiv( GLuint program, GLenum programInterface, GLenum pname, GLint *params )
+ {
+     struct glGetProgramInterfaceiv_params args = { .teb = NtCurrentTeb(), .program = program, .programInterface = programInterface, .pname = pname, .params = params };
+@@ -9769,14 +9628,6 @@ static void WINAPI glGetProgramSubroutineParameteruivNV( GLenum target, GLuint i
+     if ((status = UNIX_CALL( glGetProgramSubroutineParameteruivNV, &args ))) WARN( "glGetProgramSubroutineParameteruivNV returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glGetProgramiv( GLuint program, GLenum pname, GLint *params )
+-{
+-    struct glGetProgramiv_params args = { .teb = NtCurrentTeb(), .program = program, .pname = pname, .params = params };
+-    NTSTATUS status;
+-    TRACE( "program %d, pname %d, params %p\n", program, pname, params );
+-    if ((status = UNIX_CALL( glGetProgramiv, &args ))) WARN( "glGetProgramiv returned %#lx\n", status );
+-}
+-
+ static void WINAPI glGetProgramivARB( GLenum target, GLenum pname, GLint *params )
+ {
+     struct glGetProgramivARB_params args = { .teb = NtCurrentTeb(), .target = target, .pname = pname, .params = params };
+@@ -9993,14 +9844,6 @@ static void WINAPI glGetSeparableFilterEXT( GLenum target, GLenum format, GLenum
+     if ((status = UNIX_CALL( glGetSeparableFilterEXT, &args ))) WARN( "glGetSeparableFilterEXT returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glGetShaderInfoLog( GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog )
+-{
+-    struct glGetShaderInfoLog_params args = { .teb = NtCurrentTeb(), .shader = shader, .bufSize = bufSize, .length = length, .infoLog = infoLog };
+-    NTSTATUS status;
+-    TRACE( "shader %d, bufSize %d, length %p, infoLog %p\n", shader, bufSize, length, infoLog );
+-    if ((status = UNIX_CALL( glGetShaderInfoLog, &args ))) WARN( "glGetShaderInfoLog returned %#lx\n", status );
+-}
+-
+ static void WINAPI glGetShaderPrecisionFormat( GLenum shadertype, GLenum precisiontype, GLint *range, GLint *precision )
+ {
+     struct glGetShaderPrecisionFormat_params args = { .teb = NtCurrentTeb(), .shadertype = shadertype, .precisiontype = precisiontype, .range = range, .precision = precision };
+@@ -10025,14 +9868,6 @@ static void WINAPI glGetShaderSourceARB( GLhandleARB obj, GLsizei maxLength, GLs
+     if ((status = UNIX_CALL( glGetShaderSourceARB, &args ))) WARN( "glGetShaderSourceARB returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glGetShaderiv( GLuint shader, GLenum pname, GLint *params )
+-{
+-    struct glGetShaderiv_params args = { .teb = NtCurrentTeb(), .shader = shader, .pname = pname, .params = params };
+-    NTSTATUS status;
+-    TRACE( "shader %d, pname %d, params %p\n", shader, pname, params );
+-    if ((status = UNIX_CALL( glGetShaderiv, &args ))) WARN( "glGetShaderiv returned %#lx\n", status );
+-}
+-
+ static void WINAPI glGetShadingRateImagePaletteNV( GLuint viewport, GLuint entry, GLenum *rate )
+ {
+     struct glGetShadingRateImagePaletteNV_params args = { .teb = NtCurrentTeb(), .viewport = viewport, .entry = entry, .rate = rate };
+@@ -12085,22 +11920,6 @@ static void WINAPI glLineWidthxOES( GLfixed width )
+     if ((status = UNIX_CALL( glLineWidthxOES, &args ))) WARN( "glLineWidthxOES returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glLinkProgram( GLuint program )
+-{
+-    struct glLinkProgram_params args = { .teb = NtCurrentTeb(), .program = program };
+-    NTSTATUS status;
+-    TRACE( "program %d\n", program );
+-    if ((status = UNIX_CALL( glLinkProgram, &args ))) WARN( "glLinkProgram returned %#lx\n", status );
+-}
+-
+-static void WINAPI glLinkProgramARB( GLhandleARB programObj )
+-{
+-    struct glLinkProgramARB_params args = { .teb = NtCurrentTeb(), .programObj = programObj };
+-    NTSTATUS status;
+-    TRACE( "programObj %d\n", programObj );
+-    if ((status = UNIX_CALL( glLinkProgramARB, &args ))) WARN( "glLinkProgramARB returned %#lx\n", status );
+-}
+-
+ static void WINAPI glListDrawCommandsStatesClientNV( GLuint list, GLuint segment, const void **indirects, const GLsizei *sizes, const GLuint *states, const GLuint *fbos, GLuint count )
+ {
+     struct glListDrawCommandsStatesClientNV_params args = { .teb = NtCurrentTeb(), .list = list, .segment = segment, .indirects = indirects, .sizes = sizes, .states = states, .fbos = fbos, .count = count };
+@@ -12906,6 +12725,7 @@ static void WINAPI glMultiDrawArrays( GLenum mode, const GLint *first, const GLs
+ {
+     struct glMultiDrawArrays_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .drawcount = drawcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %p, count %p, drawcount %d\n", mode, first, count, drawcount );
+     if ((status = UNIX_CALL( glMultiDrawArrays, &args ))) WARN( "glMultiDrawArrays returned %#lx\n", status );
+ }
+@@ -12914,6 +12734,7 @@ static void WINAPI glMultiDrawArraysEXT( GLenum mode, const GLint *first, const
+ {
+     struct glMultiDrawArraysEXT_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %p, count %p, primcount %d\n", mode, first, count, primcount );
+     if ((status = UNIX_CALL( glMultiDrawArraysEXT, &args ))) WARN( "glMultiDrawArraysEXT returned %#lx\n", status );
+ }
+@@ -12922,6 +12743,7 @@ static void WINAPI glMultiDrawArraysIndirect( GLenum mode, const void *indirect,
+ {
+     struct glMultiDrawArraysIndirect_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect, .drawcount = drawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p, drawcount %d, stride %d\n", mode, indirect, drawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawArraysIndirect, &args ))) WARN( "glMultiDrawArraysIndirect returned %#lx\n", status );
+ }
+@@ -12930,6 +12752,7 @@ static void WINAPI glMultiDrawArraysIndirectAMD( GLenum mode, const void *indire
+ {
+     struct glMultiDrawArraysIndirectAMD_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect, .primcount = primcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p, primcount %d, stride %d\n", mode, indirect, primcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawArraysIndirectAMD, &args ))) WARN( "glMultiDrawArraysIndirectAMD returned %#lx\n", status );
+ }
+@@ -12938,6 +12761,7 @@ static void WINAPI glMultiDrawArraysIndirectBindlessCountNV( GLenum mode, const
+ {
+     struct glMultiDrawArraysIndirectBindlessCountNV_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect, .drawCount = drawCount, .maxDrawCount = maxDrawCount, .stride = stride, .vertexBufferCount = vertexBufferCount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p, drawCount %d, maxDrawCount %d, stride %d, vertexBufferCount %d\n", mode, indirect, drawCount, maxDrawCount, stride, vertexBufferCount );
+     if ((status = UNIX_CALL( glMultiDrawArraysIndirectBindlessCountNV, &args ))) WARN( "glMultiDrawArraysIndirectBindlessCountNV returned %#lx\n", status );
+ }
+@@ -12946,6 +12770,7 @@ static void WINAPI glMultiDrawArraysIndirectBindlessNV( GLenum mode, const void
+ {
+     struct glMultiDrawArraysIndirectBindlessNV_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect, .drawCount = drawCount, .stride = stride, .vertexBufferCount = vertexBufferCount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p, drawCount %d, stride %d, vertexBufferCount %d\n", mode, indirect, drawCount, stride, vertexBufferCount );
+     if ((status = UNIX_CALL( glMultiDrawArraysIndirectBindlessNV, &args ))) WARN( "glMultiDrawArraysIndirectBindlessNV returned %#lx\n", status );
+ }
+@@ -12954,6 +12779,7 @@ static void WINAPI glMultiDrawArraysIndirectCount( GLenum mode, const void *indi
+ {
+     struct glMultiDrawArraysIndirectCount_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect, .drawcount = drawcount, .maxdrawcount = maxdrawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p, drawcount %Id, maxdrawcount %d, stride %d\n", mode, indirect, drawcount, maxdrawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawArraysIndirectCount, &args ))) WARN( "glMultiDrawArraysIndirectCount returned %#lx\n", status );
+ }
+@@ -12962,6 +12788,7 @@ static void WINAPI glMultiDrawArraysIndirectCountARB( GLenum mode, const void *i
+ {
+     struct glMultiDrawArraysIndirectCountARB_params args = { .teb = NtCurrentTeb(), .mode = mode, .indirect = indirect, .drawcount = drawcount, .maxdrawcount = maxdrawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, indirect %p, drawcount %Id, maxdrawcount %d, stride %d\n", mode, indirect, drawcount, maxdrawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawArraysIndirectCountARB, &args ))) WARN( "glMultiDrawArraysIndirectCountARB returned %#lx\n", status );
+ }
+@@ -12970,6 +12797,7 @@ static void WINAPI glMultiDrawElementArrayAPPLE( GLenum mode, const GLint *first
+ {
+     struct glMultiDrawElementArrayAPPLE_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, first %p, count %p, primcount %d\n", mode, first, count, primcount );
+     if ((status = UNIX_CALL( glMultiDrawElementArrayAPPLE, &args ))) WARN( "glMultiDrawElementArrayAPPLE returned %#lx\n", status );
+ }
+@@ -12978,6 +12806,7 @@ static void WINAPI glMultiDrawElements( GLenum mode, const GLsizei *count, GLenu
+ {
+     struct glMultiDrawElements_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .drawcount = drawcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %p, type %d, indices %p, drawcount %d\n", mode, count, type, indices, drawcount );
+     if ((status = UNIX_CALL( glMultiDrawElements, &args ))) WARN( "glMultiDrawElements returned %#lx\n", status );
+ }
+@@ -12986,6 +12815,7 @@ static void WINAPI glMultiDrawElementsBaseVertex( GLenum mode, const GLsizei *co
+ {
+     struct glMultiDrawElementsBaseVertex_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .drawcount = drawcount, .basevertex = basevertex };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %p, type %d, indices %p, drawcount %d, basevertex %p\n", mode, count, type, indices, drawcount, basevertex );
+     if ((status = UNIX_CALL( glMultiDrawElementsBaseVertex, &args ))) WARN( "glMultiDrawElementsBaseVertex returned %#lx\n", status );
+ }
+@@ -12994,6 +12824,7 @@ static void WINAPI glMultiDrawElementsEXT( GLenum mode, const GLsizei *count, GL
+ {
+     struct glMultiDrawElementsEXT_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, count %p, type %d, indices %p, primcount %d\n", mode, count, type, indices, primcount );
+     if ((status = UNIX_CALL( glMultiDrawElementsEXT, &args ))) WARN( "glMultiDrawElementsEXT returned %#lx\n", status );
+ }
+@@ -13002,6 +12833,7 @@ static void WINAPI glMultiDrawElementsIndirect( GLenum mode, GLenum type, const
+ {
+     struct glMultiDrawElementsIndirect_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect, .drawcount = drawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p, drawcount %d, stride %d\n", mode, type, indirect, drawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawElementsIndirect, &args ))) WARN( "glMultiDrawElementsIndirect returned %#lx\n", status );
+ }
+@@ -13010,6 +12842,7 @@ static void WINAPI glMultiDrawElementsIndirectAMD( GLenum mode, GLenum type, con
+ {
+     struct glMultiDrawElementsIndirectAMD_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect, .primcount = primcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p, primcount %d, stride %d\n", mode, type, indirect, primcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawElementsIndirectAMD, &args ))) WARN( "glMultiDrawElementsIndirectAMD returned %#lx\n", status );
+ }
+@@ -13018,6 +12851,7 @@ static void WINAPI glMultiDrawElementsIndirectBindlessCountNV( GLenum mode, GLen
+ {
+     struct glMultiDrawElementsIndirectBindlessCountNV_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect, .drawCount = drawCount, .maxDrawCount = maxDrawCount, .stride = stride, .vertexBufferCount = vertexBufferCount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p, drawCount %d, maxDrawCount %d, stride %d, vertexBufferCount %d\n", mode, type, indirect, drawCount, maxDrawCount, stride, vertexBufferCount );
+     if ((status = UNIX_CALL( glMultiDrawElementsIndirectBindlessCountNV, &args ))) WARN( "glMultiDrawElementsIndirectBindlessCountNV returned %#lx\n", status );
+ }
+@@ -13026,6 +12860,7 @@ static void WINAPI glMultiDrawElementsIndirectBindlessNV( GLenum mode, GLenum ty
+ {
+     struct glMultiDrawElementsIndirectBindlessNV_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect, .drawCount = drawCount, .stride = stride, .vertexBufferCount = vertexBufferCount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p, drawCount %d, stride %d, vertexBufferCount %d\n", mode, type, indirect, drawCount, stride, vertexBufferCount );
+     if ((status = UNIX_CALL( glMultiDrawElementsIndirectBindlessNV, &args ))) WARN( "glMultiDrawElementsIndirectBindlessNV returned %#lx\n", status );
+ }
+@@ -13034,6 +12869,7 @@ static void WINAPI glMultiDrawElementsIndirectCount( GLenum mode, GLenum type, c
+ {
+     struct glMultiDrawElementsIndirectCount_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect, .drawcount = drawcount, .maxdrawcount = maxdrawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p, drawcount %Id, maxdrawcount %d, stride %d\n", mode, type, indirect, drawcount, maxdrawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawElementsIndirectCount, &args ))) WARN( "glMultiDrawElementsIndirectCount returned %#lx\n", status );
+ }
+@@ -13042,6 +12878,7 @@ static void WINAPI glMultiDrawElementsIndirectCountARB( GLenum mode, GLenum type
+ {
+     struct glMultiDrawElementsIndirectCountARB_params args = { .teb = NtCurrentTeb(), .mode = mode, .type = type, .indirect = indirect, .drawcount = drawcount, .maxdrawcount = maxdrawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, type %d, indirect %p, drawcount %Id, maxdrawcount %d, stride %d\n", mode, type, indirect, drawcount, maxdrawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawElementsIndirectCountARB, &args ))) WARN( "glMultiDrawElementsIndirectCountARB returned %#lx\n", status );
+ }
+@@ -13050,6 +12887,7 @@ static void WINAPI glMultiDrawMeshTasksIndirectCountEXT( GLintptr indirect, GLin
+ {
+     struct glMultiDrawMeshTasksIndirectCountEXT_params args = { .teb = NtCurrentTeb(), .indirect = indirect, .drawcount = drawcount, .maxdrawcount = maxdrawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirect %Id, drawcount %Id, maxdrawcount %d, stride %d\n", indirect, drawcount, maxdrawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawMeshTasksIndirectCountEXT, &args ))) WARN( "glMultiDrawMeshTasksIndirectCountEXT returned %#lx\n", status );
+ }
+@@ -13058,6 +12896,7 @@ static void WINAPI glMultiDrawMeshTasksIndirectCountNV( GLintptr indirect, GLint
+ {
+     struct glMultiDrawMeshTasksIndirectCountNV_params args = { .teb = NtCurrentTeb(), .indirect = indirect, .drawcount = drawcount, .maxdrawcount = maxdrawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirect %Id, drawcount %Id, maxdrawcount %d, stride %d\n", indirect, drawcount, maxdrawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawMeshTasksIndirectCountNV, &args ))) WARN( "glMultiDrawMeshTasksIndirectCountNV returned %#lx\n", status );
+ }
+@@ -13066,6 +12905,7 @@ static void WINAPI glMultiDrawMeshTasksIndirectEXT( GLintptr indirect, GLsizei d
+ {
+     struct glMultiDrawMeshTasksIndirectEXT_params args = { .teb = NtCurrentTeb(), .indirect = indirect, .drawcount = drawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirect %Id, drawcount %d, stride %d\n", indirect, drawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawMeshTasksIndirectEXT, &args ))) WARN( "glMultiDrawMeshTasksIndirectEXT returned %#lx\n", status );
+ }
+@@ -13074,6 +12914,7 @@ static void WINAPI glMultiDrawMeshTasksIndirectNV( GLintptr indirect, GLsizei dr
+ {
+     struct glMultiDrawMeshTasksIndirectNV_params args = { .teb = NtCurrentTeb(), .indirect = indirect, .drawcount = drawcount, .stride = stride };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "indirect %Id, drawcount %d, stride %d\n", indirect, drawcount, stride );
+     if ((status = UNIX_CALL( glMultiDrawMeshTasksIndirectNV, &args ))) WARN( "glMultiDrawMeshTasksIndirectNV returned %#lx\n", status );
+ }
+@@ -13082,6 +12923,7 @@ static void WINAPI glMultiDrawRangeElementArrayAPPLE( GLenum mode, GLuint start,
+ {
+     struct glMultiDrawRangeElementArrayAPPLE_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .first = first, .count = count, .primcount = primcount };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "mode %d, start %d, end %d, first %p, count %p, primcount %d\n", mode, start, end, first, count, primcount );
+     if ((status = UNIX_CALL( glMultiDrawRangeElementArrayAPPLE, &args ))) WARN( "glMultiDrawRangeElementArrayAPPLE returned %#lx\n", status );
+ }
+@@ -17390,6 +17232,7 @@ static void WINAPI glRectxOES( GLfixed x1, GLfixed y1, GLfixed x2, GLfixed y2 )
+ {
+     struct glRectxOES_params args = { .teb = NtCurrentTeb(), .x1 = x1, .y1 = y1, .x2 = x2, .y2 = y2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "x1 %d, y1 %d, x2 %d, y2 %d\n", x1, y1, x2, y2 );
+     if ((status = UNIX_CALL( glRectxOES, &args ))) WARN( "glRectxOES returned %#lx\n", status );
+ }
+@@ -17398,6 +17241,7 @@ static void WINAPI glRectxvOES( const GLfixed *v1, const GLfixed *v2 )
+ {
+     struct glRectxvOES_params args = { .teb = NtCurrentTeb(), .v1 = v1, .v2 = v2 };
+     NTSTATUS status;
++    neutron_count_draw();
+     TRACE( "v1 %p, v2 %p\n", v1, v2 );
+     if ((status = UNIX_CALL( glRectxvOES, &args ))) WARN( "glRectxvOES returned %#lx\n", status );
+ }
+@@ -18403,14 +18247,6 @@ static void WINAPI glShaderOp3EXT( GLenum op, GLuint res, GLuint arg1, GLuint ar
+     if ((status = UNIX_CALL( glShaderOp3EXT, &args ))) WARN( "glShaderOp3EXT returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glShaderSource( GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length )
+-{
+-    struct glShaderSource_params args = { .teb = NtCurrentTeb(), .shader = shader, .count = count, .string = string, .length = length };
+-    NTSTATUS status;
+-    TRACE( "shader %d, count %d, string %p, length %p\n", shader, count, string, length );
+-    if ((status = UNIX_CALL( glShaderSource, &args ))) WARN( "glShaderSource returned %#lx\n", status );
+-}
+-
+ static void WINAPI glShaderSourceARB( GLhandleARB shaderObj, GLsizei count, const GLcharARB **string, const GLint *length )
+ {
+     struct glShaderSourceARB_params args = { .teb = NtCurrentTeb(), .shaderObj = shaderObj, .count = count, .string = string, .length = length };
+@@ -21258,14 +21094,6 @@ static void WINAPI glUploadGpuMaskNVX( GLbitfield mask )
+     if ((status = UNIX_CALL( glUploadGpuMaskNVX, &args ))) WARN( "glUploadGpuMaskNVX returned %#lx\n", status );
+ }
+ 
+-static void WINAPI glUseProgram( GLuint program )
+-{
+-    struct glUseProgram_params args = { .teb = NtCurrentTeb(), .program = program };
+-    NTSTATUS status;
+-    TRACE( "program %d\n", program );
+-    if ((status = UNIX_CALL( glUseProgram, &args ))) WARN( "glUseProgram returned %#lx\n", status );
+-}
+-
+ static void WINAPI glUseProgramObjectARB( GLhandleARB programObj )
+ {
+     struct glUseProgramObjectARB_params args = { .teb = NtCurrentTeb(), .programObj = programObj };
+@@ -27574,6 +27402,14 @@ const void *extension_procs[] =
+     wglChoosePixelFormatARB,
+     wglCreateContextAttribsARB,
+     wglCreatePbufferARB,
++    wglDXCloseDeviceNV,
++    wglDXLockObjectsNV,
++    wglDXObjectAccessNV,
++    wglDXOpenDeviceNV,
++    wglDXRegisterObjectNV,
++    wglDXSetResourceShareHandleNV,
++    wglDXUnlockObjectsNV,
++    wglDXUnregisterObjectNV,
+     wglDestroyPbufferARB,
+     wglFreeMemoryNV,
+     wglGetCurrentReadDCARB,
+@@ -30335,6 +30171,14 @@ const struct registry_entry extension_registry[] =
+     { "wglChoosePixelFormatARB", wglChoosePixelFormatARB, 0, 0, { WGL_ARB_pixel_format, GL_EXTENSION_COUNT }},
+     { "wglCreateContextAttribsARB", wglCreateContextAttribsARB, 0, 0, { WGL_ARB_create_context, GL_EXTENSION_COUNT }},
+     { "wglCreatePbufferARB", wglCreatePbufferARB, 0, 0, { WGL_ARB_pbuffer, GL_EXTENSION_COUNT }},
++    { "wglDXCloseDeviceNV", wglDXCloseDeviceNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXLockObjectsNV", wglDXLockObjectsNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXObjectAccessNV", wglDXObjectAccessNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXOpenDeviceNV", wglDXOpenDeviceNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXRegisterObjectNV", wglDXRegisterObjectNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXSetResourceShareHandleNV", wglDXSetResourceShareHandleNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXUnlockObjectsNV", wglDXUnlockObjectsNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
++    { "wglDXUnregisterObjectNV", wglDXUnregisterObjectNV, 0, 0, { WGL_NV_DX_interop, WGL_NVX_DX_interop, GL_EXTENSION_COUNT }},
+     { "wglDestroyPbufferARB", wglDestroyPbufferARB, 0, 0, { WGL_ARB_pbuffer, GL_EXTENSION_COUNT }},
+     { "wglFreeMemoryNV", wglFreeMemoryNV, 0, 0, { WGL_NV_vertex_array_range, GL_EXTENSION_COUNT }},
+     { "wglGetCurrentReadDCARB", wglGetCurrentReadDCARB, 0, 0, { WGL_ARB_make_current_read, GL_EXTENSION_COUNT }},
+diff --git a/dlls/opengl32/thunks.h b/dlls/opengl32/thunks.h
+index 67d5691ed8c..dc57f6b4cd2 100644
+--- a/dlls/opengl32/thunks.h
++++ b/dlls/opengl32/thunks.h
+@@ -1,13 +1,42 @@
+ /* Automatically generated from http://www.opengl.org/registry files; DO NOT EDIT! */
+ 
++extern void WINAPI glBindFramebuffer( GLenum target, GLuint framebuffer );
++extern void WINAPI glBindFramebufferEXT( GLenum target, GLuint framebuffer );
++extern void WINAPI glBlitFramebuffer( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter );
++extern void WINAPI glBlitFramebufferEXT( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter );
++extern GLenum WINAPI glCheckFramebufferStatus( GLenum target );
++extern GLenum WINAPI glCheckFramebufferStatusEXT( GLenum target );
++extern void WINAPI glCompileShader( GLuint shader );
++extern void WINAPI glCompileShaderARB( GLhandleARB shaderObj );
+ extern GLsync WINAPI glCreateSyncFromCLeventARB( struct _cl_context *context, struct _cl_event *event, GLbitfield flags );
+ extern void WINAPI glDeleteSync( GLsync sync );
++extern void WINAPI glDrawArraysInstanced( GLenum mode, GLint first, GLsizei count, GLsizei instancecount );
++extern void WINAPI glDrawElementsInstanced( GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount );
++extern void WINAPI glDrawRangeElements( GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices );
+ extern GLsync WINAPI glFenceSync( GLenum condition, GLbitfield flags );
++extern void WINAPI glFramebufferTexture2D( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level );
++extern void WINAPI glFramebufferTexture2DEXT( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level );
++extern void WINAPI glGetProgramInfoLog( GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog );
++extern void WINAPI glGetProgramiv( GLuint program, GLenum pname, GLint *params );
++extern void WINAPI glGetShaderInfoLog( GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog );
++extern void WINAPI glGetShaderiv( GLuint shader, GLenum pname, GLint *params );
+ extern const GLubyte * WINAPI glGetStringi( GLenum name, GLuint index );
+ extern GLsync WINAPI glImportSyncEXT( GLenum external_sync_type, GLintptr external_sync, GLbitfield flags );
++extern void WINAPI glLinkProgram( GLuint program );
++extern void WINAPI glLinkProgramARB( GLhandleARB programObj );
++extern void WINAPI glShaderSource( GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length );
++extern void WINAPI glUseProgram( GLuint program );
+ extern BOOL WINAPI wglChoosePixelFormatARB( HDC hdc, const int *piAttribIList, const FLOAT *pfAttribFList, UINT nMaxFormats, int *piFormats, UINT *nNumFormats );
+ extern HGLRC WINAPI wglCreateContextAttribsARB( HDC hDC, HGLRC hShareContext, const int *attribList );
+ extern HPBUFFERARB WINAPI wglCreatePbufferARB( HDC hDC, int iPixelFormat, int iWidth, int iHeight, const int *piAttribList );
++extern BOOL WINAPI wglDXCloseDeviceNV( HANDLE hDevice );
++extern BOOL WINAPI wglDXLockObjectsNV( HANDLE hDevice, GLint count, HANDLE *hObjects );
++extern BOOL WINAPI wglDXObjectAccessNV( HANDLE hObject, GLenum access );
++extern HANDLE WINAPI wglDXOpenDeviceNV( void *dxDevice );
++extern HANDLE WINAPI wglDXRegisterObjectNV( HANDLE hDevice, void *dxObject, GLuint name, GLenum type, GLenum access );
++extern BOOL WINAPI wglDXSetResourceShareHandleNV( void *dxObject, HANDLE shareHandle );
++extern BOOL WINAPI wglDXUnlockObjectsNV( HANDLE hDevice, GLint count, HANDLE *hObjects );
++extern BOOL WINAPI wglDXUnregisterObjectNV( HANDLE hDevice, HANDLE hObject );
+ extern BOOL WINAPI wglDestroyPbufferARB( HPBUFFERARB hPbuffer );
+ extern HDC WINAPI wglGetCurrentReadDCARB(void);
+ extern const char * WINAPI wglGetExtensionsStringARB( HDC hdc );
+diff --git a/dlls/opengl32/wgl.c b/dlls/opengl32/wgl.c
+index f4ca0e924b9..485d936426f 100644
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -34,6 +34,13 @@
+ #include "unixlib.h"
+ #include "private.h"
+ 
++/* NEUTRON: WGL_NV_DX_interop needs to inspect the app's D3D objects (QueryInterface for
++ * IDXGIResource, read D3D11_TEXTURE2D_DESC). COBJMACROS so we can use the C call syntax. */
++#define COBJMACROS
++#include "dxgi.h"
++#include "dxgi1_2.h"   /* IDXGIResource1::CreateSharedHandle + DXGI_SHARED_RESOURCE_READ */
++#include "d3d11.h"
++
+ #include "wine/glu.h"
+ #include "wine/debug.h"
+ 
+@@ -105,17 +112,53 @@ static void init_wgl_extensions( const BOOLEAN extensions[GL_EXTENSION_COUNT] )
+ {
+     UINT pos = 0, len = 0, ext;
+     char *str;
++    /* NEUTRON round-41 (NEUTRON_GL_FAKEINTEROP=1): ADVERTISE-ONLY probe, no implementation.
++     *
++     * The Windows reference capture settled the mechanism: native AE requests all 8 wglDX*
++     * entry points, Wine AE requests none, and the wgl* delta is EXACTLY 10 -- the 8 interop
++     * functions plus wglCopyImageSubDataNV and wglDelayBeforeSwapNV, i.e. precisely the entry
++     * points of the extensions Windows advertises and Wine does not. So AE gates wgl*
++     * resolution on the ADVERTISED EXTENSION STRING and never discovers a path we don't name.
++     * (Wine has no enum for these extensions at all, hence appending to the string by hand.)
++     *
++     * Naming them here should make AE ask for wglDXOpenDeviceNV & co. Those lookups will
++     * return NULL -- nothing is implemented -- and the round-39 procmiss trace will record
++     * them. That CONFIRMS the diagnosis before anyone writes the real thing.
++     * ⚠️ DIAGNOSTIC ONLY. AE may crash when a promised entry point comes back NULL; that is an
++     *    acceptable outcome here because the measurement (does the probe list change?) has
++     *    already been taken by then. NEVER ship this enabled. */
++    static const char neutron_fake_exts[] = " WGL_NV_DX_interop WGL_NV_DX_interop2";
++    const char *fake_env = getenv( "NEUTRON_GL_FAKEINTEROP" );
++    BOOL fake = (fake_env && fake_env[0] == '1');
+ 
+     for (ext = WGL_FIRST_EXTENSION; ext < GL_EXTENSION_COUNT; ext++)
+         if (extensions[ext]) len += strlen( extension_names[ext] ) + 1;
+ 
+-    if (!(str = malloc( len + 1 ))) return;
++    if (!(str = malloc( len + 1 + (fake ? sizeof(neutron_fake_exts) : 0) ))) return;
+ 
+     for (ext = WGL_FIRST_EXTENSION; ext < GL_EXTENSION_COUNT; ext++)
+         if (extensions[ext]) pos += sprintf( str + pos, "%s ", extension_names[ext] );
+     str[pos - 1] = 0;
+ 
++    if (fake)
++    {
++        strcat( str, neutron_fake_exts );
++        ERR( "NT-GL FAKEINTEROP: advertising WGL_NV_DX_interop(2) WITHOUT implementing them\n" );
++    }
++
+     wgl_extensions = str;
++
++    /* NEUTRON round-39b (NEUTRON_GL_PROCTRACE=1): print the exact WGL extension string an
++     * app is handed. AE's DisplaySurface.dll may rely on WGL_NV_DX_interop/interop2 (the
++     * D3D-texture-into-GL bridge) which Wine does not implement, and a well-behaved app
++     * checks THIS STRING and then silently gives up rather than calling wglGetProcAddress.
++     * Seeing what we advertise is the only way to tell "app declined" from "app never
++     * looked". */
++    {
++        const char *e = getenv( "NEUTRON_GL_PROCTRACE" );
++        if (e && e[0] == '1')
++            ERR( "NT-GL wglextensions advertised: %s\n", wgl_extensions );
++    }
+ }
+ 
+ struct handle_entry
+@@ -336,6 +379,41 @@ HGLRC WINAPI wglCreateContext( HDC hdc )
+ {
+     static const int attribs[] = { WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB, 0, 0 };
+     TRACE( "hdc %p\n", hdc );
++
++    /* NEUTRON round-46 (NEUTRON_GL_DISABLE=1) -- reproduce the ONE state in which After
++     * Effects' composition panel has ever rendered.
++     *
++     * On 2026-08-01 an accidental ABI mismatch (GL_EXTENSION_COUNT changed without rebuilding
++     * winewayland/opengl32.so) left AE unable to obtain a current GL context: its first
++     * wglGetProcAddress("wglCreateContextAttribsARB") returned NULL, AE printed "Advanced 3D is
++     * not supported by the current hardware" and "display acceleration disabled", fell back to
++     * its software display path -- AND THE COMPOSITION RENDERED. That is the only time it has.
++     *
++     * Everything else is measured healthy: the comp viewer's D2D HwndRenderTarget is the right
++     * size (2734x1174) and AE issues ops=0 clears=0 into it across 197 frames while every other
++     * panel draws normally; its GL surface is correctly sized/positioned/composited and empty;
++     * no DXGI swapchain is ever created; the Classic 3D artisan (Standard3D.aex, "pure CPU")
++     * loads without error. So the display path works and AE simply never draws the comp.
++     *
++     * Denying GL outright forces AE down the path that demonstrably works. This gives us
++     * (a) a usable configuration, and (b) a KNOWN-GOOD run to diff against a known-bad one,
++     * which is worth more than another hypothesis.
++     * ⚠️ Diagnostic/workaround gate -- never enabled by default. */
++    {
++        static int disabled = -1;
++        if (disabled < 0)
++        {
++            const char *e = getenv( "NEUTRON_GL_DISABLE" );
++            disabled = (e && e[0] == '1') ? 1 : 0;
++            if (disabled) ERR( "NT-GL DISABLE: refusing all GL contexts (forcing the app's software path)\n" );
++        }
++        if (disabled)
++        {
++            RtlSetLastWin32Error( ERROR_NOT_SUPPORTED );
++            return NULL;
++        }
++    }
++
+     return wglCreateContextAttribsARB( hdc, NULL, attribs );
+ }
+ 
+@@ -1292,6 +1370,287 @@ INT WINAPI wglGetPixelFormat(HDC hdc)
+     return args.ret;
+ }
+ 
++/***********************************************************************
++ *              wglSwapBuffers (OPENGL32.@)
++ */
++/* NEUTRON round-47 WHOLE-FRAME GL TRACE (NEUTRON_GL_FBOTRACE=1) -- closes the gap in round-42.
++ *
++ * ⚠️ WHY THIS EXISTS: round-42 sampled GL_DRAW_FRAMEBUFFER_BINDING *only at swap time*. An app
++ * that binds an FBO, renders into it, unbinds, and then swaps reads back drawFBO=0 on every
++ * single frame. So round-42's "drawFBO=0" NEVER established that AE avoids FBOs -- it could not
++ * have seen one. A whole-frame instrument is the only way to tell those two worlds apart, and
++ * they need completely different fixes:
++ *
++ *   draws > 0 and they land in a non-zero FBO, with no blit back to framebuffer 0
++ *       -> AE renders the composition offscreen and expects to bridge that texture out to D3D
++ *          (WGL_NV_DX_interop) rather than present it through GL. Wine then swaps a default
++ *          framebuffer nobody ever drew into. The bug is the missing bridge.
++ *   draws == 0 and clears == 0
++ *       -> AE issues NO GL rendering for this window at all. The GL surface is vestigial; the
++ *          ~350 swaps/session are AE ticking an output path it never fills, and the composition
++ *          is being produced somewhere else entirely (DirectX, per Adobe's own docs). Every
++ *          further minute spent on the GL path would be wasted.
++ *
++ * Counting has to happen inside the calls themselves, so the 12 functions below are moved out of
++ * the generated thunks into hand-written ones (make_opengl %manual_win_thunks). Each keeps its
++ * generated body verbatim and adds a counter bump -- no behaviour change when the env var is off,
++ * and the enabled path costs one TEB read plus an increment.
++ *
++ * Per-thread frame counters (reset at each swap) answer "what did THIS frame draw"; the global
++ * interlocked totals answer "did anything anywhere ever draw", which matters because a thread
++ * that renders but never swaps would otherwise be invisible.
++ */
++struct neutron_glcounters
++{
++    DWORD  tid;
++    /* reset every swap -- one frame's worth of work */
++    LONG   draws, clears, binds, blits, fbtex;
++    LONG   draws_to_fbo, draws_to_default;
++    /* never reset -- this thread's session totals */
++    LONG   t_draws, t_clears, t_binds, t_blits, t_fbtex;
++    LONG   t_draws_to_fbo, t_draws_to_default, t_blits_to_default;
++    GLuint cur_draw_fbo, max_fbo;
++};
++
++static struct neutron_glcounters neutron_glc[32];
++static LONG neutron_gl_all_draws, neutron_gl_all_clears, neutron_gl_all_binds, neutron_gl_all_blits;
++/* round-50: how many times a shader program has been made current, anywhere. A drawbot that
++ * never binds one has nothing to draw with. Reported alongside the draw counts at each swap. */
++static LONG neutron_gl_useprogram;
++
++static BOOL neutron_gltrace_on(void)
++{
++    static int enabled = -1;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_FBOTRACE" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    return enabled == 1;
++}
++
++/* Per-thread slot, found without a lock: a thread only ever writes its own slot, and the single
++ * race (two threads claiming the same free slot) is settled by the compare-exchange. Uses the TEB
++ * client id rather than GetCurrentThreadId so this pulls in no extra import. */
++static struct neutron_glcounters *neutron_glc_slot(void)
++{
++    DWORD tid;
++    unsigned int i;
++
++    if (!neutron_gltrace_on()) return NULL;
++
++    tid = (DWORD)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
++    for (i = 0; i < ARRAY_SIZE(neutron_glc); i++)
++    {
++        if (neutron_glc[i].tid == tid) return &neutron_glc[i];
++        if (!neutron_glc[i].tid &&
++            !InterlockedCompareExchange( (LONG *)&neutron_glc[i].tid, tid, 0 ))
++            return &neutron_glc[i];
++    }
++    return NULL;
++}
++
++static void neutron_glc_draw( struct neutron_glcounters *c )
++{
++    static LONG announced;
++
++    c->draws++; c->t_draws++;
++    if (c->cur_draw_fbo) { c->draws_to_fbo++; c->t_draws_to_fbo++; }
++    else { c->draws_to_default++; c->t_draws_to_default++; }
++    InterlockedIncrement( &neutron_gl_all_draws );
++
++    /* One-shot: the very first draw call of the session, with the window it landed on. If this
++     * line never appears, After Effects renders nothing through OpenGL, full stop. */
++    if (!InterlockedCompareExchange( &announced, 1, 0 ))
++        ERR( "NT-GLD first draw call: hwnd=%p drawFBO=%u\n",
++             NtUserWindowFromDC( wglGetCurrentDC() ), c->cur_draw_fbo );
++}
++
++/* round-51: called from every generated draw thunk (make_opengl inserts the call), so that
++ * "After Effects issues no drawing" is a statement about ALL of OpenGL's ~70 draw commands and
++ * not just the five that happened to be hand-written. */
++void neutron_count_draw(void)
++{
++    struct neutron_glcounters *c = neutron_glc_slot();
++    if (c) neutron_glc_draw( c );
++}
++
++static void neutron_glc_bind( struct neutron_glcounters *c, GLenum target, GLuint fb )
++{
++    static LONG announced;
++
++    c->binds++; c->t_binds++;
++    InterlockedIncrement( &neutron_gl_all_binds );
++    if (fb > c->max_fbo) c->max_fbo = fb;
++    /* GL_FRAMEBUFFER (0x8D40) sets both bindings; GL_DRAW_FRAMEBUFFER (0x8CA9) only the draw one.
++     * GL_READ_FRAMEBUFFER (0x8CA8) does not affect where drawing lands, so it is not tracked. */
++    if (target == 0x8D40 || target == 0x8CA9) c->cur_draw_fbo = fb;
++
++    if (fb && !InterlockedCompareExchange( &announced, 1, 0 ))
++        ERR( "NT-GLD first non-zero FBO bound: target=%#x fbo=%u hwnd=%p\n",
++             target, fb, NtUserWindowFromDC( wglGetCurrentDC() ) );
++}
++
++/* NEUTRON round-42 FBO TEST (NEUTRON_GL_FBOTRACE=1).
++ *
++ * HYPOTHESIS, from the Windows reference capture (HANDOFF-LINUX-ae-followup2 update.md):
++ * a second Windows capture covering startup + composition creation + 30 s of viewer scrubbing
++ * was BYTE-FOR-BYTE identical to the startup-only one -- 2,479 calls, SwapBuffers = 0,
++ * wglMakeCurrent = 5 -- with a verified positive control. So native AE NEVER presents the comp
++ * viewer with SwapBuffers, while Wine presents it ~350x/session. Wine is presenting a surface
++ * Windows never presents, and we already proved that surface is composited-but-EMPTY.
++ *
++ * The coherent reading: AE renders the composition into a GL FBO / texture, bridges it into
++ * D3D and presents via DXGI (invisible to API Monitor, which has no gl* definitions); under
++ * Wine it ends up calling SwapBuffers on a DEFAULT FRAMEBUFFER IT NEVER DREW INTO.
++ *
++ * This measures exactly that, at the only moment that matters -- the instant of the swap:
++ *   fbo=N (N != 0)  -> an FBO is bound for drawing, i.e. AE's output went somewhere ELSE and
++ *                      the default framebuffer being presented is not its render target.
++ *   fbo=0           -> AE really is drawing to the default framebuffer, and the emptiness is a
++ *                      different bug (it drew nothing, or something erased it).
++ * plus a centre-pixel sample of the BACK buffer actually about to be presented, and a
++ * black-vs-content tally, so "empty" is measured rather than inferred.
++ *
++ * Read-only: queries state and reads pixels, restores nothing because it changes nothing.
++ * Throttled to once every 64 swaps after the first 8 -- glReadPixels stalls the pipeline. */
++static void neutron_fbotrace( HDC hdc )
++{
++    static int enabled = -1;
++    static LONG swaps, black, sampled;
++    GLint draw_fbo = 0, read_fbo = 0, vp[4] = {0};
++    UINT32 px = 0;
++    LONG n;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_FBOTRACE" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (!enabled) return;
++
++    n = InterlockedIncrement( &swaps );
++    if (n > 8 && (n % 64)) return;
++
++    /* GL_DRAW_FRAMEBUFFER_BINDING == GL_FRAMEBUFFER_BINDING (0x8CA6); read binding 0x8CAA. */
++    glGetIntegerv( 0x8CA6, &draw_fbo );
++    glGetIntegerv( 0x8CAA, &read_fbo );
++    glGetIntegerv( GL_VIEWPORT, vp );
++
++    /* Sample the centre of the buffer that is about to be presented. */
++    if (vp[2] > 0 && vp[3] > 0)
++    {
++        glReadBuffer( GL_BACK );
++        glReadPixels( vp[0] + vp[2] / 2, vp[1] + vp[3] / 2, 1, 1, GL_BGRA, GL_UNSIGNED_BYTE, &px );
++        InterlockedIncrement( &sampled );
++        if (!(px & 0x00f0f0f0)) InterlockedIncrement( &black );
++    }
++
++    /* NEUTRON round-42b: name the WINDOW behind this DC and its real client size. Every swap
++     * came back viewport=1x1 on a single HDC, which has two very different explanations:
++     *   client rect 1x1        -> this is a genuinely tiny helper surface and the comp viewer
++     *                             is presented some other way entirely.
++     *   client rect 2734x1174  -> this IS the comp viewer, and AE's GL VIEWPORT was never
++     *                             updated after the window grew from its 1x1 placeholder --
++     *                             so AE renders the composition into a 1x1 corner of a
++     *                             full-size drawable. That would produce exactly a blank
++     *                             panel with healthy swaps, and it would be OUR bug: the
++     *                             context/drawable is created during the 1x1 placeholder
++     *                             phase (round-38 measured createsize=1x1) and something
++     *                             must tell the app the size changed. */
++    {
++        HWND hwnd = NtUserWindowFromDC( hdc );
++        RECT cr = {0};
++        if (hwnd) NtUserGetClientRect( hwnd, &cr, NtUserGetDpiForWindow( hwnd ) );
++        ERR( "NT-FBO swap#%ld hdc=%p hwnd=%p client=%dx%d drawFBO=%d readFBO=%d "
++             "viewport=%dx%d+%d+%d centre=%06x blackSamples=%ld/%ld\n",
++             n, hdc, hwnd, (int)(cr.right - cr.left), (int)(cr.bottom - cr.top),
++             draw_fbo, read_fbo, vp[2], vp[3], vp[0], vp[1], px & 0xffffff, black, sampled );
++
++        /* NEUTRON round-47: what this thread actually DID since the previous report. The
++         * "since" counters are reset here, the "total" ones are not, and the "all" ones cover
++         * every thread including any that renders but never swaps. */
++        {
++            struct neutron_glcounters *c = neutron_glc_slot();
++            if (c)
++            {
++                ERR( "NT-FBO2 swap#%ld hwnd=%p SINCE-LAST draws=%ld (fbo=%ld default=%ld) "
++                     "clears=%ld binds=%ld blits=%ld fbtex=%ld | THREAD-TOTAL draws=%ld "
++                     "(fbo=%ld default=%ld) clears=%ld binds=%ld blits=%ld (default=%ld) "
++                     "fbtex=%ld curFBO=%u maxFBO=%u | ALL-THREADS draws=%ld clears=%ld "
++                     "binds=%ld blits=%ld useProgram=%ld\n",
++                     n, hwnd, c->draws, c->draws_to_fbo, c->draws_to_default,
++                     c->clears, c->binds, c->blits, c->fbtex,
++                     c->t_draws, c->t_draws_to_fbo, c->t_draws_to_default,
++                     c->t_clears, c->t_binds, c->t_blits, c->t_blits_to_default, c->t_fbtex,
++                     c->cur_draw_fbo, c->max_fbo,
++                     neutron_gl_all_draws, neutron_gl_all_clears,
++                     neutron_gl_all_binds, neutron_gl_all_blits, neutron_gl_useprogram );
++                c->draws = c->clears = c->binds = c->blits = c->fbtex = 0;
++                c->draws_to_fbo = c->draws_to_default = 0;
++            }
++        }
++    }
++}
++
++/* NEUTRON round-44 CAUSAL TEST (NEUTRON_GL_FIXVIEWPORT=1) -- diagnostic, not the fix.
++ *
++ * MEASURED: After Effects' composition viewer (client 2734x1174) swaps with viewport=1x1 and
++ * drawFBO=0, and a full-session glViewport trace shows AE calls glViewport exactly TWICE, both
++ * on a different tiny window -- NEVER on the comp viewer. So AE relies on GL's initial viewport,
++ * which is the drawable size when the context is first made current, and Wine hands it the 1x1
++ * PLACEHOLDER drawable (round-38: createsize=1x1) because AE sets GL up before its window has
++ * been laid out. The EGL window is later resized correctly (1x1 -> 2734x1174) but a viewport is
++ * context state and nothing updates it.
++ *
++ * This forces the viewport to the window's real client size, but ONLY for a context whose
++ * viewport the app has never set itself -- never fight an app that manages its own viewport.
++ * Applied at swap time, so it takes effect for the NEXT frame's drawing (viewport is persistent
++ * state); the current frame is already rendered and cannot be rescued.
++ *
++ *   composition appears -> mechanism PROVEN, and the real fix is to stop handing out a 1x1
++ *       drawable / to make the initial viewport reflect the window rather than the placeholder.
++ *   still blank         -> the 1x1 viewport is a real bug but not THE bug, and something else
++ *       also prevents AE drawing. Either way this is measured, not argued.
++ *
++ * ⚠️ NEVER SHIP THIS ENABLED. Silently overriding app GL state is wrong as a permanent fix; it
++ *    exists to turn an inference into an observation.
++ */
++static void neutron_fixviewport( HDC hdc )
++{
++    static int enabled = -1;
++    static LONG applied;
++    GLint vp[4] = {0};
++    HWND hwnd;
++    RECT cr = {0};
++    LONG n;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_FIXVIEWPORT" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (!enabled) return;
++
++    /* Respect an app that sets its own viewport -- neutron_glviewport_was_set() is true once
++     * glViewport has been called on any context, which for AE it has (twice, elsewhere), so
++     * scope the check to this window instead. */
++    if (!(hwnd = NtUserWindowFromDC( hdc ))) return;
++    NtUserGetClientRect( hwnd, &cr, NtUserGetDpiForWindow( hwnd ) );
++    if (cr.right - cr.left <= 1 || cr.bottom - cr.top <= 1) return;
++
++    glGetIntegerv( GL_VIEWPORT, vp );
++    if (vp[2] == cr.right - cr.left && vp[3] == cr.bottom - cr.top) return;  /* already correct */
++    if (vp[2] > 1 || vp[3] > 1) return;  /* app set something real -- leave it alone */
++
++    glViewport( 0, 0, cr.right - cr.left, cr.bottom - cr.top );
++    n = InterlockedIncrement( &applied );
++    if (n <= 4 || !(n % 64))
++        ERR( "NT-VPFIX hwnd=%p viewport %dx%d -> %dx%d (applies from next frame) n=%ld\n",
++             hwnd, vp[2], vp[3], (int)(cr.right - cr.left), (int)(cr.bottom - cr.top), n );
++}
++
+ /***********************************************************************
+  *              wglSwapBuffers (OPENGL32.@)
+  */
+@@ -1300,6 +1659,9 @@ BOOL WINAPI DECLSPEC_HOTPATCH wglSwapBuffers( HDC hdc )
+     struct wglSwapBuffers_params args = { .teb = NtCurrentTeb(), .hdc = hdc };
+     NTSTATUS status;
+ 
++    neutron_fbotrace( hdc );   /* NEUTRON round-42: sample BEFORE the swap consumes the buffer */
++    neutron_fixviewport( hdc );/* NEUTRON round-44: see below */
++
+     if ((status = UNIX_CALL( wglSwapBuffers, &args ))) WARN( "wglSwapBuffers returned %#lx\n", status );
+     else if (TRACE_ON(fps))
+     {
+@@ -1358,6 +1720,85 @@ int WINAPI wglGetLayerPaletteEntries( HDC hdc, int plane, int start, int count,
+     return 0;
+ }
+ 
++/* NEUTRON round-39: report GL/WGL entry points an app requested but did not get.
++ * De-duplicated -- apps re-query the same name every frame. Env-gated, OFF by default. */
++static void neutron_proctrace_miss( const char *name )
++{
++    /* COPY the name: `name` belongs to the caller and may be a temporary, so keeping the
++     * pointer would compare against freed memory on the next call. */
++    static char seen[128][64];
++    static int nseen, enabled = -1;
++    int i;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_PROCTRACE" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (!enabled || !name) return;
++
++    for (i = 0; i < nseen; i++) if (!strcmp( seen[i], name )) return;
++    if (nseen < 128)
++    {
++        lstrcpynA( seen[nseen], name, sizeof(seen[0]) );
++        nseen++;
++    }
++    ERR( "NT-GL procmiss %s (app asked, Wine does not provide)\n", name );
++}
++
++/* NEUTRON round-39b: round 39 came back with 30 misses, ALL legacy ATI/APPLE GL functions
++ * (glbinding probing a fixed list) and ZERO wgl* misses -- which did NOT refute the
++ * WGL_NV_DX_interop theory, because that test had two blind spots:
++ *   (1) wglGetProcAddress returns NULL BEFORE the miss trace when no context is current;
++ *   (2) a well-behaved app queries the EXTENSION STRING first and never asks for entry
++ *       points it already knows are absent -- exactly what DisplaySurface.dll would do.
++ * So log EVERY wgl* lookup, hit or miss, plus the no-context bail. If AE never probes any
++ * wgl* name at all, it is not going down the interop road and the theory is dead; if it
++ * probes and we answer NULL, it is alive. De-duplicated. */
++static void neutron_proctrace_wgl( const char *name, const char *outcome )
++{
++    static char seen[128][80];
++    static int nseen, enabled = -1;
++    int i;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_PROCTRACE" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (!enabled || !name) return;
++    if (name[0] != 'w' || name[1] != 'g' || name[2] != 'l') return;
++
++    for (i = 0; i < nseen; i++) if (!strcmp( seen[i], name )) return;
++    if (nseen < 128)
++    {
++        lstrcpynA( seen[nseen], name, sizeof(seen[0]) );
++        nseen++;
++    }
++    ERR( "NT-GL wglquery %s -> %s\n", name, outcome );
++}
++
++/* NEUTRON round-41: running total of wglGetProcAddress lookups, gl* included. Logged at
++ * powers-of-two up to 512 then every 512, so the final line gives the magnitude to compare
++ * against Windows' 1,909 distinct gl* probes without flooding the log. */
++static void neutron_proctrace_count( const char *name )
++{
++    static LONG total;
++    static int enabled = -1;
++    LONG n;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_PROCTRACE" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (!enabled) return;
++
++    n = InterlockedIncrement( &total );
++    if (n <= 512 ? !(n & (n - 1)) : !(n % 512))
++        ERR( "NT-GL probecount total=%ld (latest %s)\n", n, name );
++}
++
+ /***********************************************************************
+  *		wglGetProcAddress (OPENGL32.@)
+  */
+@@ -1367,11 +1808,39 @@ PROC WINAPI wglGetProcAddress( LPCSTR name )
+     const enum opengl_extension *ext;
+     struct context *ctx;
+ 
+-    if (!(ctx = context_from_handle( NtCurrentTeb()->glCurrentRC ))) return NULL;
++    if (!(ctx = context_from_handle( NtCurrentTeb()->glCurrentRC )))
++    {
++        /* NEUTRON round-39b: this early bail silently returned NULL without ever reaching
++         * the miss trace -- blind spot (1). An app probing before making a context current
++         * looked identical to an app that never probed at all. */
++        neutron_proctrace_wgl( name, "NULL (no current context)" );
++        neutron_proctrace_miss( name );
++        return NULL;
++    }
++
++    neutron_proctrace_wgl( name, "queried" );
++    /* NEUTRON round-41: the Windows reference says native AE blanket-enumerates 1,909 distinct
++     * gl* entry points with NO gating (only wgl* is gated on the extension string). That gives
++     * a sharp split: ~1,900 probes here means AE's GL loader ran to completion and the ONLY gap
++     * is the gated wgl* set; far fewer means AE ABORTED GL init early, and the missing
++     * extension is a symptom rather than the cause. This one number decides where the effort
++     * goes, so count every lookup -- gl* included, which the round-39 traces did not do. */
++    neutron_proctrace_count( name );
+ 
+     if (!(func = get_function_entry( name )))
+     {
+         WARN( "Function %s unknown\n", name );
++        /* NEUTRON round-39 (NEUTRON_GL_PROCTRACE=1): name every GL/WGL entry point an app
++         * asks for and does NOT get. After Effects' composition panel is blank while its
++         * GL surface is provably healthy (correctly sized, positioned, composited -- and
++         * empty; see memory neutron-ae-composition-content-blank). AE's DisplaySurface.dll
++         * may rely on WGL_NV_DX_interop / WGL_NV_DX_interop2 / wglDXOpenDeviceNV /
++         * wglDXRegisterObjectNV / wglDXLockObjectsNV, and Wine implements NONE of them
++         * (0 hits across opengl32.dll/.so, winewayland.so, win32u.so, with wglCreateContext
++         * as a positive control). If AE renders the comp with D3D11 and shares it into its
++         * GL surface via that extension, the share silently yields nothing -- exactly a
++         * black panel with healthy swaps. This turns that inference into a fact. */
++        neutron_proctrace_miss( name );
+         return NULL;
+     }
+ 
+@@ -1392,6 +1861,10 @@ PROC WINAPI wglGetProcAddress( LPCSTR name )
+     }
+ 
+     WARN( "Extensions required for %s not supported\n", name );
++    /* NEUTRON round-39: the OTHER way a lookup fails -- the entry point exists in the
++     * registry but the required GL/WGL extension is absent from this context. Trace it
++     * too, or a miss here looks like a success. */
++    neutron_proctrace_miss( name );
+     return NULL;
+ }
+ 
+@@ -2238,3 +2711,817 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, LPVOID reserved )
+     }
+     return TRUE;
+ }
++
++/***********************************************************************
++ *      WGL_NV_DX_interop / WGL_NV_DX_interop2   (NEUTRON)
++ *
++ * WHY THIS EXISTS. After Effects renders its composition into a D3D texture and bridges that
++ * texture into its OpenGL display surface with this extension. Wine never implemented it AND
++ * never advertised it -- and AE gates wgl* resolution on the advertised extension string, so it
++ * never even asked. Proven by a controlled A/B: advertise the two names with no implementation
++ * and AE immediately requests all 8 entry points (23 -> 31 distinct wgl*); leave them out and it
++ * requests none. With no bridge, AE presents an empty GL surface (~350x/session), which is
++ * exactly the blank composition panel. Native AE calls SwapBuffers ZERO times -- it presents
++ * through D3D/DXGI. See ~/neutron/docs/WGL_NV_DX_interop-design.md.
++ *
++ * ⚠️ STAGE 1 -- THIS IS A PROBE, NOT AN IMPLEMENTATION. Register deliberately returns NULL.
++ *
++ * The design hinges on one thing nobody has measured: can we get a SHARED HANDLE for the D3D
++ * texture AE hands us? Wine already owns the hard half of the real fix -- win32u's
++ * import_memory() turns a D3D shared NT handle into a dma-buf fd and feeds glImportMemoryFdEXT
++ * -- so if a share handle is available, the implementation is mostly
++ * glCreateMemoryObjectsEXT + glImportMemoryWin32HandleEXT + glTextureStorageMem2DEXT.
++ * But WGL_NV_DX_interop does NOT require D3D10/11 resources to be created shared (only D3D9
++ * does, which is what wglDXSetResourceShareHandleNV is for). If AE's textures are ordinary
++ * non-shared textures, that whole approach is dead and we need DXVK interop instead
++ * (ID3D11VkInteropSurface -> exportable VkImage -> vkCmdCopyImage), which is a far bigger job.
++ *
++ * So: measure first. This reports exactly what AE passes -- interfaces it supports, whether a
++ * share handle can be obtained by either route, and the texture description -- in ~150 lines
++ * instead of ~1000 built on a guess. Sequencing chosen deliberately after a session in which
++ * reasoning ahead of the evidence cost several rounds.
++ */
++
++struct dxinterop_device
++{
++    IUnknown *device;       /* the app's D3D device, AddRef'd */
++    ID3D11Device *d3d11;    /* non-NULL if it is a D3D11 device */
++    LONG refcount;
++};
++
++static struct dxinterop_device *dxinterop_devices[8];
++static CRITICAL_SECTION dxinterop_cs;
++static CRITICAL_SECTION_DEBUG dxinterop_cs_debug =
++{
++    0, 0, &dxinterop_cs,
++    { &dxinterop_cs_debug.ProcessLocksList, &dxinterop_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": dxinterop_cs") }
++};
++static CRITICAL_SECTION dxinterop_cs = { &dxinterop_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct dxinterop_device *dxinterop_device_from_handle( HANDLE handle )
++{
++    UINT_PTR idx = (UINT_PTR)handle - 1;
++    if (idx >= ARRAY_SIZE(dxinterop_devices)) return NULL;
++    return dxinterop_devices[idx];
++}
++
++HANDLE WINAPI wglDXOpenDeviceNV( void *dxDevice )
++{
++    struct dxinterop_device *dev;
++    ID3D11Device *d3d11 = NULL;
++    IUnknown *unk = dxDevice;
++    UINT i;
++
++    TRACE( "dxDevice %p\n", dxDevice );
++
++    if (!dxDevice) { RtlSetLastWin32Error( ERROR_INVALID_PARAMETER ); return NULL; }
++
++    /* Identify the device type. D3D11 is what After Effects uses; D3D9/D3D10 are not
++     * handled yet and are rejected rather than half-supported. */
++    if (FAILED(IUnknown_QueryInterface( unk, &IID_ID3D11Device, (void **)&d3d11 )))
++    {
++        ERR( "NT-DXI OpenDevice: NOT a D3D11 device (%p) -- unsupported device type\n", dxDevice );
++        RtlSetLastWin32Error( ERROR_NOT_SUPPORTED );
++        return NULL;
++    }
++
++    if (!(dev = calloc( 1, sizeof(*dev) )))
++    {
++        ID3D11Device_Release( d3d11 );
++        RtlSetLastWin32Error( ERROR_OUTOFMEMORY );
++        return NULL;
++    }
++    dev->device = unk;
++    dev->d3d11 = d3d11;   /* keeps the reference taken by QueryInterface */
++    dev->refcount = 1;
++
++    EnterCriticalSection( &dxinterop_cs );
++    for (i = 0; i < ARRAY_SIZE(dxinterop_devices); i++) if (!dxinterop_devices[i]) break;
++    if (i == ARRAY_SIZE(dxinterop_devices))
++    {
++        LeaveCriticalSection( &dxinterop_cs );
++        ID3D11Device_Release( d3d11 );
++        free( dev );
++        ERR( "NT-DXI OpenDevice: too many interop devices\n" );
++        RtlSetLastWin32Error( ERROR_TOO_MANY_OPEN_FILES );
++        return NULL;
++    }
++    dxinterop_devices[i] = dev;
++    LeaveCriticalSection( &dxinterop_cs );
++
++    ERR( "NT-DXI OpenDevice: D3D11 device %p accepted, handle %p, feature level %#x\n",
++         dxDevice, (HANDLE)(UINT_PTR)(i + 1), ID3D11Device_GetFeatureLevel( d3d11 ) );
++    return (HANDLE)(UINT_PTR)(i + 1);
++}
++
++BOOL WINAPI wglDXCloseDeviceNV( HANDLE hDevice )
++{
++    struct dxinterop_device *dev;
++    UINT_PTR idx = (UINT_PTR)hDevice - 1;
++
++    TRACE( "hDevice %p\n", hDevice );
++
++    EnterCriticalSection( &dxinterop_cs );
++    if (!(dev = dxinterop_device_from_handle( hDevice )))
++    {
++        LeaveCriticalSection( &dxinterop_cs );
++        RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
++        return FALSE;
++    }
++    dxinterop_devices[idx] = NULL;
++    LeaveCriticalSection( &dxinterop_cs );
++
++    if (dev->d3d11) ID3D11Device_Release( dev->d3d11 );
++    free( dev );
++    ERR( "NT-DXI CloseDevice: handle %p closed\n", hDevice );
++    return TRUE;
++}
++
++/* STAGE 1 PROBE: report everything about the object the app wants to share, then decline.
++ * The single question is whether a share handle is obtainable; everything else is context. */
++HANDLE WINAPI wglDXRegisterObjectNV( HANDLE hDevice, void *dxObject, GLuint name,
++                                     GLenum type, GLenum access )
++{
++    ID3D11Texture2D *tex2d = NULL;
++    IDXGIResource1 *res1 = NULL;
++    IDXGIResource *res = NULL;
++    IUnknown *unk = dxObject;
++    HANDLE shared = NULL, nt_shared = NULL;
++    D3D11_TEXTURE2D_DESC desc = {0};
++    HRESULT hr;
++
++    TRACE( "hDevice %p, dxObject %p, name %u, type %#x, access %#x\n",
++           hDevice, dxObject, name, type, access );
++
++    if (!dxinterop_device_from_handle( hDevice ) || !dxObject)
++    {
++        RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
++        return NULL;
++    }
++
++    if (SUCCEEDED(IUnknown_QueryInterface( unk, &IID_ID3D11Texture2D, (void **)&tex2d )))
++    {
++        ID3D11Texture2D_GetDesc( tex2d, &desc );
++        ERR( "NT-DXI Register: ID3D11Texture2D %ux%u mips=%u arr=%u fmt=%u samples=%u "
++             "usage=%u bind=%#x cpu=%#x misc=%#x (gl name=%u type=%#x access=%#x)\n",
++             desc.Width, desc.Height, desc.MipLevels, desc.ArraySize, desc.Format,
++             desc.SampleDesc.Count, desc.Usage, desc.BindFlags, desc.CPUAccessFlags,
++             desc.MiscFlags, name, type, access );
++    }
++    else ERR( "NT-DXI Register: object %p is NOT an ID3D11Texture2D\n", dxObject );
++
++    /* ── THE KEY QUESTION ─────────────────────────────────────────────────────────
++     * D3D11_RESOURCE_MISC_SHARED (0x2) -> IDXGIResource::GetSharedHandle works.
++     * D3D11_RESOURCE_MISC_SHARED_NTHANDLE (0x800) -> IDXGIResource1::CreateSharedHandle.
++     * Neither flag set -> no share handle, and the memory-object route is not viable. */
++    if (SUCCEEDED(IUnknown_QueryInterface( unk, &IID_IDXGIResource, (void **)&res )))
++    {
++        hr = IDXGIResource_GetSharedHandle( res, &shared );
++        ERR( "NT-DXI Register: IDXGIResource::GetSharedHandle hr=%#lx handle=%p\n", hr, shared );
++        IDXGIResource_Release( res );
++    }
++    else ERR( "NT-DXI Register: object does NOT support IDXGIResource\n" );
++
++    if (SUCCEEDED(IUnknown_QueryInterface( unk, &IID_IDXGIResource1, (void **)&res1 )))
++    {
++        hr = IDXGIResource1_CreateSharedHandle( res1, NULL, DXGI_SHARED_RESOURCE_READ, NULL, &nt_shared );
++        ERR( "NT-DXI Register: IDXGIResource1::CreateSharedHandle hr=%#lx handle=%p\n", hr, nt_shared );
++        if (SUCCEEDED(hr) && nt_shared) NtClose( nt_shared );
++        IDXGIResource1_Release( res1 );
++    }
++    else ERR( "NT-DXI Register: object does NOT support IDXGIResource1\n" );
++
++    if (tex2d) ID3D11Texture2D_Release( tex2d );
++
++    /* Stage 1 declines every registration -- see the header comment. AE has already been
++     * shown to survive these entry points failing (it did not crash when they returned NULL). */
++    ERR( "NT-DXI Register: STAGE 1 PROBE -- declining registration by design\n" );
++    RtlSetLastWin32Error( ERROR_NOT_SUPPORTED );
++    return NULL;
++}
++
++BOOL WINAPI wglDXUnregisterObjectNV( HANDLE hDevice, HANDLE hObject )
++{
++    TRACE( "hDevice %p, hObject %p\n", hDevice, hObject );
++    /* Nothing is ever registered in stage 1, so any handle here is bogus. */
++    RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
++    return FALSE;
++}
++
++BOOL WINAPI wglDXObjectAccessNV( HANDLE hObject, GLenum access )
++{
++    TRACE( "hObject %p, access %#x\n", hObject, access );
++    RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
++    return FALSE;
++}
++
++BOOL WINAPI wglDXLockObjectsNV( HANDLE hDevice, GLint count, HANDLE *hObjects )
++{
++    TRACE( "hDevice %p, count %d, hObjects %p\n", hDevice, count, hObjects );
++    RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
++    return FALSE;
++}
++
++BOOL WINAPI wglDXUnlockObjectsNV( HANDLE hDevice, GLint count, HANDLE *hObjects )
++{
++    TRACE( "hDevice %p, count %d, hObjects %p\n", hDevice, count, hObjects );
++    RtlSetLastWin32Error( ERROR_INVALID_HANDLE );
++    return FALSE;
++}
++
++/* D3D9-era entry point: the app supplies a share handle it obtained itself. Recorded so the
++ * trace shows whether AE uses this route (it would make stage 2 much easier). */
++BOOL WINAPI wglDXSetResourceShareHandleNV( void *dxObject, HANDLE shareHandle )
++{
++    ERR( "NT-DXI SetResourceShareHandle: dxObject %p shareHandle %p -- APP SUPPLIED A HANDLE\n",
++         dxObject, shareHandle );
++    return TRUE;
++}
++
++/***********************************************************************
++ *              glViewport (OPENGL32.@)
++ *
++ * NEUTRON round-43. Hand-written purely so it can be observed.
++ *
++ * MEASURED: After Effects' composition viewer (hwnd 0x10244, client 2734x1174) swaps its GL
++ * surface with the viewport stuck at 1x1+0+0 and drawFBO=0 -- i.e. AE renders the composition
++ * into ONE PIXEL of a full-size drawable and presents that. Blank panel, healthy swaps. Every
++ * present-path negative we collected was therefore correct: the surface, geometry, stacking and
++ * lifetime were all fine, and AE was faithfully drawing a single pixel.
++ *
++ * The GL drawable for that window is created during AE's 1x1 placeholder phase (round-38
++ * measured createsize=1x1), and GL's initial viewport is the drawable size at context creation.
++ * This trace distinguishes the three candidate mechanisms, which need different fixes:
++ *   no calls at all              -> AE inherited the 1x1 creation-time default and never
++ *                                   re-issues a viewport. Our bug is handing it a 1x1 drawable.
++ *   called with 1x1              -> AE believes the window is tiny; find what told it that.
++ *   called with the real size    -> something RESETS it afterwards; a Wine state bug.
++ * Logs first occurrence per (hwnd,size) plus a call count, so a per-frame caller cannot flood.
++ */
++void WINAPI glViewport( GLint x, GLint y, GLsizei width, GLsizei height )
++{
++    struct glViewport_params args = { .teb = NtCurrentTeb(), .x = x, .y = y, .width = width, .height = height };
++    NTSTATUS status;
++
++    {
++        static int enabled = -1;
++        static struct { HWND hwnd; int w, h; } seen[32];
++        static int nseen;
++        static LONG calls;
++        LONG n;
++
++        if (enabled < 0)
++        {
++            const char *e = getenv( "NEUTRON_GL_FBOTRACE" );
++            enabled = (e && e[0] == '1') ? 1 : 0;
++        }
++        if (enabled)
++        {
++            HWND hwnd = NtUserWindowFromDC( wglGetCurrentDC() );
++            int i; BOOL known = FALSE;
++
++            n = InterlockedIncrement( &calls );
++            for (i = 0; i < nseen; i++)
++                if (seen[i].hwnd == hwnd && seen[i].w == width && seen[i].h == height) { known = TRUE; break; }
++            if (!known)
++            {
++                RECT cr = {0};
++                if (nseen < 32) { seen[nseen].hwnd = hwnd; seen[nseen].w = width; seen[nseen].h = height; nseen++; }
++                if (hwnd) NtUserGetClientRect( hwnd, &cr, NtUserGetDpiForWindow( hwnd ) );
++                ERR( "NT-VP glViewport(%d,%d,%d,%d) hwnd=%p client=%dx%d call#%ld\n",
++                     x, y, width, height, hwnd,
++                     (int)(cr.right - cr.left), (int)(cr.bottom - cr.top), n );
++            }
++        }
++    }
++
++    TRACE( "x %d, y %d, width %d, height %d\n", x, y, width, height );
++    if ((status = UNIX_CALL( glViewport, &args ))) WARN( "glViewport returned %#lx\n", status );
++}
++
++/***********************************************************************
++ * NEUTRON round-47 -- counted GL entry points.
++ *
++ * These twelve are byte-for-byte the bodies make_opengl would generate, plus one counter bump
++ * each. They live here rather than in thunks.c only because a generated thunk has nowhere to
++ * hang instrumentation. See neutron_glcounters above for what the counts are for.
++ */
++
++void WINAPI glClear( GLbitfield mask )
++{
++    struct glClear_params args = { .teb = NtCurrentTeb(), .mask = mask };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) { c->clears++; c->t_clears++; InterlockedIncrement( &neutron_gl_all_clears ); }
++    TRACE( "mask %d\n", mask );
++    if ((status = UNIX_CALL( glClear, &args ))) WARN( "glClear returned %#lx\n", status );
++}
++
++void WINAPI glDrawArrays( GLenum mode, GLint first, GLsizei count )
++{
++    struct glDrawArrays_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_draw( c );
++    TRACE( "mode %d, first %d, count %d\n", mode, first, count );
++    if ((status = UNIX_CALL( glDrawArrays, &args ))) WARN( "glDrawArrays returned %#lx\n", status );
++}
++
++void WINAPI glDrawElements( GLenum mode, GLsizei count, GLenum type, const void *indices )
++{
++    struct glDrawElements_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_draw( c );
++    TRACE( "mode %d, count %d, type %d, indices %p\n", mode, count, type, indices );
++    if ((status = UNIX_CALL( glDrawElements, &args ))) WARN( "glDrawElements returned %#lx\n", status );
++}
++
++void WINAPI glDrawArraysInstanced( GLenum mode, GLint first, GLsizei count, GLsizei instancecount )
++{
++    struct glDrawArraysInstanced_params args = { .teb = NtCurrentTeb(), .mode = mode, .first = first, .count = count, .instancecount = instancecount };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_draw( c );
++    TRACE( "mode %d, first %d, count %d, instancecount %d\n", mode, first, count, instancecount );
++    if ((status = UNIX_CALL( glDrawArraysInstanced, &args ))) WARN( "glDrawArraysInstanced returned %#lx\n", status );
++}
++
++void WINAPI glDrawElementsInstanced( GLenum mode, GLsizei count, GLenum type, const void *indices, GLsizei instancecount )
++{
++    struct glDrawElementsInstanced_params args = { .teb = NtCurrentTeb(), .mode = mode, .count = count, .type = type, .indices = indices, .instancecount = instancecount };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_draw( c );
++    TRACE( "mode %d, count %d, type %d, indices %p, instancecount %d\n", mode, count, type, indices, instancecount );
++    if ((status = UNIX_CALL( glDrawElementsInstanced, &args ))) WARN( "glDrawElementsInstanced returned %#lx\n", status );
++}
++
++void WINAPI glDrawRangeElements( GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, const void *indices )
++{
++    struct glDrawRangeElements_params args = { .teb = NtCurrentTeb(), .mode = mode, .start = start, .end = end, .count = count, .type = type, .indices = indices };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_draw( c );
++    TRACE( "mode %d, start %d, end %d, count %d, type %d, indices %p\n", mode, start, end, count, type, indices );
++    if ((status = UNIX_CALL( glDrawRangeElements, &args ))) WARN( "glDrawRangeElements returned %#lx\n", status );
++}
++
++void WINAPI glBindFramebuffer( GLenum target, GLuint framebuffer )
++{
++    struct glBindFramebuffer_params args = { .teb = NtCurrentTeb(), .target = target, .framebuffer = framebuffer };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_bind( c, target, framebuffer );
++    TRACE( "target %d, framebuffer %d\n", target, framebuffer );
++    if ((status = UNIX_CALL( glBindFramebuffer, &args ))) WARN( "glBindFramebuffer returned %#lx\n", status );
++}
++
++void WINAPI glBindFramebufferEXT( GLenum target, GLuint framebuffer )
++{
++    struct glBindFramebufferEXT_params args = { .teb = NtCurrentTeb(), .target = target, .framebuffer = framebuffer };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_bind( c, target, framebuffer );
++    TRACE( "target %d, framebuffer %d\n", target, framebuffer );
++    if ((status = UNIX_CALL( glBindFramebufferEXT, &args ))) WARN( "glBindFramebufferEXT returned %#lx\n", status );
++}
++
++/* A blit whose DRAW binding is 0 is the app copying its offscreen result to the window -- the
++ * step whose absence would explain a black panel exactly. Counted separately for that reason. */
++void WINAPI glBlitFramebuffer( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter )
++{
++    struct glBlitFramebuffer_params args = { .teb = NtCurrentTeb(), .srcX0 = srcX0, .srcY0 = srcY0, .srcX1 = srcX1, .srcY1 = srcY1, .dstX0 = dstX0, .dstY0 = dstY0, .dstX1 = dstX1, .dstY1 = dstY1, .mask = mask, .filter = filter };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c)
++    {
++        c->blits++; c->t_blits++;
++        if (!c->cur_draw_fbo) c->t_blits_to_default++;
++        InterlockedIncrement( &neutron_gl_all_blits );
++    }
++    TRACE( "srcX0 %d, srcY0 %d, srcX1 %d, srcY1 %d, dstX0 %d, dstY0 %d, dstX1 %d, dstY1 %d, mask %d, filter %d\n", srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter );
++    if ((status = UNIX_CALL( glBlitFramebuffer, &args ))) WARN( "glBlitFramebuffer returned %#lx\n", status );
++}
++
++void WINAPI glBlitFramebufferEXT( GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter )
++{
++    struct glBlitFramebufferEXT_params args = { .teb = NtCurrentTeb(), .srcX0 = srcX0, .srcY0 = srcY0, .srcX1 = srcX1, .srcY1 = srcY1, .dstX0 = dstX0, .dstY0 = dstY0, .dstX1 = dstX1, .dstY1 = dstY1, .mask = mask, .filter = filter };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c)
++    {
++        c->blits++; c->t_blits++;
++        if (!c->cur_draw_fbo) c->t_blits_to_default++;
++        InterlockedIncrement( &neutron_gl_all_blits );
++    }
++    TRACE( "srcX0 %d, srcY0 %d, srcX1 %d, srcY1 %d, dstX0 %d, dstY0 %d, dstX1 %d, dstY1 %d, mask %d, filter %d\n", srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter );
++    if ((status = UNIX_CALL( glBlitFramebufferEXT, &args ))) WARN( "glBlitFramebufferEXT returned %#lx\n", status );
++}
++
++/* Attaching a texture to an FBO names the surface AE renders into -- the thing that would have
++ * to be handed to D3D. Logged once per (fbo,texture,size) so a per-frame caller cannot flood. */
++static void neutron_glc_fbtex( struct neutron_glcounters *c, GLenum attachment, GLuint texture )
++{
++    static struct { GLuint fbo, tex; } seen[16];
++    static int nseen;
++    int i;
++
++    c->fbtex++; c->t_fbtex++;
++    for (i = 0; i < nseen; i++)
++        if (seen[i].fbo == c->cur_draw_fbo && seen[i].tex == texture) return;
++    if (nseen < ARRAY_SIZE(seen)) { seen[nseen].fbo = c->cur_draw_fbo; seen[nseen].tex = texture; nseen++; }
++    ERR( "NT-GLD fbo attach: fbo=%u attachment=%#x texture=%u hwnd=%p\n",
++         c->cur_draw_fbo, attachment, texture, NtUserWindowFromDC( wglGetCurrentDC() ) );
++}
++
++void WINAPI glFramebufferTexture2D( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level )
++{
++    struct glFramebufferTexture2D_params args = { .teb = NtCurrentTeb(), .target = target, .attachment = attachment, .textarget = textarget, .texture = texture, .level = level };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_fbtex( c, attachment, texture );
++    TRACE( "target %d, attachment %d, textarget %d, texture %d, level %d\n", target, attachment, textarget, texture, level );
++    if ((status = UNIX_CALL( glFramebufferTexture2D, &args ))) WARN( "glFramebufferTexture2D returned %#lx\n", status );
++}
++
++void WINAPI glFramebufferTexture2DEXT( GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level )
++{
++    struct glFramebufferTexture2DEXT_params args = { .teb = NtCurrentTeb(), .target = target, .attachment = attachment, .textarget = textarget, .texture = texture, .level = level };
++    struct neutron_glcounters *c = neutron_glc_slot();
++    NTSTATUS status;
++    if (c) neutron_glc_fbtex( c, attachment, texture );
++    TRACE( "target %d, attachment %d, textarget %d, texture %d, level %d\n", target, attachment, textarget, texture, level );
++    if ((status = UNIX_CALL( glFramebufferTexture2DEXT, &args ))) WARN( "glFramebufferTexture2DEXT returned %#lx\n", status );
++}
++
++/***********************************************************************
++ * NEUTRON round-48 -- WHAT DOES AFTER EFFECTS' GL SELF-TEST SEE?
++ *
++ * Round 47 measured this: across a whole session After Effects issues 44 draw calls, ALL of them
++ * at startup, ALL on a hidden helper window (client 187x0), rendering into FBO 1 at 8x8 and then
++ * 256x1 with two colour attachments. After that it never issues another GL draw -- and the
++ * composition viewer's own GL surface is swapped 128+ times having never been drawn to, cleared,
++ * or even had a framebuffer bound. So AE is not failing to *deliver* GL rendering; it decides at
++ * startup not to *do* any, and that decision is made by this little offscreen self-test.
++ *
++ * Two readings, and only one of them is our bug:
++ *   the self-test FAILED  -> AE concluded its GL renderer is unusable here and shut the path
++ *                            down. The failure is ours to find and fix, and it is happening in
++ *                            a 44-draw sequence small enough to understand completely.
++ *   the self-test PASSED  -> AE enabled the path and then expects the frames to arrive by some
++ *                            route that is not GL drawing at all.
++ *
++ * These four report exactly what the self-test is told:
++ *   glCheckFramebufferStatus  is the render target AE built even complete? (0x8CD5 = COMPLETE)
++ *   glGetError                any GL error at all, which the app polls for and we never see
++ *   glReadPixels              the values AE reads back and judges -- if these are black or
++ *                             wrong, that IS the decision being made, in the open
++ *   glTexImage2D              the formats it asks for, since an unsupported one fails silently
++ *
++ * ⚠️ Note the self-test window's client rect is 187x0 -- ZERO height. Wine clamps that drawable
++ *    to 1x1 (a latent bug already noted separately). An 8x8 or 256x1 render into an FBO does not
++ *    depend on the drawable, but a readback that lands on the default framebuffer would.
++ */
++
++/* Shared cap so a per-frame caller cannot turn a diagnostic into a gigabyte. */
++static BOOL neutron_gl_budget( LONG *counter, LONG cap )
++{
++    return InterlockedIncrement( counter ) <= cap;
++}
++
++GLenum WINAPI glCheckFramebufferStatus( GLenum target )
++{
++    struct glCheckFramebufferStatus_params args = { .teb = NtCurrentTeb(), .target = target };
++    static LONG budget;
++    NTSTATUS status;
++    if ((status = UNIX_CALL( glCheckFramebufferStatus, &args ))) WARN( "glCheckFramebufferStatus returned %#lx\n", status );
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 24 ))
++        ERR( "NT-GLS fbstatus target=%#x -> %#x (%s) hwnd=%p\n", target, args.ret,
++             args.ret == 0x8CD5 ? "COMPLETE" : "NOT COMPLETE",
++             NtUserWindowFromDC( wglGetCurrentDC() ) );
++    return args.ret;
++}
++
++GLenum WINAPI glCheckFramebufferStatusEXT( GLenum target )
++{
++    struct glCheckFramebufferStatusEXT_params args = { .teb = NtCurrentTeb(), .target = target };
++    static LONG budget;
++    NTSTATUS status;
++    if ((status = UNIX_CALL( glCheckFramebufferStatusEXT, &args ))) WARN( "glCheckFramebufferStatusEXT returned %#lx\n", status );
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 24 ))
++        ERR( "NT-GLS fbstatusEXT target=%#x -> %#x (%s) hwnd=%p\n", target, args.ret,
++             args.ret == 0x8CD5 ? "COMPLETE" : "NOT COMPLETE",
++             NtUserWindowFromDC( wglGetCurrentDC() ) );
++    return args.ret;
++}
++
++/* Only non-zero returns are logged. An app polls glGetError constantly and GL_NO_ERROR tells us
++ * nothing; the first real error, with the window it happened on, tells us a great deal. */
++GLenum WINAPI glGetError(void)
++{
++    struct glGetError_params args = { .teb = NtCurrentTeb() };
++    static LONG budget;
++    NTSTATUS status;
++    if ((status = UNIX_CALL( glGetError, &args ))) WARN( "glGetError returned %#lx\n", status );
++    if (args.ret && neutron_gltrace_on() && neutron_gl_budget( &budget, 32 ))
++        ERR( "NT-GLS glGetError -> %#x hwnd=%p\n", args.ret, NtUserWindowFromDC( wglGetCurrentDC() ) );
++    return args.ret;
++}
++
++/* NEUTRON round-49 CAUSAL TEST (NEUTRON_GL_FAKEREAD=<8 hex digits>) -- diagnostic, never ship.
++ *
++ * MEASURED in round 48: After Effects' entire per-frame loop on the composition viewer is
++ *     glReadPixels(1x1 at 0,0, BGRA, from the DEFAULT framebuffer)  ->  wglSwapBuffers
++ * repeated forever, with NO drawing of any kind in between, and the readback is `ff000000`
++ * (opaque black) every single time. That one-pixel probe is the only thing AE asks about this
++ * window, so if anything gates the panel it is that value.
++ *
++ * Black is also, of course, the honest answer to "what is in a buffer nobody drew into" -- so
++ * cause and symptom are indistinguishable by observation alone. This distinguishes them by
++ * changing the answer and watching what AE does, the same way NEUTRON_GL_MOVETEST turned
++ * "is the subsurface composited" into a colour we could see:
++ *
++ *   AE starts drawing / the panel comes alive -> the probe IS the gate. Then the real question
++ *       becomes what AE expects to find there, and why our window does not have it.
++ *   nothing changes -> the probe is a symptom, AE gave up earlier, and the answer is upstream.
++ *
++ * Scope is deliberately tight: only a 1x1 byte-format read from the DEFAULT framebuffer, so the
++ * startup self-test's own FBO readbacks are left completely alone.
++ */
++static BOOL neutron_fakeread( UINT32 *out )
++{
++    static int enabled = -1;
++    static UINT32 value;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_FAKEREAD" );
++        value = (e && *e) ? (UINT32)strtoul( e, NULL, 16 ) : 0;
++        enabled = value ? 1 : 0;
++    }
++    *out = value;
++    return enabled == 1;
++}
++
++void WINAPI glReadPixels( GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels )
++{
++    struct glReadPixels_params args = { .teb = NtCurrentTeb(), .x = x, .y = y, .width = width, .height = height, .format = format, .type = type, .pixels = pixels };
++    static LONG budget;
++    NTSTATUS status;
++
++    TRACE( "x %d, y %d, width %d, height %d, format %d, type %d, pixels %p\n", x, y, width, height, format, type, pixels );
++    if ((status = UNIX_CALL( glReadPixels, &args ))) WARN( "glReadPixels returned %#lx\n", status );
++
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 32 ))
++    {
++        GLint pack = 0, fbo = 0, readbuf = 0;
++        UINT32 sample[4] = {0}, fake = 0;
++        BOOL got = FALSE, faked = FALSE;
++
++        /* With a pixel-pack buffer bound, `pixels` is a BUFFER OFFSET, not an address --
++         * dereferencing it would fault. Ask before touching it. */
++        glGetIntegerv( 0x88ED /* GL_PIXEL_PACK_BUFFER_BINDING */, &pack );
++        glGetIntegerv( 0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &fbo );
++        /* GL_READ_BUFFER. On an EGL *window* surface under Wayland the front buffer holds
++         * nothing readable, so a GL_FRONT read would come back black no matter what the app
++         * drew -- a gate that could never pass here. Worth knowing which one AE picked. */
++        glGetIntegerv( 0x0C02 /* GL_READ_BUFFER */, &readbuf );
++
++        if (!pack && pixels && width > 0 && height > 0 &&
++            type == GL_UNSIGNED_BYTE && (format == GL_RGBA || format == GL_BGRA))
++        {
++            unsigned int i, n = min( 4u, (unsigned int)width * (unsigned int)height );
++            for (i = 0; i < n; i++) sample[i] = ((const UINT32 *)pixels)[i];
++            got = TRUE;
++        }
++        if (got && !fbo && width == 1 && height == 1 && neutron_fakeread( &fake ))
++        {
++            *(UINT32 *)pixels = fake;
++            faked = TRUE;
++        }
++        ERR( "NT-GLS glReadPixels %dx%d+%d+%d format=%#x type=%#x readFBO=%d readBuffer=%#x "
++             "pack=%d hwnd=%p first4=%s%08x %08x %08x %08x%s\n",
++             width, height, x, y, format, type, fbo, readbuf, pack,
++             NtUserWindowFromDC( wglGetCurrentDC() ), got ? "" : "(not sampled) ",
++             sample[0], sample[1], sample[2], sample[3],
++             faked ? " [FAKED]" : "" );
++    }
++    else if (!neutron_gltrace_on())
++    {
++        /* nothing */
++    }
++    else
++    {
++        /* Past the log budget the override must still apply, or the test would only affect the
++         * first 32 frames and then quietly stop -- which would read as "it made no difference". */
++        UINT32 fake;
++        GLint pack = 0, fbo = 0;
++        if (pixels && width == 1 && height == 1 && type == GL_UNSIGNED_BYTE &&
++            (format == GL_RGBA || format == GL_BGRA) && neutron_fakeread( &fake ))
++        {
++            glGetIntegerv( 0x88ED, &pack );
++            glGetIntegerv( 0x8CAA, &fbo );
++            if (!pack && !fbo) *(UINT32 *)pixels = fake;
++        }
++    }
++}
++
++void WINAPI glReadBuffer( GLenum src )
++{
++    struct glReadBuffer_params args = { .teb = NtCurrentTeb(), .src = src };
++    static LONG budget;
++    NTSTATUS status;
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 16 ))
++        ERR( "NT-GLS glReadBuffer(%#x) hwnd=%p\n", src, NtUserWindowFromDC( wglGetCurrentDC() ) );
++    TRACE( "src %d\n", src );
++    if ((status = UNIX_CALL( glReadBuffer, &args ))) WARN( "glReadBuffer returned %#lx\n", status );
++}
++
++void WINAPI glDrawBuffer( GLenum buf )
++{
++    struct glDrawBuffer_params args = { .teb = NtCurrentTeb(), .buf = buf };
++    static LONG budget;
++    NTSTATUS status;
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 16 ))
++        ERR( "NT-GLS glDrawBuffer(%#x) hwnd=%p\n", buf, NtUserWindowFromDC( wglGetCurrentDC() ) );
++    TRACE( "buf %d\n", buf );
++    if ((status = UNIX_CALL( glDrawBuffer, &args ))) WARN( "glDrawBuffer returned %#lx\n", status );
++}
++
++/***********************************************************************
++ * NEUTRON round-50 -- DOES AFTER EFFECTS' GL DRAWBOT EVEN HAVE A PIPELINE?
++ *
++ * WHERE THIS CAME FROM. Round 48 found AE's whole per-frame loop on the composition viewer is
++ * "read one pixel, swap", with no drawing. Round 49 fed that probe a non-black value on every
++ * frame and AE STILL drew nothing (draws stayed 0, ALL-THREADS frozen at 44), and showed it
++ * reads GL_BACK, not GL_FRONT -- so the probe is not a gate and the front-buffer theory is dead.
++ * AE gives up somewhere earlier, while still having gone to the trouble of uploading a glyph
++ * atlas to that very window.
++ *
++ * An app that has set up its text renderer and then issues no draw calls at all is behaving
++ * exactly like one whose shader pipeline did not come up. Without a program to draw with there
++ * is nothing to submit, so every draw is skipped and the frame loop degenerates to housekeeping.
++ * The startup self-test's 44 draws do not contradict this: they are a different, simpler path.
++ *
++ * So rather than infer, this asks the driver directly. After each compile and link we query the
++ * status ourselves -- whether or not the app bothers to -- and on failure pull the driver's own
++ * info log out and print it. If Adobe's shaders do not build here, that log says why, in words.
++ *
++ * glShaderSource also records the size and opening line of each shader, which names the GLSL
++ * version AE is targeting; a version the driver refuses is one of the commoner ways this fails.
++ */
++void WINAPI glShaderSource( GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length )
++{
++    struct glShaderSource_params args = { .teb = NtCurrentTeb(), .shader = shader, .count = count, .string = string, .length = length };
++    static LONG budget;
++    NTSTATUS status;
++
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 24 ))
++    {
++        char head[121] = {0};
++        if (count > 0 && string && string[0])
++        {
++            unsigned int i;
++            for (i = 0; i < sizeof(head) - 1 && string[0][i] && string[0][i] != '\n'; i++)
++                head[i] = string[0][i];
++        }
++        ERR( "NT-GLP shaderSource shader=%u count=%d firstline=\"%s\"\n", shader, count, head );
++    }
++    TRACE( "shader %d, count %d, string %p, length %p\n", shader, count, string, length );
++    if ((status = UNIX_CALL( glShaderSource, &args ))) WARN( "glShaderSource returned %#lx\n", status );
++}
++
++void WINAPI glGetShaderiv( GLuint shader, GLenum pname, GLint *params )
++{
++    struct glGetShaderiv_params args = { .teb = NtCurrentTeb(), .shader = shader, .pname = pname, .params = params };
++    NTSTATUS status;
++    TRACE( "shader %d, pname %d, params %p\n", shader, pname, params );
++    if ((status = UNIX_CALL( glGetShaderiv, &args ))) WARN( "glGetShaderiv returned %#lx\n", status );
++}
++
++void WINAPI glGetShaderInfoLog( GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog )
++{
++    struct glGetShaderInfoLog_params args = { .teb = NtCurrentTeb(), .shader = shader, .bufSize = bufSize, .length = length, .infoLog = infoLog };
++    NTSTATUS status;
++    TRACE( "shader %d, bufSize %d, length %p, infoLog %p\n", shader, bufSize, length, infoLog );
++    if ((status = UNIX_CALL( glGetShaderInfoLog, &args ))) WARN( "glGetShaderInfoLog returned %#lx\n", status );
++}
++
++void WINAPI glGetProgramiv( GLuint program, GLenum pname, GLint *params )
++{
++    struct glGetProgramiv_params args = { .teb = NtCurrentTeb(), .program = program, .pname = pname, .params = params };
++    NTSTATUS status;
++    TRACE( "program %d, pname %d, params %p\n", program, pname, params );
++    if ((status = UNIX_CALL( glGetProgramiv, &args ))) WARN( "glGetProgramiv returned %#lx\n", status );
++}
++
++void WINAPI glGetProgramInfoLog( GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog )
++{
++    struct glGetProgramInfoLog_params args = { .teb = NtCurrentTeb(), .program = program, .bufSize = bufSize, .length = length, .infoLog = infoLog };
++    NTSTATUS status;
++    TRACE( "program %d, bufSize %d, length %p, infoLog %p\n", program, bufSize, length, infoLog );
++    if ((status = UNIX_CALL( glGetProgramInfoLog, &args ))) WARN( "glGetProgramInfoLog returned %#lx\n", status );
++}
++
++void WINAPI glCompileShader( GLuint shader )
++{
++    struct glCompileShader_params args = { .teb = NtCurrentTeb(), .shader = shader };
++    static LONG budget, failures;
++    NTSTATUS status;
++
++    TRACE( "shader %d\n", shader );
++    if ((status = UNIX_CALL( glCompileShader, &args ))) WARN( "glCompileShader returned %#lx\n", status );
++
++    if (neutron_gltrace_on())
++    {
++        GLint ok = 1;
++        glGetShaderiv( shader, 0x8B81 /* GL_COMPILE_STATUS */, &ok );
++        if (!ok && neutron_gl_budget( &failures, 8 ))
++        {
++            char log[1024] = {0};
++            GLsizei len = 0;
++            glGetShaderInfoLog( shader, sizeof(log) - 1, &len, log );
++            ERR( "NT-GLP ⛔ SHADER %u FAILED TO COMPILE, driver says: %s\n", shader, log );
++        }
++        else if (ok && neutron_gl_budget( &budget, 8 ))
++            ERR( "NT-GLP shader %u compiled OK\n", shader );
++    }
++}
++
++void WINAPI glLinkProgram( GLuint program )
++{
++    struct glLinkProgram_params args = { .teb = NtCurrentTeb(), .program = program };
++    static LONG budget, failures;
++    NTSTATUS status;
++
++    TRACE( "program %d\n", program );
++    if ((status = UNIX_CALL( glLinkProgram, &args ))) WARN( "glLinkProgram returned %#lx\n", status );
++
++    if (neutron_gltrace_on())
++    {
++        GLint ok = 1;
++        glGetProgramiv( program, 0x8B82 /* GL_LINK_STATUS */, &ok );
++        if (!ok && neutron_gl_budget( &failures, 8 ))
++        {
++            char log[1024] = {0};
++            GLsizei len = 0;
++            glGetProgramInfoLog( program, sizeof(log) - 1, &len, log );
++            ERR( "NT-GLP ⛔ PROGRAM %u FAILED TO LINK, driver says: %s\n", program, log );
++        }
++        else if (ok && neutron_gl_budget( &budget, 8 ))
++            ERR( "NT-GLP program %u linked OK\n", program );
++    }
++}
++
++/* The old ARB-suffixed shader API is a separate set of entry points. If AE uses those instead,
++ * the core instrumentation above would report nothing and the silence would look like "no
++ * shaders at all" -- so say so plainly rather than leave a hole. */
++void WINAPI glCompileShaderARB( GLhandleARB shaderObj )
++{
++    struct glCompileShaderARB_params args = { .teb = NtCurrentTeb(), .shaderObj = shaderObj };
++    static LONG budget;
++    NTSTATUS status;
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 4 ))
++        ERR( "NT-GLP glCompileShaderARB obj=%u -- AE USES THE ARB SHADER API; extend the trace\n", shaderObj );
++    TRACE( "shaderObj %d\n", shaderObj );
++    if ((status = UNIX_CALL( glCompileShaderARB, &args ))) WARN( "glCompileShaderARB returned %#lx\n", status );
++}
++
++void WINAPI glLinkProgramARB( GLhandleARB programObj )
++{
++    struct glLinkProgramARB_params args = { .teb = NtCurrentTeb(), .programObj = programObj };
++    static LONG budget;
++    NTSTATUS status;
++    if (neutron_gltrace_on() && neutron_gl_budget( &budget, 4 ))
++        ERR( "NT-GLP glLinkProgramARB obj=%u -- AE USES THE ARB SHADER API; extend the trace\n", programObj );
++    TRACE( "programObj %d\n", programObj );
++    if ((status = UNIX_CALL( glLinkProgramARB, &args ))) WARN( "glLinkProgramARB returned %#lx\n", status );
++}
++
++/* Counted, not logged per call: a drawbot that never binds a program has nothing to draw with,
++ * and the total is reported alongside the draw counts at each swap. */
++void WINAPI glUseProgram( GLuint program )
++{
++    struct glUseProgram_params args = { .teb = NtCurrentTeb(), .program = program };
++    NTSTATUS status;
++    if (neutron_gltrace_on()) InterlockedIncrement( &neutron_gl_useprogram );
++    TRACE( "program %d\n", program );
++    if ((status = UNIX_CALL( glUseProgram, &args ))) WARN( "glUseProgram returned %#lx\n", status );
++}
++
++void WINAPI glTexImage2D( GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels )
++{
++    struct glTexImage2D_params args = { .teb = NtCurrentTeb(), .target = target, .level = level, .internalformat = internalformat, .width = width, .height = height, .border = border, .format = format, .type = type, .pixels = pixels };
++    static LONG budget;
++    NTSTATUS status;
++
++    if (neutron_gltrace_on() && level == 0 && neutron_gl_budget( &budget, 24 ))
++        ERR( "NT-GLS glTexImage2D target=%#x internalformat=%#x %dx%d format=%#x type=%#x hwnd=%p\n",
++             target, internalformat, width, height, format, type,
++             NtUserWindowFromDC( wglGetCurrentDC() ) );
++
++    TRACE( "target %d, level %d, internalformat %d, width %d, height %d, border %d, format %d, type %d, pixels %p\n", target, level, internalformat, width, height, border, format, type, pixels );
++    if ((status = UNIX_CALL( glTexImage2D, &args ))) WARN( "glTexImage2D returned %#lx\n", status );
++}
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 3d03b41fc24..4d444a7c7ca 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -1946,6 +1946,44 @@ static void opengl_client_pbuffer_init( HPBUFFERARB client_pbuffer, struct pbuff
+     client->unix_funcs = (UINT_PTR)funcs;
+ }
+ 
++/* NEUTRON round-40: trace the pbuffer / render-to-texture path.
++ *
++ * After Effects' composition panel is blank while its GL surface is provably healthy and
++ * provably COMPOSITED-BUT-EMPTY (NEUTRON_GL_MOVETEST). Round 39b showed AE probes 23 wgl*
++ * entry points and NONE of them is a DX-interop function -- so it does NOT use
++ * WGL_NV_DX_interop (theory killed). What it DOES probe is the pbuffer + render-to-texture
++ * set: wglCreatePbufferARB/QueryPbufferARB/SetPbufferAttribARB and
++ * wglBindTexImageARB/wglReleaseTexImageARB (WGL_ARB_render_texture).
++ *
++ * That path is suspect on Wayland. winewayland has no real pbuffer -- wayland_pbuffer_create
++ * fakes one with a hidden wl_surface + wl_egl_window ("Wayland EGL doesn't support pixmap or
++ * pbuffer"), and wayland_pbuffer_bind returns -1, i.e. "use the default implementation".
++ * The default is win32u_wglBindTexImageARB's fallback: glReadBuffer(source) +
++ * glCopyTexImage2D. For an EGL WINDOW surface, GL_FRONT is not meaningfully readable -- the
++ * rendered content is in the BACK buffer -- so a bind of WGL_FRONT_LEFT_ARB would copy
++ * nothing and hand the app a BLACK texture. That is exactly the observed symptom.
++ *
++ * This trace records whether AE actually creates pbuffers, which buffer it binds, and
++ * whether the bind succeeds -- turning that reading of the code into evidence. */
++static void neutron_gltrace( const char *fmt, ... )
++{
++    static int enabled = -1;
++    char buf[256];
++    va_list ap;
++
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_PROCTRACE" );
++        enabled = (e && e[0] == '1') ? 1 : 0;
++    }
++    if (!enabled) return;
++
++    va_start( ap, fmt );
++    vsnprintf( buf, sizeof(buf), fmt, ap );
++    va_end( ap );
++    ERR( "%s\n", buf );
++}
++
+ static BOOL win32u_pbuffer_create( HDC hdc, int format, int width, int height, const int *attribs,
+                                    HPBUFFERARB client_pbuffer )
+ {
+@@ -1969,6 +2007,8 @@ static BOOL win32u_pbuffer_create( HDC hdc, int format, int width, int height, c
+ 
+     if (!(pbuffer = pbuffer_create( format, width, height, attribs ))) return FALSE;
+     opengl_client_pbuffer_init( client_pbuffer, pbuffer, funcs );
++    /* NEUTRON round-40 (NEUTRON_GL_PROCTRACE=1) -- see win32u_wglBindTexImageARB below. */
++    neutron_gltrace( "NT-GL pbuffer-create %dx%d format=%d", width, height, format );
+     return TRUE;
+ }
+ 
+@@ -2159,7 +2199,18 @@ static BOOL win32u_wglBindTexImageARB( HPBUFFERARB client_pbuffer, int buffer )
+     }
+ 
+     if ((ret = driver_funcs->p_pbuffer_bind( pbuffer->hdc, pbuffer->drawable, source )) != -1)
++    {
++        neutron_gltrace( "NT-GL bindteximage buffer=%#x source=%#x -> driver ret=%u (%dx%d)",
++                         buffer, source, ret, pbuffer->width, pbuffer->height );
+         return ret;
++    }
++
++    /* NEUTRON round-40: the generic glCopyTexImage2D fallback -- the suspect path on
++     * Wayland, where the "pbuffer" is really an EGL window surface and GL_FRONT holds
++     * nothing. source=0x404 is GL_FRONT, 0x405 GL_BACK. */
++    neutron_gltrace( "NT-GL bindteximage buffer=%#x source=%#x -> COPY fallback (%dx%d fmt=%#x target=%#x)",
++                     buffer, source, pbuffer->width, pbuffer->height,
++                     pbuffer->texture_format, pbuffer->texture_target );
+ 
+     funcs->p_glGetIntegerv( binding_from_target( pbuffer->texture_target ), &prev_texture );
+     push_internal_context( NtCurrentTeb()->glContext, pbuffer->drawable, format );
+@@ -2771,6 +2822,26 @@ static void display_funcs_init(void)
+     {
+         display_funcs.p_glImportMemoryWin32HandleEXT = win32u_glImportMemoryWin32HandleEXT;
+         display_funcs.p_glImportMemoryWin32NameEXT = win32u_glImportMemoryWin32NameEXT;
++
++        /* NEUTRON: advertise WGL_NV_DX_interop / _interop2. The 8 entry points are implemented
++         * by hand PE-side in dlls/opengl32/wgl.c (they take COM pointers, which the unix side
++         * cannot touch), so nothing is registered in display_funcs here -- but the extension
++         * BIT must be set or wglGetProcAddress refuses to hand them out and, more importantly,
++         * apps never ask: After Effects gates wgl* resolution on the advertised extension
++         * string, which is precisely why its composition viewer is blank on Wine.
++         *
++         * Gated on p_glImportMemoryFdEXT deliberately: the real implementation bridges the D3D
++         * texture into GL through import_memory() above (shared handle -> d3dkmt fd ->
++         * glImportMemoryFdEXT), so without external-memory support there is no bridge to offer
++         * and advertising would be a lie. */
++        global_extensions[WGL_NV_DX_interop] = 1;
++        global_extensions[WGL_NV_DX_interop2] = 1;
++        /* NVIDIA also exposes an experimental alias, and the Windows reference capture shows
++         * all THREE advertised there (WGL_NV_DX_interop, _interop2, WGL_NVX_DX_interop).
++         * make_opengl already knows it as an alias of the same 8 entry points, so advertising
++         * it costs nothing and removes one more difference from the native string -- worth
++         * doing because AE was already proven to gate purely on what the string names. */
++        global_extensions[WGL_NVX_DX_interop] = 1;
+     }
+     if (display_funcs.p_glImportSemaphoreFdEXT)
+     {
+diff --git a/include/wine/wgl.h b/include/wine/wgl.h
+index 3b46ee51b87..c40df56248c 100644
+--- a/include/wine/wgl.h
++++ b/include/wine/wgl.h
+@@ -6699,6 +6699,9 @@ typedef unsigned int GLhandleARB;
+ #define GL_ZOOM_Y                                                                  0x0D17
+ #define GL_Z_EXT                                                                   0x87D7
+ #define WGL_ACCELERATION_ARB                                                       0x2003
++#define WGL_ACCESS_READ_ONLY_NV                                                    0x00000000
++#define WGL_ACCESS_READ_WRITE_NV                                                   0x00000001
++#define WGL_ACCESS_WRITE_DISCARD_NV                                                0x00000002
+ #define WGL_ACCUM_ALPHA_BITS_ARB                                                   0x2021
+ #define WGL_ACCUM_BITS_ARB                                                         0x201D
+ #define WGL_ACCUM_BLUE_BITS_ARB                                                    0x2020
+@@ -10700,6 +10703,14 @@ typedef BOOL       (GLAPIENTRY *PFN_wglBindTexImageARB)( HPBUFFERARB hPbuffer, i
+ typedef BOOL       (GLAPIENTRY *PFN_wglChoosePixelFormatARB)( HDC hdc, const int *piAttribIList, const FLOAT *pfAttribFList, UINT nMaxFormats, int *piFormats, UINT *nNumFormats );
+ typedef HGLRC      (GLAPIENTRY *PFN_wglCreateContextAttribsARB)( HDC hDC, HGLRC hShareContext, const int *attribList );
+ typedef HPBUFFERARB (GLAPIENTRY *PFN_wglCreatePbufferARB)( HDC hDC, int iPixelFormat, int iWidth, int iHeight, const int *piAttribList );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXCloseDeviceNV)( HANDLE hDevice );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXLockObjectsNV)( HANDLE hDevice, GLint count, HANDLE *hObjects );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXObjectAccessNV)( HANDLE hObject, GLenum access );
++typedef HANDLE     (GLAPIENTRY *PFN_wglDXOpenDeviceNV)( void *dxDevice );
++typedef HANDLE     (GLAPIENTRY *PFN_wglDXRegisterObjectNV)( HANDLE hDevice, void *dxObject, GLuint name, GLenum type, GLenum access );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXSetResourceShareHandleNV)( void *dxObject, HANDLE shareHandle );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXUnlockObjectsNV)( HANDLE hDevice, GLint count, HANDLE *hObjects );
++typedef BOOL       (GLAPIENTRY *PFN_wglDXUnregisterObjectNV)( HANDLE hDevice, HANDLE hObject );
+ typedef BOOL       (GLAPIENTRY *PFN_wglDestroyPbufferARB)( HPBUFFERARB hPbuffer );
+ typedef void       (GLAPIENTRY *PFN_wglFreeMemoryNV)( void *pointer );
+ typedef HDC        (GLAPIENTRY *PFN_wglGetCurrentReadDCARB)(void);
+@@ -10751,6 +10762,9 @@ typedef BOOL       (GLAPIENTRY *PFN_wglSwapIntervalEXT)( int interval );
+     USE_GL_EXT(WGL_EXT_pixel_format_packed_float) \
+     USE_GL_EXT(WGL_EXT_swap_control) \
+     USE_GL_EXT(WGL_EXT_swap_control_tear) \
++    USE_GL_EXT(WGL_NVX_DX_interop) \
++    USE_GL_EXT(WGL_NV_DX_interop) \
++    USE_GL_EXT(WGL_NV_DX_interop2) \
+     USE_GL_EXT(WGL_NV_float_buffer) \
+     USE_GL_EXT(WGL_NV_multigpu_context) \
+     USE_GL_EXT(WGL_NV_multisample_coverage) \
+@@ -10794,6 +10808,14 @@ typedef BOOL       (GLAPIENTRY *PFN_wglSwapIntervalEXT)( int interval );
+     USE_GL_FUNC(wglChoosePixelFormatARB) \
+     USE_GL_FUNC(wglCreateContextAttribsARB) \
+     USE_GL_FUNC(wglCreatePbufferARB) \
++    USE_GL_FUNC(wglDXCloseDeviceNV) \
++    USE_GL_FUNC(wglDXLockObjectsNV) \
++    USE_GL_FUNC(wglDXObjectAccessNV) \
++    USE_GL_FUNC(wglDXOpenDeviceNV) \
++    USE_GL_FUNC(wglDXRegisterObjectNV) \
++    USE_GL_FUNC(wglDXSetResourceShareHandleNV) \
++    USE_GL_FUNC(wglDXUnlockObjectsNV) \
++    USE_GL_FUNC(wglDXUnregisterObjectNV) \
+     USE_GL_FUNC(wglDestroyPbufferARB) \
+     USE_GL_FUNC(wglFreeMemoryNV) \
+     USE_GL_FUNC(wglGetCurrentReadDCARB) \

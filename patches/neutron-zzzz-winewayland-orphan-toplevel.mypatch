@@ -2,24 +2,50 @@ diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
 index 2b3b98f5c7c..4422ebf67e5 100644
 --- a/dlls/winewayland.drv/window.c
 +++ b/dlls/winewayland.drv/window.c
-@@ -59,6 +59,39 @@ static BOOL neutron_wl_diag(void)
+@@ -59,6 +59,65 @@ static BOOL neutron_wl_diag(void)
      if (v < 0) { const char *e = getenv("NEUTRON_WL_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
      return v;
  }
 +
-+/* NEUTRON orphan-toplevel fix (NEUTRON_WL_ORPHAN_TOPLEVEL=0 to disable).
++/* NEUTRON orphan-toplevel fix -- OPT-IN, OFF BY DEFAULT.
++ * Enable with NEUTRON_WL_ORPHAN_TOPLEVEL=1 (the `aftereffects` profile in ~/neutron/bin/neutron
++ * sets it; no other app does).
 + *
 + * A wl_subsurface is only ever shown when its PARENT surface is mapped. An owned window whose
 + * owner has no xdg_surface yet therefore becomes a subsurface of something that does not exist
-+ * on screen, and is never displayed at all -- not lost, not mispositioned, attached to nothing.
++ * on screen, and is never displayed at all -- it is not lost or mispositioned, it is attached to
++ * nothing.
 + *
 + * After Effects' splash screen is exactly this: an owned `#32770` dialog, 1301x877, which AE
-+ * shows ~22,000 log lines BEFORE the main window that owns it first gets a Wayland surface.
-+ * Photoshop and Premiere are unaffected: their splashes are not owned by an unmapped window. */
++ * shows ~22,000 log lines BEFORE the main window that owns it first gets a Wayland surface. The
++ * splash is created, sized and shown (win32u logs `SHOW hwnd=... class=#32770 size=1301x877`) and
++ * then silently never appears.
++ *
++ * ⚠️ WHY THIS IS OPT-IN RATHER THAN DEFAULT-ON (2026-08-03).
++ * When first written this said "Photoshop and Premiere are unaffected because their splashes are
++ * not owned by a window that is still unmapped." THAT WAS WRONG, and it was asserted from
++ * reasoning about AE's log rather than from ever running another app with the fix on. The very
++ * first Premiere launch after this shipped promoted its splash too --
++ *     neutron-orphan: hwnd=0x102d0 promoted SUBSURFACE->TOPLEVEL (owner is an unmapped root)
++ *     (#32770, 543x849, child DroverLord 0x102d2)
++ * -- and put a GHOST WINDOW behind Premiere's splash, the same defect this fix's own
++ * `neutron_owner_is_root` test was added to cure for AE. So the ownership-depth test is NOT
++ * sufficient on its own: it is necessary but it does not generalise across apps.
++ *
++ * Default-off means every app except AE gets byte-identical behaviour to before the fix existed,
++ * which is the smallest blast radius available. The correct long-term fix is to understand what
++ * genuinely distinguishes AE's splash from Premiere's -- BOTH are owned `#32770` dialogs whose
++ * owner is an unmapped root, so the current predicate cannot tell them apart at all. Until that
++ * discriminator is found, do NOT flip this back on globally.
++ *
++ * The promotion itself stays deliberately narrow: only when the prospective parent has no
++ * xdg_surface whatsoever. An earlier, broader attempt made every not-ready owned window a
++ * standalone toplevel and produced a ghost second window, which is why the surrounding code
++ * chooses subsurface here -- see the comment in WAYLAND_WindowPosChanged. */
 +static BOOL neutron_orphan_toplevel(void)
 +{
 +    static int v = -1;
-+    if (v < 0) { const char *e = getenv("NEUTRON_WL_ORPHAN_TOPLEVEL"); v = (e && e[0] == '0') ? 0 : 1; }
++    if (v < 0) { const char *e = getenv("NEUTRON_WL_ORPHAN_TOPLEVEL"); v = (e && e[0] == '1') ? 1 : 0; }
 +    return v;
 +}
 +

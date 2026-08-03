@@ -1,0 +1,452 @@
+The text leading up to this was:
+--------------------------
+|# neutron-heap-large-cache
+|#
+|# Retain freed LARGE heap blocks (>= HEAP_MIN_LARGE_BLOCK_SIZE, ~1 MB) instead of releasing them
+|# to the kernel, so the next allocation of a compatible size writes into WARM pages.
+|# Gate: NEUTRON_HEAP_LARGE_CACHE=1. Touches: dlls/ntdll/heap.c only.
+|#
+|# THE PROBLEM
+|# Wine's heap_free_large() calls NtFreeVirtualMemory(MEM_RELEASE) unconditionally and retains
+|# nothing, so an app that allocates a large scratch buffer per frame always writes into fresh,
+|# unfaulted pages. On Linux the kernel faults and zeroes each 4 KB page on first touch.
+|#
+|# Measured in Premiere's timeline zoom (30 s, GPU-accelerated UI mode, runtime 11.10-15):
+|# ~16,000 large allocations totalling 22 GB, average 1,435 KB, 98% the same size as a block freed
+|# moments earlier -- about 5.6 million page faults. A CPU profile put 27.9% of the UI thread on a
+|# single `rep movsb` inside ucrtbase!memmove with a further 15.1% in kernel frames beneath it.
+|#
+|# CROSS-CHECKED AGAINST NATIVE WINDOWS (two rounds on a Ryzen 9700X / Win 11 box):
+|#   * Windows does NOT retain large freed blocks either -- HeapAlloc-per-iteration (11.99 GB/s)
+|#     is identical to raw VirtualAlloc-per-iteration (12.03). So this is NOT a Wine bug.
+|#   * But Windows' fresh-page path is ~3x cheaper (zero-page thread vs zeroing in the fault
+|#     handler), so Wine is disadvantaged by how LINUX hands out pages. This patch compensates.
+|#   * Premiere churns HARDER natively (285,686 page faults/sec while zooming vs 32 idle,
+|#     Virtual Bytes sawtoothing 1.8 GB), so the allocation pattern is Adobe's design and there is
+|#     no upstream bug to fix instead.
+|#   * With this patch Linux reaches 12.9 GB/s vs Windows' 11.27 -- 1.14x, i.e. PARITY.
+|#
+|# SIZING. The process cap is 1% of physical RAM clamped to [64 MB, 512 MB] (512 MB on a 62 GB
+|# box, 160 MB on 16 GB, 80 MB on 8 GB), overridable with NEUTRON_HEAP_LARGE_CACHE_MB. Derived,
+|# not guessed: matching Windows needs a hit rate h where h*12.9 + (1-h)*4.5 = 11.27 -> 81%, and
+|# for Lightroom's ~30 MB blocks that means holding ~16 of them. 32 slots because Premiere and
+|# Photoshop are slot-limited rather than byte-limited, and 98% of Premiere's allocations matched
+|# one of the last 32 freed sizes.
+|#
+|# ⚠️ MEASURE PAST L3. Every "warm" number here is from a >= 64 MB payload. At 14 MB the buffers
+|# fit in L3 on both reference machines and the warm rows measure CACHE, which produced three
+|# wrong conclusions before it was caught (a 6-8x penalty that is really 3.2x, a 3.4x "overshoot"
+|# of Windows that is really parity, and "copy chunk size barely matters" when at DRAM scale
+|# 256-byte chunks run at 0.28 GB/s).
+|#
+|# FOUR THINGS THIS GOT WRONG IN DEVELOPMENT -- do not reintroduce:
+|#  1. NO EVICTION -> the cache died permanently once all slots filled with sizes the app stopped
+|#     requesting. Round-robin evicts now, and releases the evicted region OUTSIDE the heap lock
+|#     (NtFreeVirtualMemory is a syscall; holding the lock across it serialises other threads).
+|#  2. GATED ON A DEBUG CHANNEL -> TRACE_ON() is FALSE when stderr is /dev/null, so the cache
+|#     silently did not engage while appearing enabled. Never gate behaviour on debug output.
+|#  3. HEAP_ZERO_MEMORY -> RtlAllocateHeap's large path never calls initialize_block(), so zeroing
+|#     is satisfied only implicitly by fresh pages arriving zeroed. A recycled block is dirty. The
+|#     reuse path memsets explicitly; harnesses/heapzero.c is the null control and was verified to
+|#     FAIL (poison 0xaa at round 1) on a build with that memset removed.
+|#  4. A PER-HEAP CAP IS NOT A PROCESS BOUND -- a process has several heaps. Both caps apply.
+|#
+|# Also included: an inert churn counter on the `neutronheap` debug channel (allocation/free rate,
+|# average size, and the hit rate a cache WOULD achieve). It is TRACE-gated like any Wine debug
+|# output and costs a predictable-branch test when off; it is what made the sizing measurable and
+|# is kept so the next person can re-measure rather than guess.
+|--- a/dlls/ntdll/heap.c
+|+++ b/dlls/ntdll/heap.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+7 out of 7 hunks ignored
+The text leading up to this was:
+--------------------------
+|diff --git a/dlls/win32k.sys/win32k.sys.spec b/dlls/win32k.sys/win32k.sys.spec
+|index c79439151e4..c36733b5932 100644
+|--- a/dlls/win32k.sys/win32k.sys.spec
+|+++ b/dlls/win32k.sys/win32k.sys.spec
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+2 out of 2 hunks ignored
+The text leading up to this was:
+--------------------------
+|# neutron-windows.ui-radialcontroller-null
+|#
+|# Premiere project-load CRASH fix (c0000005). Touches: dlls/windows.ui/radialcontroller.c,
+|# which is added by wine-tkg's staging patches, so this applies on top of those.
+|#
+|# RadialController is the Surface Dial API. Wine's IRadialControllerInterop::CreateForWindow
+|# called factory_RadialController_ActivateInstance -- which returns E_NOTIMPL WITHOUT writing
+|# the out-param -- and then returned S_OK. The caller therefore saw success plus an unwritten
+|# (NULL/garbage) pointer, called a method on it, and jumped through a null vtable. Observed as
+|# an unhandled c0000005 with rax=rbx=0 when Premiere loads a project.
+|#
+|# CreateForWindow/GetForWindow are documented FAILABLE APIs -- Surface Dial is optional
+|# hardware -- so the correct answer is a clean failure with a NULLed out-param, which makes
+|# the app take its no-dial path. Also NULLs the out-param in both ActivateInstance stubs so
+|# no other caller can inherit the same garbage.
+|--- a/dlls/windows.ui/radialcontroller.c
+|+++ b/dlls/windows.ui/radialcontroller.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+4 out of 4 hunks ignored
+1 out of 1 hunk FAILED -- saving rejects to file dlls/windows.storage/Makefile.in.rej
+The text leading up to this was:
+--------------------------
+|--- a/dlls/dwrite/main.c
+|+++ b/dlls/dwrite/main.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+4 out of 4 hunks ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/dwrite/dwrite_private.h
+|+++ b/dlls/dwrite/dwrite_private.h
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+2 out of 2 hunks ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/dwrite/freetype.c
+|+++ b/dlls/dwrite/freetype.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+15 out of 15 hunks ignored
+The text leading up to this was:
+--------------------------
+|# neutron-zzz6-dwrite-fontface-keepalive
+|#
+|# Keep the N most recently used IDWriteFontFace objects alive so their RASTERISED GLYPH CACHES
+|# survive, instead of dying with the face and being re-rasterised through FreeType.
+|# Touches: dlls/dwrite/main.c, dlls/dwrite/font.c.
+|#
+|# ORDERING: zzz6 -- applies after neutron-zzz5-dwrite-parsed-font-cache, whose factory-level
+|# cache it sits beside and mirrors in shape.
+|#
+|# THE PROBLEM
+|# dwrite's glyph cache lives on the fontface. The factory's fontface cache tracks faces but holds
+|# NO REFERENCE -- a face unlinks itself when destroyed. Code that builds text layouts per frame
+|# therefore destroys and recreates faces constantly, and every new face starts with an EMPTY
+|# glyph cache.
+|#
+|# MEASURED (preserved-fixes/harnesses/glyphbench.c -- 5 text formats, 10 timeline-like strings,
+|# 40 frames), before -> after:
+|#   fontfaces created   2189  ->     1
+|#   glyph cache misses 39,824 ->   318
+|#   hit rate              66% ->   99%
+|#   ms/frame (best)      2.14 ->  1.47      (-31%)
+|#
+|# Motivated by a CPU profile of Premiere's timeline zoom (2026-07-30, runtime 11.10-16) which put
+|# ~19.6% of the UI thread in font rasterisation: libfreetype 8.98% plus another 10.6% of libc
+|# called FROM libfreetype (its allocation traffic).
+|#
+|# ⚠️ THE OBVIOUS FIX WAS WRONG, AND THIS IS WHY THE INSTRUMENTATION SHIPS WITH IT.
+|# The code carried a long comment arguing the 32 KB glyph cache was far too small and should be
+|# "a few MB". It is not the constraint: a sweep from 32 KB to 4 MB moved nothing (2.06-2.16
+|# ms/frame), because with faces dying constantly the cache never filled -- peak 3 KB, ZERO
+|# evictions. Capacity was never the problem; object LIFETIME was. Raising the cap would have been
+|# a no-op that looked like progress. Only after this patch does the cache actually fill (peak
+|# 32 KB), and even then a re-sweep shows no further gain, so the default is left ALONE.
+|# `NEUTRON_DWRITE_GLYPH_CACHE_KB` exists to re-measure that in a real app rather than guess.
+|#
+|# WHY NOT SHARE ONE GLYPH CACHE AT FACTORY LEVEL (the "obvious" bigger fix):
+|# cache entries are MUTATED after lookup (entry->advance, entry->bitmap) under the caller's
+|# fontface->cs. Sharing one cache across faces would require restructuring that locking across
+|# three hot call sites in a DLL every Adobe app loads -- reopening the freeze/deadlock class this
+|# project has spent months closing. Keeping the face alive gets the same glyph reuse and changes
+|# NO locking: each face still owns its cache under its own cs.
+|#
+|# BOUNDED at 24 faces. The evicted face is released OUTSIDE factory->cs, because a face's
+|# destructor takes that same lock to unlink itself from the fontface cache -- releasing the last
+|# reference while holding it would self-deadlock.
+|#
+|# Also included: TRACE-gated counters on the `nglyph` channel (hits/misses/evictions/peak, plus
+|# faces created/cleared). They are what proved the size hypothesis wrong and identified lifetime
+|# as the real mechanism; a statistic that never prints is not a measurement.
+|diff --git a/dlls/dwrite/font.c b/dlls/dwrite/font.c
+|index d33bc61c70e..4457568d5a3 100644
+|#
+|# MEASURED IN PREMIERE (30 s zoom, GPU mode, one build A/B'd via NEUTRON_DWRITE_FACE_KEEPALIVE):
+|#   fontfaces created  88,980 -> 5      (~3,000 faces/sec created while zooming)
+|#   glyph cache misses 587,522 -> 424   (63% -> 99% hit)
+|#   evictions               0 -> 0      peak 13 KB -> 17 KB of a 32 KB cap
+|# User-confirmed the keepalive-OFF arm was 'a little choppier' (test was NOT blind --
+|# corroboration, not proof; the counters are the evidence).
+|# The synthetic benchmark understated the churn by 40x (2189 vs 88,980) -- it got the
+|# mechanism right and the magnitude badly wrong. Confirm synthetics in the real app.
+|--- a/dlls/dwrite/main.c
+|+++ b/dlls/dwrite/main.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+7 out of 7 hunks ignored
+The text leading up to this was:
+--------------------------
+|dwrite: trailing whitespace must not cause a line to wrap.
+|
+|WHAT THE USER SEES: in Media Encoder and After Effects, UI titles render broken across
+|several rows instead of inline -- "Frame Size" appears as "Frame" above "Size". It looks
+|like a multi-word problem; it is not. SINGLE words break too ("Format", "Preset",
+|"Status"), which is what finally pointed at the real trigger.
+|
+|ROOT CAUSE: every one of Adobe's labels ends in a TRAILING SPACE. The drawbot measures the
+|label with IDWriteTextLayout::GetMetrics().width -- which by specification EXCLUDES trailing
+|whitespace -- and then lays the string out at exactly that width. Wine's line breaker counted
+|the trailing space toward the line width, so every such label overflowed by exactly the width
+|of that space, and DWRITE_WORD_WRAPPING_WRAP rewound to the last break opportunity. That is
+|why "Frame Size " became "Frame" / "Size " and "Format " became "Format" + a line holding
+|only the space. DirectWrite carries both `width` and `widthIncludingTrailingWhitespace`
+|precisely because trailing whitespace must not participate in this decision.
+|
+|THE FIX: keep accumulating `width` exactly as before and SNAPSHOT it into
+|`width_no_trailing_ws` at each non-whitespace cluster; compare that in both overflow tests.
+|
+|⚠️ IT MUST BE A SNAPSHOT, NOT ARITHMETIC -- two earlier attempts failed on floating point,
+|both caught only by the harness:
+|  * deferring the additions (`width += trailing_ws + w`) RE-ASSOCIATES the sum -> 3 failures;
+|  * subtracting afterwards (`width - trailing_ws`) is inexact, (a+b)-b != a -> 7 failures.
+|Both shifted results by an ulp, which made strings whose natural width lands on a
+|representable boundary wrap at their own width -- i.e. they reproduced the very bug being
+|fixed, in fewer cases. A snapshot is the exact partial sum, bit-identical to what the old
+|code compared, so text with NO trailing whitespace is provably unaffected.
+|
+|EVIDENCE:
+|  * Traced from the app itself (`NEUTRON_DWRITE_LAYOUTTRACE=1`, preserved as
+|    preserved-fixes/neutron-dwrite-layouttrace-diag.patch), which reported e.g.
+|    `LINES layoutW=36.684 textW=36.684 lines=2 text=L"Format "` and
+|    `LINES layoutW=55.152 textW=32.400 lines=2 text=L"Frame Size "`.
+|  * Regression test preserved-fixes/harnesses/wrapinvariant.c: 17 strings (9 of them the
+|    real trailing-space labels lifted verbatim from that trace) x 4 families x 5 sizes x 2
+|    weights -> PASS, 0 violations, with the sanity leg (`natW-0.01` must still wrap) still
+|    firing 680 times so the test can still fail.
+|  * User-confirmed in Media Encoder: column headers render inline.
+|
+|⚠️ AN EARLIER RUN OF THAT HARNESS REPORTED "0 violations" WHILE BOTH APPS WERE VISIBLY
+|BROKEN -- because none of its 8 strings had a trailing space. A harness only disproves what
+|it actually exercises. The trailing-space strings are now in it permanently.
+|
+|This is a DirectWrite conformance bug, not an Adobe quirk: it affects any application that
+|measures with `width` and then lays out at that value. Upstream-suitable.
+|
+|--- a/dlls/dwrite/layout.c
+|+++ b/dlls/dwrite/layout.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+3 out of 3 hunks ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/dwrite/layout.c
+|+++ b/dlls/dwrite/layout.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+1 out of 1 hunk ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/dwrite/main.c
+|+++ b/dlls/dwrite/main.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+1 out of 1 hunk ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/gdiplus/graphics.c
+|+++ b/dlls/gdiplus/graphics.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+6 out of 6 hunks ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/win32u/hook.c
+|+++ b/dlls/win32u/hook.c
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+2 out of 2 hunks ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/win32u/ntuser_private.h
+|+++ b/dlls/win32u/ntuser_private.h
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+1 out of 1 hunk ignored
+The text leading up to this was:
+--------------------------
+|--- a/dlls/win32u/win32u_private.h
+|+++ b/dlls/win32u/win32u_private.h
+--------------------------
+File to patch: 
+Skip this patch? [y] 
+1 out of 1 hunk ignored
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -3130,6 +3130,21 @@
+     if (!effect->input_count)
+         return NULL;
+ 
++    /* ⚠️ NEUTRON 2026-08-03 -- REGRESSION FIX. This used to return inputs[0] for ANY effect with
++     * an input. DrawImage() follows this chain, so every app calling DrawImage() on a REAL,
++     * working effect got the effect's INPUT drawn instead of its OUTPUT -- the effect silently
++     * did nothing. It shipped because it was only ever tested against After Effects, whose
++     * Unpremultiply IS a stub, where the fallback is correct and invisible.
++     *
++     * What it cost: Premiere's Program Monitor draws video through D2D effects, so it rendered
++     * black and left trails on resize (nothing was compositing the real output). It read exactly
++     * like a present-path bug and sent the investigation to dcomp, DXVK and winewayland first.
++     *
++     * Only OUR stubs may pass through. A stub has no implementation, so DrawImage() on its output
++     * would otherwise draw nothing at all -- that, and only that, is what this is for. */
++    if (!effect->neutron_passthrough)
++        return NULL;
++
+     return effect->inputs[0];
+ }
+ 
+@@ -3627,6 +3642,12 @@
+     object->ID2D1Image_iface.lpVtbl = &d2d_effect_image_vtbl;
+     object->refcount = 1;
+     object->effect_context = effect_context;
++    /* NEUTRON: mark ONLY our two registration stubs as passthrough. Whitelisting the exact
++     * CLSIDs, rather than inferring "is a stub" from having no properties, keeps every real
++     * effect on its normal path -- an inference here is what regressed Premiere's Program
++     * Monitor. If another stub is ever added, add it here deliberately. */
++    object->neutron_passthrough = IsEqualGUID(effect_id, &CLSID_D2D1UnPremultiply)
++            || IsEqualGUID(effect_id, &CLSID_D2D1Premultiply);
+ 
+     /* Create properties */
+     d2d_effect_duplicate_properties(object, &object->properties, reg->properties);
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -353,6 +353,50 @@
+ /* NEUTRON LAZY GROUP PATH: force a group's combined path before reading ->outline. */
+ HRESULT d2d_geometry_require_outline(struct d2d_geometry *geometry);
+ 
++/* NEUTRON: skip the DC-direct blit-back for a frame in which D2D drew NOTHING
++ * (env NEUTRON_D2D_SKIPEMPTY=1).
++ *
++ * WHY. DC-direct reads the window's current pixels into the D2D bitmap at BeginDraw, lets D2D
++ * draw over them, then blits the drawn union back. If D2D issued no operations at all, that
++ * blit writes back exactly what it read -- a no-op AT BEST. It is actively harmful if anything
++ * else painted the window between our read and our write-back, because we then restore the
++ * stale pixels over that content.
++ *
++ * After Effects' composition viewer (2734x1174) does precisely this: measured over 91 frames it
++ * reports ops=0 clears=0 every time, with a FULL-PANEL union, while issuing no GPU present of
++ * any kind (0 DXVK presents, 0 OpenGL). So its content -- if it arrives by GDI, which is the one
++ * path none of our tracing covers -- would be erased by a full-panel blit-back of pixels
++ * captured before it was drawn.
++ *
++ * Skipping is correct regardless of whether that is the cause: a frame that drew nothing has
++ * nothing to composite. */
++static inline BOOL neutron_skipempty(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        v = (GetEnvironmentVariableA("NEUTRON_D2D_SKIPEMPTY", buf, sizeof(buf)) && buf[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
++/* NEUTRON op-trace level 2 (NEUTRON_D2D_OPTRACE=2): drop the timeline-shaped size filter and
++ * trace EVERY DC-direct container. The level-1 filter (>=3000 wide, <=700 tall) was written for
++ * Premiere's timeline rows and silently excludes After Effects' composition viewer (2734x1174),
++ * which is exactly the window whose content never appears. Level 2 is noisy by design -- use it
++ * for one targeted run, not a soak. */
++static inline BOOL neutron_optrace_all(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        v = (GetEnvironmentVariableA("NEUTRON_D2D_OPTRACE", buf, sizeof(buf)) && buf[0] == '2') ? 1 : 0;
++    }
++    return v;
++}
++
+ /* NEUTRON op-trace (env NEUTRON_D2D_OPTRACE=1): per-frame op/clear log for the timeline
+  * rows -- does the app WIPE its own panel and then draw almost nothing? */
+ static inline BOOL neutron_optrace(void)
+@@ -361,7 +405,10 @@
+     if (v < 0)
+     {
+         char buf[8];
+-        v = (GetEnvironmentVariableA("NEUTRON_D2D_OPTRACE", buf, sizeof(buf)) && buf[0] == '1') ? 1 : 0;
++        /* NEUTRON: level 2 must IMPLY level 1. Testing only for '1' meant NEUTRON_D2D_OPTRACE=2
++         * disabled every trace it was supposed to widen, and the run logged nothing at all. */
++        v = (GetEnvironmentVariableA("NEUTRON_D2D_OPTRACE", buf, sizeof(buf))
++                && (buf[0] == '1' || buf[0] == '2')) ? 1 : 0;
+     }
+     return v;
+ }
+@@ -738,6 +785,7 @@
+     int excl_count;
+     DWORD excl_tick;               /* GetTickCount of last scan (0 = never) */
+     int excl_logged;               /* one-time per-hwnd diagnostic emitted */
++    int skipempty_logged;          /* one-time SKIPEMPTY diagnostic emitted */
+     /* NEUTRON D2D DC-DIRECT: present-rate probe -- is this window SPINNING (present ->
+      * InvalidateRect -> WM_PAINT -> present ...)? Logged every 1000 presents. */
+     unsigned int pres_n;
+@@ -1310,15 +1358,25 @@
+     return v;
+ }
+ 
+-/* NEUTRON WIC READ-THROUGH: off by default. It changes who owns rendered pixels and when
+- * they are copied, which is worth soaking behind a switch before it becomes the default
+- * -- the same rollout the large-block heap cache got. */
++/* NEUTRON WIC READ-THROUGH: ON BY DEFAULT since 11.10-19. Set NEUTRON_WIC_READTHROUGH=0
++ * to disable.
++ *
++ * It shipped OFF in 11.10-18 and was soaked for hours of real Premiere use with the gate on:
++ * every hard counter stayed zero (no stale frames, no faults, no cap hits, no declined
++ * reads, no access violations), 3,432 reads served, peak working set 1 MB against a 192 MB
++ * budget. Correctness is separately covered by preserved-fixes/harnesses/wicrt.c -- 227
++ * pixel-value checks that pass with the gate both off and on, including the interleave case
++ * (draw A, draw B, then read A) that a naive deferred download fails.
++ *
++ * The escape hatch stays because this changes who owns rendered pixels: if a wrong-image
++ * bug ever appears, NEUTRON_WIC_READTHROUGH=0 is the one-step bisect. */
+ static inline BOOL neutron_wic_readthrough(void)
+ {
+     static int v = -1;
+     if (v < 0)
+     {
+         char buf[8];
++        /* absent -> ON; "0" -> OFF */
+         v = (GetEnvironmentVariableA("NEUTRON_WIC_READTHROUGH", buf, sizeof(buf)) && buf[0] == '0') ? 0 : 1;
+     }
+     return v;
+@@ -1427,6 +1485,11 @@
+     ID2D1Image **inputs;
+     size_t inputs_size;
+     size_t input_count;
++    /* NEUTRON: this effect is one of OUR registration stubs (Unpremultiply/Premultiply), which
++     * have no implementation at all -- so DrawImage() on their output must fall back to drawing
++     * the source input. NEVER set for a real effect: doing so silently draws an effect's INPUT
++     * instead of its OUTPUT, bypassing the effect. See d2d_effect_image_get_source(). */
++    BOOL neutron_passthrough;
+ };
+ 
+ ID2D1Image *d2d_effect_image_get_source(ID2D1Image *iface);
+@@ -1524,6 +1587,9 @@
+ void d2d_command_list_push_layer(struct d2d_command_list *command_list, const struct d2d_device_context *context,
+         const D2D1_LAYER_PARAMETERS1 *params);
+ void d2d_command_list_pop_layer(struct d2d_command_list *command_list);
++/* NEUTRON: replay a closed command list into a device context (DrawImage). */
++HRESULT d2d_command_list_playback(struct d2d_command_list *command_list, ID2D1DeviceContext *context,
++        const D2D1_POINT_2F *target_offset, const D2D1_RECT_F *image_rect);
+ 
+ static inline BOOL d2d_array_reserve(void **elements, size_t *capacity, size_t count, size_t size)
+ {

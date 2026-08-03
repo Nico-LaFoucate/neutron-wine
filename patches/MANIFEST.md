@@ -18,6 +18,49 @@ tree in any order (verified: the full set reproduces the working source byte-for
 
 ## Production (`patches/`)
 
+### `neutron-wgl-nv-dx-interop.mypatch`  🔑 NEW 2026-08-03
+**`WGL_NV_DX_interop` / `_interop2`** — the OpenGL↔DirectX sharing extension. `dlls/win32u/opengl.c`
+advertises it and implements the 8 entry points; `dlls/opengl32/wgl.c` adds the D3D-object
+inspection it needs; `make_opengl` + the generated `thunks.c/h` + `include/wine/wgl.h` carry the
+plumbing.
+
+**Why it matters:** Premiere's display surface runs on the **OpenGL** backend
+(`DS.DisableDirectXDisplay=true`), so without this extension its **Program Monitor renders BLACK**
+while the rest of the UI looks perfectly fine. Bisected in both directions 2026-08-03 (see
+`~/neutron/docs/wiki/INCIDENTS.md`): reverting these three binaries alone blacks the monitor;
+reverting `dxcore` alone does not.
+
+⛔ **The three binaries move as ONE SET** (`win32u.so`, `opengl32.so`, `opengl32.dll`) — they share
+the `dlls/opengl32/unixlib.h` win32u↔opengl32 interface. Mixing vintages gives
+`cuGLGetDevices ret=219` and a **"display surface initialization failed"** dialog at startup.
+
+Base: plain upstream HEAD is correct here — **wine-staging touches none of these 7 files** (checked).
+Verified: applies with no rejects and reproduces all 7 files **byte-for-byte**.
+
+### `neutron-zzzzz-d2d1-effect-passthrough-scope.mypatch`  NEW 2026-08-03
+Captures the d2d1 dev-tree work no patch covered. Chiefly the **regression fix** to
+`d2d_effect_image_get_source()`: it returned `inputs[0]` for **any** effect with an input, and
+`DrawImage()` follows that chain — so every app drawing through a **real** effect got the effect's
+**INPUT drawn instead of its OUTPUT**. Invisible in AE (its `Unpremultiply` IS a stub, so the
+fallback is correct); it blacked Premiere's Program Monitor. Now whitelisted to
+`CLSID_D2D1UnPremultiply` / `CLSID_D2D1Premultiply` via `d2d_effect.neutron_passthrough`.
+Also carries the previously-uncaptured `neutron_skipempty` DC-direct work.
+
+**Named `zzzzz` deliberately: it must collate LAST among the d2d1 set.** It was generated as
+base(HEAD + all 50 earlier patches) → dev tree, which is only valid for a patch nothing follows.
+⚠️ `neutron-d2d1-unpremultiply-effect.mypatch` is a MIDDLE patch and therefore **cannot** be
+regenerated this way — later patches also edit `d2d1_private.h`/`device.c`, so a regeneration
+would swallow their hunks. Leave it alone; add to `zzzzz` instead.
+Verified: full-set apply reproduces `effect.c` and `d2d1_private.h` byte-for-byte.
+
+### Regenerating a patch
+Use `~/neutron/preserved-fixes/harnesses/regen-mypatch.sh <patch> <file>...`. It rebuilds the true
+base (HEAD + every earlier patch in **system collation order**, seeding every file they touch) and
+diffs against the dev tree. **Only valid when no later patch touches the same files** — otherwise
+you capture theirs too. It refuses any file wine-staging modifies, since HEAD is then the wrong base.
+
+
+
 ### `neutron-winewayland.mypatch`
 Combined `winewayland.drv` patch — fractional-scale + xdg_popup menus + client-side decorations. These
 three were originally separate patches but overlap heavily in the same `winewayland.drv` files and are
