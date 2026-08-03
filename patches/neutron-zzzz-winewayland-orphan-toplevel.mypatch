@@ -1,0 +1,60 @@
+diff --git a/dlls/winewayland.drv/window.c b/dlls/winewayland.drv/window.c
+index 2b3b98f5c7c..4422ebf67e5 100644
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -59,6 +59,39 @@ static BOOL neutron_wl_diag(void)
+     if (v < 0) { const char *e = getenv("NEUTRON_WL_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
+     return v;
+ }
++
++/* NEUTRON orphan-toplevel fix (NEUTRON_WL_ORPHAN_TOPLEVEL=0 to disable).
++ *
++ * A wl_subsurface is only ever shown when its PARENT surface is mapped. An owned window whose
++ * owner has no xdg_surface yet therefore becomes a subsurface of something that does not exist
++ * on screen, and is never displayed at all -- not lost, not mispositioned, attached to nothing.
++ *
++ * After Effects' splash screen is exactly this: an owned `#32770` dialog, 1301x877, which AE
++ * shows ~22,000 log lines BEFORE the main window that owns it first gets a Wayland surface.
++ * Photoshop and Premiere are unaffected: their splashes are not owned by an unmapped window. */
++static BOOL neutron_orphan_toplevel(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_WL_ORPHAN_TOPLEVEL"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++
++/* Only the OUTERMOST orphan may be promoted: the window's owner must be a genuine root (a window
++ * with no owner of its own) that simply has not been mapped yet.
++ *
++ * Without this test the first cut promoted TWO windows during AE's startup and produced a ghost
++ * window behind the splash:
++ *   0x70104  splash, 1301x877  owner 0x20064 (the main app window, itself unowned)  <- want this
++ *   0x10108  dialog,  503x764  owner 0x70104 (the splash -- itself an owned dialog) <- ghost
++ * Both are seen while their owner is still unmapped, so "is the owner visible yet" cannot separate
++ * them; ownership DEPTH can. A window owned by another owned window must wait and attach to it
++ * once that one is resolved, otherwise every dialog in an unmapped chain becomes its own toplevel. */
++static BOOL neutron_owner_is_root(HWND hwnd)
++{
++    HWND owner = NtUserGetWindowRelative(hwnd, GW_OWNER);
++    if (!owner || owner == hwnd) return FALSE;
++    return !NtUserGetWindowRelative(owner, GW_OWNER);
++}
+ static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
+ 
+ /***********************************************************************
+@@ -246,6 +279,15 @@ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *dat
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
++    else if (toplevel_surface && !toplevel_surface->xdg_surface && neutron_orphan_toplevel() &&
++             neutron_owner_is_root(data->hwnd))
++    {
++        /* the prospective parent has no xdg_surface, so a subsurface of it can never be shown --
++         * see neutron_orphan_toplevel(). Give this window its own toplevel instead. */
++        role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
++        ERR("neutron-orphan: hwnd=%p promoted SUBSURFACE->TOPLEVEL (owner is an unmapped root)\n",
++            data->hwnd);
++    }
+     else if (toplevel_surface) role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     else role = WAYLAND_SURFACE_ROLE_TOPLEVEL;
+ 

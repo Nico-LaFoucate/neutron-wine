@@ -234,6 +234,19 @@ enumeration (`DedicatedAdapterMemory`, `DedicatedSystemMemory`, `SharedSystemMem
 init** ("An unrecoverable problem has occurred"). Memory figures come from the wined3d adapter
 identifier; integrated/detachable default to FALSE (discrete desktop GPU). Touches: `dlls/dxcore/dxcore.c`.
 
+### `neutron-dxcore-event-notification.mypatch`
+Implements `IDXCoreAdapterFactory`'s three notification methods, which upstream Wine left as stubs
+(`IsNotificationTypeSupported` → FALSE, `Register`/`UnregisterEventNotification` → `E_NOTIMPL`).
+**After Effects 2025** calls `RegisterEventNotification(AdapterBudgetChange)` while bringing up its
+Direct3D 12 display layer and was refused outright. Accepting a registration that never fires is
+correct — Windows invokes the callback only when the adapter set or memory budget actually changes,
+and it is legal for that never to happen; refusing to register is not. Bookkeeping is real (64-slot
+table, unique cookies, a reference held on the registered object, working Unregister), so
+register/unregister/re-register behaves correctly; Wine simply has no event source yet.
+⚠️ **This did NOT fix the AE composition viewer** (measured: still no swapchain, still blank) — it is
+a real defect fixed on its own merits, not the cause of that bug. Applies on top of
+`neutron-dxcore-xpuinfo.mypatch`. Touches: `dlls/dxcore/dxcore.c`.
+
 ### `neutron-user32-windowfeedbacksetting.mypatch`
 Adds the missing `SetWindowFeedbackSetting` (USER32) export as a no-op touch/pen feedback stub.
 Photoshop calls it during document-window creation; without a real export the import stub raises an
@@ -379,3 +392,26 @@ aborts the build. Removed as redundant; the fix is still in every build via stag
 `msvcrt!_FindAndUnlinkFrame` dereferenced NULL when the frame list is empty and the unlinked frame
 isn't the head — hit during the Adobe installer's C++ exception unwinding. One-line guard. Ported from
 PhialsBasement/wine-adobe-installers.
+
+**`neutron-d2d1-unpremultiply-effect.mypatch` (2026-08-02) — After Effects composition viewer:**
+Wine's `dlls/d2d1/effect.c` registered 17 built-in effects; `CLSID_D2D1UnPremultiply` was not one of
+them ("premultiply" appeared nowhere in d2d1). After Effects' hardware blit
+(in `aedisplay.dll`) calls
+`ID2D1DeviceContext::CreateEffect(CLSID_D2D1UnPremultiply)` on every blit, turns the failed HRESULT
+into `0xA00F0001`, and **throws it as a bare `int`**; the blit loop catches it,
+logs `Permanent failure: -1609629695`, and sets a **process-wide
+latch** that kills the hardware blit for the rest of the session. Measured:
+`warn:d2d:d2d_effect_create Effect id {fb9ac489-…} not found.` ×13, matching 13 latch messages, on
+AE's blit thread. No other D2D effect failed to be created: the blit needs exactly one missing effect,
+this one.
+Registers `CLSID_D2D1UnPremultiply` and `CLSID_D2D1Premultiply` in the same stub form as the other
+built-ins, and adds `d2d_effect_image_get_source()` so a stub effect's output image can be resolved
+to its source input.
+⚠️ **INCOMPLETE CAPTURE**: the matching `d2d_device_context_DrawImage()` hunk (follow
+`d2d_effect_image_get_source` before drawing, so the effect's output actually renders) is NOT in
+this file — it sits inside the heavily-patched `device.c` and must be folded into the existing
+device.c patch. Without it `CreateEffect` succeeds and nothing throws, but the effect draws nothing.
+✅ Verified with it: the whole D2D half of AE's blit succeeds — `CreateEffect(unpremultiply) hr=0`,
+`SetTarget(dxgi-backed) 2734x1174`, `DrawImage(effect->source)`, `EndDraw(bitmap-target,drew,OK)`.
+❌ Does NOT by itself make the composition appear: AE's Direct2D UI-overlay draw then
+fails on its own (command-list overlay draw) and throws the same generic code. Second, separate bug.

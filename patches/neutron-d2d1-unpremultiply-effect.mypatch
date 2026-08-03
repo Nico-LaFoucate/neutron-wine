@@ -1,0 +1,121 @@
+diff --git a/dlls/d2d1/d2d1_private.h b/dlls/d2d1/d2d1_private.h
+index 74da2342a69..be4b4d0c20a 100644
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -1429,6 +1429,7 @@ struct d2d_effect
+     size_t input_count;
+ };
+ 
++ID2D1Image *d2d_effect_image_get_source(ID2D1Image *iface);
+ HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
+         ID2D1Effect **effect);
+ void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
+diff --git a/dlls/d2d1/device.c b/dlls/d2d1/device.c
+index 3a9f3be50f8..3104d6b615c 100644
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -3829,6 +3829,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
+     struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+     neutron_op(context, NEUTRON_OP_DRAWIMAGE);
+     ID2D1Bitmap *bitmap;
++    unsigned int i;
+ 
+     TRACE("iface %p, image %p, target_offset %s, image_rect %s, interpolation_mode %#x, composite_mode %#x.\n",
+             iface, image, debug_d2d_point_2f(target_offset), debug_d2d_rect_f(image_rect),
+@@ -3843,6 +3844,17 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawImage(ID2D1DeviceContext6 *
+         return;
+     }
+ 
++    /* Built-in effects are registration stubs, so their output image has nothing behind it.
++     * Follow it back to the source input, bounded in case inputs ever form a cycle. */
++    for (i = 0; i < 8; ++i)
++    {
++        ID2D1Image *source;
++
++        if (!(source = d2d_effect_image_get_source(image)))
++            break;
++        image = source;
++    }
++
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+     {
+         d2d_command_list_draw_image(context->target.command_list, image, target_offset, image_rect,
+diff --git a/dlls/d2d1/effect.c b/dlls/d2d1/effect.c
+index f56f7a8afc7..0363613d502 100644
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -1857,6 +1857,40 @@ static HRESULT __stdcall scale_factory(IUnknown **effect)
+     return d2d_effect_create_impl(effect, &properties, sizeof(properties));
+ }
+ 
++static const WCHAR unpremultiply_description[] =
++L"<?xml version='1.0'?>                                                   \
++  <Effect>                                                                \
++    <Property name='DisplayName' type='string' value='Unpremultiply'/>    \
++    <Property name='Author'      type='string' value='The Wine Project'/> \
++    <Property name='Category'    type='string' value='Stub'/>             \
++    <Property name='Description' type='string' value='Unpremultiply'/>    \
++    <Inputs >                                                             \
++      <Input name='Source'/>                                              \
++    </Inputs>                                                             \
++  </Effect>";
++
++static HRESULT __stdcall unpremultiply_factory(IUnknown **effect)
++{
++    return d2d_effect_create_impl(effect, NULL, 0);
++}
++
++static const WCHAR premultiply_description[] =
++L"<?xml version='1.0'?>                                                   \
++  <Effect>                                                                \
++    <Property name='DisplayName' type='string' value='Premultiply'/>      \
++    <Property name='Author'      type='string' value='The Wine Project'/> \
++    <Property name='Category'    type='string' value='Stub'/>             \
++    <Property name='Description' type='string' value='Premultiply'/>      \
++    <Inputs >                                                             \
++      <Input name='Source'/>                                              \
++    </Inputs>                                                             \
++  </Effect>";
++
++static HRESULT __stdcall premultiply_factory(IUnknown **effect)
++{
++    return d2d_effect_create_impl(effect, NULL, 0);
++}
++
+ void d2d_effects_init_builtins(struct d2d_factory *factory)
+ {
+     static const struct builtin_description
+@@ -1888,6 +1922,8 @@ void d2d_effects_init_builtins(struct d2d_factory *factory)
+         { &CLSID_D2D1HueRotation, X2(hue_rotation) },
+         { &CLSID_D2D1Saturation, X2(saturation) },
+         { &CLSID_D2D1Scale, X2(scale) },
++        { &CLSID_D2D1UnPremultiply, X(unpremultiply) },
++        { &CLSID_D2D1Premultiply, X(premultiply) },
+ #undef X2
+ #undef X
+     };
+@@ -3079,6 +3115,24 @@ static const ID2D1ImageVtbl d2d_effect_image_vtbl =
+     d2d_effect_image_GetFactory,
+ };
+ 
++/* The built-in effects are registration stubs: they carry properties but no transform graph,
++ * so the ID2D1Image handed out by GetOutput() has no pixels behind it and DrawImage() drew
++ * nothing at all. Resolve such an image back to the effect's own source input, which is at
++ * least the unprocessed picture rather than a blank. */
++ID2D1Image *d2d_effect_image_get_source(ID2D1Image *iface)
++{
++    struct d2d_effect *effect;
++
++    if (!iface || iface->lpVtbl != &d2d_effect_image_vtbl)
++        return NULL;
++
++    effect = CONTAINING_RECORD(iface, struct d2d_effect, ID2D1Image_iface);
++    if (!effect->input_count)
++        return NULL;
++
++    return effect->inputs[0];
++}
++
+ static inline struct d2d_effect_properties *impl_from_ID2D1Properties(ID2D1Properties *iface)
+ {
+     return CONTAINING_RECORD(iface, struct d2d_effect_properties, ID2D1Properties_iface);

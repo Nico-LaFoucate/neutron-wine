@@ -1,0 +1,175 @@
+Wine dxcore: implement adapter event notification registration
+
+Wine's IDXCoreAdapterFactory left three notification methods as stubs:
+
+    IsNotificationTypeSupported  -> FALSE
+    RegisterEventNotification    -> E_NOTIMPL
+    UnregisterEventNotification  -> E_NOTIMPL
+
+After Effects 2025 calls RegisterEventNotification with type
+AdapterBudgetChange while bringing up its display layer (in
+DisplaySurface.dll, which uses DirectX on Windows) and is refused
+outright:
+
+    fixme:dxcore:dxcore_adapter_factory_RegisterEventNotification
+        ... type 2 ... stub!
+
+Accepting a registration that never fires is correct behaviour, not a
+pretence: Windows invokes the callback only when the adapter set or its
+memory budget actually changes, and it is legal for that never to happen
+during a run.  Refusing to register at all is not.  Wine has no source
+for these events yet, so no callback fires, but the bookkeeping is real
+-- unique cookies, a reference held on the registered object for as long
+as it is remembered, and an Unregister that genuinely removes the
+registration -- so an application that registers, unregisters and
+re-registers behaves correctly.
+
+Note: this did NOT fix the After Effects composition viewer (measured:
+still no swapchain created, panel still blank), so it is not the cause of
+that bug.  It is a real defect on its own merits and is fixed here as one.
+
+Applies on top of neutron-dxcore-xpuinfo.mypatch.
+
+--- a/dlls/dxcore/dxcore.c
++++ b/dlls/dxcore/dxcore.c
+@@ -613,24 +613,133 @@
+     return E_INVALIDARG;
+ }
+ 
++/* NEUTRON (2026-08-01): adapter event notifications.
++ *
++ * These three were stubs returning FALSE / E_NOTIMPL. After Effects 2025 calls
++ * RegisterEventNotification(type = AdapterBudgetChange) while bringing up its display layer --
++ * DisplaySurface.dll, which uses DirectX on Windows -- and a hard failure there
++ * is a plausible reason for it to abandon that backend. Measured symptom: no swapchain is ever
++ * created for any window in the whole session and the composition viewer stays blank.
++ *
++ * A registration that is accepted and never fires is not a lie: Windows invokes the callback
++ * only when the adapter set or its memory budget actually changes, and it is entirely legal for
++ * that never to happen during a run. What was NOT legal was refusing to register at all.
++ * Wine has no source of these events yet, so nothing fires -- but the bookkeeping is real, the
++ * cookies are unique, and Unregister genuinely removes a registration, so an application that
++ * registers, unregisters and re-registers behaves correctly.
++ *
++ * Registrations are process-wide because the factory is a singleton (see dxcore_adapter_factory).
++ */
++struct dxcore_notification
++{
++    uint32_t cookie;                            /* 0 = free slot */
++    IUnknown *object;
++    DXCoreNotificationType type;
++    PFN_DXCORE_NOTIFICATION_CALLBACK callback;
++    void *context;
++};
++
++static struct dxcore_notification dxcore_notifications[64];
++static uint32_t dxcore_next_cookie = 1;
++static CRITICAL_SECTION dxcore_notification_cs;
++static CRITICAL_SECTION_DEBUG dxcore_notification_cs_debug =
++{
++    0, 0, &dxcore_notification_cs,
++    { &dxcore_notification_cs_debug.ProcessLocksList, &dxcore_notification_cs_debug.ProcessLocksList },
++    0, 0, { (DWORD_PTR)(__FILE__ ": dxcore_notification_cs") }
++};
++static CRITICAL_SECTION dxcore_notification_cs = { &dxcore_notification_cs_debug, -1, 0, 0, 0, 0 };
++
+ static BOOL STDMETHODCALLTYPE dxcore_adapter_factory_IsNotificationTypeSupported(IDXCoreAdapterFactory *iface, DXCoreNotificationType type)
+ {
+-    FIXME("iface %p, type %u stub!\n", iface, type);
+-    return FALSE;
++    TRACE("iface %p, type %u\n", iface, type);
++
++    switch (type)
++    {
++        case AdapterListStale:
++        case AdapterNoLongerValid:
++        case AdapterBudgetChange:
++        case AdapterHardwareContentProtectionTeardown:
++            return TRUE;
++        default:
++            WARN("unknown notification type %u\n", type);
++            return FALSE;
++    }
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxcore_adapter_factory_RegisterEventNotification(IDXCoreAdapterFactory *iface, IUnknown *dxcore_object,
+         DXCoreNotificationType type, PFN_DXCORE_NOTIFICATION_CALLBACK callback, void *callback_context, uint32_t *event_cookie)
+ {
+-    FIXME("iface %p, dxcore_object %p, type %u, callback %p, callback_context %p, event_cookie %p stub!\n", iface, dxcore_object, type, callback,
+-            callback_context, event_cookie);
+-    return E_NOTIMPL;
++    unsigned int i;
++
++    TRACE("iface %p, dxcore_object %p, type %u, callback %p, callback_context %p, event_cookie %p\n",
++            iface, dxcore_object, type, callback, callback_context, event_cookie);
++
++    if (!dxcore_object || !callback || !event_cookie)
++        return E_INVALIDARG;
++    if (!dxcore_adapter_factory_IsNotificationTypeSupported(iface, type))
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&dxcore_notification_cs);
++
++    for (i = 0; i < ARRAY_SIZE(dxcore_notifications); i++)
++        if (!dxcore_notifications[i].cookie) break;
++
++    if (i == ARRAY_SIZE(dxcore_notifications))
++    {
++        LeaveCriticalSection(&dxcore_notification_cs);
++        WARN("no free notification slots\n");
++        return E_OUTOFMEMORY;
++    }
++
++    /* Hold a reference for as long as we remember the object, exactly as a real registration
++     * would -- otherwise the caller could release it and leave us a dangling pointer. */
++    IUnknown_AddRef(dxcore_object);
++
++    dxcore_notifications[i].cookie = dxcore_next_cookie++;
++    dxcore_notifications[i].object = dxcore_object;
++    dxcore_notifications[i].type = type;
++    dxcore_notifications[i].callback = callback;
++    dxcore_notifications[i].context = callback_context;
++    *event_cookie = dxcore_notifications[i].cookie;
++
++    LeaveCriticalSection(&dxcore_notification_cs);
++
++    FIXME("registered notification type %u as cookie %u; Wine has no source for these events, "
++          "so the callback will not fire\n", type, *event_cookie);
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE dxcore_adapter_factory_UnregisterEventNotification(IDXCoreAdapterFactory *iface, uint32_t event_cookie)
+ {
+-    FIXME("iface %p, event_cookie %u stub!\n", iface, event_cookie);
+-    return E_NOTIMPL;
++    IUnknown *object = NULL;
++    unsigned int i;
++
++    TRACE("iface %p, event_cookie %u\n", iface, event_cookie);
++
++    if (!event_cookie)
++        return E_INVALIDARG;
++
++    EnterCriticalSection(&dxcore_notification_cs);
++
++    for (i = 0; i < ARRAY_SIZE(dxcore_notifications); i++)
++    {
++        if (dxcore_notifications[i].cookie != event_cookie) continue;
++        object = dxcore_notifications[i].object;
++        memset(&dxcore_notifications[i], 0, sizeof(dxcore_notifications[i]));
++        break;
++    }
++
++    LeaveCriticalSection(&dxcore_notification_cs);
++
++    if (!object)
++    {
++        WARN("unknown event cookie %u\n", event_cookie);
++        return E_INVALIDARG;
++    }
++
++    IUnknown_Release(object);
++    return S_OK;
+ }
+ 
+ static const struct IDXCoreAdapterFactoryVtbl dxcore_adapter_factory_vtbl =
