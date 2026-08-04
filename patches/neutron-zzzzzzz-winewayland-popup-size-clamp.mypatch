@@ -1,0 +1,49 @@
+# NEUTRON: clamp xdg_positioner size to >= 1x1.
+#
+# A non-positive xdg_positioner size is a Wayland protocol violation; the compositor
+# destroys the connection and winewayland then terminates the process. Win32 allows an
+# empty menu rect, so an app popping an empty dropdown killed itself instantly.
+# Found 2026-08-04: Animate exited on any dropdown-menu click (KWin: 'width and height
+# must be positive and non-zero'). Sorts last so it lands on top of neutron-winewayland.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -589,15 +589,37 @@
+ {
+     struct xdg_positioner *xdg_positioner =
+         xdg_wm_base_create_positioner(process_wayland.xdg_wm_base);
++    int width, height;
+ 
+     if (!xdg_positioner) return NULL;
+ 
++    /* NEUTRON: xdg_positioner.set_size REQUIRES a strictly positive size; a zero or
++     * negative one is a protocol violation (XDG_POSITIONER_ERROR_INVALID_INPUT) and the
++     * compositor answers by DESTROYING THE CONNECTION -- wayland_read_events_thread then
++     * terminates the whole process. Win32 has no such rule: an empty menu/tooltip rect is
++     * perfectly legal there and simply shows nothing, so any app that pops an empty menu
++     * killed itself instantly under winewayland. Measured 2026-08-04: Animate exited the
++     * moment a dropdown menu was clicked, with KWin reporting
++     *   [destroyed object]: error 0: width and height must be positive and non-zero
++     * Two ways in: an empty popup window rect, and -- more insidious -- the reposition
++     * path below, which scales width/height through wayland_surface_coords_from_window()
++     * for fractional scale and can ROUND a small menu down to 0. Clamp at the single
++     * choke point both paths share. */
++    width = config->width > 0 ? config->width : 1;
++    height = config->height > 0 ? config->height : 1;
++    if (width != config->width || height != config->height)
++    {
++        WARN("popup size %dx%d is not strictly positive, clamping to %dx%d "
++             "(a non-positive xdg_positioner size would kill the connection)\n",
++             config->width, config->height, width, height);
++    }
++
+     xdg_positioner_set_anchor_rect(xdg_positioner, owner->geometry.left,
+                                    owner->geometry.top, 1, 1);
+     xdg_positioner_set_anchor(xdg_positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+     xdg_positioner_set_gravity(xdg_positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+     xdg_positioner_set_offset(xdg_positioner, config->x, config->y);
+-    xdg_positioner_set_size(xdg_positioner, config->width, config->height);
++    xdg_positioner_set_size(xdg_positioner, width, height);
+     /* Let the compositor slide the popup to keep it on-screen. Slide-only keeps
+      * the size constant so it stays consistent with our fixed menu buffer and
+      * window geometry (flip/resize would change size/orientation). */
