@@ -19,3 +19,40 @@
          v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DIRECT", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
      }
      return v;
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -205,12 +205,32 @@
+     HWND a;
+     int depth;
+ 
++    HWND native_host = NULL;
++
++    /* NEUTRON 2026-08-04: Adobe uses TWO different CEP host window classes, and matching only the
++     * first one meant a whole app never got this present path:
++     *   Premiere (Captioneer panel) -> WC_PLUGPLUG_HTMLEXTENSION_CLASS_NAME   (matched, worked)
++     *   Animate  (New Document)     -> PLUGPLUG_UI_NATIVE_WINDOW_CLASS_NAME   (NOT matched)
++     * With no host found, `target` fell back to the same-process window, `cross_proc` was computed
++     * as 0, the shared-memory bridge never engaged, and Animate's New Document dialog rendered
++     * WHITE and non-interactive -- its pixels stayed in the CEPHtmlEngine process. Its window chain
++     * spans FOUR pids (Intermediate D3D Window <- Chrome_WidgetWin_0 <- CefBrowserWindow <-
++     * {guid} <- PLUGPLUG_UI_NATIVE_WINDOW_CLASS_NAME <- #32769), so it is exactly the cross-process
++     * case this path exists for.
++     *
++     * ⚠️ Deliberately ADDITIVE: HTMLEXTENSION still wins outright, and the native host is only used
++     * when the chain contains no HTMLEXTENSION at all. Returning whichever matched FIRST while
++     * walking up would have changed which ancestor Premiere selects, and Premiere's panel works
++     * today -- this must not disturb it. */
+     for (a = hwnd, depth = 0; a && depth < 16; a = GetAncestor(a, GA_PARENT), depth++)
+     {
+-        if (GetClassNameW(a, cls, 128) > 0 && wcsstr(cls, L"HTMLEXTENSION"))
++        if (GetClassNameW(a, cls, 128) <= 0) continue;
++        if (wcsstr(cls, L"HTMLEXTENSION"))
+             return a;
++        if (!native_host && wcsstr(cls, L"PLUGPLUG_UI_NATIVE"))
++            native_host = a;
+     }
+-    return NULL;
++    return native_host;
+ }
+ 
+ static struct list presentations = LIST_INIT(presentations);
