@@ -1,0 +1,176 @@
+# NEUTRON: win32u clip/blit trace (NEUTRON_BLT_TRACE=1, NEUTRON_BLT_BAND="ymin:ymax").
+#
+# Logs every draw-op destination rect passing through clip_visrect on a WINDOW DC,
+# together with the DC's effective clip region, so we can see whether an app issues an
+# erase draw over a stale area and whether the clip eats it. Inert unless the env is set.
+#
+# Trace-ONLY: the sole logic change is capturing the return value in a variable so the
+# trace can run before returning; clip_device_rect/intersect_rect behaviour is identical.
+#
+# Captured 2026-08-04 (LEAKY EXPORT): dlls/win32u/clipping.c was entirely uncaptured -
+# it had NEVER shipped in any runtime, so NEUTRON_BLT_TRACE=1 silently produced zero
+# lines on 11.10-25 and the empty result nearly read as 'the clip is innocent'.
+
+diff --git a/dlls/win32u/clipping.c b/dlls/win32u/clipping.c
+index cf71cf0645c..1f5507176c4 100644
+--- a/dlls/win32u/clipping.c
++++ b/dlls/win32u/clipping.c
+@@ -23,6 +23,7 @@
+ #endif
+ 
+ #include <stdarg.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include "windef.h"
+ #include "winbase.h"
+@@ -32,6 +33,29 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(clipping);
+ 
++/* NEUTRON PM-TRAILS DIAG (NEUTRON_BLT_TRACE=1, optional NEUTRON_BLT_BAND="ymin:ymax"
++ * in device coords): log every draw-op destination rect that passes through
++ * clip_visrect on a WINDOW DC (dc->dce != NULL), together with the DC's effective
++ * clip region, so we can see whether the app issues an erase draw over the old
++ * playhead-marker rect and whether the clip eats it. Inert unless env is set. */
++static int neutron_blt_trace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_BLT_TRACE"); v = (e && e[0]=='1') ? 1 : 0; }
++    return v;
++}
++static int neutron_blt_band( int *lo, int *hi )
++{
++    static int blo = -1, bhi = -1, init = 0;
++    if (!init)
++    {
++        const char *e = getenv("NEUTRON_BLT_BAND");
++        if (e && sscanf( e, "%d:%d", &blo, &bhi ) != 2) { blo = bhi = -1; }
++        init = 1;
++    }
++    *lo = blo; *hi = bhi;
++    return blo >= 0;
++}
+ 
+ /* return the DC device rectangle if not empty */
+ static inline BOOL get_dc_device_rect( DC *dc, RECT *rect )
+@@ -86,10 +110,39 @@ BOOL clip_device_rect( DC *dc, RECT *dst, const RECT *src )
+ BOOL clip_visrect( DC *dc, RECT *dst, const RECT *src )
+ {
+     RECT clip;
++    BOOL ret;
+ 
+-    if (!clip_device_rect( dc, dst, src )) return FALSE;
+-    if (NtGdiGetRgnBox( get_dc_region(dc), &clip )) return intersect_rect( dst, dst, &clip );
+-    return TRUE;
++    if (!clip_device_rect( dc, dst, src )) ret = FALSE;
++    else if (NtGdiGetRgnBox( get_dc_region(dc), &clip )) ret = intersect_rect( dst, dst, &clip );
++    else ret = TRUE;
++
++    /* NEUTRON PM-TRAILS DIAG: see neutron_blt_trace() above */
++    if (neutron_blt_trace() && dc->dce)
++    {
++        int lo, hi;
++        if (!neutron_blt_band( &lo, &hi ) || (src->bottom > lo && src->top < hi))
++        {
++            RECT rb = {0};
++            int nrects = -1;
++            HRGN rgn = get_dc_region( dc );
++            if (rgn)
++            {
++                DWORD sz;
++                neutron_diag_busy = 1;
++                sz = NtGdiGetRegionData( rgn, 0, NULL );
++                if (sz >= sizeof(RGNDATAHEADER)) nrects = (sz - sizeof(RGNDATAHEADER)) / sizeof(RECT);
++                NtGdiGetRgnBox( rgn, &rb );
++                neutron_diag_busy = 0;
++            }
++            ERR( "neutron-blt: visrect hwnd=%p dc=%p in=(%d,%d)-(%d,%d) out=%d(%d,%d)-(%d,%d) rgn=n%d(%d,%d)-(%d,%d) visorg=(%d,%d)\n",
++                 neutron_dce_hwnd( dc->dce ), dc->hSelf,
++                 (int)src->left, (int)src->top, (int)src->right, (int)src->bottom,
++                 ret, (int)dst->left, (int)dst->top, (int)dst->right, (int)dst->bottom,
++                 nrects, (int)rb.left, (int)rb.top, (int)rb.right, (int)rb.bottom,
++                 (int)dc->attr->vis_rect.left, (int)dc->attr->vis_rect.top );
++        }
++    }
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -332,6 +385,10 @@ BOOL WINAPI NtGdiPtVisible( HDC hdc, INT x, INT y )
+            (pt.x >= visrect.left && pt.x < visrect.right &&
+             pt.y >= visrect.top && pt.y < visrect.bottom));
+     if (ret && get_dc_region( dc )) ret = NtGdiPtInRegion( get_dc_region( dc ), pt.x, pt.y );
++    /* NEUTRON READ-TRACE */
++    if (neutron_read_pt_hit( pt.x, pt.y ) || neutron_read_pt_hit( x, y ))
++        ERR( "neutron-read: PtVisible dc=%p hwnd=%p lp=(%d,%d) dp=(%d,%d) ret=%d\n",
++             hdc, dc->dce ? neutron_dce_hwnd( dc->dce ) : 0, x, y, (int)pt.x, (int)pt.y, ret );
+     release_dc_ptr( dc );
+     return ret;
+ }
+@@ -355,6 +412,12 @@ BOOL WINAPI NtGdiRectVisible( HDC hdc, const RECT *rect )
+     update_dc( dc );
+     ret = (!get_dc_device_rect( dc, &visrect ) || intersect_rect( &visrect, &visrect, &tmpRect ));
+     if (ret && get_dc_region( dc )) ret = NtGdiRectInRegion( get_dc_region( dc ), &tmpRect );
++    /* NEUTRON READ-TRACE */
++    if (neutron_read_band_hit( &tmpRect ) || neutron_read_band_hit( rect ))
++        ERR( "neutron-read: RectVisible dc=%p hwnd=%p lp=(%d,%d)-(%d,%d) dp=(%d,%d)-(%d,%d) ret=%d\n",
++             hdc, dc->dce ? neutron_dce_hwnd( dc->dce ) : 0,
++             (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom,
++             (int)tmpRect.left, (int)tmpRect.top, (int)tmpRect.right, (int)tmpRect.bottom, ret );
+     release_dc_ptr( dc );
+     return ret;
+ }
+@@ -390,6 +453,11 @@ INT WINAPI NtGdiGetAppClipBox( HDC hdc, RECT *rect )
+         rect->right = tmp - 1;
+     }
+     dp_to_lp( dc, (LPPOINT)rect, 2 );
++    /* NEUTRON READ-TRACE */
++    if (neutron_read_band_hit( rect ))
++        ERR( "neutron-read: GetAppClipBox dc=%p hwnd=%p ret=%d box=(%d,%d)-(%d,%d)\n",
++             hdc, dc->dce ? neutron_dce_hwnd( dc->dce ) : 0, ret,
++             (int)rect->left, (int)rect->top, (int)rect->right, (int)rect->bottom );
+     release_dc_ptr( dc );
+     TRACE("%p => %d %s\n", hdc, ret, wine_dbgstr_rect( rect ));
+     return ret;
+@@ -441,6 +509,22 @@ INT WINAPI NtGdiGetRandomRgn( HDC hDC, HRGN hRgn, INT iCode )
+             /* On Windows NT/2000, the SYSRGN returned is in screen coordinates */
+             if (RtlGetCurrentPeb()->OSPlatformId != VER_PLATFORM_WIN32s)
+                 NtGdiOffsetRgn( hRgn, dc->attr->vis_rect.left, dc->attr->vis_rect.top );
++            /* NEUTRON PM-TRAILS DIAG: does the app fetch SYSRGN to decide its repaint set? */
++            if (neutron_blt_trace())
++            {
++                RECT rb = {0};
++                DWORD sz;
++                int nrects;
++                neutron_diag_busy = 1;
++                sz = NtGdiGetRegionData( hRgn, 0, NULL );
++                nrects = (sz >= sizeof(RGNDATAHEADER)) ? (int)((sz - sizeof(RGNDATAHEADER)) / sizeof(RECT)) : -1;
++                NtGdiGetRgnBox( hRgn, &rb );
++                neutron_diag_busy = 0;
++                ERR( "neutron-blt: SYSRGN hwnd=%p dc=%p ret=n%d(%d,%d)-(%d,%d) visorg=(%d,%d)\n",
++                     dc->dce ? neutron_dce_hwnd( dc->dce ) : 0, dc->hSelf, nrects,
++                     (int)rb.left, (int)rb.top, (int)rb.right, (int)rb.bottom,
++                     (int)dc->attr->vis_rect.left, (int)dc->attr->vis_rect.top );
++            }
+         }
+         else if (!IsRectEmpty( &dc->device_rect ))
+             NtGdiSetRectRgn( hRgn, dc->device_rect.left, dc->device_rect.top,
+@@ -473,6 +557,18 @@ INT WINAPI NtGdiGetRandomRgn( HDC hDC, HRGN hRgn, INT iCode )
+         NtGdiDeleteObjectApp( region );
+     }
+ 
++    /* NEUTRON READ-TRACE: app queries of the clip/meta/rao region */
++    if (neutron_read_trace() && !neutron_diag_busy && ret >= 0)
++    {
++        RECT rb = {0,0,0,0};
++        neutron_diag_busy = 1;
++        if (ret > 0) NtGdiGetRgnBox( hRgn, &rb );
++        neutron_diag_busy = 0;
++        if (neutron_read_band_hit( &rb ))
++            ERR( "neutron-read: GetRandomRgn dc=%p iCode=%d ret=%d box=(%d,%d)-(%d,%d)\n",
++                 hDC, iCode, ret, (int)rb.left, (int)rb.top, (int)rb.right, (int)rb.bottom );
++    }
++
+     return ret;
+ }
+ 
