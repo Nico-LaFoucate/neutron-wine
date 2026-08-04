@@ -1,22 +1,3 @@
-# build workspace (cloned wine-tkg + built wine tree)
-_work/
-*-build/
-
-# build artifacts
-*.o
-*.a
-*.so
-*.dll
-*.exe
-*.pkg.tar.*
-
-# OS / editor
-.DS_Store
-*.swp
-
-# release output (tarballs + checksums + manifest)
-dist/
-
-# local debug backups & shader caches — never committed
-dll-backups/
-vkd3d-proton.cache
+# Generated build/package logs (large; not source)
+build-*.log
+package-*.log
