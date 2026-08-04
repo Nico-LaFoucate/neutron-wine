@@ -508,3 +508,45 @@
      return result;
  }
  
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5121,6 +5121,21 @@
+    returns a placeholder (484x484 / 100x500-style) rect vs the real document area. */
+ static LONG neutron_relayout_trace;    /* 1 while tracing the doc-create relayout */
+ static LONG neutron_relayout_budget;   /* remaining log lines (hard cap on volume) */
++
++/* NEUTRON 2026-08-03: env gate, OFF BY DEFAULT (NEUTRON_RELAYOUT_TRACE=1 to arm).
++ *
++ * This probe used to arm ITSELF on every OWL document creation with a 20,000-line budget, so a
++ * SHIPPED runtime wrote 20,000 `neutron-geom:` lines into Photoshop's log on an ordinary launch.
++ * The bounded budget stopped it flooding the whole session, which is why it went unnoticed --
++ * a cap is not a gate. Found by the 11.10-22 full-suite smoke test.
++ *
++ * Matches neutron_mask_trace_on() directly below: a diagnostic must be inert in production. */
++static int neutron_relayout_trace_on( void )
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_RELAYOUT_TRACE" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
+ static BOOL neutron_is_relayout_win( HWND hwnd, const char *c )
+ {
+     if (neutron_ascii_has( c, "OWL.Dock" ) || neutron_ascii_has( c, "OWL.TabPane" )
+@@ -5296,9 +5311,14 @@
+         InterlockedExchange( &neutron_dismiss_pending, 1 );
+         InterlockedExchange( &neutron_shell_emit_pending, 1 );
+         /* NEUTRON avenue-3: arm the geometry trace for the doc-create relayout window. Bounded line
+-           budget auto-disarms it (see neutron_geom_log) so it can't flood the whole session. */
+-        InterlockedExchange( &neutron_relayout_budget, 20000 );
+-        InterlockedExchange( &neutron_relayout_trace, 1 );
++           budget auto-disarms it (see neutron_geom_log) so it can't flood the whole session.
++           ⚠️ ENV-GATED OFF BY DEFAULT since 2026-08-03 — the budget bounds the volume but never
++           stopped it running, so a shipped runtime wrote 20,000 lines per Photoshop launch. */
++        if (neutron_relayout_trace_on())
++        {
++            InterlockedExchange( &neutron_relayout_budget, 20000 );
++            InterlockedExchange( &neutron_relayout_trace, 1 );
++        }
+         /* Bounded pass budget (NOT a timer/hammer): a few workspace/doc window ops follow doc-create;
+            run the force-show on the first few so a dock whose geometry lands a beat late still gets
+            revealed. Capped hard at NEUTRON_DOCKSHOW_PASSES; each pass is idempotent (shows only
