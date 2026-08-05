@@ -1,0 +1,125 @@
+diff --git a/dlls/user32/win.c b/dlls/user32/win.c
+index bcf88ee21bd..9e940e921fb 100644
+--- a/dlls/user32/win.c
++++ b/dlls/user32/win.c
+@@ -1812,3 +1812,96 @@ WORD WINAPI TileChildWindows( HWND parent, UINT flags )
+ {
+     return TileWindows( parent, flags, NULL, 0, NULL );
+ }
++
++/**********************************************************************
++ * NEUTRON RECT BACKTRACE DIAG (NEUTRON_RECT_BT=<right edge>)
++ *
++ * Animate's playback invalidation is 13 pixels short on its right edge, and the
++ * blit trace showed Wine clips nothing -- the rect is already short when it
++ * reaches us.  This probe answers the remaining question, "who computed it":
++ * when an app invalidates with a rect whose right edge equals NEUTRON_RECT_BT,
++ * capture the call stack and resolve every frame to module+offset so the
++ * calling module is named in the log.
++ *
++ * It deliberately lives on the PE side.  A backtrace taken inside win32u.so
++ * runs on the syscall stack and cannot see any of the application's frames.
++ */
++static int neutron_rect_bt_target(void)
++{
++    static int target = -1;
++
++    if (target < 0)
++    {
++        WCHAR buf[32];
++        const WCHAR *p = buf;
++        int v = 0;
++
++        if (GetEnvironmentVariableW( L"NEUTRON_RECT_BT", buf, ARRAY_SIZE(buf) ))
++            while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
++        target = v;
++    }
++    return target;
++}
++
++static void neutron_rect_bt( const char *api, HWND hwnd, const RECT *rect, UINT flags )
++{
++    static LONG shots;
++    void *frames[32];
++    USHORT n, i;
++
++    if (!rect || rect->right != neutron_rect_bt_target()) return;
++    if (InterlockedIncrement( &shots ) > 8) return;
++
++    n = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL );
++    ERR( "neutron-rectbt: %s hwnd=%p rect=%s flags=%08x frames=%u\n",
++         api, hwnd, wine_dbgstr_rect(rect), flags, n );
++    for (i = 0; i < n; i++)
++    {
++        WCHAR path[MAX_PATH];
++        void *base = NULL;
++
++        RtlPcToFileHeader( frames[i], &base );
++        if (!base || !GetModuleFileNameW( base, path, ARRAY_SIZE(path) )) path[0] = 0;
++        ERR( "neutron-rectbt:   #%02u %p  %s + %#Ix\n", i, frames[i],
++             path[0] ? debugstr_w(path) : "<unknown>",
++             base ? (ULONG_PTR)frames[i] - (ULONG_PTR)base : 0 );
++    }
++}
++
++/**********************************************************************
++ *              RedrawWindow (USER32.@)
++ */
++BOOL WINAPI neutron_RedrawWindow( HWND hwnd, const RECT *rect, HRGN hrgn, UINT flags )
++{
++    if (neutron_rect_bt_target())
++    {
++        RECT box;
++
++        if (hrgn && GetRgnBox( hrgn, &box )) neutron_rect_bt( "RedrawWindow/rgn", hwnd, &box, flags );
++        else if (!hrgn) neutron_rect_bt( "RedrawWindow", hwnd, rect, flags );
++    }
++    return NtUserRedrawWindow( hwnd, rect, hrgn, flags );
++}
++
++/**********************************************************************
++ *              InvalidateRect (USER32.@)
++ */
++BOOL WINAPI neutron_InvalidateRect( HWND hwnd, const RECT *rect, BOOL erase )
++{
++    if (neutron_rect_bt_target()) neutron_rect_bt( "InvalidateRect", hwnd, rect, erase );
++    return NtUserInvalidateRect( hwnd, rect, erase );
++}
++
++/**********************************************************************
++ *              InvalidateRgn (USER32.@)
++ */
++BOOL WINAPI neutron_InvalidateRgn( HWND hwnd, HRGN hrgn, BOOL erase )
++{
++    if (neutron_rect_bt_target() && hrgn)
++    {
++        RECT box;
++
++        if (GetRgnBox( hrgn, &box )) neutron_rect_bt( "InvalidateRgn", hwnd, &box, erase );
++    }
++    return NtUserInvalidateRgn( hwnd, hrgn, erase );
++}
+diff --git a/dlls/user32/user32.spec b/dlls/user32/user32.spec
+index fe41f9cb2e7..ab93ada6a87 100644
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -765,8 +765,8 @@
+ @ stdcall InternalGetWindowIcon(ptr long) NtUserInternalGetWindowIcon
+ @ stdcall InternalGetWindowText(long ptr long) NtUserInternalGetWindowText
+ @ stdcall IntersectRect(ptr ptr ptr)
+-@ stdcall InvalidateRect(long ptr long) NtUserInvalidateRect
+-@ stdcall InvalidateRgn(long long long) NtUserInvalidateRgn
++@ stdcall InvalidateRect(long ptr long) neutron_InvalidateRect
++@ stdcall InvalidateRgn(long long long) neutron_InvalidateRgn
+ @ stdcall InvertRect(long ptr)
+ @ stdcall -import IsCharAlphaA(long)
+ @ stdcall -import IsCharAlphaNumericA(long)
+@@ -948,7 +948,7 @@
+ # @ stub ReasonCodeNeedsBugID
+ # @ stub ReasonCodeNeedsComment
+ # @ stub RecordShutdownReason
+-@ stdcall RedrawWindow(long ptr long long) NtUserRedrawWindow
++@ stdcall RedrawWindow(long ptr long long) neutron_RedrawWindow
+ # @ stub RegisterBSDRWindow
+ @ stdcall RegisterClassA(ptr)
+ @ stdcall RegisterClassExA(ptr)
