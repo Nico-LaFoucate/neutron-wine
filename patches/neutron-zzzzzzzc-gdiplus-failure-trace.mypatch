@@ -1,0 +1,129 @@
+--- a/dlls/gdiplus/gdiplus_private.h
++++ b/dlls/gdiplus/gdiplus_private.h
+@@ -72,6 +72,8 @@
+     REAL startAngle, REAL sweepAngle);
+ extern REAL gdiplus_atan2(REAL dy, REAL dx);
+ extern GpStatus hresult_to_status(HRESULT res);
++/* NEUTRON GDI+ FAILURE TRACE (NEUTRON_GDIP_TRACE=1) -- see graphics.c */
++extern int neutron_gdip_trace(void);
+ extern REAL units_to_pixels(REAL units, GpUnit unit, REAL dpi, BOOL printer_display);
+ extern REAL pixels_to_units(REAL pixels, GpUnit unit, REAL dpi, BOOL printer_display);
+ extern REAL units_scale(GpUnit from, GpUnit to, REAL dpi, BOOL printer_display);
+--- a/dlls/gdiplus/graphics.c
++++ b/dlls/gdiplus/graphics.c
+@@ -6987,7 +6987,11 @@
+         return InvalidParameter;
+ 
+     if(graphics->busy)
++    {
++        if (neutron_gdip_trace())
++            ERR( "neutron-gdip: SetWorldTransform FAIL=ObjectBusy graphics=%p\n", graphics );
+         return ObjectBusy;
++    }
+ 
+     if (is_metafile_graphics(graphics)) {
+         stat = METAFILE_SetWorldTransform((GpMetafile*)graphics->image, matrix);
+@@ -7269,6 +7273,28 @@
+     return Ok;
+ }
+ 
++/* NEUTRON GDI+ FAILURE TRACE (NEUTRON_GDIP_TRACE=1, read-only).
++ *
++ * WHY: Animate's UI framework dvaui.dll is a GDI+ drawbot -- its error messages read like
++ * "Unable to {multiply transform,draw path,create pen buffer,...}. GDI Status: ^1" -- and it
++ * reported a FAILED TRANSFORM MULTIPLY while its canvas artwork was rendering 13px offset from
++ * the dirty rect it invalidates. A transform that fails to apply produces exactly a translation.
++ *
++ * dvaui swallows the status into its own message, so the only way to see WHICH call failed first
++ * is from inside gdiplus. These functions return non-Ok in only a handful of ways, so logging the
++ * failures (not the calls) is cheap and names the culprit directly.
++ *
++ * ⚠️ ObjectBusy is the interesting one. graphics->busy is set by GdipGetDC and cleared by
++ * GdipReleaseDC ONLY when that call returns Ok -- so a ReleaseDC with a mismatched HDC leaves
++ * busy stuck TRUE and EVERY later Graphics call on that object fails forever. That is a permanent,
++ * silent failure mode, and it would look precisely like a transform that stopped being applied. */
++int neutron_gdip_trace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_GDIP_TRACE"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
+ GpStatus WINGDIPAPI GdipMultiplyWorldTransform(GpGraphics *graphics, GDIPCONST GpMatrix *matrix,
+     GpMatrixOrder order)
+ {
+@@ -7278,10 +7304,21 @@
+     TRACE("(%p, %s, %d)\n", graphics, debugstr_matrix(matrix), order);
+ 
+     if(!graphics || !matrix)
++    {
++        if (neutron_gdip_trace())
++            ERR( "neutron-gdip: MultiplyWorldTransform FAIL=InvalidParameter graphics=%p matrix=%p order=%d\n",
++                 graphics, matrix, order );
+         return InvalidParameter;
++    }
+ 
+     if(graphics->busy)
++    {
++        if (neutron_gdip_trace())
++            ERR( "neutron-gdip: MultiplyWorldTransform FAIL=ObjectBusy graphics=%p hdc=%p temp_hdc=%p owndc=%d hwnd=%p"
++                 "  <<< busy stuck from a GdipGetDC whose ReleaseDC never returned Ok\n",
++                 graphics, graphics->hdc, graphics->temp_hdc, graphics->owndc, graphics->hwnd );
+         return ObjectBusy;
++    }
+ 
+     if (is_metafile_graphics(graphics))
+     {
+@@ -7313,7 +7350,11 @@
+         return InvalidParameter;
+ 
+     if(graphics->busy)
++    {
++        if (neutron_gdip_trace())
++            ERR( "neutron-gdip: GetDC FAIL=ObjectBusy graphics=%p (a DC is already checked out)\n", graphics );
+         return ObjectBusy;
++    }
+ 
+     if (is_metafile_graphics(graphics))
+     {
+@@ -7444,6 +7485,10 @@
+ 
+     if (stat == Ok)
+         graphics->busy = FALSE;
++    else if (neutron_gdip_trace())
++        ERR( "neutron-gdip: ReleaseDC FAILED stat=%d graphics=%p hdc=%p (graphics->hdc=%p temp_hdc=%p owndc=%d)"
++             "  <<< busy LEFT SET -- every later Graphics call on this object now returns ObjectBusy\n",
++             stat, graphics, hdc, graphics->hdc, graphics->temp_hdc, graphics->owndc );
+ 
+     return stat;
+ }
+--- a/dlls/gdiplus/matrix.c
++++ b/dlls/gdiplus/matrix.c
+@@ -242,14 +242,27 @@
+     TRACE("(%s, %s, %d)\n", debugstr_matrix(matrix), debugstr_matrix(matrix2), order);
+ 
+     if(!matrix || !matrix2)
++    {
++        /* NEUTRON: dvaui reports this as "Unable to multiply transform. GDI Status: ^1" and
++         * swallows which side was NULL. A NULL here means an EARLIER GdipCreateMatrix* /
++         * GdipCloneMatrix failed and dvaui carried on with the null handle. */
++        if (neutron_gdip_trace())
++            ERR( "neutron-gdip: MultiplyMatrix FAIL=InvalidParameter matrix=%p matrix2=%p order=%d"
++                 "  <<< a NULL operand means an earlier matrix creation failed\n",
++                 matrix, matrix2, order );
+         return InvalidParameter;
++    }
+ 
+     if(order == MatrixOrderAppend)
+         matrix_multiply(matrix->matrix, matrix2->matrix, matrix->matrix);
+     else if (order == MatrixOrderPrepend)
+         matrix_multiply(matrix2->matrix, matrix->matrix, matrix->matrix);
+     else
++    {
++        if (neutron_gdip_trace())
++            ERR( "neutron-gdip: MultiplyMatrix FAIL=InvalidParameter bad order=%d\n", order );
+         return InvalidParameter;
++    }
+ 
+     return Ok;
+ }
