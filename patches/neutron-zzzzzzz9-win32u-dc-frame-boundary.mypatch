@@ -1,0 +1,261 @@
+# NEUTRON: give ReleaseDC the frame-boundary semantics EndPaint already has.
+# Env-gated: NEUTRON_DC_FRAME=1 (default OFF). Diag: NEUTRON_DC_FRAME_TRACE=1.
+#
+# A window painted with GetDC/ReleaseDC has NO frame boundary in Wine: NtUserEndPaint
+# flushes, but release_dc touches no surface state at all. Meanwhile every publish goes
+# through flush_window_surfaces(), which fires from an empty PeekMessage, any message
+# wait, and -- synchronously on the CALLING thread -- the input polls (GetAsyncKeyState,
+# GetQueueStatus, GetInputState, SetCursor). surface->mutex is held per single GDI
+# primitive, so a flush cannot tear one op, but between primitive N and N+1 a publish can
+# and does happen. An app that calls any of those inside its paint sequence therefore
+# publishes its own half-painted color_bits at the SAME sequence point every frame.
+#
+# MEASURED on Animate's canvas (2026-08-04): NEUTRON_PIXPROBE showed a stroke at a fixed x
+# going present/absent/present/absent on consecutive flushes (235 transitions), with BOTH
+# states published by the SAME thread (269 with / 369 without on one tid; only 4 from any
+# other) -- the drawing thread publishing its own unfinished bitmap. Windows does not do
+# this: a GetDC draw lands in the DWM redirection surface, sampled at vblank and
+# uncorrelated with the app's syscalls, so a microsecond erase->draw gap is invisible.
+#
+# Suppression lives in window_surface_flush (not flush_window_surfaces) so that dibdrv's
+# in-draw 50ms timeout -- which calls window_surface_flush directly, synchronously after
+# an arbitrary GDI primitive -- cannot bypass the bracket.
+#
+# STALENESS ESCAPE (50ms): an app holding a DC indefinitely must never freeze.
+# The wrong-window ReleaseDC early-return deliberately does NOT end the frame.
+#
+# ALSO (2026-08-04, same file): NEUTRON_PIXPROBE now sweeps the whole band at
+# "l:t:r:b[:stride]" (default stride 8) and logs only rows containing something, plus
+# one SWEEP summary per flush. It previously scanned exactly TWO rows at 1/3 and 2/3 of
+# the band -- useful only if you already know where the artwork is, and guessing wrong
+# is INVISIBLE in the output. That produced two confidently wrong scene reconstructions
+# while chasing Animate's canvas artifacts.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -621,6 +621,8 @@
+     pthread_mutex_unlock( &surface->mutex );
+ }
+ 
++static BOOL neutron_dc_suppress_flush(void);
++
+ void window_surface_flush( struct window_surface *surface )
+ {
+     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+@@ -630,6 +632,13 @@
+     RECT dirty = surface->rect, bounds;
+     void *color_bits;
+ 
++    /* NEUTRON: never publish a half-painted frame. Placed HERE rather than in
++     * flush_window_surfaces() because dibdrv's in-draw 50ms timeout (dibdrv/dc.c,
++     * unlock_surface) calls window_surface_flush directly and would otherwise bypass the
++     * bracket entirely -- that path fires synchronously right after an arbitrary GDI
++     * primitive, i.e. mid-sequence by construction. See neutron_dc_suppress_flush(). */
++    if (neutron_dc_suppress_flush()) return;
++
+     window_surface_lock( surface );
+ 
+     /* align bounds / dirty rect to help with 1bpp shape bitmap updates */
+@@ -648,19 +657,32 @@
+         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
+                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+ 
+-        /* NEUTRON PM-TRAILS DIAG (NEUTRON_PIXPROBE="l:t:r:b", surface coords):
+-         * objectively answer "is the stale playhead marker in color_bits at flush
+-         * time?" without any eyeball judgment. At each flush of a wide surface,
+-         * RLE-scan two rows of the given band in color_bits and log the non-
+-         * background segments: the current marker appears as 1-2 blobs; any
+-         * additional blobs at older x positions == stale pixels in color_bits. */
++        /* NEUTRON PM-TRAILS DIAG (NEUTRON_PIXPROBE="l:t:r:b[:stride]", surface coords):
++         * objectively answer "are stale pixels in color_bits at flush time?" without any
++         * eyeball judgment. At each flush of a wide surface, RLE-scan rows of the given
++         * band in color_bits and log the non-background segments.
++         *
++         * ⚠️ 2026-08-04: this used to scan exactly TWO rows, at 1/3 and 2/3 of the band.
++         * That is only useful if you already know where the artwork is — and guessing
++         * wrong is invisible in the output, because a row that misses the shapes looks
++         * identical to a row where nothing is wrong. Chasing Animate's canvas artifacts
++         * it produced two confidently WRONG scene reconstructions in a row (concluding
++         * the two test shapes sat at different y when they share one, and reading a
++         * shape legitimately animating in and out of one x as a "blink" bug).
++         * It now sweeps the whole band at `stride` (default 8) and logs only rows that
++         * actually contain something, so the output is a coarse PICTURE of the artwork
++         * rather than two slices through an assumed layout. Residue = a run at an x the
++         * current frame should not have. */
+         {
+             static int pp = -1;
+             static int band[4];
++            static int pp_stride;
+             if (pp < 0)
+             {
+                 const char *e = getenv("NEUTRON_PIXPROBE");
+-                pp = (e && sscanf( e, "%d:%d:%d:%d", &band[0], &band[1], &band[2], &band[3] ) == 4) ? 1 : 0;
++                pp_stride = 0;
++                pp = (e && sscanf( e, "%d:%d:%d:%d:%d", &band[0], &band[1], &band[2], &band[3], &pp_stride ) >= 4) ? 1 : 0;
++                if (pp_stride < 1) pp_stride = 8;
+             }
+             if (pp && color_info->bmiHeader.biBitCount == 32 &&
+                 color_info->bmiHeader.biWidth > 2000 &&
+@@ -669,11 +691,10 @@
+                 int width = color_info->bmiHeader.biWidth;
+                 int height = abs( color_info->bmiHeader.biHeight );
+                 int bottom_up = color_info->bmiHeader.biHeight > 0;
+-                int rows[2] = { band[1] + (band[3] - band[1]) / 3, band[1] + 2 * (band[3] - band[1]) / 3 };
+-                int r;
+-                for (r = 0; r < 2; r++)
++                int y_scan, scanned = 0, with_content = 0;
++                for (y_scan = band[1]; y_scan < band[3]; y_scan += pp_stride)
+                 {
+-                    int y = rows[r], x, l = band[0], rt = min( band[2], width );
++                    int y = y_scan, x, l = band[0], rt = min( band[2], width );
+                     const UINT *px;
+                     UINT bg;
+                     char buf[360]; int n = 0, nseg = 0, sx = -1;
+@@ -700,10 +721,25 @@
+                         }
+                         sx = x; scol = c;
+                     }
+-                    ERR( "neutron-pix: hwnd=%p y=%d bg=%06x dirty=(%d,%d)-(%d,%d) nseg=%d%s\n",
+-                         surface->hwnd, y, bg, (int)dirty.left, (int)dirty.top, (int)dirty.right, (int)dirty.bottom,
++                    /* NEUTRON: `surface` is printed because two surfaces for the SAME hwnd
++                     * flushing alternately would be indistinguishable from content blinking
++                     * in one surface. (Checked 2026-08-04: the pointer stays CONSTANT across
++                     * the alternation, so that explanation is dead.)
++                     * Only rows that actually contain something are logged -- sweeping the
++                     * whole band at stride 8 otherwise buries the signal in empty rows. */
++                    scanned++;
++                    if (!nseg) continue;
++                    with_content++;
++                    ERR( "neutron-pix: hwnd=%p surf=%p y=%d bg=%06x dirty=(%d,%d)-(%d,%d) nseg=%d%s\n",
++                         surface->hwnd, surface, y, bg, (int)dirty.left, (int)dirty.top, (int)dirty.right, (int)dirty.bottom,
+                          nseg, buf );
+                 }
++                /* One summary per flush so "no rows logged" is distinguishable from "the
++                 * probe never ran" -- an empty result silently meaning the wrong thing is
++                 * exactly how this probe misled the Animate investigation. */
++                ERR( "neutron-pix: SWEEP hwnd=%p surf=%p rows=%d with-content=%d stride=%d band=(%d,%d)-(%d,%d)\n",
++                     surface->hwnd, surface, scanned, with_content, pp_stride,
++                     band[0], band[1], band[2], band[3] );
+             }
+         }
+ 
+@@ -820,6 +856,74 @@
+  *
+  * Flush pending output from all window surfaces.
+  */
++/* NEUTRON DRAW-TRANSACTION BRACKET (env NEUTRON_DC_FRAME=1, default OFF).
++ *
++ * PROBLEM (measured 2026-08-04, Animate canvas playback fragments): a window painted
++ * with GetDC/ReleaseDC has NO frame boundary. NtUserEndPaint flushes; release_dc does
++ * not touch surface state at all. Meanwhile EVERY publish funnels through
++ * flush_window_surfaces(), which fires from an empty PeekMessage, any message wait, and
++ * -- synchronously on the CALLING thread -- the input polls (GetAsyncKeyState,
++ * GetQueueStatus, GetInputState, SetCursor). surface->mutex is held per single GDI
++ * primitive, so a flush cannot tear one op, but between primitive N and N+1 a publish
++ * can and does happen. If the app makes any of those calls inside its paint sequence,
++ * the half-painted color_bits is published at the SAME sequence point every frame.
++ *
++ * MEASURED: NEUTRON_PIXPROBE showed a stroke at a fixed x going present/absent/present/
++ * absent on consecutive flushes (235 transitions), and BOTH states were published by the
++ * SAME thread (269 with / 369 without on tid 0160; only 4 from any other thread) -- i.e.
++ * the drawing thread publishing its own unfinished bitmap. Windows does not do this: a
++ * GetDC draw lands in the DWM redirection surface and is sampled at vblank, uncorrelated
++ * with the app's syscalls, so a microsecond erase->draw gap is invisible.
++ *
++ * FIX: give ReleaseDC the frame-boundary semantics EndPaint already has. Count screen DCs
++ * outstanding on this thread; suppress publishing while any is held, and flush when the
++ * last one is released. Per-thread (not per-surface) because the measurement shows the
++ * offending publishes are self-inflicted by the drawing thread; cross-thread flushes are
++ * left alone.
++ *
++ * STALENESS ESCAPE: an app that holds a DC indefinitely (CS_OWNDC, a cached DC kept for
++ * the process lifetime) must not freeze. If suppression has been active longer than
++ * NEUTRON_DC_FRAME_MAX_MS, publish anyway. Correctness beats atomicity. */
++#define NEUTRON_DC_FRAME_MAX_MS 50
++
++static int neutron_dc_frame_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_DC_FRAME" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static int neutron_dc_frame_trace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_DC_FRAME_TRACE" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static __thread int neutron_dc_depth;          /* screen DCs outstanding on this thread */
++static __thread DWORD neutron_dc_since;        /* ticks when suppression began */
++static __thread unsigned int neutron_dc_saved; /* publishes suppressed (diag) */
++
++/* Returns TRUE if a publish from this thread should be held back right now. */
++static BOOL neutron_dc_suppress_flush(void)
++{
++    DWORD now;
++    if (!neutron_dc_frame_on() || neutron_dc_depth <= 0) return FALSE;
++    now = NtGetTickCount();
++    if ((int)(now - neutron_dc_since) >= NEUTRON_DC_FRAME_MAX_MS)
++    {
++        if (neutron_dc_frame_trace())
++            ERR( "neutron-dcframe: STALENESS ESCAPE depth=%d held=%ums -> publishing anyway\n",
++                 neutron_dc_depth, (unsigned)(now - neutron_dc_since) );
++        return FALSE;
++    }
++    neutron_dc_saved++;
++    if (neutron_dc_frame_trace() && !(neutron_dc_saved % 60))
++        ERR( "neutron-dcframe: suppressed %u mid-paint publishes (depth=%d)\n",
++             neutron_dc_saved, neutron_dc_depth );
++    return TRUE;
++}
++
+ void flush_window_surfaces( BOOL idle )
+ {
+     static DWORD last_idle;
+@@ -1332,11 +1436,29 @@
+             set_dc_pixel_format_internal( hdc, 0, &drawables );
+             set_dce_flags( dce->hdc, DCHF_DISABLEDC );
+         }
++        /* NEUTRON draw-transaction bracket: this DC is really being torn down, so the
++         * frame it belonged to is over. NOTE this is deliberately NOT reached by the
++         * wrong-window ReleaseDC early-return above: there the owning window is still
++         * painting into the DC on this very thread (LrC's MFC subclass ReleaseDC()s a
++         * child's in-flight BeginPaint DC), and ending the frame there would publish
++         * exactly the half-painted bitmap this fix exists to prevent. */
++        if (neutron_dc_frame_on() && neutron_dc_depth > 0) neutron_dc_depth--;
+         ret = TRUE;
+     }
+     user_unlock();
+ 
+     release_opengl_drawables( &drawables );
++
++    /* Frame boundary: last screen DC released -> publish the completed frame. Done after
++     * user_unlock() so the flush does not run under the user lock. */
++    if (ret && neutron_dc_frame_on() && !neutron_dc_depth)
++    {
++        if (neutron_dc_frame_trace() && neutron_dc_saved)
++            ERR( "neutron-dcframe: frame end (hwnd=%p) after %u suppressed publishes\n",
++                 hwnd, neutron_dc_saved );
++        neutron_dc_saved = 0;
++        flush_window_surfaces( FALSE );
++    }
+     return ret;
+ }
+ 
+@@ -1497,6 +1619,14 @@
+                  hwnd, (int)flags, dce->hdc, wine_dbgstr_rect(&cb), update_vis_rgn );
+         }
+     }
++
++    /* NEUTRON draw-transaction bracket: opening a screen DC starts a frame. Balanced by
++     * release_dc(), which BeginPaint/EndPaint also goes through (BeginPaint acquires via
++     * this same NtUserGetDCEx), so EndPaint semantics are preserved unchanged. */
++    if (neutron_dc_frame_on())
++    {
++        if (!neutron_dc_depth++) neutron_dc_since = NtGetTickCount();
++    }
+     return dce->hdc;
+ }
+ 
