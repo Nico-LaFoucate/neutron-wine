@@ -1,0 +1,70 @@
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2011,11 +2011,67 @@
+     return get_window_rect_rel( hwnd, COORDS_SCREEN, rect, dpi );
+ }
+ 
++/* NEUTRON CANVAS-EXTENT DIAG (NEUTRON_RECT_TRACE=1, read-only).
++ *
++ * WHY: Animate's playback repaint invalidates only (0,188)-(3075,1293) of a canvas window whose
++ * client area is 3230x1666, leaving a 139px-wide strip down the right of the stage that is NEVER
++ * repainted during playback -- artwork that moves through it is stranded there until the next full
++ * repaint. Wine hands back EXACTLY the region the app asks for (measured), so the wrong number is
++ * computed upstream, from something Wine told the app about the window's size.
++ *
++ * get_client_rect_rel() is the single funnel behind GetClientRect, so logging here shows precisely
++ * what the app is told. Volume control: only windows wider than 1500 (canvas-scale) are considered,
++ * and a small table suppresses repeats so only a CHANGE in a window's reported size prints -- a
++ * client rect that silently changes size mid-session is itself the thing we're hunting.
++ * On first sight of such a window its child tree is dumped once (class + window/client rect +
++ * style), to show whether a genuinely 3075-wide child view exists or the inset is invented. */
++static void neutron_rect_trace( HWND hwnd, enum coords_relative rel, const struct window_rects *rects, UINT dpi )
++{
++    static int on = -1;
++    static struct { HWND hwnd; RECT client; } seen[32];
++    static int n_seen;
++    int i, w = rects->client.right - rects->client.left;
++
++    if (on < 0) { const char *e = getenv("NEUTRON_RECT_TRACE"); on = (e && e[0] == '1') ? 1 : 0; }
++    if (!on || w <= 1500) return;
++
++    for (i = 0; i < n_seen; i++) if (seen[i].hwnd == hwnd) break;
++    if (i < n_seen && EqualRect( &seen[i].client, &rects->client )) return;   /* unchanged */
++
++    ERR( "neutron-rect: hwnd=%p rel=%d dpi=%u window=%s client=%s%s\n", hwnd, rel, dpi,
++         wine_dbgstr_rect( &rects->window ), wine_dbgstr_rect( &rects->client ),
++         i < n_seen ? "  *** CHANGED ***" : "" );
++
++    if (i < n_seen) { seen[i].client = rects->client; return; }
++    if (n_seen < 32) { seen[n_seen].hwnd = hwnd; seen[n_seen].client = rects->client; n_seen++; }
++
++    /* first sight: dump the child tree once */
++    {
++        HWND *list = list_window_children( hwnd );
++        int k;
++        for (k = 0; list && list[k]; k++)
++        {
++            struct window_rects cr;
++            WCHAR cw[64]; char cb[64]; UNICODE_STRING cn;
++            int l, j;
++            cn.Buffer = cw; cn.MaximumLength = sizeof(cw); cn.Length = 0;
++            l = NtUserGetClassName( list[k], FALSE, &cn ); if (l < 0 || l >= 64) l = 0;
++            for (j = 0; j < l; j++) cb[j] = (char)cw[j]; cb[l] = 0;
++            if (!get_window_rects( list[k], COORDS_SCREEN, &cr, dpi )) continue;
++            ERR( "neutron-rect:   child[%d] hwnd=%p class=%s window=%s client=%s style=%08x\n",
++                 k, list[k], cb, wine_dbgstr_rect( &cr.window ), wine_dbgstr_rect( &cr.client ),
++                 (UINT)get_window_long( list[k], GWL_STYLE ) );
++        }
++        free( list );
++    }
++}
++
+ BOOL get_client_rect_rel( HWND hwnd, enum coords_relative rel, RECT *rect, UINT dpi )
+ {
+     struct window_rects rects;
+     BOOL ret = get_window_rects( hwnd, rel, &rects, dpi );
+     if (ret) *rect = rects.client;
++    if (ret) neutron_rect_trace( hwnd, rel, &rects, dpi );
+     return ret;
+ }
+ 

@@ -1,0 +1,113 @@
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -25,6 +25,8 @@
+ 
+ #include <assert.h>
+ #include <pthread.h>
++#include <stdio.h>
++#include <unistd.h>
+ #include "ntstatus.h"
+ #include "ntgdi_private.h"
+ #include "ntuser_private.h"
+@@ -743,6 +745,101 @@
+             }
+         }
+ 
++        /* NEUTRON PPM FRAME DUMP (NEUTRON_PPM="dir:l:t:r:b[:every[:max[:step]]]", surface coords).
++         *
++         * WHY THIS EXISTS: the RLE probe above reports what a handful of scanlines contain, which
++         * requires knowing in advance where the artwork is -- and it produced two confidently WRONG
++         * scene reconstructions while chasing Animate's canvas residue. This dumps the actual
++         * published pixels to a P6 PPM so the frames can be LOOKED AT (and diffed against each
++         * other) with zero inference. `step` subsamples both axes so a first pass can cover the
++         * whole surface cheaply to LOCATE the artwork, then a second pass crops it at step=1.
++         *
++         * The dirty rect is encoded in the filename on purpose: it splits the residue question in
++         * two. If a leftover pixel lies OUTSIDE the dirty rect of every subsequent frame, the
++         * surface content was fine and the PUBLISH was partial (stale region never re-sent). If it
++         * lies INSIDE, the drawing itself produced it. Those have completely different fixes.
++         *
++         * Runs after the probe but before funcs->flush, i.e. on exactly the bits about to be
++         * published. Diagnostic only: the fopen/fwrite happen under the surface lock on the app
++         * thread, so this DOES perturb frame pacing -- never leave it enabled.
++         *
++         * ARMING: nothing is written until the file "<dir>/GO" exists, then it latches on. The
++         * budget is small (tens of frames) and app STARTUP produces hundreds of flushes, so an
++         * unarmed dump would spend its entire budget on the splash screen and capture none of the
++         * behaviour under investigation. `touch <dir>/GO` at the moment of interest. */
++        {
++            static int pd = -1;
++            static int cb[4];
++            static int pd_every, pd_max, pd_step, pd_seq, pd_written, pd_armed;
++            static char pd_dir[200];
++            if (pd < 0)
++            {
++                const char *e = getenv("NEUTRON_PPM");
++                pd_every = 1; pd_max = 120; pd_step = 1;
++                pd = (e && sscanf( e, "%199[^:]:%d:%d:%d:%d:%d:%d:%d", pd_dir, &cb[0], &cb[1],
++                                   &cb[2], &cb[3], &pd_every, &pd_max, &pd_step ) >= 5) ? 1 : 0;
++                if (pd_every < 1) pd_every = 1;
++                if (pd_max < 1) pd_max = 1;
++                if (pd_step < 1) pd_step = 1;
++            }
++            if (pd && !pd_armed)
++            {
++                char gopath[224];
++                snprintf( gopath, sizeof(gopath), "%s/GO", pd_dir );
++                if (!access( gopath, F_OK ))
++                {
++                    pd_armed = 1;
++                    ERR( "neutron-ppm: ARMED by %s -- capturing up to %d frames\n", gopath, pd_max );
++                }
++            }
++            if (pd && pd_armed && pd_written < pd_max && color_info->bmiHeader.biBitCount == 32 &&
++                color_info->bmiHeader.biWidth > 2000)
++            {
++                int width = color_info->bmiHeader.biWidth;
++                int height = abs( color_info->bmiHeader.biHeight );
++                int bottom_up = color_info->bmiHeader.biHeight > 0;
++                int l = cb[0] < 0 ? 0 : cb[0], t = cb[1] < 0 ? 0 : cb[1];
++                int r = cb[2] > width ? width : cb[2], b = cb[3] > height ? height : cb[3];
++                int seq = pd_seq++;
++                if (r > l && b > t && !(seq % pd_every))
++                {
++                    int ow = (r - l + pd_step - 1) / pd_step;
++                    int oh = (b - t + pd_step - 1) / pd_step;
++                    char path[320];
++                    FILE *f;
++                    snprintf( path, sizeof(path), "%s/f%05d_d%d,%d,%d,%d.ppm", pd_dir, seq,
++                              (int)dirty.left, (int)dirty.top, (int)dirty.right, (int)dirty.bottom );
++                    if (!(f = fopen( path, "wb" )))
++                        ERR( "neutron-ppm: cannot write %s\n", path );
++                    else
++                    {
++                        unsigned char *row = malloc( ow * 3 );
++                        int y, x, o;
++                        fprintf( f, "P6\n%d %d\n255\n", ow, oh );
++                        for (y = t; row && y < b; y += pd_step)
++                        {
++                            const UINT *px = (const UINT *)color_bits +
++                                             (bottom_up ? (height - 1 - y) : y) * (SIZE_T)width;
++                            for (x = l, o = 0; x < r; x += pd_step, o += 3)
++                            {
++                                UINT c = px[x];
++                                row[o]     = (c >> 16) & 0xff;
++                                row[o + 1] = (c >> 8) & 0xff;
++                                row[o + 2] = c & 0xff;
++                            }
++                            fwrite( row, 3, ow, f );
++                        }
++                        free( row );
++                        fclose( f );
++                        pd_written++;
++                        ERR( "neutron-ppm: f%05d %dx%d step=%d hwnd=%p surf=%p dirty=(%d,%d)-(%d,%d) [%d/%d]\n",
++                             seq, ow, oh, pd_step, surface->hwnd, surface, (int)dirty.left, (int)dirty.top,
++                             (int)dirty.right, (int)dirty.bottom, pd_written, pd_max );
++                    }
++                }
++            }
++        }
++
+         if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
+                                    shape_changed, shape_info, shape_bits ))
+             reset_bounds( &surface->bounds );

@@ -1,3 +1,9 @@
 # Generated build/package logs (large; not source)
 build-*.log
 package-*.log
+
+# Build tree + packaged runtimes (huge; regenerate with build.sh / package.sh)
+_work/
+dist/
+Desktop/
+Files/
