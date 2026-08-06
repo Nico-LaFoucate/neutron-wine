@@ -1,0 +1,43 @@
+diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
+index c7a78cd327d..6baa3c3677e 100644
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -249,18 +249,34 @@ static INT nulldrv_GetDeviceCaps( PHYSDEV dev, INT cap )
+             return devmode.dmDisplayFrequency;
+         return 1;
+     }
++    /* DESKTOP{HORZ,VERT}RES is the PHYSICAL resolution of the display this DC is on --
++     * NOT the union of every monitor. Returning the virtual-screen rect made a two-monitor
++     * desktop report DESKTOPHORZRES=5760 against HORZRES=3840, while a Windows 11 reference
++     * machine reports the two as EQUAL for a DPI-aware process. The old value was also
++     * internally inconsistent here: the horizontal figure spanned both monitors while the
++     * vertical one did not. win32u consumes this itself to size a screen DC's vis_rect
++     * (dc.c), so the error was not confined to applications. Mirrors the HORZRES/VERTRES
++     * lookup above: this DC's display, else the primary monitor. */
+     case DESKTOPHORZRES:
+         if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
+         {
+-            RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
+-            return rect.right - rect.left;
++            DC *dc = get_nulldrv_dc( dev );
++            RECT rect = {0};
++
++            if (dc->display[0]) rect = get_display_rect( dc->display );
++            if (IsRectEmpty( &rect )) rect = get_primary_monitor_rect( 0 );
++            if (!IsRectEmpty( &rect )) return rect.right - rect.left;
+         }
+         return NtGdiGetDeviceCaps( dev->hdc, HORZRES );
+     case DESKTOPVERTRES:
+         if (NtGdiGetDeviceCaps( dev->hdc, TECHNOLOGY ) == DT_RASDISPLAY)
+         {
+-            RECT rect = get_virtual_screen_rect( 0, MDT_DEFAULT );
+-            return rect.bottom - rect.top;
++            DC *dc = get_nulldrv_dc( dev );
++            RECT rect = {0};
++
++            if (dc->display[0]) rect = get_display_rect( dc->display );
++            if (IsRectEmpty( &rect )) rect = get_primary_monitor_rect( 0 );
++            if (!IsRectEmpty( &rect )) return rect.bottom - rect.top;
+         }
+         return NtGdiGetDeviceCaps( dev->hdc, VERTRES );
+     case BLTALIGNMENT:    return 0;
