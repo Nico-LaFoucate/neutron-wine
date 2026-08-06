@@ -1,0 +1,207 @@
+# NEUTRON: PE-side blit BACKTRACE (NEUTRON_GDI_BLITBT=<dest width>). Diagnostic, inert unless set.
+#
+# Names the code that writes the sheared rows in Illustrator. State of the hunt: the shear is a
+# linear buffer written at one row pitch and read at another (PROVEN - a modular roll by the
+# measured shear reconstructs the content perfectly, so it wraps), and the sheared region is pinned
+# to hwnd 0x30a88, class "DroverLord - Window Class", client (0,0)-(3294,1927) at visorg (73,158),
+# matching the measured block x 73..3366 width 3294 on BOTH edges.
+#
+# Everything that could plausibly drop a stride has been cleared: DXVK DetermineSubresourceLayout,
+# WIC CreateBitmapFromMemory/BitmapImpl_Create, D2D CopyFromMemory (all honour their pitch), and
+# NEUTRON_DIB_PAD proved NO padded-pitch bitmap exists anywhere in the process (with a positive
+# control confirming the probe fires). So the open question is simply WHO writes those rows.
+#
+# Set NEUTRON_GDI_BLITBT to the destination width of interest (3294 canvas, 438 panel); any blit of
+# that width captures 32 frames resolved to module + offset.
+#
+# ⚠️ PE SIDE ON PURPOSE. dlls/win32u/* compiles into win32u.so (the UNIX side) and is reached via
+# the syscall dispatcher, WHICH SWITCHES STACKS -- a backtrace there sees the dispatcher and none of
+# the app's frames. That mistake already cost a build during the Animate residue hunt; hooking
+# gdi32's PE entry points is what finally named the caller there.
+#
+# Extends the existing neutron_blittrace hooks (PatBlt/BitBlt/StretchBlt/SetDIBitsToDevice/
+# StretchDIBits) and arms independently of NEUTRON_GDI_BLITTRACE. Read-only, capped at 8 captures.
+diff --git a/dlls/gdi32/dc.c b/dlls/gdi32/dc.c
+index adfcd5195dc..670c03d046d 100644
+--- a/dlls/gdi32/dc.c
++++ b/dlls/gdi32/dc.c
+@@ -21,11 +21,14 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <stdlib.h>
++
+ #include "gdi_private.h"
+ #include "ntuser.h"
+ #include "ddrawgdi.h"
+ #include "winnls.h"
+ #include "winppi.h"
++#include "winternl.h"   /* NEUTRON: RtlCaptureStackBackTrace / RtlPcToFileHeader for the blit backtrace */
+ 
+ #include "wine/list.h"
+ #include "wine/debug.h"
+@@ -1924,9 +1927,132 @@ BOOL WINAPI SetTextJustification( HDC hdc, INT extra, INT breaks )
+ /***********************************************************************
+  *           PatBlt    (GDI32.@)
+  */
++
++/* NEUTRON GDI BLIT TRACE (env NEUTRON_GDI_BLITTRACE=1).
++ *
++ * WHY. After Effects 2025's composition viewer (hwnd 0x2027C, 2734x1174) renders nothing, and
++ * every other delivery route has been measured out: the D2D drawbot issues ops=0/clears=0 across
++ * 91 frames on that window, our DC-direct blit-back is not erasing it (NEUTRON_D2D_SKIPEMPTY
++ * changed nothing), AE's hardware-accelerated viewer is irrelevant (disabled, still blank), and
++ * there is NO GPU present of any kind (0 DXVK presents, 0 OpenGL). Plain GDI straight to the
++ * window DC is the only path left untraced -- so trace it.
++ *
++ * Logs only blits whose destination DC belongs to a WINDOW (NtUserWindowFromDC != NULL); memory
++ * DCs are the overwhelming majority and are not what we are hunting. Deduped per (function,hwnd)
++ * and hard-capped, so it stays readable in a real session.
++ *
++ *   blits arrive at that hwnd  -> AE renders on the CPU and something downstream loses them.
++ *   none arrive                -> AE's render engine produces no frames at all: a different bug
++ *                                 class entirely, nothing to do with the present path.
++ */
++/* NEUTRON BLIT BACKTRACE (NEUTRON_GDI_BLITBT=<dest width>). PE SIDE ON PURPOSE.
++ *
++ * Illustrator's UI shear is a linear buffer written at one row pitch and read at another (proven:
++ * a modular roll by the measured shear reconstructs the content perfectly, so it WRAPS). The
++ * sheared region is now pinned to a named window: hwnd 0x30a88, class "DroverLord - Window Class",
++ * client (0,0)-(3294,1927) at visorg (73,158) -- which matches the measured block x 73..3366,
++ * width 3294 on BOTH edges. Every stride-taking API has been cleared by inspection (DXVK, WIC,
++ * D2D) and no padded-pitch bitmap exists anywhere in the process (NEUTRON_DIB_PAD, with a positive
++ * control). So the remaining question is simply WHO writes those rows.
++ *
++ * Set NEUTRON_GDI_BLITBT to the destination width of interest (3294 for the canvas, 438 for the
++ * Properties panel) and any blit of that width captures 32 frames, each resolved to module +
++ * offset -- enough to name the Adobe DLL that wrote the rows.
++ *
++ * ⚠️ MUST live on the PE side: dlls/win32u/* compiles into win32u.so (the UNIX side), reached
++ * through the syscall dispatcher, WHICH SWITCHES STACKS -- a backtrace there sees the dispatcher
++ * and stops, with none of the app's frames reachable. That mistake cost a build on the Animate
++ * residue; this hooks gdi32's PE entry points instead, which is what finally named the caller
++ * there. Independent of NEUTRON_GDI_BLITTRACE so the backtrace can be armed on its own. */
++static int neutron_blitbt_target(void)
++{
++    static int target = -2;
++    if (target == -2)
++    {
++        char buf[16];
++        target = GetEnvironmentVariableA( "NEUTRON_GDI_BLITBT", buf, sizeof(buf) ) ? atoi( buf ) : -1;
++    }
++    return target;
++}
++
++static void neutron_blitbt( const char *fn, HWND hwnd, INT x, INT y, INT cx, INT cy )
++{
++    static LONG shots;
++    void *frames[32];
++    USHORT n, i;
++
++    if (cx != neutron_blitbt_target()) return;
++    if (InterlockedIncrement( &shots ) > 8) return;
++
++    n = RtlCaptureStackBackTrace( 1, ARRAY_SIZE(frames), frames, NULL );
++    ERR( "neutron-blitbt: %s hwnd=%p dst=(%d,%d %dx%d) frames=%u\n", fn, hwnd, x, y, cx, cy, n );
++    for (i = 0; i < n; i++)
++    {
++        WCHAR path[MAX_PATH];
++        void *base = NULL;
++
++        RtlPcToFileHeader( frames[i], &base );
++        if (!base || !GetModuleFileNameW( base, path, ARRAY_SIZE(path) )) path[0] = 0;
++        ERR( "neutron-blitbt:   #%02u %p  %s + %#Ix\n", i, frames[i],
++             path[0] ? debugstr_w(path) : "<unknown>",
++             base ? (ULONG_PTR)frames[i] - (ULONG_PTR)base : 0 );
++    }
++}
++
++static void neutron_blittrace( const char *fn, HDC hdc, INT x, INT y, INT cx, INT cy, DWORD rop )
++{
++    static int enabled = -1;
++    static struct { const char *fn; HWND hwnd; LONG count; } seen[64];
++    static LONG seen_n, total;
++    HWND hwnd;
++    int i;
++
++    if (enabled < 0)
++    {
++        char buf[8];
++        enabled = (GetEnvironmentVariableA( "NEUTRON_GDI_BLITTRACE", buf, sizeof(buf) ) && buf[0] == '1') ? 1 : 0;
++    }
++    /* the backtrace arms independently of the counting trace */
++    if (neutron_blitbt_target() >= 0 && (hwnd = NtUserWindowFromDC( hdc )))
++        neutron_blitbt( fn, hwnd, x, y, cx, cy );
++    if (!enabled) return;
++    if (!(hwnd = NtUserWindowFromDC( hdc ))) return;   /* memory DC: not the target */
++
++    /* COUNT, don't just dedupe. A single blit at startup and a steadily-repainting window are
++     * indistinguishable from a first-sighting line alone -- and for the After Effects
++     * composition viewer that difference IS the bug: "delivered once then never again" looks
++     * exactly like "never delivered". */
++    for (i = 0; i < seen_n && i < 64; i++)
++    {
++        if (seen[i].fn == fn && seen[i].hwnd == hwnd)
++        {
++            seen[i].count++;
++            goto counted;
++        }
++    }
++    if (seen_n < 64)
++    {
++        seen[seen_n].fn = fn;
++        seen[seen_n].hwnd = hwnd;
++        seen[seen_n].count = 1;
++        seen_n++;
++        ERR( "neutron-blit: FIRST %s hwnd=%p dc=%p dst=(%d,%d %dx%d) rop=%#lx\n",
++             fn, hwnd, hdc, x, y, cx, cy, rop );
++    }
++counted:
++    total++;
++    if (total % 512 == 0)
++    {
++        ERR( "neutron-blit: ---- totals after %ld window blits ----\n", total );
++        for (i = 0; i < seen_n && i < 64; i++)
++            ERR( "neutron-blit:   %-18s hwnd=%p  n=%ld\n", seen[i].fn, seen[i].hwnd, seen[i].count );
++    }
++}
++
+ BOOL WINAPI PatBlt( HDC hdc, INT left, INT top, INT width, INT height, DWORD rop )
+ {
+     DC_ATTR *dc_attr;
++    neutron_blittrace( "PatBlt", hdc, left, top, width, height, rop );
+ 
+     if (is_meta_dc( hdc )) return METADC_PatBlt( hdc, left, top, width, height, rop );
+     if (!(dc_attr = get_dc_attr( hdc ))) return FALSE;
+@@ -1943,6 +2069,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH BitBlt( HDC hdc_dst, INT x_dst, INT y_dst, INT wid
+                                       HDC hdc_src, INT x_src, INT y_src, DWORD rop )
+ {
+     DC_ATTR *dc_attr;
++    neutron_blittrace( "BitBlt", hdc_dst, x_dst, y_dst, width, height, rop );
+ 
+     if (is_meta_dc( hdc_dst )) return METADC_BitBlt( hdc_dst, x_dst, y_dst, width, height,
+                                                  hdc_src, x_src, y_src, rop );
+@@ -1963,6 +2090,7 @@ BOOL WINAPI StretchBlt( HDC hdc, INT x_dst, INT y_dst, INT width_dst, INT height
+                         DWORD rop )
+ {
+     DC_ATTR *dc_attr;
++    neutron_blittrace( "StretchBlt", hdc, x_dst, y_dst, width_dst, height_dst, rop );
+ 
+     if (is_meta_dc( hdc )) return METADC_StretchBlt( hdc, x_dst, y_dst, width_dst, height_dst,
+                                                      hdc_src, x_src, y_src, width_src,
+@@ -2075,6 +2203,7 @@ INT WINAPI SetDIBitsToDevice( HDC hdc, INT x_dst, INT y_dst, DWORD cx,
+                               UINT coloruse )
+ {
+     DC_ATTR *dc_attr;
++    neutron_blittrace( "SetDIBitsToDevice", hdc, x_dst, y_dst, cx, cy, 0 );
+ 
+     if (is_meta_dc( hdc ))
+         return METADC_SetDIBitsToDevice( hdc, x_dst, y_dst, cx, cy, x_src, y_src, startscan,
+@@ -2098,6 +2227,7 @@ INT WINAPI DECLSPEC_HOTPATCH StretchDIBits( HDC hdc, INT x_dst, INT y_dst, INT w
+                                             UINT coloruse, DWORD rop )
+ {
+     DC_ATTR *dc_attr;
++    neutron_blittrace( "StretchDIBits", hdc, x_dst, y_dst, width_dst, height_dst, rop );
+ 
+     if (is_meta_dc( hdc ))
+         return METADC_StretchDIBits( hdc, x_dst, y_dst, width_dst, height_dst, x_src, y_src,
