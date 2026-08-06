@@ -1,0 +1,438 @@
+# NEUTRON: implement DRAG AND DROP from the desktop (wl_data_device DnD).
+#
+# winewayland's data_device_enter/leave/motion/drop were EMPTY STUBS -- only the clipboard half
+# (selection) was ever implemented -- so dropping a file from Dolphin/Nautilus onto Premiere, Media
+# Encoder or any other app did nothing at all: no WM_DROPFILES, no OLE drop. AME's own empty-queue
+# text tells the user to "drag files here ... from the desktop", so the gap cost a documented
+# workflow. Under X11 this has always worked (winex11.drv/xdnd.c); it broke when the project went
+# Wayland-native.
+#
+# ⭐ Delivery is DRIVER-AGNOSTIC and already existed in win32u: NtUserMessageCall(hwnd,
+# WINE_DRAG_DROP_*, ..., NtUserDragDropCall, FALSE). win32u (dlls/win32u/clipboard.c:745-805) turns
+# those into the OLE IDropTarget sequence -- which is what Adobe actually registers -- and/or a
+# posted WM_DROPFILES. So this patch implements NEITHER protocol; it only feeds that path, exactly
+# as winex11.drv/event.c:1398-1440 does:
+#     enter  -> fetch the offered data, WINE_DRAG_DROP_ENTER(format entries), then DRAG
+#     motion -> WINE_DRAG_DROP_DRAG  (returns the effect the app wants)
+#     leave  -> WINE_DRAG_DROP_LEAVE
+#     drop   -> WINE_DRAG_DROP_POST(DROPFILES) for legacy apps, then WINE_DRAG_DROP_DROP
+# ⚠️ ENTER must carry the DATA, fetched up front: apps inspect it during the drag
+# (IDropTarget::DragEnter), not at the drop. winex11 fetches synchronously too.
+#
+# Also adds "text/uri-list" -> CF_HDROP to supported_formats, with uri_to_dos()/import_uri_list()
+# ported from winex11.drv/clipboard.c (they already handle file:///path, file://host/path and
+# konqueror's file:/path). Without that, a file drag is not representable as a clipboard format at
+# all, so neither the OLE target nor WM_DROPFILES could carry it.
+#
+# Coordinate mapping reuses the pointer path's approach (wayland_pointer.c
+# pointer_handle_motion_internal), so fractional scale is handled by code that already gets it right.
+#
+# ⭐ THE SECOND HALF OF THE BUG, found by tracing a real drop: wayland_data_device_init() was only
+# reachable from the CLIPBOARD window's WM_NCCREATE (one process) or from the seat branch guarded on
+# a data device already existing (chicken-and-egg). So every OTHER app process had NO
+# wl_data_device and received NO drag events at all -- a drop on Media Encoder produced literally
+# zero callbacks. DnD is inherently per-process, so the device is now created whenever the seat and
+# a manager both exist, in every process. data_device_selection() is guarded on clipboard_hwnd so
+#
+# ⚠️ PATCH BASE: wayland.c is touched by EARLIER patches, so this delta is generated against
+# the BUILT tree (staging + all patches), NOT 'git diff HEAD' -- the latter re-emits the other
+# patches' hunks and all 6 get rejected. wayland_data_device.c is touched by no other patch,
+# so git diff is correct for it.
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -30,6 +30,15 @@
+ #include <unistd.h>
+ 
+ #include "waylanddrv.h"
++
++/* NEUTRON (drag & drop): DROPFILES/CF_HDROP come from shlobj/shellapi, DROPEFFECT_* from objidl,
++ * and ntdll_get_dos_file_name (URI -> DOS path) from wine/unixlib.h. Mirrors the include set
++ * winex11.drv/clipboard.c uses for the same job. */
++#include "shlobj.h"
++#include "shellapi.h"
++#include "objidl.h"
++#include "ntuser.h"
++#include "wine/unixlib.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(clipboard);
+@@ -212,8 +221,140 @@ static void *import_data(void *data, size_t size, size_t *ret_size)
+ 
+ /* Order is important. When selecting a mime-type for a clipboard format we
+  * will choose the first entry that matches the specified clipboard format. */
++/* NEUTRON (drag & drop): text/uri-list -> CF_HDROP.
++ *
++ * Ported from winex11.drv/clipboard.c (uri_to_dos / uri_list_to_drop_files), which already handles
++ * the three URI spellings real file managers emit. Without this, a file drag is not REPRESENTABLE
++ * as a clipboard format, so neither the OLE drop target nor WM_DROPFILES can carry it. */
++static WCHAR *uri_to_dos(const char *encoded_uri)
++{
++    WCHAR *ret = NULL;
++    char *uri;
++    int i, j = 0;
++
++    if (!(uri = calloc(1, strlen(encoded_uri) + 1))) return NULL;
++    for (i = 0; encoded_uri[i]; ++i)
++    {
++        if (encoded_uri[i] == '%' && encoded_uri[i + 1] && encoded_uri[i + 2])
++        {
++            char buffer[3] = {encoded_uri[i + 1], encoded_uri[i + 2], 0};
++            unsigned int number;
++            if (sscanf(buffer, "%x", &number) != 1)
++            {
++                WARN("invalid URI encoding in %s\n", debugstr_a(encoded_uri));
++                free(uri);
++                return NULL;
++            }
++            uri[j++] = number;
++            i += 2;
++        }
++        else uri[j++] = encoded_uri[i];
++    }
++
++    /* "Read http://www.freedesktop.org/wiki/Draganddropwarts and cry..." -- winex11 */
++    if (!strncmp(uri, "file:/", 6))
++    {
++        if (uri[6] == '/')
++        {
++            if (uri[7] == '/')                     /* file:///path (nautilus, thunar, dolphin) */
++                ntdll_get_dos_file_name(&uri[7], &ret, FILE_OPEN);
++            else if (uri[7])                       /* file://hostname/path */
++            {
++                char hostname[256];
++                char *path = strchr(&uri[7], '/');
++                if (path)
++                {
++                    *path = '\0';
++                    if (!strcmp(&uri[7], "localhost") ||
++                        (!gethostname(hostname, sizeof(hostname)) && !strcmp(hostname, &uri[7])))
++                    {
++                        *path = '/';
++                        ntdll_get_dos_file_name(path, &ret, FILE_OPEN);
++                    }
++                }
++            }
++        }
++        else if (uri[6])                           /* file:/path (konqueror) */
++            ntdll_get_dos_file_name(&uri[5], &ret, FILE_OPEN);
++    }
++    free(uri);
++    return ret;
++}
++
++/* Import: a text/uri-list payload becomes a DROPFILES block (wide, double-NUL terminated). */
++static void *import_uri_list(void *data, size_t size, size_t *ret_size)
++{
++    const char *uri_list = data;
++    DROPFILES *drop_files = NULL;
++    WCHAR *out;
++    size_t total = 0, capacity = 4096;
++    size_t start = 0, end = 0;
++
++    if (!(out = malloc(capacity * sizeof(WCHAR)))) return NULL;
++
++    while (end < size)
++    {
++        WCHAR *path;
++        char *uri;
++
++        while (end < size && uri_list[end] != '\r') ++end;
++        if (end + 1 < size && uri_list[end + 1] != '\n')
++        {
++            WARN("URI list line doesn't end in \\r\\n\n");
++            break;
++        }
++        if (!(uri = malloc(end - start + 1))) break;
++        memcpy(uri, &uri_list[start], end - start);
++        uri[end - start] = 0;
++
++        path = (uri[0] == '#') ? NULL : uri_to_dos(uri);   /* '#' lines are comments */
++        TRACE("URI %s -> DOS %s\n", debugstr_a(uri), debugstr_w(path));
++        free(uri);
++
++        if (path)
++        {
++            size_t path_size = wcslen(path) + 1;
++            if (path_size > capacity - total)
++            {
++                WCHAR *new_out;
++                capacity = 2 * capacity + path_size;
++                if (!(new_out = realloc(out, (capacity + 1) * sizeof(WCHAR))))
++                {
++                    free(path);
++                    free(out);
++                    return NULL;
++                }
++                out = new_out;
++            }
++            memcpy(&out[total], path, path_size * sizeof(WCHAR));
++            total += path_size;
++            free(path);
++        }
++        start = end + 2;
++        end = start;
++    }
++
++    if (total)
++    {
++        *ret_size = sizeof(DROPFILES) + (total + 1) * sizeof(WCHAR);
++        if ((drop_files = malloc(*ret_size)))
++        {
++            drop_files->pFiles = sizeof(DROPFILES);
++            drop_files->pt.x = 0;
++            drop_files->pt.y = 0;
++            drop_files->fNC = 0;
++            drop_files->fWide = TRUE;
++            out[total] = 0;
++            memcpy((char *)drop_files + drop_files->pFiles, out, (total + 1) * sizeof(WCHAR));
++        }
++    }
++    free(out);
++    return drop_files;
++}
++
+ static struct data_device_format supported_formats[] =
+ {
++    {"text/uri-list", CF_HDROP, NULL, export_data, import_uri_list},
+     {"text/plain;charset=utf-8", CF_UNICODETEXT, NULL, export_unicode_text, import_unicode_text},
+     {"text/rtf", 0, rich_text_formatW, export_data, import_data},
+     {"image/tiff", CF_TIFF, NULL, export_data, import_data},
+@@ -660,29 +801,204 @@ static void data_device_data_offer(void *data, struct wl_data_device *wl_data_de
+     wayland_data_offer_create(wl_data_offer);
+ }
+ 
++/* NEUTRON: DRAG AND DROP FROM THE DESKTOP (wl_data_device DnD).
++ *
++ * These four callbacks were EMPTY STUBS, so dropping a file from Dolphin/Nautilus onto Premiere or
++ * Media Encoder did nothing at all -- no WM_DROPFILES, no OLE drop. Only the clipboard half
++ * (data_device_selection) was ever implemented. AME's own empty-queue text tells the user to "drag
++ * files here ... from the desktop", so the gap costs a documented workflow.
++ *
++ * Delivery uses NtUserMessageCall(..., NtUserDragDropCall, ...), which is DRIVER-AGNOSTIC -- the
++ * same path winex11.drv uses. win32u turns it into the OLE IDropTarget sequence (what Adobe
++ * actually registers) and/or a posted WM_DROPFILES, so we do not have to implement either
++ * ourselves; we only have to feed it. Sequence mirrors winex11.drv/event.c:
++ *     enter  -> fetch the offered data, WINE_DRAG_DROP_ENTER(format entries), then DRAG for feedback
++ *     motion -> WINE_DRAG_DROP_DRAG   (returns the effect the app wants; we echo it to the source)
++ *     leave  -> WINE_DRAG_DROP_LEAVE
++ *     drop   -> WINE_DRAG_DROP_DROP, plus WINE_DRAG_DROP_POST with a DROPFILES for legacy apps
++ */
++
++static struct
++{
++    struct wayland_data_offer *offer;
++    HWND hwnd;
++    uint32_t enter_serial;
++    int x, y;                    /* surface-local, in wayland (logical) units */
++} dnd;
++
++/* Map a surface-local pointer position to the raw screen coordinates win32u expects.
++ * Same shape as pointer_handle_motion_internal() in wayland_pointer.c -- reuse that pattern rather
++ * than inventing one; it is what already handles fractional scale correctly. */
++static void dnd_screen_point(HWND hwnd, wl_fixed_t x_w, wl_fixed_t y_w, POINT *pt)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++
++    pt->x = wl_fixed_to_int(x_w);
++    pt->y = wl_fixed_to_int(y_w);
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if ((surface = data->wayland_surface))
++    {
++        RECT *window_rect = &surface->window.rect;
++        wayland_surface_coords_to_window(surface, wl_fixed_to_double(x_w),
++                                         wl_fixed_to_double(y_w),
++                                         (int *)&pt->x, (int *)&pt->y);
++        pt->x += window_rect->left;
++        pt->y += window_rect->top;
++    }
++    wayland_win_data_release(data);
++}
++
++/* Pull every offered mime type we understand into a format_entry array for WINE_DRAG_DROP_ENTER.
++ * The data must be fetched UP FRONT: the app inspects it during the drag (IDropTarget::DragEnter),
++ * not only at the drop. winex11.drv does the same thing synchronously. */
++static struct format_entry *dnd_build_entries(struct wayland_data_offer *offer, size_t *ret_size)
++{
++    struct format_entry *entries = NULL;
++    size_t total = 0;
++    char **p;
++
++    wl_array_for_each(p, &offer->types)
++    {
++        struct data_device_format *format = data_device_format_for_mime_type(*p);
++        struct format_entry *entry;
++        size_t size, entry_size;
++        void *bytes;
++        int fd;
++
++        if (!format) continue;
++        if ((fd = wayland_data_offer_get_import_fd(offer, format->mime_type)) < 0) continue;
++        bytes = import_format(fd, format, &size);
++        close(fd);
++        if (!bytes) continue;
++
++        entry_size = (offsetof(struct format_entry, data[size]) + 7) & ~7;
++        if (!(entry = realloc(entries, total + entry_size)))
++        {
++            free(bytes);
++            continue;
++        }
++        entries = entry;
++        entry = (struct format_entry *)((char *)entries + total);
++        entry->format = format->clipboard_format;
++        entry->size = size;
++        memcpy(entry->data, bytes, size);
++        total += entry_size;
++        free(bytes);
++    }
++
++    *ret_size = total;
++    return entries;
++}
++
+ static void data_device_enter(void *data, struct wl_data_device *wl_data_device,
+                               uint32_t serial, struct wl_surface *wl_surface,
+                               wl_fixed_t x_w, wl_fixed_t y_w,
+                               struct wl_data_offer *wl_data_offer)
+ {
++    struct wayland_data_offer *offer = wl_data_offer_get_user_data(wl_data_offer);
++    struct format_entry *entries;
++    size_t entries_size = 0;
++    HWND hwnd;
++    POINT pt;
++
++    if (!wl_surface || !offer) return;
++    if (!(hwnd = wl_surface_get_user_data(wl_surface))) return;
++
++    TRACE("hwnd=%p offer=%p pos=%d,%d\n", hwnd, offer,
++          wl_fixed_to_int(x_w), wl_fixed_to_int(y_w));
++
++    dnd.offer = offer;
++    dnd.hwnd = hwnd;
++    dnd.enter_serial = serial;
++    dnd.x = wl_fixed_to_int(x_w);
++    dnd.y = wl_fixed_to_int(y_w);
++
++    if ((entries = dnd_build_entries(offer, &entries_size)) && entries_size)
++        NtUserMessageCall(0, WINE_DRAG_DROP_ENTER, entries_size, (LPARAM)entries,
++                          NULL, NtUserDragDropCall, FALSE);
++    free(entries);
++
++    dnd_screen_point(hwnd, x_w, y_w, &pt);
++    NtUserMessageCall(hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(pt.x, pt.y), DROPEFFECT_COPY,
++                      NULL, NtUserDragDropCall, FALSE);
++
++    wl_data_offer_accept(wl_data_offer, serial, "text/uri-list");
+ }
+ 
+ static void data_device_leave(void *data, struct wl_data_device *wl_data_device)
+ {
++    TRACE("hwnd=%p\n", dnd.hwnd);
++    if (!dnd.hwnd) return;
++    NtUserMessageCall(0, WINE_DRAG_DROP_LEAVE, 0, 0, NULL, NtUserDragDropCall, FALSE);
++    dnd.hwnd = NULL;
++    dnd.offer = NULL;
+ }
+ 
+ static void data_device_motion(void *data, struct wl_data_device *wl_data_device,
+                                uint32_t time, wl_fixed_t x_w, wl_fixed_t y_w)
+ {
++    POINT pt;
++
++    if (!dnd.hwnd) return;
++    dnd.x = wl_fixed_to_int(x_w);
++    dnd.y = wl_fixed_to_int(y_w);
++    dnd_screen_point(dnd.hwnd, x_w, y_w, &pt);
++    /* the app's answer drives the cursor the compositor shows */
++    NtUserMessageCall(dnd.hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(pt.x, pt.y), DROPEFFECT_COPY,
++                      NULL, NtUserDragDropCall, FALSE);
+ }
+ 
+ static void data_device_drop(void *data, struct wl_data_device *wl_data_device)
+ {
++    struct wayland_data_offer *offer = dnd.offer;
++    HWND hwnd = dnd.hwnd;
++    DROPFILES *drop;
++    size_t drop_size;
++    void *uris = NULL;
++    size_t uris_size = 0;
++    int fd;
++
++    TRACE("hwnd=%p offer=%p\n", hwnd, offer);
++    if (!hwnd || !offer) return;
++
++    /* Legacy WM_DROPFILES path: apps that never registered an OLE drop target still expect this,
++     * and it costs one extra read of the uri-list we already know the source provides. */
++    if ((fd = wayland_data_offer_get_import_fd(offer, "text/uri-list")) >= 0)
++    {
++        uris = read_all(fd, &uris_size);
++        close(fd);
++    }
++    if (uris && (drop = import_uri_list(uris, uris_size, &drop_size)))
++    {
++        POINT pt;
++        dnd_screen_point(hwnd, wl_fixed_from_int(dnd.x), wl_fixed_from_int(dnd.y), &pt);
++        drop->pt = pt;
++        NtUserMessageCall(hwnd, WINE_DRAG_DROP_POST, drop_size, (LPARAM)drop,
++                          NULL, NtUserDragDropCall, FALSE);
++        free(drop);
++    }
++    free(uris);
++
++    NtUserMessageCall(hwnd, WINE_DRAG_DROP_DROP, 0, 0, NULL, NtUserDragDropCall, FALSE);
++
++    if (wl_data_offer_get_version(offer->wl_data_offer) >= 3)
++        wl_data_offer_finish(offer->wl_data_offer);
++
++    dnd.hwnd = NULL;
++    dnd.offer = NULL;
+ }
+ 
+ static void data_device_selection(void *data, struct wl_data_device *wl_data_device,
+                                   struct wl_data_offer *wl_data_offer)
+ {
++    /* NEUTRON: every process now creates a data device so it can receive DRAG AND DROP for its own
++     * surfaces (see wayland_data_device_init). Clipboard ownership stays where it was: only the
++     * process hosting the clipboard window may touch the clipboard. Without this guard, each app
++     * process would answer selection events with clipboard_hwnd == NULL and they would fight over
++     * (and empty) the clipboard. */
++    if (!clipboard_hwnd) return;
+     handle_selection(data, wl_data_offer ? wl_data_offer_get_user_data(wl_data_offer) : NULL);
+ }
+ 
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -174,9 +174,15 @@
+         /* NEUTRON: bring up the tablet seat now that we have a wl_seat (no-op if the
+          * tablet manager global hasn't arrived yet; the manager branch retries too). */
+         if (process_wayland.tablet.zwp_tablet_manager_v2) wayland_tablet_init();
+-        /* Recreate the data device for the new seat. */
+-        if (process_wayland.data_device.zwlr_data_control_device_v1 ||
+-            process_wayland.data_device.wl_data_device)
++        /* Recreate the data device for the new seat.
++         * NEUTRON: create it whenever a manager exists, not only when one already exists. The old
++         * guard was a chicken-and-egg: the data device was otherwise created ONLY from the
++         * clipboard window's WM_NCCREATE, which lives in a single process -- so every other app
++         * process had NO wl_data_device and therefore received NO drag-and-drop events for its own
++         * surfaces. That is why dropping a file from Dolphin onto Media Encoder did nothing: the
++         * enter/drop events had nowhere to arrive. DnD is inherently per-process. */
++        if (process_wayland.zwlr_data_control_manager_v1 ||
++            process_wayland.wl_data_device_manager)
+         {
+             wayland_data_device_init();
+         }
+@@ -247,6 +253,12 @@
+     {
+         process_wayland.wl_data_device_manager =
+             wl_registry_bind(registry, id, &wl_data_device_manager_interface, 2);
++        /* NEUTRON: the globals can arrive in either order, so create the data device here too if
++         * the seat already exists. Needed for drag-and-drop, which requires every app process to
++         * have its own wl_data_device (see the seat branch above). */
++        pthread_mutex_lock(&process_wayland.seat.mutex);
++        if (process_wayland.seat.wl_seat) wayland_data_device_init();
++        pthread_mutex_unlock(&process_wayland.seat.mutex);
+     }
+     else if (strcmp(interface, "xdg_toplevel_icon_manager_v1") == 0)
+     {
