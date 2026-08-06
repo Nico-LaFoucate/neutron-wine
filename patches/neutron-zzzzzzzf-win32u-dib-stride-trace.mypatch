@@ -1,25 +1,25 @@
-# NEUTRON: win32u DIB-stride trace (NEUTRON_DIB_TRACE=1). DIAGNOSTIC, inert unless set.
+# NEUTRON: padded-stride diag + SetDIBits blind-spot fix (NEUTRON_DIB_PAD=1, NEUTRON_DIB_W=<w>).
 #
-# Hunting Illustrator's UI shear. Measured 2026-08-06: a uniform horizontal shear of
-# exactly align4(W) - W pixels per row (W=438 Properties panel -> +2.000 px/row;
-# W~873 Wacom dialog -> +3.000 px/row), present in color_bits, content-specific inside
-# a single surface, and the corruption WRAPS - content leaving the right edge of a block
-# reappears at the left of the row below. A rect copy with mismatched strides CLIPS;
-# only a LINEAR buffer written at one row pitch and read at another wraps.
+# Round 2 of the Illustrator shear hunt. 11.10-37 EXCLUDED the DIB blit entry points: with
+# NEUTRON_DIB_TRACE=1 only icon-sized blits (<=64px) ever reached StretchDIBits and there were ZERO
+# SetDIBitsToDevice calls, so Illustrator's panel/dialog pixels do not arrive that way.
 #
-# Prime suspect: bitmapinfo_from_user_bitmapinfo() OVERWRITES the caller's biSizeImage
-# with get_dib_image_size() for every BI_RGB/BI_BITFIELDS DIB - a pitch derived purely
-# from biWidth. An app whose biSizeImage describes a PADDED pitch has it silently
-# discarded, and every downstream reader then walks rows at get_dib_stride(biWidth).
+# The defect is a linear buffer written at one row pitch and read at another (it WRAPS), with
+# delta = align4(W) - W. init_dib_info is the SINGLE funnel through which every bitmap in the
+# process receives its stride, so one check there is decisive instead of guessing further entry
+# points: NEUTRON_DIB_PAD=1 logs every bitmap whose stride is not the packed
+# get_dib_stride(width,bpp); NEUTRON_DIB_W=<w> also logs every bitmap of exactly that width.
 #
-# This logs the caller's ORIGINAL biSizeImage beside the recomputed one, with the blit
-# geometry, on both DIB blit entry points, and flags the two shapes that would explain
-# the defect: *** PITCH MISMATCH *** (app's biSizeImage implies a different pitch) and
-# *** SRC NARROWER THAN biWidth *** (real pitch is biWidth, only wSrc copied).
+# If no padded-pitch bitmap ever appears, the two pitches cannot originate in Wine's GDI at all and
+# the hunt moves to the app writing its own buffer -- a definite answer either way.
 #
-# Read-only: logs only, touches no pixels, capped at 400 lines. No behaviour change.
+# Also closes a real blind spot in 11.10-37: NtGdiSetDIBitsToDeviceInternal early-returns into
+# set_di_bits() when xform != NULL, and the probe sat AFTER that return, so SetDIBits-to-BITMAP was
+# never logged. It calls the same bitmapinfo_from_user_bitmapinfo.
+#
+# Read-only: logs only, no pixels touched, capped. No behaviour change.
 diff --git a/dlls/win32u/dib.c b/dlls/win32u/dib.c
-index 8473ae3c429..fb6a6d31d73 100644
+index 8473ae3c429..73c42c288dc 100644
 --- a/dlls/win32u/dib.c
 +++ b/dlls/win32u/dib.c
 @@ -621,6 +621,66 @@ done:
@@ -99,7 +99,19 @@ index 8473ae3c429..fb6a6d31d73 100644
      if ((dc = get_dc_ptr( hdc )))
      {
          update_dc( dc );
-@@ -904,6 +967,9 @@ INT WINAPI NtGdiSetDIBitsToDeviceInternal( HDC hdc, INT xDest, INT yDest, DWORD
+@@ -686,6 +749,11 @@ static int set_di_bits( HDC hdc, HBITMAP hbitmap, UINT startscan,
+         }
+     }
+ 
++    /* NEUTRON: 11.10-37's probe sat AFTER NtGdiSetDIBitsToDeviceInternal's early return into this
++     * function, so every SetDIBits-to-BITMAP call was invisible to it. Close that blind spot. */
++    neutron_dib_trace( "SetDIBits", info, src_info, 0, 0, src_info->bmiHeader.biWidth, lines,
++                       0, startscan, src_info->bmiHeader.biWidth, lines );
++
+     src_bits.ptr = (void *)bits;
+     src_bits.is_copy = FALSE;
+     src_bits.free = NULL;
+@@ -904,6 +972,9 @@ INT WINAPI NtGdiSetDIBitsToDeviceInternal( HDC hdc, INT xDest, INT yDest, DWORD
          return 0;
      }
  
@@ -109,7 +121,7 @@ index 8473ae3c429..fb6a6d31d73 100644
      if ((dc = get_dc_ptr( hdc )))
      {
          update_dc( dc );
-@@ -1237,6 +1303,14 @@ INT WINAPI NtGdiGetDIBitsInternal( HDC hdc, HBITMAP hbitmap, UINT startscan, UIN
+@@ -1237,6 +1308,14 @@ INT WINAPI NtGdiGetDIBitsInternal( HDC hdc, HBITMAP hbitmap, UINT startscan, UIN
  	return 0;
      }
  
@@ -124,3 +136,161 @@ index 8473ae3c429..fb6a6d31d73 100644
      src.visrect.left   = 0;
      src.visrect.top    = 0;
      src.visrect.right  = bmp->dib.dsBm.bmWidth;
+diff --git a/dlls/win32u/dibdrv/dc.c b/dlls/win32u/dibdrv/dc.c
+index 8a72d9789ea..94db15d9192 100644
+--- a/dlls/win32u/dibdrv/dc.c
++++ b/dlls/win32u/dibdrv/dc.c
+@@ -23,6 +23,7 @@
+ #endif
+ 
+ #include <assert.h>
++#include <stdlib.h>
+ 
+ #include "ntgdi_private.h"
+ #include "dibdrv.h"
+@@ -72,9 +73,54 @@ static void init_bit_fields(dib_info *dib, const DWORD *bit_fields)
+     calc_shift_and_len(dib->blue_mask,  &dib->blue_shift,  &dib->blue_len);
+ }
+ 
++/* NEUTRON PADDED-STRIDE DIAG (NEUTRON_DIB_PAD=1, optional NEUTRON_DIB_W=<width>). Read-only.
++ *
++ * Hunting Illustrator's UI shear: content is displaced right by exactly align4(W) - W pixels per
++ * row (W=438 -> +2, W~873 -> +3) and it WRAPS, which is the signature of a linear buffer written at
++ * one row pitch and read at another. 11.10-37 excluded the DIB blit entry points (StretchDIBits /
++ * SetDIBitsToDevice see only <=64px icons), so the two pitches must arise elsewhere.
++ *
++ * init_dib_info is the SINGLE funnel through which every bitmap in the process gets its stride, so
++ * one check here is decisive rather than another guess at an entry point:
++ *   NEUTRON_DIB_PAD=1  logs every dib whose stride is NOT the packed get_dib_stride(width,bpp) --
++ *                      i.e. every padded-pitch bitmap that exists anywhere in the process.
++ *   NEUTRON_DIB_W=438  additionally logs every dib of exactly that width, padded or not, to show
++ *                      whether a bitmap the size of the sheared block passes through GDI at all.
++ *
++ * If NOTHING padded ever appears, the two pitches cannot originate in Wine's GDI and the shear must
++ * come from the app writing its own buffer at a pitch Wine reported to it -- which is a different
++ * hunt. Either outcome is worth the line. Capped so a busy app cannot flood. */
++static void neutron_dib_pad_trace( const BITMAPINFOHEADER *bi, int stride )
++{
++    static int on = -1, want_w = -1;
++    static LONG shots;
++    int packed, delta;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_DIB_PAD" );
++        const char *w = getenv( "NEUTRON_DIB_W" );
++        on = (e && e[0] == '1') ? 1 : 0;
++        want_w = w ? atoi( w ) : -1;
++        if (want_w > 0) on = 1;
++    }
++    if (!on || !bi->biBitCount) return;
++
++    packed = get_dib_stride( bi->biWidth, bi->biBitCount );
++    delta  = abs( stride ) - packed;
++    if (!delta && bi->biWidth != want_w) return;          /* packed and uninteresting */
++    if (InterlockedIncrement( &shots ) > 300) return;
++
++    ERR( "neutron-dibpad: %dx%d bpp=%u stride=%d packed=%d delta=%dB (%d px)%s\n",
++         (int)bi->biWidth, (int)bi->biHeight, (UINT)bi->biBitCount, stride, packed, delta,
++         bi->biBitCount ? delta * 8 / (int)bi->biBitCount : 0,
++         delta ? "  *** PADDED PITCH ***" : "" );
++}
++
+ static void init_dib_info(dib_info *dib, const BITMAPINFOHEADER *bi, int stride,
+                           const DWORD *bit_fields, const RGBQUAD *color_table, void *bits)
+ {
++    neutron_dib_pad_trace( bi, stride );
+     dib->bit_count    = bi->biBitCount;
+     dib->width        = bi->biWidth;
+     dib->height       = bi->biHeight;
+@@ -261,21 +307,71 @@ int clip_rect_to_dib( const dib_info *dib, RECT *rc )
+     return get_dib_rect( dib, &rect ) && intersect_rect( rc, &rect, rc );
+ }
+ 
++/* NEUTRON PM-TRAILS DIAG (NEUTRON_BLT_TRACE=1): rasterizer-level probe. Logs every
++ * dibdrv draw whose target rect falls in the y-band of the program-monitor scrubber,
++ * on large (window-surface-sized) dibs, incl. the post-clip result. Catches paths
++ * that bypass clip_visrect (Rectangle/Polygon/TextOut). Inert unless env set. */
++static int neutron_dib_trace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_BLT_TRACE"); v = (e && e[0]=='1') ? 1 : 0; }
++    return v;
++}
++
+ int get_clipped_rects( const dib_info *dib, const RECT *rc, HRGN clip, struct clipped_rects *clip_rects )
+ {
+     const WINEREGION *region;
+     RECT rect, *out = clip_rects->buffer;
+     int i;
++    int neutron_log = 0;
++    RECT neutron_in = {0};
+ 
+     init_clipped_rects( clip_rects );
+ 
+     if (!get_dib_rect( dib, &rect )) return 0;
+-    if (rc && !intersect_rect( &rect, &rect, rc )) return 0;
++    if (rc && !intersect_rect( &rect, &rect, rc ))
++    {
++        if (neutron_dib_trace() && dib->rect.right - dib->rect.left > 1500 &&
++            rc->bottom > 900 && rc->top < 1500)
++            ERR( "neutron-dib: op dib=(%d,%d)-(%d,%d) in=(%d,%d)-(%d,%d) OUT-OF-DIB\n",
++                 (int)dib->rect.left, (int)dib->rect.top, (int)dib->rect.right, (int)dib->rect.bottom,
++                 (int)rc->left, (int)rc->top, (int)rc->right, (int)rc->bottom );
++        return 0;
++    }
++    if (neutron_dib_trace() && dib->rect.right - dib->rect.left > 1500 &&
++        rect.bottom > 900 && rect.top < 1500)
++    {
++        neutron_log = 1;
++        neutron_in = rect;
++    }
++    /* NEUTRON PM-TRAILS DIAG (NEUTRON_STRIP=1): log EVERY draw op into "strip-
++     * shaped" dibs (the app's scrubber-bar back-buffer: ~2400x200). Shows whether
++     * the app issues an erase over the OLD sprite area of its own buffer (and its
++     * exact extent) or only re-renders the NEW envelope. Decides app-bug vs
++     * Wine-memdc-clipping for the trailing-sliver under-erase. */
++    {
++        static int st = -1;
++        if (st < 0) { const char *e = getenv("NEUTRON_STRIP"); st = (e && e[0]=='1') ? 1 : 0; }
++        if (st)
++        {
++            int w = dib->rect.right - dib->rect.left, h = dib->rect.bottom - dib->rect.top;
++            if (w >= 1800 && w <= 2700 && h >= 60 && h <= 500)
++            {
++                neutron_log = 2;
++                neutron_in = rect;
++            }
++        }
++    }
+ 
+     if (!clip)
+     {
+         *out = rect;
+         clip_rects->count = 1;
++        if (neutron_log)
++            ERR( "%s: op dib=(%d,%d)-(%d,%d) in=(%d,%d)-(%d,%d) NOCLIP out=1\n",
++                 neutron_log == 2 ? "neutron-strip" : "neutron-dib",
++                 (int)dib->rect.left, (int)dib->rect.top, (int)dib->rect.right, (int)dib->rect.bottom,
++                 (int)neutron_in.left, (int)neutron_in.top, (int)neutron_in.right, (int)neutron_in.bottom );
+         return 1;
+     }
+ 
+@@ -296,6 +392,17 @@ int get_clipped_rects( const dib_info *dib, const RECT *rc, HRGN clip, struct cl
+     }
+     release_wine_region( clip );
+     clip_rects->count = out - clip_rects->rects;
++    if (neutron_log)
++    {
++        RECT c0 = clip_rects->count ? clip_rects->rects[0] : (RECT){0};
++        RECT cl = clip_rects->count ? clip_rects->rects[clip_rects->count - 1] : (RECT){0};
++        ERR( "%s: op dib=(%d,%d)-(%d,%d) in=(%d,%d)-(%d,%d) out=%d first=(%d,%d)-(%d,%d) last=(%d,%d)-(%d,%d)\n",
++             neutron_log == 2 ? "neutron-strip" : "neutron-dib",
++             (int)dib->rect.left, (int)dib->rect.top, (int)dib->rect.right, (int)dib->rect.bottom,
++             (int)neutron_in.left, (int)neutron_in.top, (int)neutron_in.right, (int)neutron_in.bottom,
++             clip_rects->count, (int)c0.left, (int)c0.top, (int)c0.right, (int)c0.bottom,
++             (int)cl.left, (int)cl.top, (int)cl.right, (int)cl.bottom );
++    }
+     return clip_rects->count;
+ }
+ 
