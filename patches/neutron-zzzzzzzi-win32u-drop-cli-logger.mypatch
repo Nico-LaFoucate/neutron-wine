@@ -1,0 +1,32 @@
+# NEUTRON: remove the hardcoded ~/neutron-cli.log writer from the message wait loop.
+#
+# neutron-zzzzzz-win32u-devtree-capture.mypatch wrapped wait_message() in a diagnostic that opens a
+# HARDCODED path and does two fprintf+fflush per iteration. wait_message_reply is one of the hottest
+# paths in the system, so on the dev machine this wrote a 24 MB log during a single afternoon --
+# and on ANY OTHER machine the fopen FAILS, leaving neutron_c NULL, so it retries the fopen syscall
+# on EVERY message wait, forever. That is a real performance defect shipped to every user.
+#
+# Applied as a follow-on rather than by editing the capture patch: that file is known-good and
+# hand-editing its hunk headers produced a malformed patch twice. Removing the block afterwards is
+# equivalent and far safer.
+#
+# Found by the 2026-08-06 leaky-export audit (diff built tree vs dev tree).
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -3785,15 +3785,6 @@
+             continue;
+         }
+ 
+-        {   /* NEUTRON diag: log around the ntsync wait to catch a lost QS_SMRESULT wakeup */
+-            static FILE *neutron_c;
+-            unsigned int tid = (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread;
+-            DWORD r;
+-            if (!neutron_c) neutron_c = fopen( "~/neutron-cli.log", "a" );
+-            if (neutron_c) { fprintf( neutron_c, "WMR tid %04x WAIT wake_bits=%08x mask=%08x\n",
+-                                      tid, wake_bits, wake_mask ); fflush( neutron_c ); }
+-            r = wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
+-            if (neutron_c) { fprintf( neutron_c, "WMR tid %04x WOKE ret=%08x\n", tid, (unsigned)r ); fflush( neutron_c ); }
+-        }
++        wait_message( 1, &server_queue, INFINITE, wake_mask, wake_mask, 0 );
+     }
+ }
