@@ -1,0 +1,33 @@
+# NEUTRON: match the msvcrt FILE* stream cap to the fd cap (Premiere native muxing).
+#
+# msvcrt kept TWO limits: the fd table holds MSVCRT_MAX_FILES (8192) but the FILE* stream table
+# defaulted to 512. Adobe's MediaCore hardware exporter opens its OUTPUT via _wopen (fd table, fine)
+# but its elementary .m4v/.aac INPUTS via _wfopen (this stream table). Under a font/plugin-heavy
+# Premiere the 512 slots exhaust, _wfopen returns NULL, and MainConcept's mp4 muxer treats a NULL
+# input as fatal and SKIPS the interleave -- producing a 0-byte MP4.
+#
+# Matching the stream cap to the fd cap is equivalent to the app calling _setmaxstdio(8192); the
+# fstream table is already dimensioned for MSVCRT_MAX_FILES, so nothing is resized.
+#
+# ⚠️ CAPTURED 2026-08-06 BY A LEAKY-EXPORT AUDIT. This fix had lived ONLY in the dev tree and was in
+# NO released runtime -- every shipped build still had the 512 cap. Found by diffing the built tree
+# (staging + all patches) against the dev tree. Do that diff before every release.
+--- a/dlls/msvcrt/file.c
++++ b/dlls/msvcrt/file.c
+@@ -276,7 +276,15 @@
+ #endif
+ 
+ static file_crit* MSVCRT_fstream[MSVCRT_MAX_FILES/MSVCRT_FD_BLOCK_SIZE];
+-static int MSVCRT_max_streams = 512, MSVCRT_stream_idx;
++/* Neutron: the FILE* stream table defaulted to 512 while the fd table holds
++ * MSVCRT_MAX_FILES (8192). Adobe's MediaCore HW-export muxer opens its output via
++ * _wopen (fd table, OK) but the elementary .m4v/.aac inputs via _wfopen (this
++ * stream table); under a font/plugin-heavy Premiere the 512 slots exhaust, _wfopen
++ * returns NULL, and MainConcept's mp4 muxer treats the NULL input as fatal and
++ * skips the interleave -> 0-byte MP4. Match the stream cap to the fd cap (the
++ * fstream table is already sized for MSVCRT_MAX_FILES) so both opener paths agree.
++ * Equivalent to the app calling _setmaxstdio(8192); table is pre-dimensioned. */
++static int MSVCRT_max_streams = MSVCRT_MAX_FILES, MSVCRT_stream_idx;
+ 
+ /* INTERNAL: process umask */
+ static int MSVCRT_umask = 0;
