@@ -1,0 +1,84 @@
+# NEUTRON FIX CANDIDATE: CreateBitmapIndirect must honour bmWidthBytes when READING the caller's bits.
+#
+# Illustrator's whole UI shears: content is displaced +2.00000 px per row (exact, rms 0.000 over
+# 1543 rows) and WRAPS -- rolling each row modulo the block width reconstructs the image perfectly.
+#
+# Root cause chain, each step measured:
+#  * PE-side blit backtrace (NEUTRON_GDI_BLITBT) named the writer: drawbotagm.dll +0x13f48,
+#    Adobe's AGM drawing layer flushing its offscreen image to the window.
+#  * The blit shows it builds a BITMAP whose bmWidth and bmWidthBytes describe different rows
+#    (a padded stride), wraps it with CreateBitmapIndirect, selects it
+#    into a memory DC and BitBlts it to the window. In Illustrator those disagree: width 3294
+#    (measured block x 73..3366 -- matches hwnd 0x30a88's client exactly), rows 13184 B apart.
+#  * Wine's CreateBitmapIndirect forwarded only width/height/planes/bpp/bits and DROPPED
+#    bmWidthBytes, so the supplied pixels were walked at the packed 13176 -> every row read 2 px
+#    early -> uniform shear with wrap. Exactly the measured defect.
+#
+# Fix: REPACK the caller's rows (read at bmWidthBytes, store packed) instead of storing the stride.
+# GetObject must keep reporting the NORMALISED bmWidthBytes -- dlls/gdi32/tests/bitmap.c "show that
+# Windows ignores the provided bm.bmWidthBytes" checks that, and it passes bmBits=NULL so it says
+# nothing about how supplied PIXELS are read. Repacking satisfies both.
+#
+# Conservative: only when bmBits != NULL, bmPlanes == 1, and bmWidthBytes is LARGER than the packed
+# stride. Every other call takes the original path unchanged.
+#
+# ⚠️ STATUS: candidate. Whether Windows reads supplied bits at bmWidthBytes is NOT yet confirmed on
+# a real Windows box -- a tiny handoff test (padded bmWidthBytes + real bits + BitBlt) is pending.
+diff --git a/dlls/gdi32/objects.c b/dlls/gdi32/objects.c
+index f2b353cff27..6d632ce52a6 100644
+--- a/dlls/gdi32/objects.c
++++ b/dlls/gdi32/objects.c
+@@ -594,6 +594,53 @@ HBITMAP WINAPI CreateBitmapIndirect( const BITMAP *bmp )
+         return NULL;
+     }
+ 
++    /* NEUTRON (Illustrator UI shear): honour bmWidthBytes when READING the caller's bits.
++     *
++     * We forwarded only width/height/planes/bpp/bits and dropped bmWidthBytes, so the supplied
++     * pixels were always walked at the PACKED stride. A caller whose rows are padded therefore had
++     * every row read a few bytes early -- a uniform horizontal shear that wraps onto the next row.
++     *
++     * That is exactly what Adobe's AGM drawbot hits. When it flushes its offscreen image it
++     * builds a BITMAP whose bmWidth and bmWidthBytes describe different row lengths (its
++     * stride is padded), wraps it with CreateBitmapIndirect,
++     * and BitBlts it to the window. In Illustrator those disagree -- width 3294, rows 13184 bytes
++     * apart (3296 px) -- so every row landed 2 px early and the whole canvas sheared.
++     *
++     * Repack rather than store the caller's stride: GetObject must keep REPORTING the normalised
++     * bmWidthBytes (dlls/gdi32/tests/bitmap.c "show that Windows ignores the provided
++     * bm.bmWidthBytes" checks precisely that, and it passes bmBits=NULL so it says nothing about
++     * how supplied PIXELS are read). Repacking satisfies both: the reported metric is unchanged,
++     * and the caller's rows are interpreted where the caller actually put them.
++     *
++     * Only for a padded stride on a single-plane bitmap; everything else takes the old path
++     * untouched, so a caller passing 0 or a too-small bmWidthBytes behaves exactly as before. */
++    if (bmp->bmBits && bmp->bmPlanes == 1 && bmp->bmWidth > 0 && bmp->bmHeight != 0)
++    {
++        LONG height = abs( bmp->bmHeight );
++        LONG packed = ((bmp->bmWidth * bmp->bmBitsPixel + 15) >> 3) & ~1;   /* get_bitmap_stride */
++
++        if (packed > 0 && bmp->bmWidthBytes > packed && height > 0)
++        {
++            char *repacked = malloc( (SIZE_T)packed * height );
++
++            if (repacked)
++            {
++                const char *src = bmp->bmBits;
++                HBITMAP ret;
++                LONG y;
++
++                for (y = 0; y < height; y++)
++                    memcpy( repacked + (SIZE_T)y * packed,
++                            src + (SIZE_T)y * bmp->bmWidthBytes, packed );
++
++                ret = CreateBitmap( bmp->bmWidth, bmp->bmHeight, bmp->bmPlanes,
++                                    bmp->bmBitsPixel, repacked );
++                free( repacked );
++                return ret;
++            }
++        }
++    }
++
+     return CreateBitmap( bmp->bmWidth, bmp->bmHeight, bmp->bmPlanes,
+                          bmp->bmBitsPixel, bmp->bmBits );
+ }
