@@ -1,8 +1,6 @@
-diff --git a/dlls/win32u/driver.c b/dlls/win32u/driver.c
-index c7a78cd327d..6baa3c3677e 100644
 --- a/dlls/win32u/driver.c
 +++ b/dlls/win32u/driver.c
-@@ -249,18 +249,34 @@ static INT nulldrv_GetDeviceCaps( PHYSDEV dev, INT cap )
+@@ -249,18 +249,34 @@
              return devmode.dmDisplayFrequency;
          return 1;
      }
@@ -41,3 +39,52 @@ index c7a78cd327d..6baa3c3677e 100644
          }
          return NtGdiGetDeviceCaps( dev->hdc, VERTRES );
      case BLTALIGNMENT:    return 0;
+--- a/dlls/win32u/dc.c
++++ b/dlls/win32u/dc.c
+@@ -773,10 +773,22 @@
+ 
+     }
+ 
+-    dc->attr->vis_rect.left   = 0;
+-    dc->attr->vis_rect.top    = 0;
+-    dc->attr->vis_rect.right  = NtGdiGetDeviceCaps( hdc, DESKTOPHORZRES );
+-    dc->attr->vis_rect.bottom = NtGdiGetDeviceCaps( hdc, DESKTOPVERTRES );
++    /* NEUTRON: a DC's visible rect must span the WHOLE virtual desktop so drawing can
++     * cross monitors. It used to be taken from DESKTOP{HORZ,VERT}RES, but that cap is
++     * specified to report the PRIMARY display (gdi32 test dc.c:468 expects
++     * DESKTOPHORZRES == SM_CXSCREEN, with a todo_wine_if for the multihead case Wine
++     * gets wrong). Fixing the cap therefore silently narrowed this rect to the primary
++     * monitor and clipped all GDI drawing on any secondary display. Ask for the virtual
++     * screen directly instead, which is what this actually wants and preserves the
++     * behaviour the cap used to provide. */
++    {
++        RECT virt = get_virtual_screen_rect( 0, MDT_DEFAULT );
++
++        dc->attr->vis_rect.left   = 0;
++        dc->attr->vis_rect.top    = 0;
++        dc->attr->vis_rect.right  = virt.right - virt.left;
++        dc->attr->vis_rect.bottom = virt.bottom - virt.top;
++    }
+     dc->is_display            = !!is_display;
+ 
+     DC_InitDC( dc );
+--- a/dlls/win32u/clipping.c
++++ b/dlls/win32u/clipping.c
+@@ -185,10 +185,15 @@
+ 
+     if (!get_dc_device_rect( dc, &rect ))
+     {
++        /* NEUTRON: virtual screen, not DESKTOP{HORZ,VERT}RES -- see the matching comment
++         * in dc.c. That cap reports the primary display, so using it here clipped the
++         * default region to one monitor on a multihead desktop. */
++        RECT virt = get_virtual_screen_rect( 0, MDT_DEFAULT );
++
+         rect.left = 0;
+         rect.top = 0;
+-        rect.right = NtGdiGetDeviceCaps( dc->hSelf, DESKTOPHORZRES );
+-        rect.bottom = NtGdiGetDeviceCaps( dc->hSelf, DESKTOPVERTRES );
++        rect.right = virt.right - virt.left;
++        rect.bottom = virt.bottom - virt.top;
+     }
+     dc->hClipRgn = NtGdiCreateRectRgn( rect.left, rect.top, rect.right, rect.bottom );
+ }
