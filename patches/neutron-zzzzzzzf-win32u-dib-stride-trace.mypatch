@@ -1,0 +1,126 @@
+# NEUTRON: win32u DIB-stride trace (NEUTRON_DIB_TRACE=1). DIAGNOSTIC, inert unless set.
+#
+# Hunting Illustrator's UI shear. Measured 2026-08-06: a uniform horizontal shear of
+# exactly align4(W) - W pixels per row (W=438 Properties panel -> +2.000 px/row;
+# W~873 Wacom dialog -> +3.000 px/row), present in color_bits, content-specific inside
+# a single surface, and the corruption WRAPS - content leaving the right edge of a block
+# reappears at the left of the row below. A rect copy with mismatched strides CLIPS;
+# only a LINEAR buffer written at one row pitch and read at another wraps.
+#
+# Prime suspect: bitmapinfo_from_user_bitmapinfo() OVERWRITES the caller's biSizeImage
+# with get_dib_image_size() for every BI_RGB/BI_BITFIELDS DIB - a pitch derived purely
+# from biWidth. An app whose biSizeImage describes a PADDED pitch has it silently
+# discarded, and every downstream reader then walks rows at get_dib_stride(biWidth).
+#
+# This logs the caller's ORIGINAL biSizeImage beside the recomputed one, with the blit
+# geometry, on both DIB blit entry points, and flags the two shapes that would explain
+# the defect: *** PITCH MISMATCH *** (app's biSizeImage implies a different pitch) and
+# *** SRC NARROWER THAN biWidth *** (real pitch is biWidth, only wSrc copied).
+#
+# Read-only: logs only, touches no pixels, capped at 400 lines. No behaviour change.
+diff --git a/dlls/win32u/dib.c b/dlls/win32u/dib.c
+index 8473ae3c429..fb6a6d31d73 100644
+--- a/dlls/win32u/dib.c
++++ b/dlls/win32u/dib.c
+@@ -621,6 +621,66 @@ done:
+     return ret;
+ }
+ 
++/* NEUTRON DIB-STRIDE DIAG (NEUTRON_DIB_TRACE=1, read-only, logs only).
++ *
++ * WHY: Illustrator's UI is drawn with a uniform horizontal SHEAR of exactly
++ * align4(W) - W pixels per row -- measured +2.000 px/row on the 438px-wide
++ * Properties panel and +3.000 px/row on the ~873px-wide Wacom dialog -- and the
++ * corruption WRAPS: content leaving the right edge of a block reappears at the
++ * left of the row below. A rect copy with mismatched strides CLIPS; only a
++ * LINEAR buffer written at one row pitch and read at another wraps. So some
++ * buffer is written with rows padded to a 4-pixel (16-byte) boundary and read
++ * back tightly packed at W.
++ *
++ * The prime suspect is right here: bitmapinfo_from_user_bitmapinfo() OVERWRITES
++ * the caller's biSizeImage with get_dib_image_size() for every BI_RGB /
++ * BI_BITFIELDS DIB (see dib.c above, "dst->biSizeImage = get_dib_image_size"),
++ * i.e. a pitch derived purely from biWidth. If an app hands us a header whose
++ * biSizeImage describes a PADDED pitch, that value is silently discarded and
++ * every downstream reader walks rows at get_dib_stride(biWidth) instead --
++ * producing exactly this shear, with exactly this wrap.
++ *
++ * So this logs the caller's ORIGINAL biSizeImage beside the recomputed one,
++ * with the blit geometry, and flags the two shapes that would explain the
++ * defect:
++ *   *** PITCH MISMATCH ***  the app's own biSizeImage implies a row pitch
++ *                           different from the one Wine computes -> Wine is
++ *                           discarding the app's real pitch.
++ *   *** SRC NARROWER ***    the source rect is narrower than biWidth, so the
++ *                           real pitch is biWidth but only wSrc is copied.
++ * Either flag on a 438-wide blit names the mechanism outright.
++ *
++ * Capped at 400 lines so a busy app cannot flood the log. */
++static void neutron_dib_trace( const char *api, const BITMAPINFO *user_bmi, const BITMAPINFO *info,
++                               int xDst, int yDst, int wDst, int hDst,
++                               int xSrc, int ySrc, int wSrc, int hSrc )
++{
++    static int on = -1;
++    static LONG shots;
++    DWORD user_size = 0;
++    int stride, implied = 0, height;
++
++    if (on < 0) { const char *e = getenv( "NEUTRON_DIB_TRACE" ); on = (e && e[0] == '1') ? 1 : 0; }
++    if (!on) return;
++    if (InterlockedIncrement( &shots ) > 400) return;
++
++    if (user_bmi && user_bmi->bmiHeader.biSize >= sizeof(BITMAPINFOHEADER))
++        user_size = user_bmi->bmiHeader.biSizeImage;
++
++    height = abs( info->bmiHeader.biHeight );
++    stride = get_dib_stride( info->bmiHeader.biWidth, info->bmiHeader.biBitCount );
++    if (user_size && height) implied = user_size / height;
++
++    ERR( "neutron-dib: %s dst=(%d,%d %dx%d) src=(%d,%d %dx%d) biW=%d biH=%d bpp=%u comp=%u "
++         "userSizeImage=%u normSizeImage=%u stride=%d impliedStride=%d%s%s\n",
++         api, xDst, yDst, wDst, hDst, xSrc, ySrc, wSrc, hSrc,
++         (int)info->bmiHeader.biWidth, (int)info->bmiHeader.biHeight,
++         (UINT)info->bmiHeader.biBitCount, (UINT)info->bmiHeader.biCompression,
++         user_size, info->bmiHeader.biSizeImage, stride, implied,
++         (implied && implied != stride) ? "  *** PITCH MISMATCH ***" : "",
++         (wSrc > 0 && wSrc != info->bmiHeader.biWidth) ? "  *** SRC NARROWER THAN biWidth ***" : "" );
++}
++
+ /***********************************************************************
+  *           NtGdiStretchDIBitsInternal   (win32u.@)
+  */
+@@ -642,6 +702,9 @@ INT WINAPI NtGdiStretchDIBitsInternal( HDC hdc, INT xDst, INT yDst, INT widthDst
+         return 0;
+     }
+ 
++    neutron_dib_trace( "StretchDIBits", bmi, info, xDst, yDst, widthDst, heightDst,
++                       xSrc, ySrc, widthSrc, heightSrc );
++
+     if ((dc = get_dc_ptr( hdc )))
+     {
+         update_dc( dc );
+@@ -904,6 +967,9 @@ INT WINAPI NtGdiSetDIBitsToDeviceInternal( HDC hdc, INT xDest, INT yDest, DWORD
+         return 0;
+     }
+ 
++    neutron_dib_trace( "SetDIBitsToDevice", bmi, info, xDest, yDest, cx, cy,
++                       xSrc, ySrc, cx, lines );
++
+     if ((dc = get_dc_ptr( hdc )))
+     {
+         update_dc( dc );
+@@ -1237,6 +1303,14 @@ INT WINAPI NtGdiGetDIBitsInternal( HDC hdc, HBITMAP hbitmap, UINT startscan, UIN
+ 	return 0;
+     }
+ 
++    /* NEUTRON READ-TRACE: app reading back a strip-shaped bitmap */
++    if (neutron_read_trace() && !neutron_diag_busy &&
++        bmp->dib.dsBm.bmWidth >= 1800 && bmp->dib.dsBm.bmWidth <= 2700 &&
++        bmp->dib.dsBm.bmHeight <= 500)
++        ERR( "neutron-read: GetDIBits dc=%p bmp=%p %dx%d startscan=%u lines=%u bits=%d\n",
++             hdc, hbitmap, (int)bmp->dib.dsBm.bmWidth, (int)bmp->dib.dsBm.bmHeight,
++             startscan, lines, !!bits );
++
+     src.visrect.left   = 0;
+     src.visrect.top    = 0;
+     src.visrect.right  = bmp->dib.dsBm.bmWidth;
