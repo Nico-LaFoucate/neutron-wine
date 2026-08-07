@@ -1,0 +1,378 @@
+# NEUTRON FIX: deliver winewayland drag-and-drop on the TARGET WINDOW'S THREAD.
+#
+# Follow-on to neutron-zzzzzzzj-winewayland-dragdrop.mypatch, which implemented the wl_data_device
+# drag callbacks. That patch was necessary but not sufficient: the drop still did nothing, while the
+# compositor showed an "accept" cursor over the target. Reported against Media Encoder's queue.
+#
+# ROOT CAUSE (measured, not inferred)
+# -----------------------------------
+# The wl_data_device callbacks run on the dedicated wayland event thread created in
+# winewayland.drv/dllmain.c (wayland_read_events_thread -> waylanddrv_unix_read_events ->
+# wl_display_dispatch_queue). They are NOT run by the thread that owns the target window.
+#
+# Underneath NtUserMessageCall(..., NtUserDragDropCall, ...), win32u/clipboard.c:743 hands the drag
+# to user32 via KeUserModeCallback(NtUserDragDrop*). user32/clipboard.c:1191 then resolves the app's
+# drop target with get_droptarget_pointer(), which at clipboard.c:1103 calls:
+#
+#     CoUnmarshalInterface(stream, &IID_IDropTarget, (void**)&droptarget);
+#
+# CoUnmarshalInterface requires COM to be initialised ON THE CALLING THREAD. The wayland event thread
+# has no apartment, so the unmarshal fails, object->drop_target stays NULL, and IDropTarget::DragEnter
+# and ::Drop are never invoked. Nothing is delivered and nothing is logged as an error -- but the
+# previous code had already told the source "I accept" with wl_data_offer_accept(), so the cursor
+# said droppable while the drop was a no-op. That is precisely the reported symptom.
+#
+# winex11.drv is immune by accident of architecture: X11 events are pumped by each window's own
+# thread, so its identical NtUserDragDropCall sequence already runs in an initialised apartment.
+#
+# THE FIX
+# -------
+# Add four driver-internal messages (WM_WAYLAND_DND_ENTER/DRAG/LEAVE/DROP) and route every
+# NtUserDragDropCall through WAYLAND_WindowMessage(), which win32u dispatches on the target window's
+# own thread (win32u/message.c:2278). That thread is by definition the one that called
+# RegisterDragDrop, so OleInitialize has run on it and the unmarshal succeeds.
+#
+# The event thread hands over with NtUserSendMessageTimeout (SMTO_ABORTIFHUNG, 3 s) rather than a
+# plain send: the wayland event thread also drives frame callbacks, so a wedged app must degrade to
+# "the drop does nothing" instead of freezing the process's rendering.
+#
+# Three correctness fixes came out of reading the delivery path end to end:
+#  * Do NOT send WINE_DRAG_DROP_POST. user32's drag_drop_drop() (clipboard.c:1284) already posts
+#    WM_DROPFILES itself from the same CF_HDROP, but only when the OLE drop was refused -- with an
+#    explicit comment that doing both duplicates the dropped files. Sending our own POST as well
+#    would have re-introduced that bug for apps that accept both.
+#  * Accept only a mime type we can actually convert (dnd_first_supported_mime) and re-accept per
+#    motion based on what the app answered, instead of unconditionally claiming "text/uri-list".
+#    Unconditional accept is what made a doomed drop still look droppable.
+#  * Clear the drag state BEFORE the cross-thread send in leave/drop: the compositor may destroy the
+#    offer as soon as it has told us, and the window thread must not follow a dangling pointer.
+#
+# Also honours wl_data_offer_set_actions / wl_data_offer_finish when the offer is v3+, guarded by the
+# generated *_SINCE_VERSION macros so it stays correct at the v2 we currently bind.
+#
+
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -815,7 +815,23 @@
+  *     enter  -> fetch the offered data, WINE_DRAG_DROP_ENTER(format entries), then DRAG for feedback
+  *     motion -> WINE_DRAG_DROP_DRAG   (returns the effect the app wants; we echo it to the source)
+  *     leave  -> WINE_DRAG_DROP_LEAVE
+- *     drop   -> WINE_DRAG_DROP_DROP, plus WINE_DRAG_DROP_POST with a DROPFILES for legacy apps
++ *     drop   -> WINE_DRAG_DROP_DROP
++ *
++ * ⚠ THREAD AFFINITY -- the part that made the first attempt silently do nothing.
++ * These callbacks run on the dedicated wayland event thread (wayland_read_events_thread), NOT on
++ * the thread that owns the target window. Underneath NtUserDragDropCall, user32's
++ * get_droptarget_pointer() unmarshals the app's IDropTarget with CoUnmarshalInterface, which needs
++ * COM initialised on the CALLING thread. The event thread has no apartment, so the unmarshal fails,
++ * drop_target stays NULL, and DragEnter/Drop are never invoked -- yet we had already told the
++ * compositor we accept, so the cursor showed a droppable target and the drop did nothing. That is
++ * exactly the symptom that was reported against Media Encoder. winex11.drv is immune only because
++ * X11 events are pumped by each window's own thread.
++ *
++ * So every NtUserDragDropCall below is issued from wayland_dnd_window_message(), which runs on the
++ * window's own thread via a WM_WAYLAND_DND_* driver message. That thread called RegisterDragDrop,
++ * so OleInitialize has run on it and the unmarshal succeeds.
++ * We do NOT send WINE_DRAG_DROP_POST: user32's drag_drop_drop() already posts WM_DROPFILES itself
++ * when the OLE drop is refused, so posting it too made apps that take both see the files twice.
+  */
+ 
+ static struct
+@@ -824,8 +840,95 @@
+     HWND hwnd;
+     uint32_t enter_serial;
+     int x, y;                    /* surface-local, in wayland (logical) units */
++    const char *mime;            /* owned by offer->types, valid while the offer lives */
+ } dnd;
+ 
++/* Payload handed to the window thread. Only one drag is in flight per process at a time, and the
++ * event thread blocks inside the synchronous send while the window thread reads this, so the
++ * handoff needs no extra locking. */
++static struct
++{
++    struct format_entry *entries;
++    size_t entries_size;
++    POINT pt;
++} dnd_xfer;
++
++/* Run one step of the drop sequence on the target window's own thread.
++ * Bounded + SMTO_ABORTIFHUNG on purpose: the wayland event thread also drives frame callbacks, so
++ * a wedged app must degrade to "the drop does nothing" rather than freeze the process's rendering.
++ * NtUserSendMessageTimeout returns the message result; params.result is the success flag. */
++static LRESULT dnd_call_on_window_thread(HWND hwnd, UINT msg)
++{
++    struct send_message_timeout_params params =
++        {.flags = SMTO_ABORTIFHUNG | SMTO_NORMAL, .timeout = 3000};
++    LRESULT res;
++
++    res = NtUserMessageCall(hwnd, msg, 0, 0, &params, NtUserSendMessageTimeout, FALSE);
++    if (!params.result)
++    {
++        WARN("hwnd=%p msg=%#x timed out, dropping the drag step\n", hwnd, msg);
++        return 0;
++    }
++    return res;
++}
++
++/* The first offered mime type we can actually convert. Accepting a type we cannot deliver is what
++ * made a doomed drop still show a droppable cursor. */
++static const char *dnd_first_supported_mime(struct wayland_data_offer *offer)
++{
++    char **p;
++
++    wl_array_for_each(p, &offer->types)
++        if (data_device_format_for_mime_type(*p)) return *p;
++
++    return NULL;
++}
++
++/* Tell the source whether we take the drag. mime==NULL means "not accepting". */
++static void dnd_accept(struct wl_data_offer *wl_data_offer, uint32_t serial, const char *mime)
++{
++    wl_data_offer_accept(wl_data_offer, serial, mime);
++
++    if (wl_data_offer_get_version(wl_data_offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
++    {
++        uint32_t actions = mime ? WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY
++                                : WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
++        wl_data_offer_set_actions(wl_data_offer, actions, actions);
++    }
++    wl_display_flush(process_wayland.wl_display);
++}
++
++/**********************************************************************
++ *          wayland_dnd_window_message
++ *
++ * Runs on the TARGET WINDOW'S THREAD (via WAYLAND_WindowMessage), which is the thread that
++ * registered the OLE drop target -- see the thread-affinity note above. This is the only place
++ * NtUserDragDropCall may be issued from.
++ */
++LRESULT wayland_dnd_window_message(HWND hwnd, UINT msg)
++{
++    switch (msg)
++    {
++    case WM_WAYLAND_DND_ENTER:
++        if (!dnd_xfer.entries || !dnd_xfer.entries_size) return 0;
++        return NtUserMessageCall(0, WINE_DRAG_DROP_ENTER, dnd_xfer.entries_size,
++                                 (LPARAM)dnd_xfer.entries, NULL, NtUserDragDropCall, FALSE);
++
++    case WM_WAYLAND_DND_DRAG:
++        return NtUserMessageCall(hwnd, WINE_DRAG_DROP_DRAG,
++                                 MAKELONG(dnd_xfer.pt.x, dnd_xfer.pt.y), DROPEFFECT_COPY,
++                                 NULL, NtUserDragDropCall, FALSE);
++
++    case WM_WAYLAND_DND_LEAVE:
++        return NtUserMessageCall(0, WINE_DRAG_DROP_LEAVE, 0, 0, NULL, NtUserDragDropCall, FALSE);
++
++    case WM_WAYLAND_DND_DROP:
++        return NtUserMessageCall(hwnd, WINE_DRAG_DROP_DROP, 0, 0, NULL, NtUserDragDropCall, FALSE);
++    }
++
++    return 0;
++}
++
+ /* Map a surface-local pointer position to the raw screen coordinates win32u expects.
+  * Same shape as pointer_handle_motion_internal() in wayland_pointer.c -- reuse that pattern rather
+  * than inventing one; it is what already handles fractional scale correctly. */
+@@ -897,13 +1000,12 @@
+                               wl_fixed_t x_w, wl_fixed_t y_w,
+                               struct wl_data_offer *wl_data_offer)
+ {
+-    struct wayland_data_offer *offer = wl_data_offer_get_user_data(wl_data_offer);
+-    struct format_entry *entries;
+-    size_t entries_size = 0;
++    struct wayland_data_offer *offer;
++    DWORD effect;
+     HWND hwnd;
+-    POINT pt;
+ 
+-    if (!wl_surface || !offer) return;
++    if (!wl_surface || !wl_data_offer) return;
++    if (!(offer = wl_data_offer_get_user_data(wl_data_offer))) return;
+     if (!(hwnd = wl_surface_get_user_data(wl_surface))) return;
+ 
+     TRACE("hwnd=%p offer=%p pos=%d,%d\n", hwnd, offer,
+@@ -914,80 +1016,89 @@
+     dnd.enter_serial = serial;
+     dnd.x = wl_fixed_to_int(x_w);
+     dnd.y = wl_fixed_to_int(y_w);
++    dnd.mime = dnd_first_supported_mime(offer);
+ 
+-    if ((entries = dnd_build_entries(offer, &entries_size)) && entries_size)
+-        NtUserMessageCall(0, WINE_DRAG_DROP_ENTER, entries_size, (LPARAM)entries,
+-                          NULL, NtUserDragDropCall, FALSE);
+-    free(entries);
+-
+-    dnd_screen_point(hwnd, x_w, y_w, &pt);
+-    NtUserMessageCall(hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(pt.x, pt.y), DROPEFFECT_COPY,
+-                      NULL, NtUserDragDropCall, FALSE);
++    if (!dnd.mime)
++    {
++        TRACE("no offered mime type we can convert, declining\n");
++        dnd_accept(wl_data_offer, serial, NULL);
++        dnd.hwnd = NULL;
++        dnd.offer = NULL;
++        return;
++    }
+ 
+-    wl_data_offer_accept(wl_data_offer, serial, "text/uri-list");
++    /* Fetch the data UP FRONT: the app inspects it during the drag (IDropTarget::DragEnter),
++     * not at the drop. winex11.drv fetches synchronously here too. The read happens on this
++     * thread; only the delivery is handed to the window thread. */
++    dnd_xfer.entries = dnd_build_entries(offer, &dnd_xfer.entries_size);
++    dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_ENTER);
++    /* user32's data_object_create() copies the entries, so this is safe (winex11 frees here too). */
++    free(dnd_xfer.entries);
++    dnd_xfer.entries = NULL;
++    dnd_xfer.entries_size = 0;
++
++    dnd_screen_point(hwnd, x_w, y_w, &dnd_xfer.pt);
++    effect = dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_DRAG);
++    dnd_accept(wl_data_offer, serial, effect != DROPEFFECT_NONE ? dnd.mime : NULL);
+ }
+ 
+ static void data_device_leave(void *data, struct wl_data_device *wl_data_device)
+ {
+-    TRACE("hwnd=%p\n", dnd.hwnd);
+-    if (!dnd.hwnd) return;
+-    NtUserMessageCall(0, WINE_DRAG_DROP_LEAVE, 0, 0, NULL, NtUserDragDropCall, FALSE);
++    HWND hwnd = dnd.hwnd;
++
++    TRACE("hwnd=%p\n", hwnd);
++
++    /* Clear the state BEFORE the cross-thread send: the compositor may destroy the offer as soon
++     * as it has told us we left, and the window thread must not follow a dangling offer. */
+     dnd.hwnd = NULL;
+     dnd.offer = NULL;
++    dnd.mime = NULL;
++    if (!hwnd) return;
++
++    dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_LEAVE);
+ }
+ 
+ static void data_device_motion(void *data, struct wl_data_device *wl_data_device,
+                                uint32_t time, wl_fixed_t x_w, wl_fixed_t y_w)
+ {
+-    POINT pt;
++    DWORD effect;
+ 
+-    if (!dnd.hwnd) return;
++    if (!dnd.hwnd || !dnd.offer) return;
+     dnd.x = wl_fixed_to_int(x_w);
+     dnd.y = wl_fixed_to_int(y_w);
+-    dnd_screen_point(dnd.hwnd, x_w, y_w, &pt);
+-    /* the app's answer drives the cursor the compositor shows */
+-    NtUserMessageCall(dnd.hwnd, WINE_DRAG_DROP_DRAG, MAKELONG(pt.x, pt.y), DROPEFFECT_COPY,
+-                      NULL, NtUserDragDropCall, FALSE);
++    dnd_screen_point(dnd.hwnd, x_w, y_w, &dnd_xfer.pt);
++
++    /* The app's answer drives the cursor the compositor shows, and decides whether the source
++     * will send us a drop at all. */
++    effect = dnd_call_on_window_thread(dnd.hwnd, WM_WAYLAND_DND_DRAG);
++    dnd_accept(dnd.offer->wl_data_offer, dnd.enter_serial,
++               effect != DROPEFFECT_NONE ? dnd.mime : NULL);
+ }
+ 
+ static void data_device_drop(void *data, struct wl_data_device *wl_data_device)
+ {
+     struct wayland_data_offer *offer = dnd.offer;
+     HWND hwnd = dnd.hwnd;
+-    DROPFILES *drop;
+-    size_t drop_size;
+-    void *uris = NULL;
+-    size_t uris_size = 0;
+-    int fd;
++    DWORD effect;
+ 
+     TRACE("hwnd=%p offer=%p\n", hwnd, offer);
+-    if (!hwnd || !offer) return;
+ 
+-    /* Legacy WM_DROPFILES path: apps that never registered an OLE drop target still expect this,
+-     * and it costs one extra read of the uri-list we already know the source provides. */
+-    if ((fd = wayland_data_offer_get_import_fd(offer, "text/uri-list")) >= 0)
+-    {
+-        uris = read_all(fd, &uris_size);
+-        close(fd);
+-    }
+-    if (uris && (drop = import_uri_list(uris, uris_size, &drop_size)))
+-    {
+-        POINT pt;
+-        dnd_screen_point(hwnd, wl_fixed_from_int(dnd.x), wl_fixed_from_int(dnd.y), &pt);
+-        drop->pt = pt;
+-        NtUserMessageCall(hwnd, WINE_DRAG_DROP_POST, drop_size, (LPARAM)drop,
+-                          NULL, NtUserDragDropCall, FALSE);
+-        free(drop);
+-    }
+-    free(uris);
++    dnd.hwnd = NULL;
++    dnd.offer = NULL;
++    dnd.mime = NULL;
++    if (!hwnd || !offer) return;
+ 
+-    NtUserMessageCall(hwnd, WINE_DRAG_DROP_DROP, 0, 0, NULL, NtUserDragDropCall, FALSE);
++    /* The IDataObject built at ENTER already holds the bytes, so the drop itself needs no further
++     * read. user32's drag_drop_drop() runs the OLE IDropTarget::Drop and, only if that is refused,
++     * falls back to posting WM_DROPFILES from the same CF_HDROP -- so we must not post one too. */
++    effect = dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_DROP);
+ 
+-    if (wl_data_offer_get_version(offer->wl_data_offer) >= 3)
++    if (wl_data_offer_get_version(offer->wl_data_offer) >= WL_DATA_OFFER_FINISH_SINCE_VERSION &&
++        effect != DROPEFFECT_NONE)
++    {
+         wl_data_offer_finish(offer->wl_data_offer);
+-
+-    dnd.hwnd = NULL;
+-    dnd.offer = NULL;
++    }
++    wl_display_flush(process_wayland.wl_display);
+ }
+ 
+ static void data_device_selection(void *data, struct wl_data_device *wl_data_device,
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -81,6 +81,19 @@
+      * re-derives conf->scale and re-commits the viewport so the window is sized with the
+      * exact compositor scale. */
+     WM_WAYLAND_SCALE_REFRESH,
++    /* NEUTRON drag-and-drop: the wl_data_device events arrive on the dedicated wayland event
++     * thread (wayland_read_events_thread), but the OLE delivery underneath NtUserDragDropCall
++     * ends in user32's get_droptarget_pointer(), which unmarshals the target's IDropTarget with
++     * CoUnmarshalInterface. That needs COM initialised on the CALLING thread -- the event thread
++     * has no apartment, so the unmarshal fails, the drop target comes back NULL, and the drop
++     * silently does nothing (while the compositor still shows an "accept" cursor). winex11 never
++     * hits this because X11 events are pumped by the window's own thread. So we hand the delivery
++     * to the target window's thread with these messages: that thread is by definition the one
++     * that called RegisterDragDrop, so OleInitialize has run on it. */
++    WM_WAYLAND_DND_ENTER,
++    WM_WAYLAND_DND_DRAG,
++    WM_WAYLAND_DND_LEAVE,
++    WM_WAYLAND_DND_DROP,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -541,6 +554,9 @@
+  */
+ 
+ void wayland_data_device_init(void);
++/* NEUTRON: runs the OLE drop delivery on the target window's thread -- see the
++ * WM_WAYLAND_DND_* comment above. Called only from WAYLAND_WindowMessage(). */
++LRESULT wayland_dnd_window_message(HWND hwnd, UINT msg);
+ 
+ /**********************************************************************
+  *          Helpers
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1146,6 +1146,13 @@
+         ERR( "neutron-wlsetfg: winewayland foregrounding hwnd=%p\n", hwnd );
+         NtUserSetForegroundWindowInternal(hwnd);
+         return 0;
++    /* NEUTRON drag-and-drop: sent from the wayland event thread so that the OLE drop delivery
++     * happens HERE, on the window's own thread -- the one with a COM apartment. */
++    case WM_WAYLAND_DND_ENTER:
++    case WM_WAYLAND_DND_DRAG:
++    case WM_WAYLAND_DND_LEAVE:
++    case WM_WAYLAND_DND_DROP:
++        return wayland_dnd_window_message(hwnd, msg);
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;

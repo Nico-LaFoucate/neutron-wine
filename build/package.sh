@@ -50,6 +50,54 @@ echo "release:             $NAME  (base: $WINE_BASE)"
 # --- stamp a version marker inside the bundle root ------------------------------
 printf '%s\n' "$VERSION" > "$TREE/NEUTRON_WINE_VERSION"
 
+# --- stage version-matched Wine Mono + Gecko INTO the bundle --------------------
+# Without this the tester gets a "Wine Mono Installer" popup on first boot / prefix
+# update, because wineboot cannot find a version-matched tree: our build asks for a
+# specific wine-mono version and the host's /usr/share/wine/mono is whatever the
+# distro shipped (here: 11.2.0 vs the 11.1.0 our build wants). The popup blocks an
+# unattended install and, if dismissed, leaves .NET-backed Adobe bits broken.
+#
+# ⚠ Derive the versions from the BUILT BINARIES, never hardcode them — a skew between
+# what the build expects and what we ship is the whole failure mode. appwiz.cpl and
+# mshtml.dll are PE files, so the strings are UTF-16 (`strings -el`).
+MONO_VER="$(strings -a -el "$TREE/lib/wine/x86_64-windows/appwiz.cpl" 2>/dev/null \
+            | command grep -oP 'wine-mono-\K[0-9.]+(?=-x86\.msi)' | head -1)"
+GECKO_VER="$(strings -a -el "$TREE/lib/wine/x86_64-windows/mshtml.dll" 2>/dev/null \
+            | command grep -oP 'wine-gecko-\K[0-9.]+(?=-x86_64)' | head -1)"
+[ -n "$MONO_VER" ]  || { echo "error: could not read the expected wine-mono version from appwiz.cpl" >&2; exit 4; }
+[ -n "$GECKO_VER" ] || { echo "error: could not read the expected wine-gecko version from mshtml.dll" >&2; exit 4; }
+echo "wine-mono:           $MONO_VER (required by this build)"
+echo "wine-gecko:          $GECKO_VER (required by this build)"
+
+# Source trees, in priority order. These are runtime artifacts, NOT in git — keep them
+# staged under ~/neutron/{mono,gecko} (same trees `neutron runtime capture` uses).
+find_tree() {  # find_tree <subdir> <leafname>
+    local d
+    for d in "${NEUTRON_MONO_GECKO_SRC:-}" "$HOME/neutron/dist/$1" "$HOME/neutron/$1" \
+             "/usr/share/wine/$1" "/opt/wine/$1"; do
+        [ -n "$d" ] && [ -d "$d/$2" ] && { echo "$d/$2"; return 0; }
+    done
+    return 1
+}
+
+stage() {  # stage <subdir> <leafname>
+    local src dst="$TREE/share/wine/$1/$2"
+    if [ -d "$dst" ]; then echo "  = share/wine/$1/$2 (already staged)"; return 0; fi
+    if ! src="$(find_tree "$1" "$2")"; then
+        echo "error: no $2 tree found. The release would pop the Wine Mono/Gecko installer" >&2
+        echo "       on every tester's first boot. Stage it under ~/neutron/$1/ (or set" >&2
+        echo "       NEUTRON_MONO_GECKO_SRC) and re-run." >&2
+        exit 5
+    fi
+    mkdir -p "$(dirname "$dst")"
+    cp -a "$src" "$dst"
+    echo "  + share/wine/$1/$2  <- $src"
+}
+
+stage mono  "wine-mono-$MONO_VER"
+stage gecko "wine-gecko-$GECKO_VER-x86"
+stage gecko "wine-gecko-$GECKO_VER-x86_64"
+
 # --- archive: contents land under  <NAME>/  ------------------------------------
 mkdir -p "$DIST"
 TARBALL="$DIST/$NAME.tar.xz"
