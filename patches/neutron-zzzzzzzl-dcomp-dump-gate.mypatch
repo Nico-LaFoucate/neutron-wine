@@ -1,0 +1,70 @@
+dcomp: gate the raw frame dumper behind NEUTRON_DCOMP_DUMP (default OFF)
+
+The BGRA frame dumper in the cross-process capture path had NO gate. The `diag`
+flag beside it is `(n % 120 == 1)` -- a rate limiter, not an env check -- and the
+CreateFileW/WriteFile block sat outside even that. Its "dump each swapchain once"
+guard keys seen[] on a swapchain POINTER, which the allocator reuses, so 16 slots
+kept re-arming.
+
+Measured on the dev box: 538 files / 3.9 GB of C:\nsc_*.bgra written into the
+user's prefix between 2026-07-04 and 08-03, each a multi-megabyte SYNCHRONOUS
+write issued from inside the 16 ms blit thread.
+
+Same defect class as the ungated nvcuda sampler that crashed every Premiere CUDA
+export the day before (INCIDENTS.md 2026-08-08): a debug feature that ships armed.
+
+Absent -> OFF, "1" -> ON. Deliberately the opposite default to neutron_dcomp_direct()
+right above it, because this one writes megabytes to disk in a present path.
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -423,6 +423,29 @@
+     return v;
+ }
+ 
++/* ---- NEUTRON DCOMP FRAME DUMP (env NEUTRON_DCOMP_DUMP=1) --------------------
++ * Writes the raw BGRA of a captured swapchain frame to C:\nsc_<sc>_<w>x<h>.bgra.
++ * A debugging aid ONLY. Absent -> OFF; "1" -> ON. Opposite default to the gate above,
++ * because this one WRITES MULTI-MEGABYTE FILES from inside the 16 ms blit thread.
++ *
++ * Why it needs a gate at all: it never had one. The `diag` flag it sat next to is
++ * `(n % 120 == 1)`, a rate limiter rather than an env check, and the write block was
++ * outside even that. Its "once per swapchain" guard keys seen[] on a swapchain POINTER,
++ * which the allocator reuses -- so 16 slots produced 538 files / 3.9 GB in the user's
++ * prefix over a month. Found by the ungated-diagnostic audit after the nvcuda sampler
++ * crashed every Premiere CUDA export (INCIDENTS.md 2026-08-08). */
++static int neutron_dcomp_dump(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[8];
++        /* absent -> OFF; "1" -> ON */
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DUMP", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
+ /* Create the shared pixel buffer if it does not exist yet. Hoisted out of the readback so
+  * it can run BEFORE the D3D device lock is taken -- file-mapping creation has no business
+  * happening under that lock. */
+@@ -787,7 +810,18 @@
+                             swapchain, hwnd, desc.Width, desc.Height, px[(SIZE_T)(H / 2) * W + W / 2],
+                             distinct, dd, dd >= 3 ? "HAS-VARIATION" : "TRULY-UNIFORM");
+                     /* Dump EACH distinct swapchain once (keyed by swapchain ptr), + again if it gains
+-                     * variation, so we SEE every ForHwnd swapchain's real content. */
++                     * variation, so we SEE every ForHwnd swapchain's real content.
++                     *
++                     * NEUTRON 2026-08-09: now gated behind NEUTRON_DCOMP_DUMP=1, default OFF.
++                     * It was not gated at all. The `diag` flag beside it is `(n % 120 == 1)` -- a
++                     * rate limiter, NOT an env gate -- and this WriteFile block sat outside even
++                     * that. The "once per swapchain" intent is defeated because seen[] is keyed on a
++                     * swapchain POINTER, which the allocator reuses. Measured on the dev box: 538
++                     * files / 3.9 GB of C:\nsc_*.bgra written into the user's prefix between
++                     * 2026-07-04 and 08-03, each a multi-megabyte SYNCHRONOUS write from inside a
++                     * 16 ms blit thread. Same class as the ungated nvcuda sampler that crashed every
++                     * Premiere CUDA export -- see INCIDENTS.md 2026-08-08. */
++                    if (neutron_dcomp_dump())
+                     {
+                         static struct { void *sc; int best; } seen[16]; static int nseen;
+                         int si, slot = -1;
