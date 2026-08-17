@@ -1,0 +1,105 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2418,7 +2418,38 @@
+ 
+         if (next.idx == origin->idx)
+         {
+-            ERR("Triangle not found.\n");
++            /* NEUTRON: this give-up makes the WHOLE geometry undrawable -- the caller nulls
++             * fill.vertices, so nothing gets filled at all. That produces silent MISSING chrome
++             * rather than mis-drawn chrome, which is a far harder symptom to trace back to here.
++             *
++             * Premiere, 2026-08-16: 55 of these in one session, while the timeline TIME RULER and
++             * the program monitor's grey in/out bar are both missing and the in/out marker thumbs
++             * (chunky geometry) render fine. The suspicion is degenerate, near-collinear input --
++             * a 1px-wide tick or a thin bar -- which is what a CDT is worst at.
++             *
++             * So report WHAT failed, not merely that something did: without bounds and a vertex
++             * count there is no way to tell a 1px tick from a rounded rect from a glyph outline,
++             * and therefore no way to choose a fix. */
++            {
++                /* No bounds field on the geometry, so derive the extent from the vertex set we are
++                 * actually failing on -- which is the thing worth knowing anyway. */
++                float l = 0.0f, t = 0.0f, r = 0.0f, b = 0.0f;
++                size_t v;
++
++                for (v = 0; v < geometry->fill.vertex_count; ++v)
++                {
++                    const D2D1_POINT_2F *p = &geometry->fill.vertices[v];
++
++                    if (!v) { l = r = p->x; t = b = p->y; continue; }
++                    if (p->x < l) l = p->x;
++                    if (p->x > r) r = p->x;
++                    if (p->y < t) t = p->y;
++                    if (p->y > b) b = p->y;
++                }
++                ERR("Triangle not found. geometry=%p figures=%lu verts=%lu extent=(%.2f,%.2f)-(%.2f,%.2f) %.2fx%.2f\n",
++                        geometry, (long)geometry->u.path.figure_count,
++                        (long)geometry->fill.vertex_count, l, t, r, b, r - l, b - t);
++            }
+             return FALSE;
+         }
+     }
+@@ -2908,6 +2939,7 @@
+     size_t vertex_count, i, j;
+     struct d2d_cdt cdt = {0};
+     D2D1_POINT_2F *vertices;
++    size_t non_hollow_figures = 0;   /* NEUTRON: gates the rectangle fast path below */
+ #ifdef __i386__
+     unsigned int control_word_x87, mask = 0;
+ #endif
+@@ -2917,6 +2949,7 @@
+         if (geometry->u.path.figures[i].flags & D2D_FIGURE_FLAG_HOLLOW)
+             continue;
+         vertex_count += geometry->u.path.figures[i].vertex_count;
++        ++non_hollow_figures;
+     }
+ 
+     if (vertex_count < 3)
+@@ -2959,6 +2992,46 @@
+     geometry->fill.vertices = vertices;
+     geometry->fill.vertex_count = vertex_count;
+ 
++    /* NEUTRON: an axis-aligned rectangle needs no triangulation, and asking the CDT to do it is
++     * how thin UI chrome disappears. A 1px-wide tick or a few-pixel-tall bar is near-collinear
++     * input; d2d_cdt_insert_segment() then walks the edges around a vertex, comes back to where it
++     * started, and gives up with "Triangle not found" -- at which point the caller nulls
++     * fill.vertices and NOTHING in that geometry is filled.
++     *
++     * Adobe draws a great deal of chrome as filled rectangles built from a path (not as
++     * D2D1RectangleGeometry, which would never come through here), so this covers the common case
++     * exactly and cheaply: after the sort above, a rectangle's four deduped corners are in a known
++     * order -- d2d_cdt_compare_vertices() orders by x then y, giving
++     * (x0,y0) (x0,y1) (x1,y0) (x1,y1). Emit the two triangles and skip the CDT entirely.
++     *
++     * ⚠️ Deliberately narrow. One non-hollow figure, exactly four vertices, strictly positive
++     * extent. A degenerate case (zero width or height) still falls through to the CDT, because a
++     * zero-area fill legitimately draws nothing and inventing triangles for it would be wrong. */
++    if (non_hollow_figures == 1 && vertex_count == 4
++            && vertices[0].x == vertices[1].x && vertices[2].x == vertices[3].x
++            && vertices[0].y == vertices[2].y && vertices[1].y == vertices[3].y
++            && vertices[0].x < vertices[2].x && vertices[0].y < vertices[1].y)
++    {
++        if (!d2d_array_reserve((void **)&geometry->fill.faces, &geometry->fill.faces_size,
++                2, sizeof(*geometry->fill.faces)))
++        {
++            geometry->fill.vertices = NULL;
++            geometry->fill.vertex_count = 0;
++            free(vertices);
++            return E_OUTOFMEMORY;
++        }
++        geometry->fill.faces[0].v[0] = 0;
++        geometry->fill.faces[0].v[1] = 1;
++        geometry->fill.faces[0].v[2] = 2;
++        geometry->fill.faces[1].v[0] = 1;
++        geometry->fill.faces[1].v[1] = 3;
++        geometry->fill.faces[1].v[2] = 2;
++        geometry->fill.face_count = 2;
++        TRACE("Axis-aligned rectangle (%.2f,%.2f)-(%.2f,%.2f); skipped triangulation.\n",
++                vertices[0].x, vertices[0].y, vertices[3].x, vertices[3].y);
++        return S_OK;
++    }
++
+     cdt.free_edge = ~0u;
+     cdt.vertices = vertices;
+ 

@@ -1,0 +1,78 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -947,13 +947,40 @@
+  *
+  * A MISSING ANSWER IS NOT A REFUSAL. Fall back to the last effect the window thread actually
+  * returned, so a slow app keeps the drop deliverable and DROP still gets its full budget to land
+- * it once the thread frees up. */
+-#define NEUTRON_DND_DRAG_TIMEOUT_MS 120
++ * it once the thread frees up.
++ *
++ * 🚨 THIRD PASS, and the reason for it: "fall back to the last effect" is NOT ENOUGH, because the
++ * last effect can itself be DROPEFFECT_NONE. Measured in Premiere on 11.10-54 -- four wedges in one
++ * session, the held effect alternating 0, 0x1, 0, 0x1, and the user reporting the drop working only
++ * on the SECOND attempt every time. The pointer crosses a region the app genuinely refuses on its
++ * way in, that honest NONE is recorded, the thread then wedges, and we replay the refusal for the
++ * rest of the drag -- including over the timeline, where the app would have said COPY. Pass two
++ * stopped us inventing a refusal; it did not stop us REPLAYING a stale one, and the user-visible
++ * result is identical: the file is silently lost.
++ *
++ * The asymmetry decides it. A wrongly ACCEPTED drag costs nothing that cannot be undone: the drop is
++ * delivered, IDropTarget::Drop makes the app's real decision, and user32 falls back to WM_DROPFILES
++ * if it refuses. A wrongly DECLINED drag is final -- the source never sends a drop and there is no
++ * second chance. So while wedged we answer with the last effect ONLY if it was an acceptance, and
++ * otherwise with COPY. We are guessing either way; guess in the recoverable direction.
++ *
++ * The budget also went 120 -> 400 ms. 120 was picked to bound the aggregate stall, but suppression
++ * already does that -- one timeout per wedge episode, not one per motion -- so the true worst case
++ * is a single budget-length stall, and 400 ms is far below the freeze threshold while giving a busy
++ * Premiere room to answer honestly. Four wedges in one short session says 120 ms was simply too
++ * tight, and every wedge is a drag we then have to guess our way through. */
++#define NEUTRON_DND_DRAG_TIMEOUT_MS 400
+ 
+ static BOOL dnd_drag_feedback_wedged;   /* set when a DRAG step times out; cleared on any success */
+ static LRESULT dnd_last_drag_effect;    /* last effect the window thread really returned, reset per drag */
+ static LONG dnd_leave_pending;          /* a LEAVE has been posted and not yet claimed */
+ 
++/* What to tell the compositor when the window thread will not answer. Never NONE -- see above. */
++static inline LRESULT dnd_wedged_effect(void)
++{
++    return dnd_last_drag_effect != DROPEFFECT_NONE ? dnd_last_drag_effect : DROPEFFECT_COPY;
++}
++
+ static LRESULT dnd_call_on_window_thread(HWND hwnd, UINT msg)
+ {
+     BOOL is_drag = (msg == WM_WAYLAND_DND_DRAG);
+@@ -965,7 +992,7 @@
+     /* Feedback-only step to a window thread that already failed to answer: skip it outright rather
+      * than block the event thread all over again -- but keep answering the compositor with what the
+      * app last told us, never with a refusal we invented. */
+-    if (is_drag && dnd_drag_feedback_wedged) return dnd_last_drag_effect;
++    if (is_drag && dnd_drag_feedback_wedged) return dnd_wedged_effect();
+ 
+     res = NtUserMessageCall(hwnd, msg, 0, 0, &params, NtUserSendMessageTimeout, FALSE);
+     if (!params.result)
+@@ -975,9 +1002,11 @@
+             dnd_drag_feedback_wedged = TRUE;
+             ERR("neutron-dnd: hwnd=%p DND_DRAG timed out after %u ms; suppressing further drag "
+                 "feedback until the window thread answers again -- continuing to block the wayland "
+-                "event thread starves every surface's buffer queue and freezes the app. Holding the "
+-                "last effect %#lx so the drop stays deliverable\n",
+-                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS, (long)dnd_last_drag_effect);
++                "event thread starves every surface's buffer queue and freezes the app. Answering "
++                "%#lx for the rest of this drag (last real answer %#lx) so the drop stays "
++                "deliverable\n",
++                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS, (long)dnd_wedged_effect(),
++                (long)dnd_last_drag_effect);
+         }
+         else if (!is_drag)
+         {
+@@ -988,7 +1017,7 @@
+             ERR("neutron-dnd: hwnd=%p msg=%#x timed out after 3000 ms -- correctness-critical step "
+                 "LOST; the app's drag state is now out of sync with the compositor's\n", hwnd, msg);
+         }
+-        return is_drag ? dnd_last_drag_effect : 0;
++        return is_drag ? dnd_wedged_effect() : 0;
+     }
+     dnd_drag_feedback_wedged = FALSE;
+     if (is_drag) dnd_last_drag_effect = res;

@@ -1,0 +1,98 @@
+Clamp pointer motion only by a rounding epsilon, not to the window edge.
+
+pointer_handle_motion_internal() clamped pointer coordinates to the focused
+window's rect. The upstream comment says this is for coordinates "slightly
+outside ... due to rounding", but the clamp was UNCONDITIONAL: motion any
+distance outside the window was pinned to that window's border.
+
+Wayland has an implicit pointer grab -- while a button is held, pointer focus
+stays on the surface that received the press and the compositor keeps reporting
+motion far outside it. Pinning those coordinates makes Wine believe the cursor
+never left the source window, so every drag that STARTS in a popup or secondary
+surface dies: the drop target never sees the pointer.
+
+Measured symptom: Premiere's Program Monitor "Button Editor" highlights entries
+on hover (in-bounds motion, never clamped) but a button cannot be dragged onto
+the button bar. Drags entirely within one toplevel (project bin -> timeline)
+share a surface, never leave window_rect, and were never affected -- which is
+why this survived so long.
+
+Clamp only an overshoot small enough to be a rounding artifact. The epsilon must
+cover fractional-scale rounding: coords_to_window() multiplies by the surface
+scale, so a 0.5 surface-px error is up to scale/2 window px (~1.13 at 2.25).
+2 px covers it; anything beyond is a real position and must be passed through so
+win32u can route it to the capture window.
+
+NOTE: dlls/winewayland.drv/wintab.c carries an identical copy of this clamp for
+the injected tablet cursor (from neutron-wintab.mypatch) and is predicted to
+break pen drags out of a popup the same way. Deliberately NOT changed here so
+this fix can be tested without perturbing the tablet path.
+
+--- a/dlls/winewayland.drv/wayland_pointer.c	2026-08-12 17:30:13.293733885 -0400
++++ b/dlls/winewayland.drv/wayland_pointer.c	2026-08-12 17:30:13.272578638 -0400
+@@ -128,6 +128,10 @@
+ static BOOL wayland_pointer_show_shape(enum wp_cursor_shape_device_v1_shape shape);
+ static volatile LONG *neutron_cursor_shm(void);
+ 
++/* NEUTRON: max overshoot (in window px) still treated as a rounding artifact by
++ * pointer_handle_motion_internal(). See the comment at the clamp below. */
++#define NEUTRON_PTR_EDGE_EPS 2
++
+ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+ {
+     INPUT input = {0};
+@@ -154,11 +158,49 @@
+     screen.x += window_rect->left;
+     screen.y += window_rect->top;
+     /* Sometimes, due to rounding, we may end up with pointer coordinates
+-     * slightly outside the target window, so bring them within bounds. */
+-    if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
+-    else if (screen.x < window_rect->left) screen.x = window_rect->left;
+-    if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
+-    else if (screen.y < window_rect->top) screen.y = window_rect->top;
++     * slightly outside the target window, so bring them within bounds.
++     *
++     * 🚨 NEUTRON: clamp ONLY a ROUNDING-SIZED overshoot, never an arbitrary one.
++     * The clamp is upstream and its comment says "slightly outside", but it was
++     * unconditional: motion ANY distance outside the focused window was pinned
++     * to that window's edge. Wayland has an IMPLICIT POINTER GRAB -- while a
++     * button is held, pointer focus stays on the surface that received the
++     * press and the compositor keeps reporting motion far outside it. Pinning
++     * those coordinates makes Wine believe the cursor never left the source
++     * window, so EVERY drag that starts in a popup or secondary surface dies:
++     * the drop target never sees the pointer. Measured symptom (2026-08-12):
++     * Premiere's Program Monitor "Button Editor" highlights on hover but a
++     * button cannot be dragged onto the button bar.
++     *
++     * Drags entirely WITHIN one toplevel (project bin -> timeline) share a
++     * surface, never leave window_rect, and were never affected -- which is why
++     * this survived so long.
++     *
++     * The epsilon must cover fractional-scale rounding: coords_to_window()
++     * multiplies by surface->window.scale, so a 0.5 surface-px rounding error
++     * is up to scale/2 window px (~1.13 at the 2.25 scale a build tester runs).
++     * 2 px covers it with margin; anything beyond that is a real position and
++     * MUST be passed through so win32u can route it to the capture window. */
++    if (screen.x >= window_rect->right)
++    {
++        if (screen.x - window_rect->right < NEUTRON_PTR_EDGE_EPS)
++            screen.x = window_rect->right - 1;
++    }
++    else if (screen.x < window_rect->left)
++    {
++        if (window_rect->left - screen.x <= NEUTRON_PTR_EDGE_EPS)
++            screen.x = window_rect->left;
++    }
++    if (screen.y >= window_rect->bottom)
++    {
++        if (screen.y - window_rect->bottom < NEUTRON_PTR_EDGE_EPS)
++            screen.y = window_rect->bottom - 1;
++    }
++    else if (screen.y < window_rect->top)
++    {
++        if (window_rect->top - screen.y <= NEUTRON_PTR_EDGE_EPS)
++            screen.y = window_rect->top;
++    }
+ 
+     wayland_win_data_release(data);
+ 

@@ -1,0 +1,134 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -931,10 +931,28 @@
+  * either, and re-asking 89 times is what turns a busy app into a frozen one. ENTER/LEAVE/DROP keep
+  * the full 3 s -- they are one-shot and correctness-critical (a missed DROP loses the user's file).
+  *
+- * ⚠️ Do NOT collapse this back to a single timeout for all four messages. */
++ * ⚠️ Do NOT collapse this back to a single timeout for all four messages.
++ *
++ * 🚨 SECOND PASS, same day. The first cut of this returned 0 for a timed-out DRAG -- and 0 IS
++ * DROPEFFECT_NONE. Both DRAG callers feed the result straight into dnd_accept():
++ *
++ *     effect = dnd_call_on_window_thread(dnd.hwnd, WM_WAYLAND_DND_DRAG);
++ *     dnd_accept(..., effect != DROPEFFECT_NONE ? dnd.mime : NULL);
++ *
++ * so "the window thread did not answer in time" reached the compositor as "the app refuses this
++ * drag", and -- as the comment in data_device_motion() already warned -- that is what decides
++ * whether the source sends us a drop at all. The freeze went away and was replaced by a
++ * GUARANTEED silent non-import: the file never arrived, every single time. Measured in Premiere
++ * on 11.10-53: one `suppressing further drag`, zero imports.
++ *
++ * A MISSING ANSWER IS NOT A REFUSAL. Fall back to the last effect the window thread actually
++ * returned, so a slow app keeps the drop deliverable and DROP still gets its full budget to land
++ * it once the thread frees up. */
+ #define NEUTRON_DND_DRAG_TIMEOUT_MS 120
+ 
+ static BOOL dnd_drag_feedback_wedged;   /* set when a DRAG step times out; cleared on any success */
++static LRESULT dnd_last_drag_effect;    /* last effect the window thread really returned, reset per drag */
++static LONG dnd_leave_pending;          /* a LEAVE has been posted and not yet claimed */
+ 
+ static LRESULT dnd_call_on_window_thread(HWND hwnd, UINT msg)
+ {
+@@ -945,8 +963,9 @@
+     LRESULT res;
+ 
+     /* Feedback-only step to a window thread that already failed to answer: skip it outright rather
+-     * than block the event thread all over again. */
+-    if (is_drag && dnd_drag_feedback_wedged) return 0;
++     * than block the event thread all over again -- but keep answering the compositor with what the
++     * app last told us, never with a refusal we invented. */
++    if (is_drag && dnd_drag_feedback_wedged) return dnd_last_drag_effect;
+ 
+     res = NtUserMessageCall(hwnd, msg, 0, 0, &params, NtUserSendMessageTimeout, FALSE);
+     if (!params.result)
+@@ -956,16 +975,23 @@
+             dnd_drag_feedback_wedged = TRUE;
+             ERR("neutron-dnd: hwnd=%p DND_DRAG timed out after %u ms; suppressing further drag "
+                 "feedback until the window thread answers again -- continuing to block the wayland "
+-                "event thread starves every surface's buffer queue and freezes the app\n",
+-                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS);
++                "event thread starves every surface's buffer queue and freezes the app. Holding the "
++                "last effect %#lx so the drop stays deliverable\n",
++                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS, (long)dnd_last_drag_effect);
+         }
+         else if (!is_drag)
+         {
+-            WARN("hwnd=%p msg=%#x timed out, dropping the drag step\n", hwnd, msg);
++            /* ERR, not WARN: these three are one-shot and correctness-critical, and a lost one is
++             * invisible in a default-channel log. A swallowed LEAVE is the worst of them -- the app
++             * keeps an IDropTarget drag open forever (Premiere then rolls back every subsequent
++             * edit), which is why LEAVE is now POSTED and can no longer reach this path. */
++            ERR("neutron-dnd: hwnd=%p msg=%#x timed out after 3000 ms -- correctness-critical step "
++                "LOST; the app's drag state is now out of sync with the compositor's\n", hwnd, msg);
+         }
+-        return 0;
++        return is_drag ? dnd_last_drag_effect : 0;
+     }
+     dnd_drag_feedback_wedged = FALSE;
++    if (is_drag) dnd_last_drag_effect = res;
+     return res;
+ }
+ 
+@@ -1007,6 +1033,12 @@
+     switch (msg)
+     {
+     case WM_WAYLAND_DND_ENTER:
++        /* A LEAVE posted for the PREVIOUS drag may still be sitting in this thread's queue: ENTER
++         * arrives by SendMessage and sent messages are dispatched ahead of posted ones, so without
++         * this the stale LEAVE would land after us and tear down the drag that just began. Retrying
++         * a drag that appeared to do nothing is the common case, not a rare one, so this ordering
++         * really does get hit. Claiming the pending LEAVE here defuses it. */
++        InterlockedExchange(&dnd_leave_pending, 0);
+         if (!dnd_xfer.entries || !dnd_xfer.entries_size) return 0;
+         return NtUserMessageCall(0, WINE_DRAG_DROP_ENTER, dnd_xfer.entries_size,
+                                  (LPARAM)dnd_xfer.entries, NULL, NtUserDragDropCall, FALSE);
+@@ -1017,6 +1049,9 @@
+                                  NULL, NtUserDragDropCall, FALSE);
+ 
+     case WM_WAYLAND_DND_LEAVE:
++        /* Delivered asynchronously (see data_device_leave), so it can be overtaken by the next
++         * drag's ENTER. Only act if we are still the outstanding one. */
++        if (!InterlockedExchange(&dnd_leave_pending, 0)) return 0;
+         return NtUserMessageCall(0, WINE_DRAG_DROP_LEAVE, 0, 0, NULL, NtUserDragDropCall, FALSE);
+ 
+     case WM_WAYLAND_DND_DROP:
+@@ -1124,6 +1159,13 @@
+         return;
+     }
+ 
++    /* A new drag starts from a clean slate: the previous drag's wedge must not decide this one.
++     * The optimistic COPY seed matters -- it is the answer we give if the very first DRAG step
++     * times out, and "accept" merely risks a drop the app then refuses (user32 falls back to
++     * WM_DROPFILES), whereas "refuse" loses the file outright with no second chance. */
++    dnd_drag_feedback_wedged = FALSE;
++    dnd_last_drag_effect = DROPEFFECT_COPY;
++
+     /* Fetch the data UP FRONT: the app inspects it during the drag (IDropTarget::DragEnter),
+      * not at the drop. winex11.drv fetches synchronously here too. The read happens on this
+      * thread; only the delivery is handed to the window thread. */
+@@ -1150,9 +1192,23 @@
+     dnd.hwnd = NULL;
+     dnd.offer = NULL;
+     dnd.mime = NULL;
++    dnd_drag_feedback_wedged = FALSE;
+     if (!hwnd) return;
+ 
+-    dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_LEAVE);
++    /* POSTED, not sent. Nobody uses LEAVE's return value, so a bounded synchronous send buys
++     * nothing here and costs everything: if the window thread is busy, the send times out and the
++     * message is DISCARDED. The app has already had IDropTarget::DragEnter, so a dropped LEAVE
++     * leaves it believing a drag is still hovering it -- forever. In Premiere that meant every
++     * later edit (cut a clip, toggle an effect) previewed and then instantly rolled back, and only
++     * a restart cleared it. A post cannot be lost: it waits in the queue and is delivered the
++     * moment the thread pumps again. It also cannot block this thread, which is the one draining
++     * the compositor socket for every surface in the process.
++     *
++     * Note this is unreachable after a drop: data_device_drop() has already NULLed dnd.hwnd, so the
++     * trailing leave the compositor sends returns above -- the app must not see DragLeave after
++     * Drop, and that guard is what keeps it from doing so. */
++    InterlockedExchange(&dnd_leave_pending, 1);
++    NtUserPostMessage(hwnd, WM_WAYLAND_DND_LEAVE, 0, 0);
+ }
+ 
+ static void data_device_motion(void *data, struct wl_data_device *wl_data_device,

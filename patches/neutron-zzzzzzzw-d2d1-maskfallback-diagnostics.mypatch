@@ -1,0 +1,112 @@
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -325,9 +325,61 @@
+     n = ID2D1GeometryGroup_GetSourceGeometryCount(group);
+     if (n > ARRAY_SIZE(srcs) || ID2D1GeometryGroup_GetFillMode(group) != D2D1_FILL_MODE_WINDING)
+     {
++        /* NEUTRON: two entirely different failures shared one message, and it printed
++         * "(limit 128)" for masks of TWO members. A 2026-08-13 capture reads as an over-cap
++         * problem at a glance and is nothing of the kind: 182 bails, every one n=2 fillmode=0
++         * (ALTERNATE). Say which condition fired, and for ALTERNATE dump the members -- ALTERNATE
++         * over rectangles is a HOLE, so the correct clip EXCLUDES the inner rect while the
++         * bounding-box fallback includes it, and the app's background fill then wipes whatever
++         * lived in the hole. That is the "timeline tool buttons vanish" symptom.
++         *
++         * Note the ordering: this bail runs BEFORE the per-member rectangle check below, so
++         * nothing here is known to be a rectangle yet -- which is why the members are dumped
++         * rather than assumed. Rate-limited: these fire thousands of times per session. */
+         if (neutron_optrace())
+-            ERR("neutron-dr: MASKFALLBACK n=%u (limit %u) fillmode=%u -- bounding box in force\n",
+-                    n, (unsigned)ARRAY_SIZE(srcs), ID2D1GeometryGroup_GetFillMode(group));
++        {
++            static LONG dumps;
++
++            if (n > ARRAY_SIZE(srcs))
++                ERR("neutron-dr: MASKFALLBACK OVER-CAP n=%u (limit %u) -- bounding box in force\n",
++                        n, (unsigned)ARRAY_SIZE(srcs));
++            else
++                ERR("neutron-dr: MASKFALLBACK FILLMODE=ALTERNATE n=%u -- bounding box in force "
++                    "(a hole; the bbox over-includes it)\n", n);
++
++            if (n && n <= ARRAY_SIZE(srcs) && InterlockedIncrement(&dumps) <= 8)
++            {
++                ID2D1Geometry *dump[ARRAY_SIZE(context->mask_rects)] = {0};
++                unsigned k;
++
++                ID2D1GeometryGroup_GetSourceGeometries(group, dump, n);
++                for (k = 0; k < n; ++k)
++                {
++                    ID2D1RectangleGeometry *rg;
++                    D2D1_RECT_F r;
++
++                    if (!dump[k])
++                    {
++                        ERR("neutron-dr:   member[%u] NULL\n", k);
++                        continue;
++                    }
++                    if (SUCCEEDED(ID2D1Geometry_QueryInterface(dump[k], &IID_ID2D1RectangleGeometry,
++                            (void **)&rg)))
++                    {
++                        ID2D1RectangleGeometry_GetRect(rg, &r);
++                        ID2D1RectangleGeometry_Release(rg);
++                        ERR("neutron-dr:   member[%u] RECT (%.1f,%.1f)-(%.1f,%.1f)\n",
++                                k, r.left, r.top, r.right, r.bottom);
++                    }
++                    else if (SUCCEEDED(ID2D1Geometry_GetBounds(dump[k], NULL, &r)))
++                        ERR("neutron-dr:   member[%u] NON-RECT bounds=(%.1f,%.1f)-(%.1f,%.1f)\n",
++                                k, r.left, r.top, r.right, r.bottom);
++                    else
++                        ERR("neutron-dr:   member[%u] NON-RECT (bounds unavailable)\n", k);
++                    ID2D1Geometry_Release(dump[k]);
++                }
++            }
++        }
+         ID2D1GeometryGroup_Release(group);
+         return FALSE;
+     }
+@@ -351,6 +403,45 @@
+         /* Only plain rectangles: for anything else the bounds are not the shape. */
+         if (FAILED(ID2D1Geometry_QueryInterface(srcs[i], &IID_ID2D1RectangleGeometry, (void **)&rg)))
+         {
++            /* NEUTRON: by far the most common bail -- 3645 in one 2026-08-13 session, all n=1 --
++             * and the old message said only "non-rectangle", which is not enough to decide what
++             * to do about it. A rounded rectangle could be handled (inset, or accept the corner
++             * bleed); an arbitrary path cannot, and needs a real mask instead of a scissor.
++             * Name the shape so the fix is chosen from evidence. Rate-limited. */
++            static LONG shape_dumps;
++
++            if (neutron_optrace() && InterlockedIncrement(&shape_dumps) <= 8)
++            {
++                static const struct { const IID *iid; const char *name; } kinds[] =
++                {
++                    { &IID_ID2D1RoundedRectangleGeometry, "ROUNDED-RECT" },
++                    { &IID_ID2D1EllipseGeometry,          "ELLIPSE" },
++                    { &IID_ID2D1TransformedGeometry,      "TRANSFORMED" },
++                    { &IID_ID2D1PathGeometry,             "PATH" },
++                    { &IID_ID2D1GeometryGroup,            "NESTED-GROUP" },
++                };
++                const char *kind = "UNKNOWN";
++                D2D1_RECT_F b;
++                unsigned k;
++
++                for (k = 0; k < ARRAY_SIZE(kinds); ++k)
++                {
++                    void *probe;
++
++                    if (SUCCEEDED(ID2D1Geometry_QueryInterface(srcs[i], kinds[k].iid, &probe)))
++                    {
++                        IUnknown_Release((IUnknown *)probe);
++                        kind = kinds[k].name;
++                        break;
++                    }
++                }
++                if (SUCCEEDED(ID2D1Geometry_GetBounds(srcs[i], NULL, &b)))
++                    ERR("neutron-dr: MASKSHAPE-DETAIL member[%u]/%u kind=%s bounds=(%.1f,%.1f)-(%.1f,%.1f)\n",
++                            i, n, kind, b.left, b.top, b.right, b.bottom);
++                else
++                    ERR("neutron-dr: MASKSHAPE-DETAIL member[%u]/%u kind=%s (bounds unavailable)\n",
++                            i, n, kind);
++            }
+             ok = FALSE;
+         }
+         else

@@ -1,0 +1,160 @@
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -434,6 +434,18 @@
+  * that never received their own wp_fractional_scale.preferred event use the precise
+  * output scale (e.g. 1.7000) instead of the imprecise raw-dpi fallback (1.6979). */
+ extern LONG neutron_last_precise_scale120;
++/* NEUTRON workarea#1: the LOGICAL height the compositor last granted a MAXIMIZED toplevel
++ * (0 = never measured). display.c reserves a top inset from the monitor's work area so a
++ * maximized Win32 window matches what the compositor will actually accept; that inset used
++ * to be a hardcoded 32-logical-px guess. This is the measured replacement. Read atomically.
++ * See the work-area note in display.c for why a wrong inset makes the window unpaintable. */
++extern LONG neutron_maximized_logical_h;
++/* Report a measured maximized logical height to the DESKTOP process and ask it to rebuild the
++ * display devices. MUST be used instead of a plain global: rc_work is only ever computed in the
++ * desktop process (see display.c), while the measurement can only be taken in whichever process
++ * owns the maximized toplevel -- normally an app. A per-process global never crosses that gap,
++ * so the value rides in the existing WM_WAYLAND_INIT_DISPLAY_DEVICES message. */
++void wayland_report_maximized_logical_h(int logical_h);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+                                           enum wayland_surface_config_state state);
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -272,11 +272,39 @@
+         int mode_h = output_info->output->current_mode ?
+                      output_info->output->current_mode->height : 0;
+         int logical_h = output_info->output->logical_h;
+-        int inset = 32; /* logical px; KWin/Breeze titlebar ~= this */
++        int logical_inset = 32; /* fallback: KWin/Breeze titlebar ~= this */
++        int inset;
++        LONG measured = InterlockedCompareExchange(&neutron_maximized_logical_h, 0, 0);
++
++        /* NEUTRON workarea#1: prefer the MEASURED inset over the 32px estimate.
++         *
++         * `measured` is the logical height the compositor last granted a maximized toplevel
++         * (recorded in xdg_toplevel_handle_configure). The reservation is therefore
++         * logical_h - measured. The estimate it replaces was correct on this dev box (32) and
++         * 2 logical px too large on a build tester's machine (30) -- and that 2px made every
++         * maximized window there permanently unpaintable, because rc_work IS the maximized
++         * window size and a window shorter than the configure never satisfies
++         * wayland_surface_config_is_compatible(). See the write-up in
++         * neutron/dist/HANDOFF-18-root-cause-our-hardcoded-32.md.
++         *
++         * Guarded, because `measured` is process-global while this runs per output: only trust
++         * it for an output whose logical height it could plausibly belong to. A multi-monitor
++         * setup where the maximized window is on the OTHER output falls back to the estimate,
++         * which is exactly the behaviour we have today. */
++        if (measured > 0 && logical_h > 0 && measured <= logical_h &&
++            (logical_h - measured) < logical_h / 4)
++        {
++            logical_inset = logical_h - measured;
++        }
++
++        inset = logical_inset;
+         if (logical_h > 0 && mode_h > 0)
+-            inset = (int)((32.0 * mode_h) / logical_h + 0.5); /* -> device px */
++            inset = (int)(((double)logical_inset * mode_h) / logical_h + 0.5); /* -> device px */
+         if (inset > 0 && inset < (monitor.rc_work.bottom - monitor.rc_work.top))
+             monitor.rc_work.top += inset;
++
++        TRACE("neutron-workarea: logical_h=%d measured=%ld logical_inset=%d device_inset=%d\n",
++              logical_h, (long)measured, logical_inset, inset);
+     }
+ 
+     TRACE("name=%s rc_monitor=%s rc_work=%s\n",
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -123,6 +123,30 @@
+     NtUserPostMessage(desktop_hwnd, WM_WAYLAND_INIT_DISPLAY_DEVICES, 0, 0);
+ }
+ 
++/* NEUTRON workarea#1: hand a MEASURED maximized logical height to the desktop process.
++ *
++ * ⚠️ This deliberately does NOT go through maybe_init_display_devices(): that bails when we are
++ * not the desktop process, and "not the desktop process" is the normal case here. The monitor
++ * list -- and therefore rc_work -- is only ever built in the desktop process (see the note in
++ * display.c), but the measurement can only be taken where the maximized toplevel lives, which is
++ * an app process. A plain per-process global is invisible across that boundary: the desktop
++ * process's copy would stay 0, the guard in display.c would fail, and the inset would silently
++ * fall back to the old 32px estimate -- a no-op that looks exactly like a working fix on any
++ * machine whose compositor happens to reserve 32.
++ *
++ * So carry the value in wparam of the message the desktop process already handles. Caught in
++ * review by the build tester before this was ever built; it could not have been caught on the
++ * dev box, where measured and estimated insets are numerically identical. */
++void wayland_report_maximized_logical_h(int logical_h)
++{
++    HWND desktop_hwnd;
++
++    if (!process_wayland.initialized || logical_h <= 0) return;
++    if (!(desktop_hwnd = NtUserGetDesktopWindow())) return;
++
++    NtUserPostMessage(desktop_hwnd, WM_WAYLAND_INIT_DISPLAY_DEVICES, (WPARAM)logical_h, 0);
++}
++
+ static void wayland_output_mode_free_rb(struct rb_entry *entry, void *ctx)
+ {
+     free(RB_ENTRY_VALUE(entry, struct wayland_output_mode, entry));
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -153,6 +153,35 @@
+ 
+     TRACE("hwnd=%p %dx%d,%#x\n", hwnd, width, height, config_state);
+ 
++    /* NEUTRON workarea#1: MEASURE what the compositor actually grants a maximized toplevel.
++     *
++     * display.c has to reserve a top inset from the monitor work area, because a maximized
++     * Win32 window is sized to rc_work and the compositor will not accept a surface larger
++     * than the area it configured. That inset used to be a hardcoded 32-logical-px estimate
++     * of the KWin/Breeze titlebar. When the estimate is too LARGE the maximized window comes
++     * out shorter than the configure, wayland_surface_config_is_compatible() then fails on
++     * `height < conf->height` for the rest of the process's life, the surface never commits a
++     * buffer, and the window is a permanent blank rectangle that cannot even be resized.
++     *
++     * Found 2026-08-10 on a build tester's machine: their compositor reserves 30 logical px,
++     * ours reserves 32. The estimate was right here and 2 logical px too big there, which was
++     * enough to make Illustrator unusable while it worked perfectly on the dev box.
++     *
++     * This is the configure that carries the truth: for a MAXIMIZED toplevel, `height` IS the
++     * logical height the compositor is willing to give us. Record it and, when it changes,
++     * ask for a display-devices rebuild so rc_work is recomputed from the measurement instead
++     * of the guess.
++     *
++     * The value must be REPORTED to the desktop process, not merely stored: rc_work is built
++     * only there. The InterlockedExchange below is purely a per-process rate limit, so a stable
++     * compositor posts once rather than on every configure. */
++    if ((config_state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && height > 0 &&
++        InterlockedExchange(&neutron_maximized_logical_h, height) != height)
++    {
++        TRACE("neutron-workarea: measured maximized logical height %d\n", height);
++        wayland_report_maximized_logical_h(height);
++    }
++
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+     if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface))
+@@ -230,6 +259,8 @@
+ /* NEUTRON scalefix#2: see waylanddrv.h. Written here (wayland event thread), read in
+  * window.c wayland_win_data_get_config (window threads); a LONG is read/written atomically. */
+ LONG neutron_last_precise_scale120 = 0;
++/* NEUTRON workarea#1: see waylanddrv.h. 0 until the first maximized configure is seen. */
++LONG neutron_maximized_logical_h = 0;
+ 
+ static void fractional_scale_handle_preferred(void *data,
+                                               struct wp_fractional_scale_v1 *fs,
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1131,6 +1131,12 @@
+     switch (msg)
+     {
+     case WM_WAYLAND_INIT_DISPLAY_DEVICES:
++        /* NEUTRON workarea#1: a non-zero wp is a MEASURED maximized logical height, reported by
++         * whichever process owns the maximized toplevel (see wayland_report_maximized_logical_h).
++         * Record it here, in the desktop process, because that is the only process that builds the
++         * monitor list and therefore the only one whose copy of this value display.c will read.
++         * Must be stored BEFORE the rebuild below, or the rebuild uses the stale estimate. */
++        if (wp) InterlockedExchange(&neutron_maximized_logical_h, (LONG)wp);
+         NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
+         return 0;
+     case WM_WAYLAND_CONFIGURE:

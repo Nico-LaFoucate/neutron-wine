@@ -1,0 +1,66 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -912,19 +912,60 @@
+ /* Run one step of the drop sequence on the target window's own thread.
+  * Bounded + SMTO_ABORTIFHUNG on purpose: the wayland event thread also drives frame callbacks, so
+  * a wedged app must degrade to "the drop does nothing" rather than freeze the process's rendering.
+- * NtUserSendMessageTimeout returns the message result; params.result is the success flag. */
++ * NtUserSendMessageTimeout returns the message result; params.result is the success flag.
++ *
++ * 🚨 A 3 s bound PER CALL is not a bound on the damage. This thread is the ONLY one that drains the
++ * compositor socket, so every millisecond blocked here is a millisecond in which no
++ * wl_buffer.release is read for ANY surface: every window's SHM queue starves at once and the app's
++ * UI thread livelocks in wayland_buffer_queue_get_free_buffer().
++ *
++ * Measured (Premiere, 2026-08-13): a timeline drag-and-drop wedged the UI for ~2 minutes, and the
++ * log shows **89 DND_DRAG deliveries during the stall** -- at up to 3 s each, up to 267 s of a
++ * completely undrained socket. `ss -xp` during a live stall: Recv-Q = 7768 bytes, sent by a healthy
++ * actively-compositing KWin and never read; ~10 failed buffer acquisitions/second; three windows
++ * starving at once; app at ~0% CPU.
++ *
++ * DRAG is pure feedback -- its only product is the cursor effect the compositor shows. It is both
++ * the most frequent step and the most expendable, so it gets a SHORT budget, and once one times out
++ * we stop sending them until one succeeds again: a wedged window thread will not answer the next one
++ * either, and re-asking 89 times is what turns a busy app into a frozen one. ENTER/LEAVE/DROP keep
++ * the full 3 s -- they are one-shot and correctness-critical (a missed DROP loses the user's file).
++ *
++ * ⚠️ Do NOT collapse this back to a single timeout for all four messages. */
++#define NEUTRON_DND_DRAG_TIMEOUT_MS 120
++
++static BOOL dnd_drag_feedback_wedged;   /* set when a DRAG step times out; cleared on any success */
++
+ static LRESULT dnd_call_on_window_thread(HWND hwnd, UINT msg)
+ {
++    BOOL is_drag = (msg == WM_WAYLAND_DND_DRAG);
+     struct send_message_timeout_params params =
+-        {.flags = SMTO_ABORTIFHUNG | SMTO_NORMAL, .timeout = 3000};
++        {.flags = SMTO_ABORTIFHUNG | SMTO_NORMAL,
++         .timeout = is_drag ? NEUTRON_DND_DRAG_TIMEOUT_MS : 3000};
+     LRESULT res;
+ 
++    /* Feedback-only step to a window thread that already failed to answer: skip it outright rather
++     * than block the event thread all over again. */
++    if (is_drag && dnd_drag_feedback_wedged) return 0;
++
+     res = NtUserMessageCall(hwnd, msg, 0, 0, &params, NtUserSendMessageTimeout, FALSE);
+     if (!params.result)
+     {
+-        WARN("hwnd=%p msg=%#x timed out, dropping the drag step\n", hwnd, msg);
++        if (is_drag && !dnd_drag_feedback_wedged)
++        {
++            dnd_drag_feedback_wedged = TRUE;
++            ERR("neutron-dnd: hwnd=%p DND_DRAG timed out after %u ms; suppressing further drag "
++                "feedback until the window thread answers again -- continuing to block the wayland "
++                "event thread starves every surface's buffer queue and freezes the app\n",
++                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS);
++        }
++        else if (!is_drag)
++        {
++            WARN("hwnd=%p msg=%#x timed out, dropping the drag step\n", hwnd, msg);
++        }
+         return 0;
+     }
++    dnd_drag_feedback_wedged = FALSE;
+     return res;
+ }
+ 

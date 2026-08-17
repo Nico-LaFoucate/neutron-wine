@@ -1,0 +1,492 @@
+--- a/programs/powershell/main.c
++++ b/programs/powershell/main.c
+@@ -16,30 +16,476 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++/*
++ * NEUTRON: powershell.exe was a pure stub -- it printed a FIXME and exited 0, producing EMPTY
++ * OUTPUT for every invocation. Applications cannot tell that apart from "the query returned
++ * nothing", so they conclude the machine has no hardware.
++ *
++ * Measured 2026-08-14, Captioneer (aescripts) inside Premiere:
++ *
++ *     powershell -Command "Get-WmiObject -Class Win32_VideoController |
++ *                          Select-Object Name, DriverVersion, VideoProcessor | ConvertTo-Csv"
++ *     -> INFO PowerShell output:            (empty)
++ *     -> INFO GPU detection complete. Found 0 NVIDIA GPUs
++ *
++ * The user has an NVIDIA card and the app fell back to CPU transcription because of this.
++ *
++ * We are NOT implementing PowerShell. What these apps actually use it for is a WMI query and a
++ * formatter, and Wine already HAS the WMI provider -- wbemprox implements Win32_VideoController
++ * (fill_videocontroller populates name, driverversion, videoprocessor among ~20 fields). So this
++ * handles exactly that shape:
++ *
++ *     Get-WmiObject|Get-CimInstance [-Class|-ClassName] <CLASS>
++ *         [ | Select-Object <prop>[,<prop>...] ]
++ *         [ | ConvertTo-Csv [-NoTypeInformation] | ConvertTo-Json ]
++ *
++ * and answers it from real WMI data. Anything else keeps the old stub behaviour, but now logs the
++ * command at ERR so the next unsupported shape is visible in a log instead of silently returning
++ * nothing -- which is how this defect hid in the first place.
++ */
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <wchar.h>
++
++#define COBJMACROS
++#include "windows.h"
++#include "ole2.h"
++/* INITGUID before wbemcli.h: CLSID_WbemLocator / IID_IWbemLocator are not in Wine's uuid lib, so
++ * define them here rather than adding a link dependency for two GUIDs. */
++#include "initguid.h"
++#include "wbemcli.h"
++
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(powershell);
+ 
++enum output_format { FORMAT_LIST, FORMAT_CSV, FORMAT_CSV_NOTYPE, FORMAT_JSON };
++
++#define MAX_PROPS 32
++
++struct query
++{
++    WCHAR class_name[128];
++    WCHAR *props[MAX_PROPS];
++    unsigned prop_count;
++    enum output_format format;
++};
++
++static WCHAR *skip_spaces(WCHAR *p)
++{
++    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
++    return p;
++}
++
++static void rstrip(WCHAR *s)
++{
++    size_t n = wcslen(s);
++    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r' || s[n - 1] == '\n'))
++        s[--n] = 0;
++}
++
++/* Strip one layer of surrounding quotes, in place. */
++static WCHAR *unquote(WCHAR *s)
++{
++    size_t n;
++
++    s = skip_spaces(s);
++    rstrip(s);
++    n = wcslen(s);
++    if (n >= 2 && ((s[0] == '"' && s[n - 1] == '"') || (s[0] == '\'' && s[n - 1] == '\'')))
++    {
++        s[n - 1] = 0;
++        ++s;
++    }
++    return s;
++}
++
++/* Case-insensitive "does token start this segment", token followed by space or end. */
++static BOOL starts_with_word(const WCHAR *s, const WCHAR *word)
++{
++    size_t n = wcslen(word);
++    if (wcsnicmp(s, word, n)) return FALSE;
++    return !s[n] || s[n] == ' ' || s[n] == '\t';
++}
++
++/* Parse the "Get-WmiObject -Class X" stage. Accepts -Class/-ClassName/-Query or a bare class. */
++static BOOL parse_source(WCHAR *seg, struct query *q)
++{
++    WCHAR *p = seg;
++
++    if (starts_with_word(p, L"Get-WmiObject")) p += wcslen(L"Get-WmiObject");
++    else if (starts_with_word(p, L"Get-CimInstance")) p += wcslen(L"Get-CimInstance");
++    else if (starts_with_word(p, L"gwmi")) p += wcslen(L"gwmi");
++    else return FALSE;
++
++    for (;;)
++    {
++        WCHAR *tok;
++
++        p = skip_spaces(p);
++        if (!*p) break;
++
++        if (*p == '-')
++        {
++            /* A switch we either consume with its value, or ignore. */
++            if (starts_with_word(p, L"-Class") || starts_with_word(p, L"-ClassName"))
++            {
++                p += starts_with_word(p, L"-ClassName") ? wcslen(L"-ClassName") : wcslen(L"-Class");
++                p = skip_spaces(p);
++            }
++            else
++            {
++                /* Unknown switch: skip it, and skip a following value if it is not a switch. */
++                while (*p && *p != ' ' && *p != '\t') ++p;
++                p = skip_spaces(p);
++                if (*p && *p != '-')
++                    while (*p && *p != ' ' && *p != '\t') ++p;
++                continue;
++            }
++        }
++
++        tok = p;
++        while (*p && *p != ' ' && *p != '\t') ++p;
++        if (*p) *p++ = 0;
++        tok = unquote(tok);
++        if (*tok && !q->class_name[0])
++            lstrcpynW(q->class_name, tok, ARRAY_SIZE(q->class_name));
++    }
++
++    return q->class_name[0] != 0;
++}
++
++/* Parse "Select-Object A, B, C" (also accepts -Property). */
++static void parse_select(WCHAR *seg, struct query *q)
++{
++    WCHAR *p = seg, *tok;
++
++    if (starts_with_word(p, L"Select-Object")) p += wcslen(L"Select-Object");
++    else if (starts_with_word(p, L"select")) p += wcslen(L"select");
++    p = skip_spaces(p);
++    if (starts_with_word(p, L"-Property")) { p += wcslen(L"-Property"); p = skip_spaces(p); }
++
++    while (*p && q->prop_count < MAX_PROPS)
++    {
++        p = skip_spaces(p);
++        if (!*p) break;
++        tok = p;
++        while (*p && *p != ',') ++p;
++        if (*p) *p++ = 0;
++        tok = unquote(tok);
++        if (*tok) q->props[q->prop_count++] = tok;
++    }
++}
++
++static void print_csv_field(const WCHAR *s, BOOL last)
++{
++    /* PowerShell's ConvertTo-Csv quotes every field and doubles embedded quotes. */
++    const WCHAR *p = s;
++
++    putwchar('"');
++    for (; p && *p; ++p)
++    {
++        if (*p == '"') putwchar('"');
++        putwchar(*p);
++    }
++    putwchar('"');
++    if (!last) putwchar(',');
++}
++
++static void print_json_string(const WCHAR *s)
++{
++    const WCHAR *p = s;
++
++    putwchar('"');
++    for (; p && *p; ++p)
++    {
++        if (*p == '"' || *p == '\\') putwchar('\\');
++        putwchar(*p);
++    }
++    putwchar('"');
++}
++
++/* VARIANT -> display string, matching what PowerShell would print for these scalar types. */
++static void variant_to_string(VARIANT *v, WCHAR *buf, size_t len)
++{
++    VARIANT copy;
++
++    buf[0] = 0;
++    if (V_VT(v) == VT_NULL || V_VT(v) == VT_EMPTY) return;
++
++    VariantInit(&copy);
++    if (SUCCEEDED(VariantChangeType(&copy, v, 0, VT_BSTR)) && V_BSTR(&copy))
++        lstrcpynW(buf, V_BSTR(&copy), len);
++    VariantClear(&copy);
++}
++
++static int run_wmi_query(struct query *q)
++{
++    IEnumWbemClassObject *enumerator = NULL;
++    IWbemServices *services = NULL;
++    IWbemLocator *locator = NULL;
++    BSTR ns = NULL, lang = NULL, wql = NULL;
++    WCHAR query_text[256];
++    HRESULT hr;
++    unsigned i;
++    BOOL first_row = TRUE;
++    int ret = 1;
++
++    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    if (FAILED(hr)) return 1;
++
++    hr = CoCreateInstance(&CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
++                          &IID_IWbemLocator, (void **)&locator);
++    if (FAILED(hr))
++    {
++        ERR("neutron-ps: CoCreateInstance(WbemLocator) failed %#lx\n", hr);
++        goto done;
++    }
++
++    ns = SysAllocString(L"ROOT\\CIMV2");
++    hr = IWbemLocator_ConnectServer(locator, ns, NULL, NULL, NULL, 0, NULL, NULL, &services);
++    if (FAILED(hr))
++    {
++        ERR("neutron-ps: ConnectServer(ROOT\\CIMV2) failed %#lx\n", hr);
++        goto done;
++    }
++
++    swprintf(query_text, ARRAY_SIZE(query_text), L"SELECT * FROM %s", q->class_name);
++    lang = SysAllocString(L"WQL");
++    wql = SysAllocString(query_text);
++    hr = IWbemServices_ExecQuery(services, lang, wql,
++                                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
++                                 NULL, &enumerator);
++    if (FAILED(hr))
++    {
++        ERR("neutron-ps: ExecQuery(%s) failed %#lx\n", debugstr_w(query_text), hr);
++        goto done;
++    }
++
++    /* ConvertTo-Csv emits a #TYPE header first unless -NoTypeInformation was given. */
++    if (q->format == FORMAT_CSV)
++        wprintf(L"#TYPE Selected.System.Management.ManagementObject\n");
++    if (q->format == FORMAT_CSV || q->format == FORMAT_CSV_NOTYPE)
++    {
++        for (i = 0; i < q->prop_count; ++i)
++            print_csv_field(q->props[i], i + 1 == q->prop_count);
++        if (q->prop_count) putwchar('\n');
++    }
++    if (q->format == FORMAT_JSON) wprintf(L"[\n");
++
++    for (;;)
++    {
++        IWbemClassObject *obj = NULL;
++        ULONG returned = 0;
++
++        hr = IEnumWbemClassObject_Next(enumerator, WBEM_INFINITE, 1, &obj, &returned);
++        if (FAILED(hr) || !returned) break;
++
++        if (q->format == FORMAT_JSON && !first_row) wprintf(L",\n");
++
++        if (q->format == FORMAT_JSON) wprintf(L"  {");
++        for (i = 0; i < q->prop_count; ++i)
++        {
++            WCHAR value[512];
++            VARIANT v;
++
++            VariantInit(&v);
++            value[0] = 0;
++            if (SUCCEEDED(IWbemClassObject_Get(obj, q->props[i], 0, &v, NULL, NULL)))
++                variant_to_string(&v, value, ARRAY_SIZE(value));
++            VariantClear(&v);
++
++            switch (q->format)
++            {
++            case FORMAT_CSV:
++            case FORMAT_CSV_NOTYPE:
++                print_csv_field(value, i + 1 == q->prop_count);
++                break;
++            case FORMAT_JSON:
++                if (i) wprintf(L", ");
++                print_json_string(q->props[i]);
++                wprintf(L": ");
++                print_json_string(value);
++                break;
++            case FORMAT_LIST:
++                wprintf(L"%-24s : %s\n", q->props[i], value);
++                break;
++            }
++        }
++        if (q->format == FORMAT_JSON) wprintf(L"}");
++        else if (q->format == FORMAT_LIST) putwchar('\n');
++        else putwchar('\n');
++
++        first_row = FALSE;
++        IWbemClassObject_Release(obj);
++    }
++    if (q->format == FORMAT_JSON) wprintf(L"\n]\n");
++
++    ret = 0;
++
++done:
++    if (enumerator) IEnumWbemClassObject_Release(enumerator);
++    if (services) IWbemServices_Release(services);
++    if (locator) IWbemLocator_Release(locator);
++    SysFreeString(ns);
++    SysFreeString(lang);
++    SysFreeString(wql);
++    CoUninitialize();
++    return ret;
++}
++
++/* Split on '|' and interpret the stages. Returns FALSE if this is not a shape we handle. */
++static BOOL try_run_pipeline(const WCHAR *command)
++{
++    WCHAR *buf, *seg, *next;
++    struct query q = {{0}};
++    BOOL have_source = FALSE;
++    int rc;
++
++    if (!(buf = wcsdup(command))) return FALSE;
++    q.format = FORMAT_LIST;
++
++    for (seg = buf; seg; seg = next)
++    {
++        if ((next = wcschr(seg, '|'))) *next++ = 0;
++        seg = skip_spaces(seg);
++        rstrip(seg);
++        if (!*seg) continue;
++
++        if (!have_source)
++        {
++            if (!(have_source = parse_source(seg, &q))) goto unsupported;
++        }
++        else if (starts_with_word(seg, L"Select-Object") || starts_with_word(seg, L"select"))
++        {
++            parse_select(seg, &q);
++        }
++        else if (starts_with_word(seg, L"ConvertTo-Csv"))
++        {
++            q.format = wcsstr(seg, L"-NoTypeInformation") ? FORMAT_CSV_NOTYPE : FORMAT_CSV;
++        }
++        else if (starts_with_word(seg, L"ConvertTo-Json"))
++        {
++            q.format = FORMAT_JSON;
++        }
++        else if (starts_with_word(seg, L"Format-List") || starts_with_word(seg, L"fl")
++                 || starts_with_word(seg, L"Format-Table") || starts_with_word(seg, L"ft")
++                 || starts_with_word(seg, L"Out-String"))
++        {
++            /* Presentation-only for our purposes; the list format is close enough. */
++        }
++        else goto unsupported;
++    }
++
++    if (!have_source) goto unsupported;
++
++    /* No Select-Object: PowerShell would print every property. Callers of this shape always
++     * select, and dumping all ~58 columns would be worse than useless, so ask for the identifying
++     * ones and say so. */
++    if (!q.prop_count)
++    {
++        static WCHAR name[] = L"Name", caption[] = L"Caption", desc[] = L"Description";
++        q.props[q.prop_count++] = name;
++        q.props[q.prop_count++] = caption;
++        q.props[q.prop_count++] = desc;
++        WARN("neutron-ps: no Select-Object; defaulting to Name/Caption/Description\n");
++    }
++
++    ERR("neutron-ps: serving WMI class %s, %u propert%s, format %d\n",
++        debugstr_w(q.class_name), q.prop_count, q.prop_count == 1 ? "y" : "ies", q.format);
++
++    rc = run_wmi_query(&q);
++    fflush(stdout);
++    free(buf);
++    return rc == 0;
++
++unsupported:
++    /* The whole point of the ERR: an unhandled shape used to be indistinguishable from an empty
++     * result set, and the app silently believed the machine had no hardware. */
++    ERR("neutron-ps: UNSUPPORTED command, returning no output: %s\n", debugstr_w(command));
++    free(buf);
++    return FALSE;
++}
++
++static WCHAR *read_script_file(const WCHAR *path)
++{
++    LARGE_INTEGER size;
++    WCHAR *text = NULL;
++    DWORD read = 0;
++    char *raw;
++    HANDLE f;
++    int len;
++
++    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    if (f == INVALID_HANDLE_VALUE) return NULL;
++    if (!GetFileSizeEx(f, &size) || size.QuadPart <= 0 || size.QuadPart > (1 << 20))
++    {
++        CloseHandle(f);
++        return NULL;
++    }
++    if (!(raw = malloc(size.QuadPart + 1)))
++    {
++        CloseHandle(f);
++        return NULL;
++    }
++    if (ReadFile(f, raw, size.QuadPart, &read, NULL) && read)
++    {
++        raw[read] = 0;
++        /* Scripts these apps generate are ASCII/UTF-8; a BOM would break the class name. */
++        len = MultiByteToWideChar(CP_UTF8, 0, raw, -1, NULL, 0);
++        if (len > 0 && (text = malloc(len * sizeof(WCHAR))))
++            MultiByteToWideChar(CP_UTF8, 0, raw, -1, text, len);
++        if (text && text[0] == 0xfeff) memmove(text, text + 1, (wcslen(text)) * sizeof(WCHAR));
++    }
++    free(raw);
++    CloseHandle(f);
++    return text;
++}
++
+ int __cdecl wmain(int argc, WCHAR *argv[])
+ {
++    const WCHAR *command = NULL;
++    WCHAR *script = NULL;
+     int i;
+ 
++    for (i = 1; i < argc; i++)
++    {
++        if ((!wcsicmp(argv[i], L"-Command") || !wcsicmp(argv[i], L"-c")) && i < argc - 1)
++        {
++            if (!wcscmp(argv[i + 1], L"-")) break;   /* stdin mode, handled below */
++            command = argv[++i];
++        }
++        else if ((!wcsicmp(argv[i], L"-File") || !wcsicmp(argv[i], L"-f")) && i < argc - 1)
++        {
++            if ((script = read_script_file(argv[++i]))) command = script;
++            else ERR("neutron-ps: cannot read script %s\n", debugstr_w(argv[i]));
++        }
++    }
++
++    if (command && try_run_pipeline(command))
++    {
++        free(script);
++        return 0;
++    }
++    free(script);
++
+     WINE_FIXME("stub.\n");
+     for (i = 0; i < argc; i++)
+     {
+         WINE_FIXME("argv[%d] %s\n", i, wine_dbgstr_w(argv[i]));
+         if (!wcsicmp(argv[i], L"-command") && i < argc - 1 && !wcscmp(argv[i + 1], L"-"))
+         {
+-            char command[4096], *p;
++            char command_buf[4096], *p;
+ 
+             ++i;
+-            while (fgets(command, sizeof(command), stdin))
++            while (fgets(command_buf, sizeof(command_buf), stdin))
+             {
+-                WINE_FIXME("command %s.\n", debugstr_a(command));
+-                p = command;
++                WINE_FIXME("command %s.\n", debugstr_a(command_buf));
++                p = command_buf;
+                 while (*p && !isspace(*p)) ++p;
+                 *p = 0;
+-                if (!stricmp(command, "exit"))
++                if (!stricmp(command_buf, "exit"))
+                     break;
+             }
+         }
+--- a/programs/powershell/Makefile.in
++++ b/programs/powershell/Makefile.in
+@@ -1,4 +1,5 @@
+ MODULE    = powershell.exe
++IMPORTS   = ole32 oleaut32 uuid
+ 
+ EXTRADLLFLAGS = -mconsole -municode
+ 

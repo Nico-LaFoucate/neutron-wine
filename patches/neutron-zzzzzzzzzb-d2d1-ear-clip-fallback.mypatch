@@ -1,0 +1,256 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2933,6 +2933,197 @@
+     return ret;
+ }
+ 
++/* NEUTRON: EAR-CLIPPING FALLBACK for geometries the CDT cannot triangulate.
++ *
++ * WHY THIS EXISTS. d2d_cdt_insert_segment() gives up with "Triangle not found" on degenerate,
++ * near-collinear input, and the caller then discards fill.vertices -- so the ENTIRE geometry
++ * becomes unfillable and simply does not appear. The symptom is missing chrome, not wrong chrome,
++ * which is very hard to trace back to a triangulator.
++ *
++ * Measured in Premiere (2026-08-17), via the diagnostic added alongside this:
++ *
++ *     Triangle not found. figures=1 verts=105 extent=(0.00,0.00)-(1177.00,13.00) 1177.00x13.00
++ *     Triangle not found. figures=1 verts=108 extent=(0.00,0.00)-(538.00,13.00)   538.00x13.00
++ *
++ * One figure, ~105 vertices, 13 px tall, over a thousand wide: the timeline's whole row of ruler
++ * TICK MARKS as a single filled comb (baseline plus up-over-down per tooth). The CDT fails on it and
++ * the time ruler is therefore absent, while the chunky in/out marker thumbs render normally. Same
++ * root cause as the program monitor's missing grey in/out bar -- one control, per the Windows
++ * reference handoff.
++ *
++ * WHY EAR CLIPPING. A comb is a SIMPLE polygon, and ear clipping needs no Delaunay properties and
++ * has no near-collinear fragility. O(n^2) is irrelevant at n~105 on a path that currently renders
++ * nothing at all.
++ *
++ * ⚠️ THIS IS A FALLBACK, NOT A REPLACEMENT. It runs only where the CDT has already failed, so it
++ * cannot regress any geometry that works today. And it DECLINES rather than guesses: no single
++ * figure, a zero-area polygon, or a pass that finds no ear (which means the polygon is not simple)
++ * all return FALSE and leave the original failure standing. Emitting plausible-looking garbage
++ * would be worse than the blank we already have.
++ *
++ * Faces index into the SORTED, DEDUPED fill.vertices array, but ear clipping needs PATH order --
++ * hence the bsearch mapping from the figure's own vertex list into that array. */
++static BOOL d2d_ear_clip_convex(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
++        const D2D1_POINT_2F *c, BOOL ccw)
++{
++    double cross = ((double)b->x - a->x) * ((double)c->y - a->y)
++                 - ((double)b->y - a->y) * ((double)c->x - a->x);
++
++    return ccw ? cross > 0.0 : cross < 0.0;
++}
++
++static BOOL d2d_ear_clip_contains(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
++        const D2D1_POINT_2F *c, const D2D1_POINT_2F *p)
++{
++    double d1, d2, d3;
++    BOOL neg, pos;
++
++    d1 = ((double)p->x - b->x) * ((double)a->y - b->y) - ((double)a->x - b->x) * ((double)p->y - b->y);
++    d2 = ((double)p->x - c->x) * ((double)b->y - c->y) - ((double)b->x - c->x) * ((double)p->y - c->y);
++    d3 = ((double)p->x - a->x) * ((double)c->y - a->y) - ((double)c->x - a->x) * ((double)p->y - a->y);
++
++    neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
++    pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
++
++    /* Strictly inside only: a vertex lying exactly on an edge does not block the ear. */
++    return !(neg && pos);
++}
++
++static BOOL d2d_path_geometry_ear_clip(struct d2d_geometry *geometry,
++        const D2D1_POINT_2F *sorted, size_t sorted_count)
++{
++    const struct d2d_figure *figure = NULL;
++    size_t i, n = 0, remaining, cursor, stalled;
++    UINT16 *poly;
++    double area2 = 0.0;
++    BOOL ccw;
++
++    if (sorted_count < 3 || sorted_count > 0xffff)
++        return FALSE;
++
++    for (i = 0; i < geometry->u.path.figure_count; ++i)
++    {
++        if (geometry->u.path.figures[i].flags & D2D_FIGURE_FLAG_HOLLOW)
++            continue;
++        if (figure) return FALSE;   /* more than one contour: not our case */
++        figure = &geometry->u.path.figures[i];
++    }
++    if (!figure || figure->vertex_count < 3)
++        return FALSE;
++
++    if (!(poly = calloc(figure->vertex_count, sizeof(*poly))))
++        return FALSE;
++
++    /* Path order -> index into the sorted fill.vertices array. */
++    for (i = 0; i < figure->vertex_count; ++i)
++    {
++        const D2D1_POINT_2F *found = bsearch(&figure->vertices[i], sorted, sorted_count,
++                sizeof(*sorted), d2d_cdt_compare_vertices);
++
++        if (!found)
++        {
++            free(poly);
++            return FALSE;
++        }
++        poly[i] = (UINT16)(found - sorted);
++    }
++
++    /* Drop consecutive repeats and a closing vertex equal to the first. */
++    {
++        size_t w = 0;
++        for (i = 0; i < figure->vertex_count; ++i)
++        {
++            if (w && poly[w - 1] == poly[i]) continue;
++            poly[w++] = poly[i];
++        }
++        while (w > 1 && poly[w - 1] == poly[0]) --w;
++        n = w;
++    }
++    if (n < 3)
++    {
++        free(poly);
++        return FALSE;
++    }
++
++    for (i = 0; i < n; ++i)
++    {
++        const D2D1_POINT_2F *a = &sorted[poly[i]], *b = &sorted[poly[(i + 1) % n]];
++
++        area2 += (double)a->x * b->y - (double)b->x * a->y;
++    }
++    if (area2 == 0.0)
++    {
++        /* Zero area fills nothing; that is correct, not a failure to paper over. */
++        free(poly);
++        return FALSE;
++    }
++    ccw = area2 > 0.0;
++
++    if (!d2d_array_reserve((void **)&geometry->fill.faces, &geometry->fill.faces_size,
++            n - 2, sizeof(*geometry->fill.faces)))
++    {
++        free(poly);
++        return FALSE;
++    }
++    geometry->fill.face_count = 0;
++
++    remaining = n;
++    cursor = 0;
++    stalled = 0;
++    while (remaining > 3)
++    {
++        size_t prev = (cursor + remaining - 1) % remaining;
++        size_t next = (cursor + 1) % remaining;
++        const D2D1_POINT_2F *a = &sorted[poly[prev]];
++        const D2D1_POINT_2F *b = &sorted[poly[cursor]];
++        const D2D1_POINT_2F *c = &sorted[poly[next]];
++        BOOL ear = d2d_ear_clip_convex(a, b, c, ccw);
++        struct d2d_face *face;
++
++        for (i = 0; ear && i < remaining; ++i)
++        {
++            if (i == prev || i == cursor || i == next) continue;
++            if (d2d_ear_clip_contains(a, b, c, &sorted[poly[i]])) ear = FALSE;
++        }
++
++        if (!ear)
++        {
++            if (++stalled > remaining)
++            {
++                /* A full pass with no ear: the polygon is not simple. Decline. */
++                WARN("Ear clipping found no ear in %lu vertices; not a simple polygon.\n", (long)remaining);
++                geometry->fill.face_count = 0;
++                free(poly);
++                return FALSE;
++            }
++            cursor = next;
++            continue;
++        }
++
++        face = &geometry->fill.faces[geometry->fill.face_count++];
++        face->v[0] = poly[prev];
++        face->v[1] = poly[cursor];
++        face->v[2] = poly[next];
++
++        memmove(&poly[cursor], &poly[cursor + 1], (remaining - cursor - 1) * sizeof(*poly));
++        --remaining;
++        stalled = 0;
++        if (cursor >= remaining) cursor = 0;
++    }
++
++    {
++        struct d2d_face *face = &geometry->fill.faces[geometry->fill.face_count++];
++
++        face->v[0] = poly[0];
++        face->v[1] = poly[1];
++        face->v[2] = poly[2];
++    }
++
++    TRACE("Ear-clipped %lu vertices into %lu faces.\n", (long)n, (long)geometry->fill.face_count);
++    free(poly);
++    return TRUE;
++}
++
+ static HRESULT d2d_path_geometry_triangulate(struct d2d_geometry *geometry)
+ {
+     struct d2d_cdt_edge_ref left_edge, right_edge;
+@@ -3040,25 +3231,50 @@
+     _controlfp(_PC_24, mask = _MCW_PC);
+ #endif
+     if (!d2d_cdt_triangulate(&cdt, 0, vertex_count, &left_edge, &right_edge))
+-        goto fail;
++        goto fallback;
+     if (!d2d_cdt_insert_segments(&cdt, geometry))
+-        goto fail;
++        goto fallback;
+ #ifdef __i386__
+     _controlfp(control_word_x87, _MCW_PC);
+     mask = 0;
+ #endif
+ 
+     if (!d2d_cdt_generate_faces(&cdt, geometry))
+-        goto fail;
++        goto fallback;
+ 
+     free(cdt.edges);
+     return S_OK;
+ 
+-fail:
++    /* NEUTRON: the CDT failed. Before throwing the geometry away -- which makes it invisible --
++     * try ear clipping, which does not care about the near-collinear input the CDT chokes on.
++     * See d2d_path_geometry_ear_clip(); it declines rather than guessing, so if it also fails we
++     * end up exactly where the original code did. */
++fallback:
++#ifdef __i386__
++    if (mask)
++    {
++        _controlfp(control_word_x87, mask);
++        mask = 0;
++    }
++#endif
++    free(cdt.edges);
++    cdt.edges = NULL;
++    /* Discard whatever partial faces the failed CDT left behind. */
++    free(geometry->fill.faces);
++    geometry->fill.faces = NULL;
++    geometry->fill.faces_size = 0;
++    geometry->fill.face_count = 0;
++
++    if (d2d_path_geometry_ear_clip(geometry, vertices, vertex_count))
++        return S_OK;
++
+     geometry->fill.vertices = NULL;
+     geometry->fill.vertex_count = 0;
+     free(vertices);
+-    free(cdt.edges);
++    free(geometry->fill.faces);
++    geometry->fill.faces = NULL;
++    geometry->fill.faces_size = 0;
++    geometry->fill.face_count = 0;
+ #ifdef __i386__
+     if (mask) _controlfp(control_word_x87, mask);
+ #endif

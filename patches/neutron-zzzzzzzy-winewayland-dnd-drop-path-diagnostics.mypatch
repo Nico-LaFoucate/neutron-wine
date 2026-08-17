@@ -1,0 +1,46 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -1208,6 +1208,11 @@
+     dnd_screen_point(hwnd, x_w, y_w, &dnd_xfer.pt);
+     effect = dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_DRAG);
+     dnd_accept(wl_data_offer, serial, effect != DROPEFFECT_NONE ? dnd.mime : NULL);
++    /* Pairs with the DROP lines below, so a session log shows whether every drag that entered also
++     * produced a drop. A missing DROP line means the compositor never sent one -- i.e. the source
++     * decided we had refused -- which is not something the drop path itself can report. */
++    ERR("neutron-dnd: ENTER hwnd=%p mime=%s first-effect=%#lx (accepting=%s)\n",
++        hwnd, debugstr_a(dnd.mime), (long)effect, effect != DROPEFFECT_NONE ? "yes" : "NO");
+ }
+ 
+ static void data_device_leave(void *data, struct wl_data_device *wl_data_device)
+@@ -1268,13 +1273,30 @@
+     dnd.hwnd = NULL;
+     dnd.offer = NULL;
+     dnd.mime = NULL;
+-    if (!hwnd || !offer) return;
++    /* NEUTRON DIAGNOSTIC: the drop path had NO default-channel logging at all, and both early
++     * returns below are silent. On 11.10-55 the user's drop still failed on the first attempt
++     * while the log proved we were accepting (`Answering 0x1`) and that no step timed out -- which
++     * means the answer is somewhere on this path, and nothing here could say where. Three
++     * outcomes are now distinguishable: the compositor never sent a drop (no line at all), it sent
++     * one we discarded (NO-TARGET), or the app was handed it and returned an effect. */
++    if (!hwnd || !offer)
++    {
++        ERR("neutron-dnd: DROP arrived with NO TARGET (hwnd=%p offer=%p) -- discarded. The drag "
++            "state was already torn down before the drop reached us\n", hwnd, offer);
++        return;
++    }
+ 
+     /* The IDataObject built at ENTER already holds the bytes, so the drop itself needs no further
+      * read. user32's drag_drop_drop() runs the OLE IDropTarget::Drop and, only if that is refused,
+      * falls back to posting WM_DROPFILES from the same CF_HDROP -- so we must not post one too. */
+     effect = dnd_call_on_window_thread(hwnd, WM_WAYLAND_DND_DROP);
+ 
++    /* The app's own verdict. effect==0 here means IDropTarget::Drop REFUSED it -- the file was
++     * delivered and the app declined, which is a completely different problem from us failing to
++     * deliver, and the two were indistinguishable before this line. */
++    ERR("neutron-dnd: DROP delivered to hwnd=%p -- app returned effect=%#lx%s\n",
++        hwnd, (long)effect, effect ? "" : " (REFUSED BY THE APP)");
++
+     if (wl_data_offer_get_version(offer->wl_data_offer) >= WL_DATA_OFFER_FINISH_SINCE_VERSION &&
+         effect != DROPEFFECT_NONE)
+     {

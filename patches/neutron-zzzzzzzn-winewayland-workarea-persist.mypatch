@@ -1,0 +1,144 @@
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -446,6 +446,13 @@
+  * owns the maximized toplevel -- normally an app. A per-process global never crosses that gap,
+  * so the value rides in the existing WM_WAYLAND_INIT_DISPLAY_DEVICES message. */
+ void wayland_report_maximized_logical_h(int logical_h);
++/* NEUTRON workarea#2: persist the measured inset across desktop-process restarts.
++ * Without this the FIRST launch in a fresh wineserver always builds rc_work from the 32px
++ * estimate, because nothing has been maximized yet -- the window that takes the measurement
++ * has already been sized wrong by the time it arrives. Confirmed on a build tester's machine
++ * 2026-08-11: first launch unusable, second launch fine. Load returns 0 when unknown. */
++int neutron_workarea_load_measured(void);
++void neutron_workarea_save_measured(int logical_h);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+                                           enum wayland_surface_config_state state);
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -248,6 +248,64 @@
+     device_manager->add_source(output_info->output->name, state_flags, dpi, param);
+ }
+ 
++/* NEUTRON workarea#2: persist the measured maximized inset across desktop-process restarts.
++ *
++ * workarea#1 carries the measurement from the app process to the desktop process, but only once
++ * something has actually been maximized. In a freshly started wineserver the desktop process
++ * builds the monitor list FIRST, with nothing maximized yet, so rc_work still came from the 32px
++ * estimate and the first launch was sized wrong -- the window that supplies the measurement has
++ * already been created by the time it arrives. Verified on the build tester's machine 2026-08-11:
++ * first launch not usable, second launch fine.
++ *
++ * A tiny file in the prefix fixes that for every launch after the first ever on a given machine.
++ * Deliberately not the registry: this code is unix-side and the driver has no registry access.
++ * Failure at any step is silent and simply leaves the estimate in place -- a diagnostic-grade
++ * store must never be able to break display enumeration. */
++#define NEUTRON_WORKAREA_PATH_MAX 1024
++
++static void neutron_workarea_path(char *buf, size_t len)
++{
++    const char *prefix = getenv("WINEPREFIX");
++    const char *home = getenv("HOME");
++
++    buf[0] = 0;
++    if (prefix && *prefix) snprintf(buf, len, "%s/.neutron-maximized-inset", prefix);
++    else if (home && *home) snprintf(buf, len, "%s/.wine/.neutron-maximized-inset", home);
++}
++
++int neutron_workarea_load_measured(void)
++{
++    static int cached = -1;   /* -1 = not read yet, 0 = absent/unusable */
++    char path[NEUTRON_WORKAREA_PATH_MAX];
++    FILE *f;
++    int v = 0;
++
++    if (cached >= 0) return cached;
++    cached = 0;
++    neutron_workarea_path(path, sizeof(path));
++    if (!path[0]) return 0;
++    if (!(f = fopen(path, "r"))) return 0;
++    if (fscanf(f, "%d", &v) != 1 || v <= 0 || v > 100000) v = 0;
++    fclose(f);
++    cached = v;
++    if (v) TRACE("neutron-workarea: loaded persisted measured=%d from %s\n", v, path);
++    return cached;
++}
++
++void neutron_workarea_save_measured(int logical_h)
++{
++    char path[NEUTRON_WORKAREA_PATH_MAX];
++    FILE *f;
++
++    if (logical_h <= 0) return;
++    neutron_workarea_path(path, sizeof(path));
++    if (!path[0]) return;
++    if (!(f = fopen(path, "w"))) return;
++    fprintf(f, "%d\n", logical_h);
++    fclose(f);
++    TRACE("neutron-workarea: persisted measured=%d to %s\n", logical_h, path);
++}
++
+ static void wayland_add_device_monitor(const struct gdi_device_manager *device_manager,
+                                        void *param, struct output_info *output_info)
+ {
+@@ -269,6 +327,10 @@
+      * from the first maximized xdg configure. */
+     monitor.rc_work = monitor.rc_monitor;
+     {
++        /* NEUTRON workarea#2: fall back to the PERSISTED measurement before the estimate.
++         * The in-memory value is 0 in a freshly started desktop process -- nothing has been
++         * maximized yet -- so on a cold wineserver rc_work was still built from the 32px guess
++         * and the first launch came up wrong even with workarea#1 in place. */
+         int mode_h = output_info->output->current_mode ?
+                      output_info->output->current_mode->height : 0;
+         int logical_h = output_info->output->logical_h;
+@@ -276,6 +338,8 @@
+         int inset;
+         LONG measured = InterlockedCompareExchange(&neutron_maximized_logical_h, 0, 0);
+ 
++        if (measured <= 0) measured = neutron_workarea_load_measured();
++
+         /* NEUTRON workarea#1: prefer the MEASURED inset over the 32px estimate.
+          *
+          * `measured` is the logical height the compositor last granted a maximized toplevel
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1136,7 +1136,14 @@
+          * Record it here, in the desktop process, because that is the only process that builds the
+          * monitor list and therefore the only one whose copy of this value display.c will read.
+          * Must be stored BEFORE the rebuild below, or the rebuild uses the stale estimate. */
+-        if (wp) InterlockedExchange(&neutron_maximized_logical_h, (LONG)wp);
++        if (wp)
++        {
++            /* NEUTRON workarea#2: also persist it, so the NEXT desktop process starts with the
++             * real inset instead of the 32px estimate. Without this the first launch in a fresh
++             * wineserver is always built from the guess. */
++            if (InterlockedExchange(&neutron_maximized_logical_h, (LONG)wp) != (LONG)wp)
++                neutron_workarea_save_measured((int)wp);
++        }
+         NtUserCallNoParam(NtUserCallNoParam_DisplayModeChanged);
+         return 0;
+     case WM_WAYLAND_CONFIGURE:
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -962,6 +962,20 @@
+     if ((conf->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+         (width < conf->width || height < conf->height))
+     {
++        /* NEUTRON workarea#2: SAY SO. A maximized window even one surface pixel short of the
++         * compositor's configure can never satisfy this test, so nothing ever commits and the
++         * window is a permanently blank, unresizable rectangle -- with no error on any channel.
++         * That cost eleven rounds with a build tester in 2026-08 to diagnose, across ten dead
++         * log signatures, because this rejection was silent. The usual cause is the work-area
++         * inset in display.c disagreeing with what the compositor reserves. Rate-limited: the
++         * first one, then every 240th. */
++        static LONG rejects;
++        LONG n = InterlockedIncrement(&rejects);
++        if (n == 1 || !(n % 240))
++            ERR("neutron-workarea: REJECTED maximized config (n=%ld) -- window %dx%d is SMALLER "
++                "than the compositor's configure %dx%d (surface px), so this surface will not "
++                "commit and its window will stay blank. Suspect the work-area inset.\n",
++                (long)n, width, height, conf->width, conf->height);
+         return FALSE;
+     }
+ 

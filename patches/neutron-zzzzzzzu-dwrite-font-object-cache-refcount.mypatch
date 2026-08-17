@@ -1,0 +1,254 @@
+--- a/dlls/dwrite/dwrite_private.h
++++ b/dlls/dwrite/dwrite_private.h
+@@ -347,6 +347,7 @@
+     UINT64 font_object;
+     void *data_context;
+     BOOL font_object_cached;   /* NEUTRON: owned by the factory cache, not by us */
++    void *font_object_cache_entry; /* NEUTRON: our refcount on that cache entry; released in the dtor */
+     p_dwrite_fontface_get_font_object get_font_object;
+     struct
+     {
+@@ -437,9 +438,13 @@
+ extern HRESULT create_fontfacereference(IDWriteFactory7 *factory, IDWriteFontFile *file, UINT32 face_index,
+         DWRITE_FONT_SIMULATIONS simulations, DWRITE_FONT_AXIS_VALUE const *axis_values, UINT32 axis_values_count,
+         IDWriteFontFaceReference1 **reference);
+-extern UINT64 factory_get_cached_font_object(IDWriteFactory7 *factory, const void *key, UINT32 key_size, UINT32 index);
++/* Both hand back a refcounted cache-entry cookie in entry_out; release it with
++ * factory_release_font_object() or the entry can be freed while a fontface still uses it. */
++extern UINT64 factory_get_cached_font_object(IDWriteFactory7 *factory, const void *key, UINT32 key_size, UINT32 index,
++        void **entry_out);
+ BOOL factory_cache_font_object(IDWriteFactory7 *factory, const void *key, UINT32 key_size, UINT32 index,
+-        UINT64 object, IDWriteFontFileStream *stream, void *data_context);
++        UINT64 object, IDWriteFontFileStream *stream, void *data_context, void **entry_out);
++void factory_release_font_object(IDWriteFactory7 *factory, void *entry);
+ void factory_release_font_objects(IDWriteFactory7 *factory);
+ HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFontFile * const *files, UINT32 num_files,
+         DWRITE_FONT_SIMULATIONS simulations, struct list **cache, REFIID riid, void **obj);
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -965,6 +965,15 @@
+ 
+         if (!fontface->font_object_cached)
+             UNIX_CALL(release_font_object, &params);
++        else
++        {
++            /* The factory cache owns the parsed font; we owned only a reference to it. Dropping
++             * that reference is what lets an evicted entry finally be destroyed -- and, until we
++             * do, what stops eviction from destroying an FT_Face we are still loading glyphs from.
++             * Skipping this (the original code did nothing here) is the use-after-free. */
++            factory_release_font_object(fontface->factory, fontface->font_object_cache_entry);
++            fontface->font_object_cache_entry = NULL;
++        }
+         if (fontface->stream)
+         {
+             if (!fontface->font_object_cached)
+@@ -5317,14 +5326,27 @@
+          * whole file. Look for the parsed font before building one. */
+         const void *cache_key = NULL;
+         UINT32 cache_key_size = 0;
++        void *cache_entry = NULL;
+         UINT64 cached_object;
+ 
+         if (SUCCEEDED(IDWriteFontFile_GetReferenceKey(fontface->file, &cache_key, &cache_key_size))
+                 && (cached_object = factory_get_cached_font_object(fontface->factory, cache_key,
+-                        cache_key_size, fontface->index)))
++                        cache_key_size, fontface->index, &cache_entry)))
+         {
++            /* factory_get_cached_font_object() handed us a reference along with the object; it is
++             * released in the fontface destructor. Holding it is what keeps eviction from calling
++             * FT_Done_Face on a face we are about to render from. */
+             if (!InterlockedCompareExchange64((LONGLONG *)&fontface->font_object, cached_object, 0))
++            {
++                fontface->font_object_cache_entry = cache_entry;
+                 fontface->font_object_cached = TRUE;
++            }
++            else
++            {
++                /* Another thread installed the object first, so this face will never store our
++                 * cookie and would never release it. Give it back now. */
++                factory_release_font_object(fontface->factory, cache_entry);
++            }
+             return fontface->font_object;
+         }
+ 
+@@ -5350,8 +5372,11 @@
+                  * factory cache -- FT_New_Memory_Face does not copy the data, so
+                  * the fragment must outlive the face. */
+                 if (cache_key && factory_cache_font_object(fontface->factory, cache_key, cache_key_size,
+-                        fontface->index, font_object, fontface->stream, data_context))
++                        fontface->index, font_object, fontface->stream, data_context, &cache_entry))
++                {
++                    fontface->font_object_cache_entry = cache_entry;
+                     fontface->font_object_cached = TRUE;
++                }
+                 else
+                     fontface->data_context = data_context;
+             }
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -965,6 +965,32 @@
+  * does NOT copy the font data, so the mapping has to outlive the face. Bounded,
+  * least-recently-used first out, so a client that walks a font menu cannot grow
+  * it without limit. */
++/* 🚨 THE ENTRY IS REFCOUNTED, AND IT HAS TO BE. The first cut of this cache handed
++ * `object` to a fontface and kept no count of who was using it. A fontface stores the
++ * value in fontface->font_object and dwrite_fontface_get_font_object() short-circuits on
++ * it being non-zero, so the face NEVER consults this cache again -- every later glyph load
++ * goes straight to that FT_Face. Eviction meanwhile called FT_Done_Face on it and released
++ * the stream fragment the face reads out of, while the face was still live and rendering.
++ *
++ * That is a use-after-free, and its signature is subtle rather than a crash: glyphs already
++ * rasterised sit in the fontface's own glyph cache and keep drawing correctly, so exactly
++ * the NEXT NOT-YET-CACHED CHARACTER comes back wrong. Observed in Premiere 2026-08-13 as one
++ * digit of a title rendering in Arial while the rest of the string stayed in the selected
++ * face -- and it survived until the app was restarted.
++ *
++ * It was aimed at the worst possible victim, too. Entries are promoted to the head only in
++ * factory_get_cached_font_object(), which is reachable only while fontface->font_object is
++ * still 0 -- i.e. once, at face creation. A long-lived, heavily-rendering face is therefore
++ * never promoted, drifts to the tail, and is evicted FIRST. The LRU was inverted with respect
++ * to actual use.
++ *
++ * So: every fontface holding `object` owns a reference. Eviction unlinks but destroys only
++ * when the last user lets go, and it will not choose a live entry at all. That second rule
++ * also retires the inverted-LRU problem without touching the glyph hot path -- an actively
++ * rendering face has refcount > 0 and simply cannot be picked.
++ *
++ * ⚠️ Do NOT "simplify" this back to freeing on eviction, and do NOT raise the cap instead.
++ * The cap was never the bug. */
+ #define DWRITE_FONT_OBJECT_CACHE_MAX 48
+ 
+ struct cached_font_object
+@@ -976,6 +1002,8 @@
+     UINT32 index;
+     UINT32 key_size;
+     void *key;
++    LONG refcount;   /* live fontfaces using ->object */
++    BOOL unlinked;   /* evicted from the list, awaiting its last user */
+ };
+ 
+ /* NEUTRON: KEEP RECENTLY USED FONTFACES ALIVE.
+@@ -1100,17 +1128,31 @@
+     LIST_FOR_EACH_ENTRY_SAFE(cached, cached2, &factory->font_objects, struct cached_font_object, entry)
+     {
+         list_remove(&cached->entry);
+-        release_cached_font_object(cached);
++        cached->unlinked = TRUE;
++        /* Factory teardown: any face still holding a reference here has outlived its factory,
++         * which the fontface cache's no-reference design does not permit. Assert the invariant
++         * loudly rather than leak it silently. */
++        if (cached->refcount)
++            ERR("neutron-dwc: font object %s still has %ld user(s) at factory teardown\n",
++                wine_dbgstr_longlong(cached->object), (long)cached->refcount);
++        else
++            release_cached_font_object(cached);
+     }
+     factory->font_object_count = 0;
+ }
+ 
+-UINT64 factory_get_cached_font_object(IDWriteFactory7 *iface, const void *key, UINT32 key_size, UINT32 index)
++/* Returns the parsed font AND takes a reference on its cache entry, handed back through
++ * `entry_out`. The caller must pass that cookie to factory_release_font_object() when it is
++ * done -- see the refcount rationale above. */
++UINT64 factory_get_cached_font_object(IDWriteFactory7 *iface, const void *key, UINT32 key_size, UINT32 index,
++        void **entry_out)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+     struct cached_font_object *cached;
+     UINT64 object = 0;
+ 
++    *entry_out = NULL;
++
+     EnterCriticalSection(&factory->cs);
+     LIST_FOR_EACH_ENTRY(cached, &factory->font_objects, struct cached_font_object, entry)
+     {
+@@ -1119,7 +1161,10 @@
+             /* most recently used to the front */
+             list_remove(&cached->entry);
+             list_add_head(&factory->font_objects, &cached->entry);
++            /* Under the cs, so this cannot race an eviction deciding the entry is idle. */
++            ++cached->refcount;
+             object = cached->object;
++            *entry_out = cached;
+             break;
+         }
+     }
+@@ -1128,13 +1173,35 @@
+     return object;
+ }
+ 
+-/* Takes ownership of the stream fragment on success. Returns FALSE if an equal
++/* Drop one fontface's claim on a cached parsed font. Destroys it only once it is both
++ * unlinked from the cache and unused -- the ordering that makes eviction safe. */
++void factory_release_font_object(IDWriteFactory7 *iface, void *entry)
++{
++    struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
++    struct cached_font_object *cached = entry;
++    BOOL destroy = FALSE;
++
++    if (!cached) return;
++
++    EnterCriticalSection(&factory->cs);
++    if (--cached->refcount <= 0 && cached->unlinked)
++        destroy = TRUE;
++    LeaveCriticalSection(&factory->cs);
++
++    if (destroy)
++        release_cached_font_object(cached);
++}
++
++/* Takes ownership of the stream fragment on success, and hands back a cookie in `entry_out`
++ * carrying the inserting face's reference (count starts at 1). Returns FALSE if an equal
+  * entry raced in, in which case the caller keeps ownership and drops its copy. */
+ BOOL factory_cache_font_object(IDWriteFactory7 *iface, const void *key, UINT32 key_size, UINT32 index,
+-        UINT64 object, IDWriteFontFileStream *stream, void *data_context)
++        UINT64 object, IDWriteFontFileStream *stream, void *data_context, void **entry_out)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+-    struct cached_font_object *cached, *evict = NULL;
++    struct cached_font_object *cached, *evict = NULL, *candidate;
++
++    *entry_out = NULL;
+ 
+     if (!(cached = calloc(1, sizeof(*cached))))
+         return FALSE;
+@@ -1149,21 +1216,36 @@
+     cached->object = object;
+     cached->stream = stream;
+     cached->data_context = data_context;
++    cached->refcount = 1;            /* the inserting fontface */
+     IDWriteFontFileStream_AddRef(stream);
+ 
+     EnterCriticalSection(&factory->cs);
+     list_add_head(&factory->font_objects, &cached->entry);
+     if (++factory->font_object_count > DWRITE_FONT_OBJECT_CACHE_MAX)
+     {
+-        evict = LIST_ENTRY(list_tail(&factory->font_objects), struct cached_font_object, entry);
+-        list_remove(&evict->entry);
+-        --factory->font_object_count;
++        /* Oldest IDLE entry, not simply the oldest: an entry with users is a live FT_Face that
++         * somebody is still loading glyphs from, and freeing it is the use-after-free this whole
++         * refcount exists to prevent. If every entry is in use we evict nothing and let the cache
++         * sit above its cap until one falls idle -- correctness outranks the bound. */
++        LIST_FOR_EACH_ENTRY_REV(candidate, &factory->font_objects, struct cached_font_object, entry)
++        {
++            if (candidate->refcount) continue;
++            evict = candidate;
++            break;
++        }
++        if (evict)
++        {
++            list_remove(&evict->entry);
++            evict->unlinked = TRUE;
++            --factory->font_object_count;
++        }
+     }
+     LeaveCriticalSection(&factory->cs);
+ 
+     if (evict)
+         release_cached_font_object(evict);
+ 
++    *entry_out = cached;
+     return TRUE;
+ }
+ 

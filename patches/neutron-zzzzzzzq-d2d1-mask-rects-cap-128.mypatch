@@ -1,0 +1,59 @@
+Raise the layer-mask scissor cap from 24 to 128 rectangles.
+
+The layer-clip fix scissors each member of a layer's geometric mask. If the mask
+has more members than mask_rects[] can hold, install_mask_rects() bails to the
+mask's BOUNDING BOX -- which spans the whole panel -- and the app's background
+fill inside that layer then wipes every control in it. That is the "Premiere
+timeline tool buttons vanish until you hover" bug.
+
+Sized from measurement, not guesswork. An OPTRACE capture of the live symptom
+(2026-08-13) recorded masks of n = 25, 25, 26, 26, 29, 29, 37, 45 and 74 members,
+ALL plain rectangles and ALL WINDING -- exactly the case the scissor path handles
+correctly -- rejected purely for exceeding the cap of 24. All nine over-cap
+fallbacks fell in the last 16% of the session, the window in which the user
+reproduced the symptom; there were none in the first 84%.
+
+This also explains why dragging over the project panel behaves while the timeline
+does not: a timeline dirty region covers dozens of separate rects (clips, tool
+buttons, track headers, playhead) where the project panel covers a handful. Same
+code path, different member counts, and 24 was the line between them.
+
+128 is ~1.7x the worst observed. Not raised further on purpose: the disjoint
+check is O(n^2) and every rect costs one extra scissored draw, so the next raise
+should be driven by a MASKFALLBACK log line showing a real mask that exceeds it.
+
+--- a/dlls/d2d1/d2d1_private.h	2026-08-13 01:19:52.147920287 -0400
++++ b/dlls/d2d1/d2d1_private.h	2026-08-13 01:19:52.139996603 -0400
+@@ -654,7 +654,31 @@
+      * the region itself (two playhead slivers plus a row band spans the whole panel), so
+      * clipping to the box lets a background fill wipe everything between the pieces. We keep
+      * the pieces and scissor each draw to them individually. */
+-    D2D1_RECT_F mask_rects[24];
++    /* 🚨 Sized from MEASURED Premiere masks, not guessed. The layer-clip fix
++     * scissors each member of a layer's geometric mask; if the mask has more
++     * members than fit here, install_mask_rects() bails to the mask's BOUNDING
++     * BOX, which spans the whole panel -- and the app's background fill inside
++     * that layer then wipes every control in it. That is the "timeline tool
++     * buttons vanish until you hover" bug.
++     *
++     * This was 24. A 2026-08-13 OPTRACE capture of the live symptom recorded
++     * masks of n = 25, 25, 26, 26, 29, 29, 37, 45 and 74 members -- ALL plain
++     * rectangles, ALL WINDING, i.e. exactly the case the scissor path handles
++     * correctly -- rejected purely for exceeding the cap. Nine over-cap
++     * fallbacks, ALL of them in the last 16% of the session, which is the
++     * window in which the user reproduced the symptom; zero in the first 84%.
++     *
++     * ⭐ It also explains why dragging over the PROJECT PANEL is fine while the
++     * TIMELINE misbehaves: a timeline dirty region covers dozens of separate
++     * rects (clips, tool buttons, track headers, playhead); the project panel
++     * covers a handful. Same code path, different member counts, 24 was the
++     * line between them.
++     *
++     * 128 gives ~1.7x headroom over the worst observed. It is NOT free: the
++     * disjoint check is O(n^2) and each rect costs one extra scissored draw, so
++     * do not raise this "just in case" -- raise it when a MASKFALLBACK log line
++     * shows a real mask exceeding it. */
++    D2D1_RECT_F mask_rects[128];
+     unsigned mask_rect_count;
+     unsigned mask_owner;        /* layer index that installed the list, +1 (0 = none) */
+     unsigned last_op;           /* NEUTRON op-trace: most recent primitive id */

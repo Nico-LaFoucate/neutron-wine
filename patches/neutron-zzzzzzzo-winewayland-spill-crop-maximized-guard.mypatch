@@ -1,0 +1,113 @@
+Stop the frame-spill crop and the maximize handshake deadlocking each other.
+
+wayland_surface_reconfigure() feeds the frame-spill crop's size to
+wayland_surface_config_is_compatible(), which rejects a maximized surface even
+one pixel short of the compositor's configure. The config is then never acked,
+current.state never becomes MAXIMIZED, the crop's own current.state guard never
+fires, and it crops again -- self-sustaining. Nothing ever commits and the
+window stays a blank rectangle.
+
+Reached whenever round(configure * scale) OVERSHOOTS the monitor, so it depends
+only on the fractional scale. A build tester's After Effects at scale 2.25 got
+round(1707*2.25)=3841 against a 3840-wide monitor, was cropped to 3836 -> 1705
+against a 1707 configure, and hit this 3360+ times in one launch with zero
+commits. The same app at 1.7 gets round(2259*1.7)=3840 exactly and never enters
+the crop, which is why it reproduced on one machine only.
+
+Skip the crop when it would put a maximized surface below its configure.
+
+A SIZE test, not a state test. Premiere's overhang window -- the case the crop
+exists for -- is also state=0x1 (measured 2026-08-12; an earlier state-based
+guard suppressed exactly the crop it was meant to keep), but its crop leaves it
+at or above its configure (3850->3840 = 2259 surface px against a 2256
+configure), so it is unaffected.
+
+--- a/dlls/winewayland.drv/wayland_surface.c	2026-08-12 02:04:57.081077810 -0400
++++ b/dlls/winewayland.drv/wayland_surface.c	2026-08-12 02:04:57.073727422 -0400
+@@ -1045,6 +1045,13 @@
+     int win_w, win_h, mon_w, mon_h;
+ 
+     if (surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
++    /* ⚠️ Do NOT widen this to surface->window.state, and do not assume the
++     * overhang case is un-maximized. Measured 2026-08-12: Premiere's overhang
++     * window -- the case this crop exists for -- reports state=0x1 (MAXIMIZED),
++     * so a state-based guard suppresses exactly the crop it is meant to keep
++     * (verified: WIN=3850x2116 cropped to 3840x2111 on 11.10-48, and gone when
++     * the guard was added). The real constraint is a SIZE one and lives at the
++     * call site in wayland_surface_reconfigure(). */
+     if (surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+                                   WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+         return FALSE;
+@@ -1070,6 +1077,60 @@
+ }
+ 
+ /**********************************************************************
++ *          neutron_crop_would_break_maximized
++ *
++ * TRUE if cropping the surface to `cw`x`ch` WINDOW px would make it smaller
++ * than a maximized config the compositor is waiting on.
++ *
++ * 🚨 Without this, the frame-spill crop and the maximize handshake deadlock each
++ * other. wayland_surface_reconfigure() converts the cropped size and hands it to
++ * wayland_surface_config_is_compatible(), which rejects a maximized surface that
++ * is even one pixel short of the configure -- so the config is never acked,
++ * current.state never becomes MAXIMIZED, the crop's own current.state guard
++ * never fires, and it crops again. Self-sustaining: nothing ever commits and the
++ * window stays a blank rectangle.
++ *
++ * Reached whenever round(configure * scale) OVERSHOOTS the monitor, so it
++ * depends only on the fractional scale. A build tester's After Effects at scale
++ * 2.25 got round(1707*2.25)=3841 against a 3840-wide monitor, was cropped to
++ * 3836 -> 1705 against a 1707 configure, and hit this 3360+ times in one launch
++ * with ZERO commits. The same app at 1.7 gets round(2259*1.7)=3840 exactly and
++ * never enters the crop at all, which is why it reproduced on one machine only.
++ *
++ * A size test, not a state test: Premiere's overhang window -- the case the crop
++ * exists for -- is ALSO state=0x1 (measured), but its crop leaves it at or above
++ * its configure (3850->3840 = 2259 surface px against a 2256 configure), so it
++ * is unaffected. 2026-08-12.
++ */
++static BOOL neutron_crop_would_break_maximized(struct wayland_surface *surface,
++                                               int cw, int ch)
++{
++    struct wayland_surface_config *configs[3];
++    int width, height, i;
++
++    wayland_surface_coords_from_window(surface, cw, ch, &width, &height);
++
++    /* The same three configs wayland_surface_reconfigure_xdg() tests. */
++    configs[0] = &surface->processing;
++    configs[1] = &surface->requested;
++    configs[2] = &surface->current;
++
++    for (i = 0; i < 3; i++)
++    {
++        if (!configs[i]->serial) continue;
++        if (!(configs[i]->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED)) continue;
++        if (width < configs[i]->width || height < configs[i]->height)
++        {
++            TRACE("hwnd=%p crop %dx%d -> %dx%d would be short of maximized config %dx%d;"
++                  " keeping the full window size\n", surface->hwnd, cw, ch, width, height,
++                  configs[i]->width, configs[i]->height);
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++/**********************************************************************
+  *          wayland_surface_reconfigure_geometry
+  *
+  * Sets the xdg_surface geometry
+@@ -1369,7 +1430,10 @@
+      * itself lives in wayland_surface_attach_shm). Shrink the viewport destination
+      * and xdg geometry to that subregion's logical size so the visible content maps
+      * 1:1 onto the monitor instead of overhanging its right/bottom edge. */
+-    if (wayland_surface_get_frame_spill_rect(surface, &spill))
++    if (wayland_surface_get_frame_spill_rect(surface, &spill) &&
++        !neutron_crop_would_break_maximized(surface,
++                                            spill.right - spill.left,
++                                            spill.bottom - spill.top))
+     {
+         win_width = spill.right - spill.left;
+         win_height = spill.bottom - spill.top;

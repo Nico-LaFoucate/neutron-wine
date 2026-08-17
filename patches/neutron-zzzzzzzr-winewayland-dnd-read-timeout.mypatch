@@ -1,0 +1,115 @@
+Never block the wayland event-reader thread on a drag-and-drop transfer read.
+
+read_all() did a plain blocking read() with no timeout, and it runs on the
+event-reader thread: data_device_enter -> dnd_build_entries -> import_format ->
+read_all. That thread is the ONLY one that drains the compositor socket, so
+while it is blocked NO wl_buffer.release is read for ANY surface: every window's
+SHM buffer queue starves at once and the UI thread livelocks in
+wayland_buffer_queue_get_free_buffer(), waiting 100 ms per frame for a release
+that can never arrive because nothing is reading it.
+
+Measured on a live stall (Premiere, 2026-08-13, after a timeline drag-and-drop):
+`ss -xp` showed Recv-Q = 7768 bytes sent by a healthy, actively-compositing KWin
+and never read, while the app sat at ~0% CPU with 3 windows starving
+simultaneously and ~10 failed buffer acquisitions per second. The UI was dead for
+roughly five minutes before something timed out and it recovered.
+
+The fd is a pipe whose write end we hand to the DRAG SOURCE, so a slow, wedged or
+uncooperative source stalls our entire rendering pipeline. Worse, when the source
+is the same process -- dragging from Premiere's project panel onto its timeline --
+the thread that must write can be the very UI thread that is starving, which is an
+outright self-deadlock.
+
+Poll with a bounded budget (2 s of total silence) and give up rather than block.
+A partial payload is discarded, not returned: a truncated uri-list would drop the
+wrong file, and failing a transfer is better than corrupting it.
+
+Note the do/while: nread must be initialised, because the timeout path `continue`s
+straight to the `while (nread > 0)` test.
+
+--- a/dlls/winewayland.drv/wayland_data_device.c	2026-08-13 02:22:35.478060224 -0400
++++ b/dlls/winewayland.drv/wayland_data_device.c	2026-08-13 02:22:35.466477159 -0400
+@@ -26,6 +26,7 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#include <poll.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
+@@ -121,12 +122,20 @@
+     }
+ }
+ 
++/* 🚨 NEUTRON: total time read_all() may spend waiting for the OTHER side of the
++ * transfer pipe. See the comment there. */
++#define NEUTRON_DND_READ_TIMEOUT_MS 2000
++
+ static void *read_all(int fd, size_t *size_out)
+ {
+     size_t buffer_size = 4096;
+     int total = 0;
+     unsigned char *buffer;
+-    int nread;
++    /* ⚠️ MUST start non-zero: the poll-timeout path below uses `continue`, which
++     * in a do/while jumps straight to the `while (nread > 0)` test -- reading it
++     * uninitialised on the very first iteration is undefined behaviour. */
++    int nread = 1;
++    int waited_ms = 0;
+ 
+     if (!(buffer = malloc(buffer_size)))
+     {
+@@ -136,6 +145,53 @@
+ 
+     do
+     {
++        /* 🚨 NEUTRON: NEVER block indefinitely here. This runs on the wayland
++         * EVENT-READER THREAD (data_device_enter -> dnd_build_entries ->
++         * import_format -> here), and that thread is the ONLY one that drains
++         * the compositor socket: while it is blocked, no wl_buffer.release is
++         * read for ANY surface, so every window's SHM buffer queue starves at
++         * once and the app's UI thread livelocks in
++         * wayland_buffer_queue_get_free_buffer(). Premiere froze for ~5 minutes
++         * that way after a timeline drag-and-drop (2026-08-13); measured during
++         * a live stall with `ss -xp`: Recv-Q = 7768 bytes sent by a healthy
++         * compositor and never read.
++         *
++         * The fd is a pipe whose write end we handed to the DRAG SOURCE. A slow,
++         * wedged, or uncooperative source therefore hangs our whole rendering
++         * pipeline -- and when the source is the SAME process (dragging from
++         * Premiere's project panel onto its timeline) the thread that must write
++         * can be the very UI thread that is starving, which is an outright
++         * self-deadlock.
++         *
++         * Bail out after a bounded wait and return what we have (or nothing):
++         * a drag that fails to deliver is a bad outcome, a frozen app is a far
++         * worse one. */
++        struct pollfd pfd = { .fd = fd, .events = POLLIN };
++        int pr = poll(&pfd, 1, 50);
++
++        if (pr == 0)
++        {
++            waited_ms += 50;
++            if (waited_ms >= NEUTRON_DND_READ_TIMEOUT_MS)
++            {
++                ERR("neutron-dnd: transfer source sent nothing in %d ms; abandoning the read "
++                    "rather than blocking the wayland event thread (that starves every "
++                    "surface's buffer queue and freezes the app)\n", waited_ms);
++                /* Discard any PARTIAL payload: a truncated uri-list would drop the
++                 * wrong file. Failing the transfer is better than corrupting it. */
++                total = 0;
++                goto out;
++            }
++            continue;
++        }
++        if (pr == -1)
++        {
++            if (errno == EINTR) continue;
++            TRACE("poll failed on transfer fd (errno: %d)\n", errno);
++            total = 0;
++            goto out;
++        }
++
+         nread = read(fd, buffer + total, buffer_size - total);
+         if (nread == -1 && errno != EINTR)
+         {

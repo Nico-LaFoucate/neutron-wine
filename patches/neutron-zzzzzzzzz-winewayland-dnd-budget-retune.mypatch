@@ -1,0 +1,27 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -990,8 +990,22 @@
+  * NEUTRON_DND_WEDGE_PROBE_MS with a much smaller budget; a probe that succeeds clears the wedge and
+  * full-rate feedback resumes. The aggregate stays bounded -- at worst one 60 ms block per 250 ms
+  * while the app is unresponsive, against the 89 x 3000 ms that started all of this -- and the
+- * moment the thread frees up the app starts hearing where the pointer is again. */
+-#define NEUTRON_DND_DRAG_TIMEOUT_MS 400
++ * moment the thread frees up the app starts hearing where the pointer is again.
++ *
++ * 🚨 FIFTH PASS -- retuning the first budget now that recovery exists. 400 ms was chosen in the
++ * third pass to give a busy Premiere room to answer honestly, BACK WHEN A WEDGE WAS PERMANENT for
++ * the rest of the drag: a generous first timeout was the only chance the app ever got. The probe
++ * backoff makes that reasoning obsolete -- a wedge self-heals within one probe interval now, so the
++ * extra budget buys nothing but stall.
++ *
++ * Measured on 11.10-57, a single drag: FIVE wedge -> recover cycles, i.e. five separate 400 ms
++ * windows in which this thread drained no compositor socket. ~2 s of stutter, which is precisely
++ * the "still a bit laggy compared to Windows" reported on a drag that otherwise worked. At 150 ms
++ * the same five wedges cost ~0.75 s, and recovery is unchanged, because what restores feedback is
++ * the probe and not the first timeout.
++ *
++ * ⚠️ Do NOT raise this again "to give the app room". The probe is what gives it room now. */
++#define NEUTRON_DND_DRAG_TIMEOUT_MS 150
+ #define NEUTRON_DND_WEDGE_PROBE_MS   250    /* how often to re-test a wedged window thread */
+ #define NEUTRON_DND_PROBE_TIMEOUT_MS  60    /* a probe must be cheap: it may well time out too */
+ 

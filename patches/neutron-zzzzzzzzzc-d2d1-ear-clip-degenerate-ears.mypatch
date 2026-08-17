@@ -1,0 +1,78 @@
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2963,15 +2963,6 @@
+  *
+  * Faces index into the SORTED, DEDUPED fill.vertices array, but ear clipping needs PATH order --
+  * hence the bsearch mapping from the figure's own vertex list into that array. */
+-static BOOL d2d_ear_clip_convex(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
+-        const D2D1_POINT_2F *c, BOOL ccw)
+-{
+-    double cross = ((double)b->x - a->x) * ((double)c->y - a->y)
+-                 - ((double)b->y - a->y) * ((double)c->x - a->x);
+-
+-    return ccw ? cross > 0.0 : cross < 0.0;
+-}
+-
+ static BOOL d2d_ear_clip_contains(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
+         const D2D1_POINT_2F *c, const D2D1_POINT_2F *p)
+ {
+@@ -3077,8 +3068,31 @@
+         const D2D1_POINT_2F *a = &sorted[poly[prev]];
+         const D2D1_POINT_2F *b = &sorted[poly[cursor]];
+         const D2D1_POINT_2F *c = &sorted[poly[next]];
+-        BOOL ear = d2d_ear_clip_convex(a, b, c, ccw);
++        double cross = ((double)b->x - a->x) * ((double)c->y - a->y)
++                     - ((double)b->y - a->y) * ((double)c->x - a->x);
+         struct d2d_face *face;
++        BOOL ear;
++
++        /* 🚨 DEGENERATE EAR. A collinear triple has cross == 0 and is therefore neither convex nor
++         * reflex; the first cut of this treated it as "not an ear", so once only collinear triples
++         * remained no ear could ever be found and the whole clip was abandoned. Measured in
++         * Premiere: ~105 vertices clipped down to exactly 9, then "no ear" -- 33 times out of 33.
++         * A shape 13 px tall with a hundred vertices is full of points sharing a y coordinate, so
++         * collinear runs are the norm here, not an edge case.
++         *
++         * A collinear vertex contributes no area and is simply redundant: drop it without emitting
++         * a triangle. This also covers a retrace spike (A->B->A), where dropping B is likewise
++         * area-preserving. */
++        if (cross == 0.0)
++        {
++            memmove(&poly[cursor], &poly[cursor + 1], (remaining - cursor - 1) * sizeof(*poly));
++            --remaining;
++            stalled = 0;
++            if (cursor >= remaining) cursor = 0;
++            continue;
++        }
++
++        ear = ccw ? cross > 0.0 : cross < 0.0;
+ 
+         for (i = 0; ear && i < remaining; ++i)
+         {
+@@ -3090,8 +3104,11 @@
+         {
+             if (++stalled > remaining)
+             {
+-                /* A full pass with no ear: the polygon is not simple. Decline. */
+-                WARN("Ear clipping found no ear in %lu vertices; not a simple polygon.\n", (long)remaining);
++                /* A full pass with no ear: the polygon is not simple. Decline.
++                 * ERR, not WARN: this and the success line below are the only two observable
++                 * outcomes of this function, and having them at WARN/TRACE cost a whole build --
++                 * both counts read as zero and said nothing about whether the code had even run. */
++                ERR("Ear clipping found no ear in %lu vertices; not a simple polygon.\n", (long)remaining);
+                 geometry->fill.face_count = 0;
+                 free(poly);
+                 return FALSE;
+@@ -3119,7 +3136,11 @@
+         face->v[2] = poly[2];
+     }
+ 
+-    TRACE("Ear-clipped %lu vertices into %lu faces.\n", (long)n, (long)geometry->fill.face_count);
++    /* ERR for the same reason as the decline above: bounded by CDT failures (a few dozen a session),
++     * and it is the only positive evidence that this path works. */
++    ERR("Ear-clipped %lu vertices into %lu faces (%lu collinear dropped).\n",
++            (long)n, (long)geometry->fill.face_count,
++            (long)(n - 2 - geometry->fill.face_count));
+     free(poly);
+     return TRUE;
+ }

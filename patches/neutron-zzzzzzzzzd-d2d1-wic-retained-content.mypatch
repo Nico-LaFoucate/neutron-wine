@@ -1,0 +1,273 @@
+d2d1: make WIC bitmap render targets retained, seeded from the bitmap.
+
+A Direct2D render target is RETAINED -- its contents persist across
+BeginDraw/EndDraw and an app may redraw only the part that changed. For a WIC
+bitmap target the backing store IS the bitmap, so on Windows a target created
+over a bitmap that already holds pixels starts out showing those pixels.
+
+Wine renders into a private D3D texture and copies the WHOLE texture over the
+bitmap at each present, and created that texture with no initial data. It
+therefore started blank, and the first EndDraw ERASED whatever the bitmap held.
+The Neutron render-target pool made it certain rather than incidental, clearing
+a reused texture to zeroes on the (mistaken) assumption that a fresh target
+starts blank.
+
+Symptom: Premiere Pro's timeline time ruler and the grey in/out highlight were
+never drawn. Both draw once and then rely on retention. Measured with
+NEUTRON_D2D_OPTRACE=1: of 1050 presents of the ruler's 3255x98 surface, 1035
+carried a single DrawTextLayout and held 0-780 non-transparent pixels, while the
+9 that carried the tick geometry held thousands -- the ticks rasterise correctly
+and are then wiped. The Program Monitor's ruler was immune only because it
+redraws all 249-442 of its geometries every frame.
+
+Seed the texture from the bitmap at creation and on pool reuse. The zero-clear
+stays as the fallback for a pooled target with no bitmap, where publishing the
+previous tenant's pixels would be worse than publishing nothing.
+
+Also adds two env-gated diagnostics that found this, kept because nothing else
+can see inside an offscreen surface: NEUTRON_D2D_OPTRACE=1 reports each
+strip-shaped WIC surface's op histogram and a non-transparent pixel census at
+present; NEUTRON_D2D_WICPAINT=1 overwrites those surfaces with magenta, which is
+what proved they reach the screen intact.
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -411,6 +411,84 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON WIC RETAINED CONTENT ------------------------------------------------
++ * A Direct2D render target is RETAINED: its contents persist from one
++ * BeginDraw/EndDraw pair to the next, and an app is entitled to redraw only the
++ * part that changed. For a WIC bitmap target the backing store IS the bitmap, so
++ * on Windows a render target created over a bitmap that already holds pixels
++ * starts out showing those pixels.
++ *
++ * Wine renders into a private D3D texture instead and copies the WHOLE texture
++ * over the bitmap at every present, and that texture was created with no initial
++ * data -- so it starts blank and the first EndDraw ERASES whatever the bitmap
++ * already held. The render-target pool made it worse still, deliberately clearing
++ * a reused texture to zeroes.
++ *
++ * Premiere's timeline time ruler is exactly this pattern: it draws its ~660 tick
++ * geometries once, then creates fresh targets over the same bitmap to update only
++ * the timecode text. Measured with NEUTRON_D2D_OPTRACE=1 (11.10-45-fix64): of 1050
++ * presents of the ruler's 3255x98 surface, 1035 carried a single DrawTextLayout
++ * and held 0-780 non-transparent pixels, while the 9 that carried the tick
++ * geometry held thousands. The ticks rasterise correctly and are then wiped. The
++ * Program Monitor's ruler is immune only because it redraws all 249-442 of its
++ * geometries every single frame. Same cause for the grey in/out highlight, which
++ * is one FillGeometry drawn once at startup.
++ *
++ * Seeding the texture from the bitmap makes the target retained the way the API
++ * says it is. Failure is non-fatal: it leaves the old blank-start behaviour. */
++static void d2d_wic_render_target_seed_from_bitmap(struct d2d_wic_render_target *rt)
++{
++    IWICBitmapLock *lock;
++    ID3D10Resource *resource;
++    ID3D10Device *device;
++    UINT size, pitch;
++    WICRect rect;
++    BYTE *data;
++
++    if (!rt->bitmap || !rt->bpp)
++        return;
++
++    rect.X = 0;
++    rect.Y = 0;
++    rect.Width = rt->width;
++    rect.Height = rt->height;
++    if (FAILED(IWICBitmap_Lock(rt->bitmap, &rect, WICBitmapLockRead, &lock)))
++        return;
++
++    if (SUCCEEDED(IWICBitmapLock_GetDataPointer(lock, &size, &data))
++            && SUCCEEDED(IWICBitmapLock_GetStride(lock, &pitch)))
++    {
++        if (SUCCEEDED(IDXGISurface_QueryInterface(rt->dxgi_surface,
++                &IID_ID3D10Resource, (void **)&resource)))
++        {
++            ID3D10Resource_GetDevice(resource, &device);
++            ID3D10Device_UpdateSubresource(device, resource, 0, NULL, data, pitch, 0);
++            ID3D10Device_Release(device);
++            ID3D10Resource_Release(resource);
++        }
++    }
++
++    IWICBitmapLock_Release(lock);
++}
++
++/* NEUTRON WIC PAINT TEST (NEUTRON_D2D_WICPAINT=1): overwrite every wide-and-short
++ * offscreen WIC surface with opaque magenta just before it is published. Four builds
++ * were spent inferring WHICH surface carries Premiere's time ruler; this stops
++ * inferring and asks the screen. Whatever band turns magenta is drawn through a WIC
++ * surface and does reach the display -- so anything missing inside it is being lost in
++ * the surface's own content. A band that stays untouched is not drawn this way at all. */
++static inline BOOL neutron_wicpaint(void)
++{
++    static int cached = -1;
++
++    if (cached < 0)
++    {
++        char buf[16];
++        cached = (GetEnvironmentVariableA("NEUTRON_D2D_WICPAINT", buf, sizeof(buf)) && buf[0] == '1');
++    }
++    return cached;
++}
++
+ static HRESULT d2d_wic_render_target_present(IUnknown *outer_unknown)
+ {
+     struct d2d_wic_render_target *render_target = impl_from_IUnknown(outer_unknown);
+@@ -423,6 +501,61 @@
+     BYTE *src, *dst;
+     unsigned int i;
+     HRESULT hr;
++    BOOL paint, diag;
++    unsigned int nz_alpha = 0, nz_rgb = 0;
++
++    /* Only the strip-shaped surfaces, and only where the pixel layout is the 32bpp
++     * one the fill and the pixel census below assume. */
++    paint = neutron_wicpaint() && render_target->bpp == 4
++            && render_target->height <= 128 && render_target->width >= 300;
++    diag = neutron_optrace() && render_target->bpp == 4
++            && render_target->height <= 128 && render_target->width >= 300;
++
++    /* NEUTRON TIMEBAR DIAG (NEUTRON_D2D_OPTRACE=1) -----------------------------
++     * Premiere's time ruler and its grey in/out highlight are missing, and four
++     * builds of d2d1 geometry work never moved either one. The reason we could
++     * not see them: Adobe's Direct2D drawbot draws these strips into WIDE, SHORT
++     * OFFSCREEN WIC surfaces (its own trace shows 3840x34, 3408x34, 1361x34 and
++     * 3255x98, premultiplied) and composites them later -- while our only
++     * per-frame op report fires at the hwnd Present, which these targets never
++     * reach. Every capture so far has therefore been blind to exactly the
++     * surfaces the ruler is drawn on.
++     *
++     * This reports what such a surface received before it is published to the
++     * WIC bitmap, and separates the two possible worlds:
++     *   ops=0           -- nothing was ever drawn, so the failure is ABOVE d2d1
++     *                      (the time-ruler control bailing during layout) and no
++     *                      amount of d2d work can fix it.
++     *   ops>0 with text -- the ruler IS drawn into the surface, and it is lost
++     *                      downstream, in this readback or the composite.
++     * Read-only, and costs nothing unless the env var is set. */
++    if (neutron_optrace() && render_target->height <= 128 && render_target->width >= 300)
++    {
++        static LONG diag_n;
++
++        if (InterlockedIncrement(&diag_n) <= 3000)
++        {
++            unsigned ops, clears;
++            RECT cr, u;
++            BOOL uvalid;
++            char hist[512];
++
++            neutron_dr_get_frame_stats(render_target->dxgi_target, &ops, &clears, &cr);
++            neutron_dr_format_hist(render_target->dxgi_target, hist, sizeof(hist));
++            neutron_dr_get_union(render_target->dxgi_target, &u, &uvalid);
++
++            if (uvalid)
++                ERR("neutron-timebar: WIC %ux%u alpha=%u ops=%u clears=%u union=(%ld,%ld,%ld,%ld) [%s]\n",
++                        render_target->width, render_target->height,
++                        (unsigned)render_target->pool_alpha_mode, ops, clears,
++                        u.left, u.top, u.right, u.bottom, hist[0] ? hist : "no ops");
++            else
++                ERR("neutron-timebar: WIC %ux%u alpha=%u ops=%u clears=%u union=NONE [%s]\n",
++                        render_target->width, render_target->height,
++                        (unsigned)render_target->pool_alpha_mode, ops, clears,
++                        hist[0] ? hist : "no ops");
++        }
++    }
+ 
+     if (FAILED(hr = IDXGISurface_QueryInterface(render_target->dxgi_surface,
+             &IID_ID3D10Resource, (void **)&src_resource)))
+@@ -441,7 +574,8 @@
+      * present can reuse a texture a reader has just finished with, and the map happens
+      * before the handoff so a failure leaves us on the ordinary path with nothing to
+      * unwind. */
+-    if (neutron_wic_readthrough() && render_target->pool_factory)
++    /* The paint test and the pixel census both work in the ordinary copy path below. */
++    if (!paint && !diag && neutron_wic_readthrough() && render_target->pool_factory)
+     {
+         struct d2d_factory *factory =
+                 unsafe_impl_from_ID2D1Factory((ID2D1Factory *)render_target->pool_factory);
+@@ -527,10 +661,54 @@
+     for (i = 0; i < render_target->height; ++i)
+     {
+         memcpy(dst, src, render_target->bpp * render_target->width);
++
++        /* NEUTRON TIMEBAR PIXEL CENSUS: the paint test proved these strips reach the
++         * screen intact, so whatever is missing is missing INSIDE the surface. Count
++         * what the surface actually holds, which separates the last two candidates
++         * without needing anything read off a screenshot:
++         *   nz_alpha=0            -- the draw produced no pixels at all
++         *   nz_alpha>0, nz_rgb=0  -- pixels exist but are black/transparent, i.e. the
++         *                            fill or the brush colour is being lost
++         *   both > 0              -- content is present and correct here, so it is lost
++         *                            after this point. */
++        if (diag)
++        {
++            const unsigned int *p = (const unsigned int *)dst;
++            unsigned int n = render_target->width;
++
++            while (n--)
++            {
++                unsigned int px = *p++;
++
++                if (px & 0xff000000)
++                    ++nz_alpha;
++                if (px & 0x00ffffff)
++                    ++nz_rgb;
++            }
++        }
++
++        if (paint)
++        {
++            /* B8G8R8A8 premultiplied, opaque magenta. */
++            unsigned int *p = (unsigned int *)dst, n = render_target->width;
++
++            while (n--)
++                *p++ = 0xffff00ff;
++        }
+         src += mapped_texture.RowPitch;
+         dst += dst_pitch;
+     }
+ 
++    if (diag)
++    {
++        static LONG census_n;
++
++        if (InterlockedIncrement(&census_n) <= 3000)
++            ERR("neutron-timebar: CENSUS %ux%u nz_alpha=%u nz_rgb=%u of %u px\n",
++                    render_target->width, render_target->height, nz_alpha, nz_rgb,
++                    render_target->width * render_target->height);
++    }
++
+     ID3D10Texture2D_Unmap(render_target->readback_texture, 0);
+     IWICBitmapLock_Release(bitmap_lock);
+ 
+@@ -586,7 +764,17 @@
+         ID2D1DeviceContext_SetUnitMode(rt->pool_context, D2D1_UNIT_MODE_DIPS);
+     }
+ 
+-    if (rt->pool_rtv)
++    /* NEUTRON WIC RETAINED CONTENT: a pooled target must come back holding what the
++     * BITMAP holds, not zeroes. Clearing was right only under the old assumption that
++     * a fresh target starts blank -- which is precisely the bug (see
++     * d2d_wic_render_target_seed_from_bitmap). The clear stays as the fallback for
++     * when there is no bitmap to seed from, since publishing the previous tenant's
++     * pixels would be worse than publishing nothing. */
++    if (rt->bitmap)
++    {
++        d2d_wic_render_target_seed_from_bitmap(rt);
++    }
++    else if (rt->pool_rtv)
+     {
+         ID3D10Texture2D_GetDevice(rt->readback_texture, &device);
+         ID3D10Device_ClearRenderTargetView(device, rt->pool_rtv, clear_colour);
+@@ -957,5 +1145,7 @@
+     render_target->bitmap = bitmap;
+     IWICBitmap_AddRef(bitmap);
+ 
++    d2d_wic_render_target_seed_from_bitmap(render_target);
++
+     return S_OK;
+ }

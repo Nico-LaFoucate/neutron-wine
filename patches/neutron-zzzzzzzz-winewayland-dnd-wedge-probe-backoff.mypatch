@@ -1,0 +1,105 @@
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -968,10 +968,35 @@
+  * already does that -- one timeout per wedge episode, not one per motion -- so the true worst case
+  * is a single budget-length stall, and 400 ms is far below the freeze threshold while giving a busy
+  * Premiere room to answer honestly. Four wedges in one short session says 120 ms was simply too
+- * tight, and every wedge is a drag we then have to guess our way through. */
++ * tight, and every wedge is a drag we then have to guess our way through.
++ *
++ * 🚨 FOURTH PASS, and the one that explains why the drop still failed. Suppression was PERMANENT
++ * for the remainder of a drag: the wedged flag is cleared only by a SUCCESSFUL call, and once set
++ * it short-circuits every DRAG before any call is made, so no DRAG can ever succeed again. The app
++ * therefore receives ZERO IDropTarget::DragOver updates for the rest of that drag.
++ *
++ * Premiere needs those. Measured on 11.10-56 with the drop path finally instrumented:
++ *
++ *     ENTER  first-effect=0 (accepting=NO)
++ *     DND_DRAG timed out after 400 ms; suppressing further drag feedback
++ *     DROP delivered to hwnd=0x10120 -- app returned effect=0 (REFUSED BY THE APP)
++ *
++ * The drop WAS delivered, every time -- the app refused it, because without position updates it
++ * never established a drop target. We cured the freeze by starving the app of the very information
++ * it needs to accept. A third attempt succeeded only because a DragOver happened to land before
++ * that drag's wedge.
++ *
++ * So a wedge is now a BACKOFF, not a mute. While wedged we retry one cheap probe every
++ * NEUTRON_DND_WEDGE_PROBE_MS with a much smaller budget; a probe that succeeds clears the wedge and
++ * full-rate feedback resumes. The aggregate stays bounded -- at worst one 60 ms block per 250 ms
++ * while the app is unresponsive, against the 89 x 3000 ms that started all of this -- and the
++ * moment the thread frees up the app starts hearing where the pointer is again. */
+ #define NEUTRON_DND_DRAG_TIMEOUT_MS 400
++#define NEUTRON_DND_WEDGE_PROBE_MS   250    /* how often to re-test a wedged window thread */
++#define NEUTRON_DND_PROBE_TIMEOUT_MS  60    /* a probe must be cheap: it may well time out too */
+ 
+ static BOOL dnd_drag_feedback_wedged;   /* set when a DRAG step times out; cleared on any success */
++static DWORD dnd_wedge_last_probe;      /* tick of the last probe while wedged */
+ static LRESULT dnd_last_drag_effect;    /* last effect the window thread really returned, reset per drag */
+ static LONG dnd_leave_pending;          /* a LEAVE has been posted and not yet claimed */
+ 
+@@ -984,15 +1009,25 @@
+ static LRESULT dnd_call_on_window_thread(HWND hwnd, UINT msg)
+ {
+     BOOL is_drag = (msg == WM_WAYLAND_DND_DRAG);
+-    struct send_message_timeout_params params =
+-        {.flags = SMTO_ABORTIFHUNG | SMTO_NORMAL,
+-         .timeout = is_drag ? NEUTRON_DND_DRAG_TIMEOUT_MS : 3000};
++    struct send_message_timeout_params params = {.flags = SMTO_ABORTIFHUNG | SMTO_NORMAL};
++    BOOL probing = FALSE;
+     LRESULT res;
+ 
+-    /* Feedback-only step to a window thread that already failed to answer: skip it outright rather
+-     * than block the event thread all over again -- but keep answering the compositor with what the
+-     * app last told us, never with a refusal we invented. */
+-    if (is_drag && dnd_drag_feedback_wedged) return dnd_wedged_effect();
++    /* Feedback-only step to a window thread that already failed to answer: back off rather than
++     * block the event thread again -- but do NOT go silent for the rest of the drag. Probe on an
++     * interval so the app starts hearing pointer positions the moment it can answer, and meanwhile
++     * keep telling the compositor what the app last told us, never a refusal we invented. */
++    if (is_drag && dnd_drag_feedback_wedged)
++    {
++        DWORD now = NtGetTickCount();
++
++        if (now - dnd_wedge_last_probe < NEUTRON_DND_WEDGE_PROBE_MS)
++            return dnd_wedged_effect();
++        dnd_wedge_last_probe = now;
++        probing = TRUE;
++    }
++    params.timeout = !is_drag ? 3000
++            : (probing ? NEUTRON_DND_PROBE_TIMEOUT_MS : NEUTRON_DND_DRAG_TIMEOUT_MS);
+ 
+     res = NtUserMessageCall(hwnd, msg, 0, 0, &params, NtUserSendMessageTimeout, FALSE);
+     if (!params.result)
+@@ -1000,12 +1035,13 @@
+         if (is_drag && !dnd_drag_feedback_wedged)
+         {
+             dnd_drag_feedback_wedged = TRUE;
+-            ERR("neutron-dnd: hwnd=%p DND_DRAG timed out after %u ms; suppressing further drag "
+-                "feedback until the window thread answers again -- continuing to block the wayland "
+-                "event thread starves every surface's buffer queue and freezes the app. Answering "
+-                "%#lx for the rest of this drag (last real answer %#lx) so the drop stays "
+-                "deliverable\n",
+-                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS, (long)dnd_wedged_effect(),
++            dnd_wedge_last_probe = NtGetTickCount();
++            ERR("neutron-dnd: hwnd=%p DND_DRAG timed out after %u ms; backing off to a %u ms probe "
++                "every %u ms -- blocking the wayland event thread on every motion starves every "
++                "surface's buffer queue and freezes the app. Answering %#lx meanwhile (last real "
++                "answer %#lx) so the drop stays deliverable\n",
++                hwnd, NEUTRON_DND_DRAG_TIMEOUT_MS, NEUTRON_DND_PROBE_TIMEOUT_MS,
++                NEUTRON_DND_WEDGE_PROBE_MS, (long)dnd_wedged_effect(),
+                 (long)dnd_last_drag_effect);
+         }
+         else if (!is_drag)
+@@ -1019,6 +1055,12 @@
+         }
+         return is_drag ? dnd_wedged_effect() : 0;
+     }
++    /* A probe that answers means the thread is alive again: resume full-rate feedback so the app
++     * gets the pointer positions it needs to establish a drop target. Announce it -- the pairing of
++     * "backing off" with "recovered" in a log is what shows whether the backoff is working. */
++    if (is_drag && dnd_drag_feedback_wedged)
++        ERR("neutron-dnd: hwnd=%p window thread answered a probe (effect=%#lx) -- resuming "
++            "full-rate drag feedback\n", hwnd, (long)res);
+     dnd_drag_feedback_wedged = FALSE;
+     if (is_drag) dnd_last_drag_effect = res;
+     return res;

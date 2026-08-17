@@ -1,0 +1,183 @@
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -299,6 +299,101 @@
+ 
+ 
+ 
++/* NEUTRON: resolve a geometry to an axis-aligned rectangle, seeing through
++ * ID2D1TransformedGeometry.
++ *
++ * Premiere's CLIP-CHILDREN exclusion masks arrive as transformed rectangles, not bare
++ * ID2D1RectangleGeometry, so the plain QueryInterface below reported them as "non-rectangle" and
++ * the whole mask fell back to its bounding box. Measured 2026-08-14: members with exactly
++ * axis-aligned integer bounds -- e.g. (0,0)-(1786,1232) with a hole at (79,67)-(325,93), which is
++ * the EXACT rect of a visible child window in the same log -- rejected purely for being wrapped.
++ *
++ * Only axis-aligned transforms qualify. Under rotation or skew a rectangle's image is not a
++ * rectangle and its bounds are strictly larger than the shape, which is the very trap the
++ * "bounds are not the shape" rule below exists to avoid. */
++static BOOL d2d_geometry_as_axis_aligned_rect(ID2D1Geometry *geometry, D2D1_RECT_F *out)
++{
++    ID2D1TransformedGeometry *tg;
++    ID2D1RectangleGeometry *rg;
++    BOOL ret = FALSE;
++
++    if (SUCCEEDED(ID2D1Geometry_QueryInterface(geometry, &IID_ID2D1RectangleGeometry, (void **)&rg)))
++    {
++        ID2D1RectangleGeometry_GetRect(rg, out);
++        ID2D1RectangleGeometry_Release(rg);
++        return TRUE;
++    }
++
++    if (SUCCEEDED(ID2D1Geometry_QueryInterface(geometry, &IID_ID2D1TransformedGeometry, (void **)&tg)))
++    {
++        D2D1_MATRIX_3X2_F m;
++        ID2D1Geometry *src = NULL;
++        D2D1_RECT_F unused;
++
++        ID2D1TransformedGeometry_GetTransform(tg, &m);
++        ID2D1TransformedGeometry_GetSourceGeometry(tg, &src);
++        ID2D1TransformedGeometry_Release(tg);
++
++        if (src)
++        {
++            /* Recurse: the source must itself be a rectangle, and the transform must keep it one.
++             * With that established, the geometry's own bounds ARE its shape. */
++            if (d2d_geometry_as_axis_aligned_rect(src, &unused) && m._12 == 0.0f && m._21 == 0.0f
++                    && SUCCEEDED(ID2D1Geometry_GetBounds(geometry, NULL, out)))
++                ret = TRUE;
++            ID2D1Geometry_Release(src);
++        }
++    }
++
++    return ret;
++}
++
++/* NEUTRON: ALTERNATE fill over two nested rectangles is a HOLE -- "everything in the outer rect
++ * except the inner one". That is how a clip-children exclusion reaches us. Rewrite it as the four
++ * disjoint rectangles of the frame, which the scissor path can express exactly.
++ *
++ * Getting this wrong is what makes controls disappear: the bounding-box fallback INCLUDES the hole,
++ * so the app's background fill paints straight over the child window living in it, and the child
++ * only comes back when something forces it to repaint (hovering it). Returns the new count, or 0 if
++ * the pair is not a shape we can represent. */
++static unsigned d2d_mask_rects_from_alternate_pair(const D2D1_RECT_F *a, const D2D1_RECT_F *b,
++        D2D1_RECT_F *out)
++{
++    const D2D1_RECT_F *outer, *hole;
++    unsigned count = 0;
++
++    if (a->left <= b->left && a->top <= b->top && a->right >= b->right && a->bottom >= b->bottom)
++    {
++        outer = a; hole = b;
++    }
++    else if (b->left <= a->left && b->top <= a->top && b->right >= a->right && b->bottom >= a->bottom)
++    {
++        outer = b; hole = a;
++    }
++    else
++    {
++        /* Disjoint: even-odd and winding agree, so both pieces stand. Anything else (a partial
++         * overlap) is a symmetric difference we are not going to guess at -- bail to the bbox. */
++        if (a->right <= b->left || b->right <= a->left || a->bottom <= b->top || b->bottom <= a->top)
++        {
++            out[0] = *a;
++            out[1] = *b;
++            return 2;
++        }
++        return 0;
++    }
++
++#define NEUTRON_EMIT(l, t, r, bt) \
++    do { if ((r) > (l) && (bt) > (t)) { d2d_rect_set(&out[count], (l), (t), (r), (bt)); ++count; } } while (0)
++    NEUTRON_EMIT(outer->left, outer->top,    outer->right, hole->top);      /* above  */
++    NEUTRON_EMIT(outer->left, hole->bottom,  outer->right, outer->bottom);  /* below  */
++    NEUTRON_EMIT(outer->left, hole->top,     hole->left,   hole->bottom);   /* left   */
++    NEUTRON_EMIT(hole->right, hole->top,     outer->right, hole->bottom);   /* right  */
++#undef NEUTRON_EMIT
++
++    return count;
++}
++
+ /* NEUTRON LAYER-MASK RECTS: if a layer's geometric mask is a WINDING geometry group of
+  * disjoint rectangles -- a dirty region -- record the pieces in device pixels so each draw
+  * inside the layer can be scissored to them individually. Clipping to the bounding box
+@@ -315,6 +410,8 @@
+     ID2D1GeometryGroup *group;
+     unsigned i, j, n, count = 0;
+     float x_scale, y_scale;
++    D2D1_FILL_MODE fillmode;
++    BOOL alternate_pair;
+     BOOL ok = TRUE;
+ 
+     if (!neutron_maskrects() || context->mask_owner)
+@@ -323,7 +420,11 @@
+         return FALSE;
+ 
+     n = ID2D1GeometryGroup_GetSourceGeometryCount(group);
+-    if (n > ARRAY_SIZE(srcs) || ID2D1GeometryGroup_GetFillMode(group) != D2D1_FILL_MODE_WINDING)
++    fillmode = ID2D1GeometryGroup_GetFillMode(group);
++    /* ALTERNATE over exactly two members is a hole and IS representable -- see
++     * d2d_mask_rects_from_alternate_pair(). Every other ALTERNATE shape still bails. */
++    alternate_pair = (fillmode == D2D1_FILL_MODE_ALTERNATE && n == 2);
++    if (n > ARRAY_SIZE(srcs) || (fillmode != D2D1_FILL_MODE_WINDING && !alternate_pair))
+     {
+         /* NEUTRON: two entirely different failures shared one message, and it printed
+          * "(limit 128)" for masks of TWO members. A 2026-08-13 capture reads as an over-cap
+@@ -391,7 +492,6 @@
+     y_scale = context->desc.dpiY / 96.0f;
+     for (i = 0; i < n; ++i)
+     {
+-        ID2D1RectangleGeometry *rg;
+         D2D1_RECT_F r, t;
+         D2D1_POINT_2F p;
+ 
+@@ -400,8 +500,9 @@
+             ok = FALSE;
+             continue;
+         }
+-        /* Only plain rectangles: for anything else the bounds are not the shape. */
+-        if (FAILED(ID2D1Geometry_QueryInterface(srcs[i], &IID_ID2D1RectangleGeometry, (void **)&rg)))
++        /* Only rectangles: for anything else the bounds are not the shape. NEUTRON: this now sees
++         * through ID2D1TransformedGeometry, which is how clip-children exclusions arrive. */
++        if (!d2d_geometry_as_axis_aligned_rect(srcs[i], &r))
+         {
+             /* NEUTRON: by far the most common bail -- 3645 in one 2026-08-13 session, all n=1 --
+              * and the old message said only "non-rectangle", which is not enough to decide what
+@@ -446,8 +547,6 @@
+         }
+         else
+         {
+-            ID2D1RectangleGeometry_GetRect(rg, &r);
+-            ID2D1RectangleGeometry_Release(rg);
+             if (mask_transform)
+             {
+                 D2D1_RECT_F mb;
+@@ -475,6 +574,27 @@
+         return FALSE;
+     }
+ 
++    /* NEUTRON: turn the even-odd pair into the frame around its hole before anything downstream
++     * sees it. From here on the list is ordinary disjoint rectangles again. */
++    if (alternate_pair)
++    {
++        D2D1_RECT_F frame[4];
++        unsigned fc;
++
++        if (count != 2 || !(fc = d2d_mask_rects_from_alternate_pair(&rects[0], &rects[1], frame)))
++        {
++            if (neutron_optrace())
++                ERR("neutron-dr: MASKFALLBACK ALTERNATE pair not a hole (count=%u) -- bounding box in force\n",
++                        count);
++            return FALSE;
++        }
++        if (neutron_optrace())
++            ERR("neutron-dr: MASKALTERNATE hole resolved into %u scissor rect(s) -- "
++                "child content inside the hole is now protected\n", fc);
++        memcpy(rects, frame, fc * sizeof(*frame));
++        count = fc;
++    }
++
+     /* Disjoint check: overlapping pieces would draw translucent content twice. */
+     for (i = 0; i < count; ++i)
+     {
