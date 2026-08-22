@@ -1,0 +1,86 @@
+neutron-zzzzzzzzzj-d2d1-mask-rects-256-and-loud-overcap
+
+d2d1: raise the layer-mask rect cap to 256, and report an over-cap UNCONDITIONALLY.
+
+SYMPTOM (user, live, 2026-08-21): "timeline just flickered and buttons disappeared" in Premiere.
+Same bug the 24 -> 128 raise addressed on 2026-08-13; 128 was not enough either.
+
+EVIDENCE. The capture running at the time held exactly one over-cap event, 143 s before the log
+ended -- i.e. the moment the user reported:
+
+    MASKFALLBACK OVER-CAP n=133 (limit 128) -- bounding box in force
+
+A layer mask of 133 rectangles exceeded mask_rects[128], so install_mask_rects() discarded the
+mask and clipped to its BOUNDING BOX, which spans the whole panel. The application's next
+background fill inside that layer then wipes every control in it -- the vanish.
+
+The same line also confirms the 11.10-51 raise is genuinely present in the shipped binary
+("limit 128", not "limit 24"), closing a verification item open since 2026-08-13.
+
+FIX 1: 128 -> 256. The comment above the array asks for exactly this discipline -- "do not raise
+this 'just in case' -- raise it when a MASKFALLBACK log line shows a real mask exceeding it" --
+and that line finally arrived. The disjoint check is O(n^2), so 256 costs ~65k float compares on
+the rare large mask, which is nothing beside the GPU draws it guards.
+
+FIX 2, and the more important one: the over-cap warning is no longer behind NEUTRON_D2D_OPTRACE.
+A silently-widened clip is a VISIBLE, WRONG-OUTPUT defect that needed a diagnostic build to
+notice -- which is precisely why it stayed open from July to August and needed a lucky capture to
+catch. It is also rare by construction (one occurrence in a 76-minute editing session), so it
+cannot spam a log. The other fallback reasons stay gated: "non-rectangle member" fired 5,380 times
+in the same session.
+
+⛔ Do NOT raise the cap again without a log line showing a real mask over 256. If one appears, the
+right answer is probably no longer a bigger array but a heap-allocated list -- at that point the
+fixed cap has been wrong three times.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -677,8 +677,17 @@
+      * 128 gives ~1.7x headroom over the worst observed. It is NOT free: the
+      * disjoint check is O(n^2) and each rect costs one extra scissored draw, so
+      * do not raise this "just in case" -- raise it when a MASKFALLBACK log line
+-     * shows a real mask exceeding it. */
+-    D2D1_RECT_F mask_rects[128];
++     * shows a real mask exceeding it.
++     *
++     * 2026-08-21: that line arrived. The user reported the flicker-and-vanish live and the
++     * capture held exactly one over-cap event, 143 s before the log ended:
++     *     MASKFALLBACK OVER-CAP n=133 (limit 128) -- bounding box in force
++     * So 128 -> 256, by the rule above and not "just in case". n^2 at 256 is ~65k float
++     * compares on the rare large mask, which is nothing beside the GPU draws it guards.
++     * The over-cap warning is now printed UNCONDITIONALLY (it was behind
++     * NEUTRON_D2D_OPTRACE): it fires about once an hour at worst, and needing a diagnostic
++     * build to discover a silently-wrong clip is how this stayed open from July to August. */
++    D2D1_RECT_F mask_rects[256];
+     unsigned mask_rect_count;
+     unsigned mask_owner;        /* layer index that installed the list, +1 (0 = none) */
+     unsigned last_op;           /* NEUTRON op-trace: most recent primitive id */
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -437,14 +437,22 @@
+          * Note the ordering: this bail runs BEFORE the per-member rectangle check below, so
+          * nothing here is known to be a rectangle yet -- which is why the members are dumped
+          * rather than assumed. Rate-limited: these fire thousands of times per session. */
++        /* NEUTRON: the over-cap case is reported UNCONDITIONALLY. It means a layer mask was
++         * discarded and the clip widened to the whole bounding box, so the app's next
++         * background fill can wipe live controls -- a visible, silent-by-default defect that
++         * took two months and a lucky diagnostic session to catch. It is also genuinely rare
++         * (one occurrence in a 76-minute editing capture), so it cannot spam a log. Everything
++         * else in this block stays behind NEUTRON_D2D_OPTRACE, because the non-rectangle case
++         * fires thousands of times per session. */
++        if (n > ARRAY_SIZE(srcs))
++            ERR("neutron-dr: MASKFALLBACK OVER-CAP n=%u (limit %u) -- bounding box in force; "
++                "raise mask_rects[] in d2d1_private.h\n", n, (unsigned)ARRAY_SIZE(srcs));
++
+         if (neutron_optrace())
+         {
+             static LONG dumps;
+ 
+-            if (n > ARRAY_SIZE(srcs))
+-                ERR("neutron-dr: MASKFALLBACK OVER-CAP n=%u (limit %u) -- bounding box in force\n",
+-                        n, (unsigned)ARRAY_SIZE(srcs));
+-            else
++            if (n <= ARRAY_SIZE(srcs))
+                 ERR("neutron-dr: MASKFALLBACK FILLMODE=ALTERNATE n=%u -- bounding box in force "
+                     "(a hole; the bbox over-includes it)\n", n);
+ 

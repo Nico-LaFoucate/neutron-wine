@@ -1,0 +1,82 @@
+neutron-zzzzzzzzzf-comdlg32-itemdlg-no-bare-dot-extension
+
+comdlg32: don't append a bare "." to a filename in the IFileDialog save path.
+
+SYMPTOM (Adobe Premiere Pro, user-reported and confirmed fixed 2026-08-19): creating a new
+project and typing the project name into the location browser returned the name with an
+extra period on the end -- "MyProject." -- which the user had been deleting by hand on
+every new project. It is in the returned NAME, not a display artifact.
+
+CAUSE. itemdlg.c treated a lone "." as an extension and concatenated it onto the user's
+filename. Two independent routes reach it:
+  1. get_first_ext_from_spec() on a filter spec of "*." returns "." -- PathFindExtension
+     finds the dot, and the "contains a glob" rejection doesn't fire because there is no
+     '*' AFTER the dot;
+  2. SetDefaultExtension(L"") -- the code does lstrcpyW(extbuf, L".") then concatenates
+     the empty default, leaving extbuf == ".".
+The same class of bug sat in the file-type-change handler, which rewrites the extension on
+the name already in the filename box using the same helper.
+
+⭐ The CLASSIC dialog in filedlg.c has always guarded exactly this case:
+       if (*filterExt) /* ignore filterExt="" */
+That guard was never carried over to itemdlg.c -- the path every modern app takes through
+IFileSaveDialog. This is an inconsistency inside comdlg32 itself, not a Wine-vs-Windows
+judgement call. (Windows additionally strips trailing dots from path components, so a
+trailing-dot name cannot survive there even if a dialog produced one.)
+
+FIX: treat "" and "." as "no extension" at both sites, and TRACE the decision on the
+commdlg channel so a future repro names the route instead of leaving it to inference.
+
+MEASURED on the live app (WINEDEBUG=+commdlg), which is what identified the route:
+  trace:commdlg:on_default_action neutron: dropping empty extension L"." \
+      (filter L"*.", defext (null))
+Premiere registers ONE file type whose spec is "*." -- it is picking a location and a name,
+not a file type. defext was never set, so route 2 was not involved here; it is guarded
+anyway because it is the same defect.
+
+User-confirmed: new project created on the fixed build, no trailing period.
+Write-up: docs/wiki/TODO.md P1e.
+
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -667,6 +667,26 @@
+                 newext = extbuf;
+             }
+ 
++            /* NEUTRON: a lone "." is not an extension -- never append one. Two ways to get
++             * here: a filter spec of "*." (PathFindExtension returns "."), or
++             * SetDefaultExtension(L"") (empty default -> extbuf is just "."). Either way the
++             * user's typed filename came back with a trailing dot. The CLASSIC dialog in
++             * filedlg.c already guards exactly this ("ignore filterExt=\"\""); this path,
++             * which is what modern apps get through IFileSaveDialog, did not.
++             * Reported in Premiere Pro: naming a new project in the location browser
++             * produced "MyProject." -- see docs/wiki/TODO.md. */
++            if(newext && (!newext[0] || !newext[1]))
++            {
++                TRACE("neutron: dropping empty extension %s (filter %s, defext %s)\n",
++                      debugstr_w(newext), debugstr_w(This->current_filter),
++                      debugstr_w(This->default_ext));
++                newext = NULL;
++            }
++            else
++                TRACE("neutron: appending extension %s to %s (filter %s, defext %s)\n",
++                      debugstr_w(newext), debugstr_w(canon_filename),
++                      debugstr_w(This->current_filter), debugstr_w(This->default_ext));
++
+             if(This->dlg_type == ITEMDLG_TYPE_SAVE)
+             {
+                 if(newext)
+@@ -2302,6 +2322,13 @@
+             WCHAR buf[MAX_PATH], extbuf[MAX_PATH], *ext;
+ 
+             ext = get_first_ext_from_spec(extbuf, This->filterspecs[This->filetypeindex].pszSpec);
++            /* NEUTRON: same guard as the save path above -- a spec of "*." yields a bare "."
++             * which would be concatenated onto the name already in the filename box. */
++            if(ext && (!ext[0] || !ext[1]))
++            {
++                TRACE("neutron: filetype change, dropping empty extension %s\n", debugstr_w(ext));
++                ext = NULL;
++            }
+             if(ext)
+             {
+                 lstrcpyW(buf, filename);

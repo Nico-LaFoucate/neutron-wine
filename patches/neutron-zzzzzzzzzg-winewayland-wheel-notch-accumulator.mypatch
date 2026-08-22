@@ -1,0 +1,117 @@
+neutron-zzzzzzzzzg-winewayland-wheel-notch-accumulator
+
+winewayland: optionally snap fragmented high-resolution wheel input to whole notches
+(NEUTRON_WHEEL_NOTCH=1, off by default).
+
+SYMPTOM (Adobe Premiere Pro, user-reported): one physical ratchet click of a Logitech
+MX Master 2S scrubbed the timeline a DIFFERENT distance every time -- measured at 3 to 8
+frames per detent -- where Windows moves exactly one.
+
+CAUSE, measured, not inferred. A high-resolution wheel (HID++ "HIRES WHEEL" {2121},
+multiplier 8) does not deliver one value120=120 per detent. Captured with a purpose-built
+meter (preserved-fixes/harnesses/wheelmeter.c) plus WINEDEBUG=+waylanddrv, five deliberate
+clicks per run, value120 histogram:
+
+    hires ON  :  61 x 15,  13 x 60,  2 x 30,  1 x 75
+    hires OFF :  32 x 15,   7 x 60
+
+One detent arrives as an IRREGULAR burst, because the layers below coalesce fragments by
+TIMING rather than by detent. (Note the "OFF" column: Solaar's hires-smooth-resolution
+toggle did not reach the event stream at all -- the device stayed in multiplier-8 mode.)
+
+Wine forwards each fragment as its own WM_MOUSEWHEEL, which is faithful to the protocol and
+harmless for an app that sums deltas. An app that treats each message as one discrete step --
+Premiere's timeline does -- therefore moves a different distance for the same physical click,
+and no fixed scale factor can correct it because the fragmentation is non-deterministic.
+
+FIX: accumulate value120 per axis and emit one WHEEL_DELTA per whole notch, carrying the
+remainder. Deterministic (arithmetic, not timing) and reproduces exactly what a plain wheel
+delivers on Windows: measured 1 message / +120 per detent, every detent. A direction change
+abandons the partial notch rather than cancelling against it, so reversing never swallows the
+first click back.
+
+ENV-GATED AND OFF BY DEFAULT, because it is a compatibility choice rather than a conformance
+fix: Windows with a high-resolution mouse also delivers fragments, and an app that sums deltas
+wants them. The launcher enables it per-app for Adobe profiles.
+
+⛔ REJECTED ALTERNATIVE, recorded so it is not retried: bounding the wineserver's
+merge_mousewheel() to a single notch (server/queue.c). It looked right -- that merge is
+unbounded and Windows does not coalesce wheel messages at all, so bursts of distinct notches
+were collapsing into one message and an app counting messages lost detents. But with this
+accumulator in place, fragments never reach the queue as separate messages, so the bound has
+no defect left to fix -- while its remaining effect is to forbid ALL coalescing, which removes
+the backpressure relief that keeps a busy app responsive. Tested live: the timeline became
+"incredibly laggy, accumulates and is impossible to interrupt". Reverted; the server merge is
+left stock.
+
+Write-up: docs/wiki/TODO.md P1f.
+
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -368,6 +368,53 @@
+ {
+ }
+ 
++/* NEUTRON: snap fragmented wheel input to whole notches (NEUTRON_WHEEL_NOTCH=1).
++ *
++ * A high-resolution wheel (Logitech HID++ "HIRES WHEEL", multiplier 8) does not deliver one
++ * value120=120 per physical detent. MEASURED on an MX Master 2S under KWin, one detent arrives
++ * as an IRREGULAR burst -- 15,15,15,15,15,15,15,15 or 60,15,15,15,15 or 60,60, and occasionally
++ * 30 or 75 -- because the layers below coalesce fragments by timing, not by detent. Wine forwards
++ * each fragment as its own WM_MOUSEWHEEL, which is faithful, but it means an app that treats each
++ * message as one discrete step (Premiere Pro's timeline does) moves a DIFFERENT distance for the
++ * same physical click every time: 3 to 8 frames per detent, measured.
++ *
++ * Accumulating and emitting per whole WHEEL_DELTA makes it deterministic -- arithmetic, not
++ * timing -- and reproduces exactly what a plain wheel delivers on Windows. Sub-notch precision is
++ * preserved as a remainder, so a slow deliberate turn still lands every notch.
++ *
++ * Env-gated because it IS a compatibility choice, not a conformance fix: Windows with a hi-res
++ * mouse also delivers fragments, and an app that sums deltas wants them. Enabled per-app by the
++ * launcher (see APP_PROFILES in bin/neutron). Not for touchpads: axis_source is checked by the
++ * caller only for wheels, and continuous scroll never reaches this handler on this driver. */
++static BOOL neutron_wheel_notch(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_WHEEL_NOTCH"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static int32_t neutron_wheel_accumulate(uint32_t axis, int32_t value120)
++{
++    /* wl_pointer events are delivered on the single wayland event thread, so plain statics are
++     * safe here and match how the rest of this file keeps per-seat state. */
++    static int32_t accum[2];
++    int32_t *a, out;
++
++    if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL &&
++        axis != WL_POINTER_AXIS_HORIZONTAL_SCROLL)
++        return value120;
++    a = &accum[axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL];
++
++    /* A direction change abandons the partial notch rather than cancelling against it: the user
++     * physically reversed, and carrying a negative remainder would swallow the first click back. */
++    if ((*a < 0) != (value120 < 0)) *a = 0;
++
++    *a += value120;
++    out = (*a / 120) * 120;
++    *a -= out;
++    return out;
++}
++
+ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_pointer,
+                                          uint32_t axis, int32_t value120)
+ {
+@@ -376,6 +423,12 @@
+ 
+     if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+ 
++    if (neutron_wheel_notch() && !(value120 = neutron_wheel_accumulate(axis, value120)))
++    {
++        TRACE("hwnd=%p axis=%u accumulating, no whole notch yet\n", hwnd, axis);
++        return;
++    }
++
+     input.type = INPUT_MOUSE;
+ 
+     switch (axis)

@@ -1,0 +1,276 @@
+neutron-zzzzzzzzzh-wic-skip-seed-for-pristine-bitmaps
+
+d2d1/windowscodecs: don't seed a WIC render target from a bitmap that has never held a pixel.
+
+BACKGROUND. neutron-zzzzzzzzzd made a D2D render target over a WIC bitmap start out holding
+the bitmap's pixels, which is what a RETAINED target must do and what fixed Premiere's missing
+time ruler. It pays for that with a full-surface CPU->GPU upload (Lock + UpdateSubresource) on
+every target creation and every pool reuse.
+
+MEASURED COST (Premiere, NEUTRON_D2D_PERF=1, ~60s of timeline scrolling):
+    d2d_factory_CreateWicBitmapRenderTarget   177us/call (July baseline, pre-seed)
+                                              334us/call (with the seed)
+                                              17,158 calls in the capture
+
+MEASURED WASTE (WINEDEBUG=+nwicgpu, same capture):
+    attached=15946  served=15798  materialized=274
+Only 274 of 17,158 bitmaps had ANY content. The rest are freshly calloc'd -- transparent
+black -- so the upload wrote a megabyte of zeroes into an already-zero texture, ~280x a
+second, for no observable effect.
+
+FIX. windowscodecs tracks whether a bitmap has ever been written: FALSE at creation only when
+it wraps caller-supplied memory, and cleared permanently by a write lock or a GPU source
+attach. d2d1 asks before seeding; a pristine bitmap gets the plain clear instead, which is
+free and GPU-side.
+
+⚠️ THE CLEAR IS LOAD-BEARING, do not "simplify" this to an early return. A pooled target that
+skips both the seed and the clear publishes the PREVIOUS TENANT's pixels -- that is the white
+striped bar across the timeline recorded in PERFORMANCE.md. The seed function therefore
+reports whether it ran, and the caller clears whenever it did not.
+
+⚠️ The query is a SEPARATE IID (INeutronWicGpuBitmap2), not a method appended to the v1 vtbl.
+d2d1 and windowscodecs are separate DLLs and this project stages individual DLLs into runtimes
+routinely, so a mismatched pair is a realistic assembly; a grown vtbl would be a call into
+whatever follows it. A missing v2 fails QueryInterface and the caller seeds unconditionally --
+the old, correct, slower behaviour.
+
+RESULT: user-confirmed correct (ruler, grey in/out highlight, no white strip). Cost moved
+334 -> 298 us/call and forced materializations 274 -> 115, but BOTH runs differ in workload
+(17.2k vs 19.6k calls) and this project's own rule is that cross-run d2d1 comparison is noise
+-- EndDraw and BeginDraw moved UP between the same two runs. So: correct and directionally
+right, magnitude NOT established. Establishing it needs per-frame alternation inside one
+session, the method that validated lazy tessellation.
+
+Next target from the same capture, and NOT a regression of ours: d2d_device_context_EndDraw,
+now the top cost at ~343us x 19.6k calls -- the GPU->CPU sync the July notes flagged as
+"explicitly requested, never investigated".
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -436,7 +436,10 @@
+  *
+  * Seeding the texture from the bitmap makes the target retained the way the API
+  * says it is. Failure is non-fatal: it leaves the old blank-start behaviour. */
+-static void d2d_wic_render_target_seed_from_bitmap(struct d2d_wic_render_target *rt)
++/* Returns TRUE when the texture now holds the bitmap's pixels. FALSE means the caller must
++ * fall back to clearing: either there was nothing to seed from, or the bitmap is pristine
++ * (transparent) and a clear is both correct and free. */
++static BOOL d2d_wic_render_target_seed_from_bitmap(struct d2d_wic_render_target *rt)
+ {
+     IWICBitmapLock *lock;
+     ID3D10Resource *resource;
+@@ -446,14 +449,36 @@
+     BYTE *data;
+ 
+     if (!rt->bitmap || !rt->bpp)
+-        return;
++        return FALSE;
++
++    /* NEUTRON PERF: a bitmap that has never held a pixel has nothing to retain, and seeding
++     * it costs a full-surface CPU->GPU upload for no effect. MEASURED in Premiere: 17,158
++     * seeds during a minute of timeline scrolling, of which only 274 bitmaps had any content
++     * -- and CreateWicBitmapRenderTarget went 177us -> 334us per call when this seed was
++     * added. Ask, and let the caller fall back to the plain clear.
++     *
++     * A bitmap that cannot answer (native windowscodecs, an older DLL in a mixed runtime) is
++     * treated as having content, which is the slow but always-correct answer. */
++    {
++        INeutronWicGpuBitmap2 *gpu2;
++        BOOL pristine = FALSE;
++
++        if (SUCCEEDED(IWICBitmap_QueryInterface(rt->bitmap, &IID_INeutronWicGpuBitmap2,
++                (void **)&gpu2)))
++        {
++            HRESULT hr = gpu2->lpVtbl->IsPristine(gpu2, &pristine);
++            gpu2->lpVtbl->Release(gpu2);
++            if (SUCCEEDED(hr) && pristine)
++                return FALSE;
++        }
++    }
+ 
+     rect.X = 0;
+     rect.Y = 0;
+     rect.Width = rt->width;
+     rect.Height = rt->height;
+     if (FAILED(IWICBitmap_Lock(rt->bitmap, &rect, WICBitmapLockRead, &lock)))
+-        return;
++        return FALSE;
+ 
+     if (SUCCEEDED(IWICBitmapLock_GetDataPointer(lock, &size, &data))
+             && SUCCEEDED(IWICBitmapLock_GetStride(lock, &pitch)))
+@@ -469,6 +494,7 @@
+     }
+ 
+     IWICBitmapLock_Release(lock);
++    return TRUE;
+ }
+ 
+ /* NEUTRON WIC PAINT TEST (NEUTRON_D2D_WICPAINT=1): overwrite every wide-and-short
+@@ -770,9 +796,9 @@
+      * d2d_wic_render_target_seed_from_bitmap). The clear stays as the fallback for
+      * when there is no bitmap to seed from, since publishing the previous tenant's
+      * pixels would be worse than publishing nothing. */
+-    if (rt->bitmap)
++    if (d2d_wic_render_target_seed_from_bitmap(rt))
+     {
+-        d2d_wic_render_target_seed_from_bitmap(rt);
++        /* texture now matches the bitmap; nothing further to do */
+     }
+     else if (rt->pool_rtv)
+     {
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -67,6 +67,11 @@
+     const struct neutron_wicgpu_source *gpu_ops;    /* NULL => ordinary CPU bitmap */
+     void *gpu_ctx;
+     BOOL gpu_was_read;      /* diagnostic only: did anyone actually read this frame? */
++    /* NEUTRON: TRUE until a pixel is written by ANY route. A D2D render target created over
++     * a pristine bitmap has nothing to retain, so it can skip the full-surface seed upload
++     * (see INeutronWicGpuBitmap2 in wine/neutron_wicgpu.h). */
++    BOOL pristine;
++    INeutronWicGpuBitmap2 INeutronWicGpuBitmap2_iface;
+ } BitmapImpl;
+ 
+ typedef struct BitmapLockImpl {
+@@ -333,6 +338,10 @@
+          * bitmap implemented elsewhere -- simply keeps doing the copy. */
+         *ppv = &This->INeutronWicGpuBitmap_iface;
+     }
++    else if (IsEqualIID(&IID_INeutronWicGpuBitmap2, iid))
++    {
++        *ppv = &This->INeutronWicGpuBitmap2_iface;
++    }
+     else
+     {
+         if (IsEqualIID(&IID_CMetaBitmapRenderTarget, iid))
+@@ -530,6 +539,10 @@
+         LeaveCriticalSection(&This->cs);
+     }
+ 
++    /* NEUTRON: a write lock hands out a raw pointer, so assume it is used. */
++    if (flags & WICBitmapLockWrite)
++        This->pristine = FALSE;
++
+     result = malloc(sizeof(BitmapLockImpl));
+     if (!result)
+         return E_OUTOFMEMORY;
+@@ -635,6 +648,10 @@
+     bitmap_gpu_drop(This, TRUE);
+     This->gpu_ops = ops;
+     This->gpu_ctx = ctx;
++    /* NEUTRON: an attached source is content, and stays content after it materialises into
++     * This->data -- so this is a permanent transition out of pristine, not a state that
++     * follows gpu_ops. */
++    if (ops) This->pristine = FALSE;
+     LeaveCriticalSection(&This->cs);
+ 
+     if (ops)
+@@ -653,6 +670,51 @@
+     neutron_wicgpu_SetSource,
+ };
+ 
++static inline BitmapImpl *impl_from_INeutronWicGpuBitmap2(INeutronWicGpuBitmap2 *iface)
++{
++    return CONTAINING_RECORD(iface, BitmapImpl, INeutronWicGpuBitmap2_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE neutron_wicgpu2_QueryInterface(INeutronWicGpuBitmap2 *iface,
++        REFIID iid, void **out)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap2(iface);
++    return IWICBitmap_QueryInterface(&This->IWICBitmap_iface, iid, out);
++}
++
++static ULONG STDMETHODCALLTYPE neutron_wicgpu2_AddRef(INeutronWicGpuBitmap2 *iface)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap2(iface);
++    return IWICBitmap_AddRef(&This->IWICBitmap_iface);
++}
++
++static ULONG STDMETHODCALLTYPE neutron_wicgpu2_Release(INeutronWicGpuBitmap2 *iface)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap2(iface);
++    return IWICBitmap_Release(&This->IWICBitmap_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE neutron_wicgpu2_IsPristine(INeutronWicGpuBitmap2 *iface,
++        BOOL *pristine)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap2(iface);
++
++    if (!pristine) return E_POINTER;
++    EnterCriticalSection(&This->cs);
++    /* An attached GPU source IS content, even though no CPU write has happened. */
++    *pristine = This->pristine && !This->gpu_ops;
++    LeaveCriticalSection(&This->cs);
++    return S_OK;
++}
++
++static const INeutronWicGpuBitmap2Vtbl neutron_wicgpu2_vtbl =
++{
++    neutron_wicgpu2_QueryInterface,
++    neutron_wicgpu2_AddRef,
++    neutron_wicgpu2_Release,
++    neutron_wicgpu2_IsPristine,
++};
++
+ static const IWICBitmapVtbl BitmapImpl_Vtbl = {
+     BitmapImpl_QueryInterface,
+     BitmapImpl_AddRef,
+@@ -1023,6 +1085,10 @@
+     This->gpu_ops = NULL;
+     This->gpu_ctx = NULL;
+     This->gpu_was_read = FALSE;
++    /* A bitmap built over caller memory (CreateBitmapFromMemory and friends) already holds
++     * pixels; one we calloc'd is transparent black and has nothing worth retaining. */
++    This->pristine = (view == NULL);
++    This->INeutronWicGpuBitmap2_iface.lpVtbl = &neutron_wicgpu2_vtbl;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": BitmapImpl.lock");
+ 
+--- a/include/wine/neutron_wicgpu.h
++++ b/include/wine/neutron_wicgpu.h
+@@ -97,6 +97,43 @@
+     const INeutronWicGpuBitmapVtbl *lpVtbl;
+ };
+ 
++/* ---------------------------------------------------------------------------------------
++ * v2: "has this bitmap ever held pixels?"
++ *
++ * A D2D render target over a WIC bitmap is RETAINED: the bitmap is the backing store, so a
++ * target created over a bitmap that already holds pixels must start out showing them (that
++ * is the time-ruler fix). Seeding costs a full-surface upload, and MEASURED in Premiere it
++ * is wasted almost every time -- 17k seeds in a minute of timeline scrolling, of which only
++ * 274 bitmaps had any content at all. The rest are freshly created and still all zeroes,
++ * where the correct and free answer is the plain clear the code did before.
++ *
++ * Deliberately a SEPARATE IID rather than a method appended to the v1 vtbl: d2d1 and
++ * windowscodecs are separate DLLs and a runtime can be assembled with one of them older
++ * (this project stages individual DLLs into runtimes routinely). A missing v2 simply fails
++ * QueryInterface and the caller seeds unconditionally, which is the old, correct, slower
++ * behaviour -- whereas a vtbl grown in place would be a call into whatever follows it.
++ * {6e657574-726f-6e02-77-69-63-67-70-75-30-32} -- "neutron" + "wicgpu02". */
++DEFINE_GUID(IID_INeutronWicGpuBitmap2, 0x6e657574,0x726f,0x6e02,0x77,0x69,0x63,0x67,0x70,0x75,0x30,0x32);
++
++typedef struct INeutronWicGpuBitmap2 INeutronWicGpuBitmap2;
++
++typedef struct INeutronWicGpuBitmap2Vtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(INeutronWicGpuBitmap2 *iface, REFIID iid, void **out);
++    ULONG   (STDMETHODCALLTYPE *AddRef)(INeutronWicGpuBitmap2 *iface);
++    ULONG   (STDMETHODCALLTYPE *Release)(INeutronWicGpuBitmap2 *iface);
++
++    /* TRUE when no pixel of this bitmap has ever been written -- not by an initialising
++     * copy, not through a write lock, not by an attached GPU source. A pristine bitmap
++     * reads as fully transparent, so there is nothing for a render target to retain. */
++    HRESULT (STDMETHODCALLTYPE *IsPristine)(INeutronWicGpuBitmap2 *iface, BOOL *pristine);
++} INeutronWicGpuBitmap2Vtbl;
++
++struct INeutronWicGpuBitmap2
++{
++    const INeutronWicGpuBitmap2Vtbl *lpVtbl;
++};
++
+ #define INeutronWicGpuBitmap_QueryInterface(p,a,b) (p)->lpVtbl->QueryInterface(p,a,b)
+ #define INeutronWicGpuBitmap_AddRef(p)             (p)->lpVtbl->AddRef(p)
+ #define INeutronWicGpuBitmap_Release(p)            (p)->lpVtbl->Release(p)

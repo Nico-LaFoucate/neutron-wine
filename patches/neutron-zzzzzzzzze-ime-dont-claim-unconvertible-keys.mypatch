@@ -1,0 +1,121 @@
+neutron-zzzzzzzzze-ime-dont-claim-unconvertible-keys
+
+Don't route keys through the IME on a driver that cannot convert them, and give the
+IME's fallback re-post a well-formed keystroke lParam.
+
+SYMPTOM (Adobe Premiere Pro, user-reported, reproduced and fixed 2026-08-19): pressing
+Backspace ONCE in a text field deletes TWO characters. Arrow keys move one, and typing
+inserts one, so it looked app-specific for months. It is not.
+
+CAUSE. winewayland.drv activates an IME HKL (get_ime_hkl() -> 0xE001xxxx) for every
+window the compositor gives text-input focus (wayland_text_input.c text_input_enter),
+i.e. effectively all of them. That makes is_ime_hkl() true, so the built-in IME claims
+EVERY keystroke -- imm32/ime.c ImeProcessKey returns TRUE for anything but a modifier
+("TODO: should be ctx->fOpen"). win32u then rewrites the message to VK_PROCESSKEY.
+
+But winewayland implements no pImeToAsciiEx at all, so __wine_set_user_driver fills it
+with nulldrv_ImeToAsciiEx, and every conversion returns STATUS_NOT_IMPLEMENTED -- 
+visible in a +imm trace as "ime_driver_call processing vkey 0x8, scan 0xe -> 3221225474"
+for every single key. imm32 then re-posts the original key. The app therefore receives
+TWO WM_KEYDOWNs per physical press where Windows delivers one, and its own
+TranslateMessage turns the second into a WM_CHAR that the Windows message stream, for
+that keystroke, does not contain.
+
+The re-posted message was also malformed: TRANSMSG.lParam was set to the raw scan value,
+putting the scan code in the REPEAT COUNT field and leaving the scan-code field zero. A
+Backspace arrived as "repeat count 14, scan 0" instead of Windows' 0x000E0001, and the
+WM_CHAR derived from it inherited that.
+
+FIX.
+  1. win32u: only offer a key to the IME if the driver actually implements ImeToAsciiEx
+     (new user_driver_can_ime_to_ascii() in driver.c, compared against nulldrv). Claiming
+     a key that can never be converted cannot do anything except duplicate it. Drivers
+     that do implement IME conversion are unaffected.
+  2. imm32: rebuild a well-formed lParam, MAKELONG(1, vsc), on the fallback re-post.
+
+Composition is unaffected: winewayland still activates the IME HKL, and the compositor's
+preedit/commit arrives through the async WM_WINE_IME_NOTIFY path, which never depended
+on the per-key claim.
+
+MEASURED, live Premiere, +timestamp,+key,+imm, properties panel:
+                     before                          after
+  messages           VK_PROCESSKEY + re-posted       VK_BACK + WM_CHAR
+                     VK_BACK + WM_CHAR lParam        lParam 000e0001
+                     0000000e
+  caret reports      225 -> 222 -> 212 (2 edits)     222 -> 212 (1 edit)
+  VK_PROCESSKEY      every keystroke                 zero in the whole session
+User-confirmed: one Backspace, one character.
+
+Causation was proven before the build by preserved-fixes/harnesses/ime-off-probe.c, which
+posts WM_INPUTLANGCHANGEREQUEST(0x04090409) to take the app off the IME layout at runtime.
+
+Full write-up: docs/wiki/TODO.md P1d.
+
+--- a/dlls/imm32/ime.c
++++ b/dlls/imm32/ime.c
+@@ -598,7 +598,13 @@
+ 
+     if (status == STATUS_NOT_IMPLEMENTED)
+     {
+-        TRANSMSG msg = {.message = vsc & KF_UP ? WM_KEYUP : WM_KEYDOWN, .wParam = vkey, .lParam = vsc};
++        /* NEUTRON: rebuild a well-formed keystroke lParam. Passing the raw scan value
++         * put it in the REPEAT COUNT field and left the scan-code field zero, so the
++         * re-posted key -- and the WM_CHAR the app's TranslateMessage derives from it --
++         * looked nothing like a real keystroke (Backspace arrived as repeat count 14,
++         * scan 0). Windows sends 0x000E0001 here; so do we now. */
++        TRANSMSG msg = {.message = vsc & KF_UP ? WM_KEYUP : WM_KEYDOWN, .wParam = vkey,
++                        .lParam = MAKELONG(1, vsc)};
+         msgs->TransMsg[count++] = msg;
+     }
+     else if (status) WARN( "WINE_IME_TO_ASCII_EX returned unexpected status %#lx\n", status );
+--- a/dlls/win32u/driver.c
++++ b/dlls/win32u/driver.c
+@@ -1338,6 +1338,17 @@
+ /******************************************************************************
+  *	     __wine_set_user_driver   (win32u.so)
+  */
++/* NEUTRON: TRUE only if the display driver can actually convert a key through an IME.
++ * A driver that doesn't implement ImeToAsciiEx gets nulldrv_ImeToAsciiEx above (see
++ * SET_USER_FUNC), whose every call returns STATUS_NOT_IMPLEMENTED -- so claiming keys
++ * for such a driver can never do anything except duplicate them. winewayland.drv is
++ * exactly that case: it implements SetIMECompositionRect but no ImeToAsciiEx. */
++BOOL user_driver_can_ime_to_ascii(void)
++{
++    if (user_driver == &lazy_load_driver) return FALSE;
++    return user_driver->pImeToAsciiEx != nulldrv_ImeToAsciiEx;
++}
++
+ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version )
+ {
+     struct user_driver_funcs *driver, *prev;
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2562,7 +2562,17 @@
+     }
+     msg->pt = point_phys_to_win_dpi( msg->hwnd, msg->pt );
+ 
+-    if (remove && (msg->message == WM_KEYDOWN || msg->message == WM_KEYUP))
++    /* NEUTRON: only offer the key to the IME if the driver can actually convert it.
++     * winewayland activates an IME HKL (0xE001xxxx) for every window the compositor
++     * gives text-input focus, which makes the built-in IME claim EVERY keystroke --
++     * but it implements no ImeToAsciiEx, so imm32 gets STATUS_NOT_IMPLEMENTED and
++     * simply re-posts the key. The app therefore sees TWO WM_KEYDOWNs per physical
++     * press where Windows delivers one, and translates the second into a WM_CHAR the
++     * Windows message stream never contains. Measured in Premiere Pro: one Backspace
++     * deleted two characters (docs/wiki/TODO.md P1d). Claiming a key that can never
++     * be converted buys nothing, so don't. */
++    if (remove && user_driver_can_ime_to_ascii() &&
++        (msg->message == WM_KEYDOWN || msg->message == WM_KEYUP))
+         if (ImmProcessKey( msg->hwnd, NtUserGetKeyboardLayout(0), msg->wParam, msg->lParam, 0 ))
+             msg->wParam = VK_PROCESSKEY;
+ 
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -357,6 +357,7 @@
+ 
+ /* driver.c */
+ extern const struct user_driver_funcs *user_driver;
++extern BOOL user_driver_can_ime_to_ascii(void);
+ extern struct client_surface *nulldrv_client_surface_create( HWND hwnd );
+ 
+ extern ULONG_PTR zero_bits;

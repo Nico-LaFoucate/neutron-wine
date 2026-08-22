@@ -1,0 +1,199 @@
+neutron-diag-d2d-present-stage-timers
+
+DIAGNOSTIC ONLY (patches/diagnostic, applied only with INCLUDE_DIAGNOSTIC=1).
+
+Splits BeginDraw/EndDraw and the WIC present into stages, reported through the existing
+NEUTRON_D2D_PERF slot table so they appear in the ordinary "#N name Nus in N calls" report:
+
+    BEGINDRAW a pre-draw hook (DC-direct)
+    ENDDRAW a release_state (SwapDeviceContextState)
+    ENDDRAW b present
+    wicPRESENT 0 drain recycle / 1 CopyResource / 2 Map READ / 3 Map READ (fallback)
+
+WHY IT IS NOT IN THE SHIPPED SET: these sit on paths taken ~17,000 times per editing session and
+each one calls QueryPerformanceCounter twice. They are gated behind NEUTRON_D2D_PERF so a normal
+launch pays nothing, but a release build has no business carrying them.
+
+WHAT THEY ESTABLISHED (2026-08-21, one session, same report windows):
+    BEGINDRAW a pre-draw hook   1205 us/call x 4,159   <- 99.9% of BeginDraw
+    ENDDRAW b present            713 us/call x 7,545   <- 99% of EndDraw
+    wicPRESENT 2 Map READ        257 us/call x 3,387
+    ENDDRAW a release_state        7 us/call
+i.e. the cost is the DC-direct window copies in and out, ~1.9 ms per begin/end pair -- NOT
+Direct2D drawing, and not the GPU sync that had been suspected since July. Full write-up and the
+four theories this killed: docs/wiki/PERFORMANCE.md 2026-08-21.
+
+Keep these. The next person to look at UI performance should not have to re-derive the split.
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -3380,6 +3380,36 @@
+             context->vb, context->vb_stride, NULL, NULL);
+ }
+ 
++/* NEUTRON PERF: split BeginDraw/EndDraw into their parts (NEUTRON_D2D_PERF=1).
++ *
++ * Both measure ~1ms/call over ~17k calls in a timeline capture -- 35 s of a session between
++ * them -- with near-identical call counts, which says a symmetric per-draw cost rather than
++ * anything to do with presenting (only 4k of those EndDraws Map at all). On paper neither
++ * function does 1ms of work: a WIC target has no begindraw hook, and BeginDraw is a few field
++ * resets. So the time is somewhere the source does not obviously show -- state swap, lock
++ * contention, or a driver call that blocks -- and three theories have already died guessing.
++ * Measure the parts. */
++struct neutron_dc_stage { LONGLONG t0; const char *name; };
++
++static inline struct neutron_dc_stage neutron_dc_stage_begin(const char *name)
++{
++    struct neutron_dc_stage st = {0, NULL};
++    LARGE_INTEGER q;
++    if (!neutron_perf()) return st;
++    QueryPerformanceCounter(&q);
++    st.t0 = q.QuadPart; st.name = name;
++    return st;
++}
++
++static inline void neutron_dc_stage_end(struct neutron_dc_stage *st)
++{
++    LARGE_INTEGER q;
++    if (!st->name) return;
++    QueryPerformanceCounter(&q);
++    neutron_api_record(st->name, q.QuadPart - st->t0);
++    st->name = NULL;
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_BeginDraw(ID2D1DeviceContext6 *iface)
+ {
+     NEUTRON_API_TIME();
+@@ -3403,7 +3433,11 @@
+      * D2D target bitmap) -- invoked HERE, the common choke point reached whether the app
+      * drives BeginDraw via the hwnd-RT iface or the ID2D1DeviceContext iface. */
+     if (context->ops && context->ops->device_context_begindraw)
++    {
++        struct neutron_dc_stage __h = neutron_dc_stage_begin("  BEGINDRAW a pre-draw hook (DC-direct)");
+         context->ops->device_context_begindraw(context->outer_unknown);
++        neutron_dc_stage_end(&__h);
++    }
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_begin_draw(context->target.command_list, context);
+@@ -3420,7 +3454,11 @@
+ 
+     TRACE("iface %p, tag1 %p, tag2 %p.\n", iface, tag1, tag2);
+ 
+-    d2d_device_context_release_state(context);
++    {
++        struct neutron_dc_stage __rs = neutron_dc_stage_begin("  ENDDRAW a release_state (SwapDeviceContextState)");
++        d2d_device_context_release_state(context);
++        neutron_dc_stage_end(&__rs);
++    }
+ 
+     if (tag1)
+         *tag1 = context->error.tag1;
+@@ -3437,7 +3475,10 @@
+ 
+     if (context->ops && context->ops->device_context_present)
+     {
+-        if (FAILED(hr = context->ops->device_context_present(context->outer_unknown)))
++        struct neutron_dc_stage __pr = neutron_dc_stage_begin("  ENDDRAW b present");
++        hr = context->ops->device_context_present(context->outer_unknown);
++        neutron_dc_stage_end(&__pr);
++        if (FAILED(hr))
+             context->error.code = hr;
+     }
+ 
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -515,6 +515,44 @@
+     return cached;
+ }
+ 
++/* NEUTRON PERF: stage breakdown of the WIC present (NEUTRON_D2D_PERF=1).
++ *
++ * EndDraw is the top cost in a timeline capture -- 343us x 19,596 calls -- and all of it is
++ * attributed to one name, so we cannot tell the GPU sync from the copies around it. The
++ * suspicion is the Map: a CPU<->GPU round trip whose latency is FIXED (measured 2026-07-28 at
++ * 1151us for a 32x16 surface), meaning only the NUMBER of syncs matters, not their size. That
++ * is a very different fix from optimising a copy, so measure the split before choosing.
++ *
++ * Records into the same slot table as the API timers, so the stages appear in the ordinary
++ * "#N name Nus in N calls" report alongside EndDraw itself. */
++#define NEUTRON_WIC_STAGE(name) \
++    struct neutron_wic_stage __stage = neutron_wic_stage_begin(name)
++#define NEUTRON_WIC_STAGE_END() neutron_wic_stage_end(&__stage)
++
++struct neutron_wic_stage { LONGLONG t0; const char *name; };
++
++static inline struct neutron_wic_stage neutron_wic_stage_begin(const char *name)
++{
++    struct neutron_wic_stage st = {0, NULL};
++    LARGE_INTEGER q;
++
++    if (!neutron_perf()) return st;
++    QueryPerformanceCounter(&q);
++    st.t0 = q.QuadPart;
++    st.name = name;
++    return st;
++}
++
++static inline void neutron_wic_stage_end(struct neutron_wic_stage *st)
++{
++    LARGE_INTEGER q;
++
++    if (!st->name) return;
++    QueryPerformanceCounter(&q);
++    neutron_api_record(st->name, q.QuadPart - st->t0);
++    st->name = NULL;
++}
++
+ static HRESULT d2d_wic_render_target_present(IUnknown *outer_unknown)
+ {
+     struct d2d_wic_render_target *render_target = impl_from_IUnknown(outer_unknown);
+@@ -591,7 +629,11 @@
+     }
+ 
+     ID3D10Texture2D_GetDevice(render_target->readback_texture, &device);
+-    ID3D10Device_CopyResource(device, (ID3D10Resource *)render_target->readback_texture, src_resource);
++    {
++        NEUTRON_WIC_STAGE("  wicPRESENT 1 CopyResource (GPU-side)");
++        ID3D10Device_CopyResource(device, (ID3D10Resource *)render_target->readback_texture, src_resource);
++        NEUTRON_WIC_STAGE_END();
++    }
+     ID3D10Device_Release(device);
+     ID3D10Resource_Release(src_resource);
+ 
+@@ -606,10 +648,18 @@
+         struct d2d_factory *factory =
+                 unsafe_impl_from_ID2D1Factory((ID2D1Factory *)render_target->pool_factory);
+ 
+-        d2d_wic_gpu_drain_recycle(factory);
++        {
++            NEUTRON_WIC_STAGE("  wicPRESENT 0 drain recycle");
++            d2d_wic_gpu_drain_recycle(factory);
++            NEUTRON_WIC_STAGE_END();
++        }
++
++        struct neutron_wic_stage __map = neutron_wic_stage_begin("  wicPRESENT 2 Map READ (CPU<->GPU sync)");
++        HRESULT __maphr = ID3D10Texture2D_Map(render_target->readback_texture, 0,
++                D3D10_MAP_READ, 0, &mapped_texture);
++        neutron_wic_stage_end(&__map);
+ 
+-        if (SUCCEEDED(ID3D10Texture2D_Map(render_target->readback_texture, 0,
+-                D3D10_MAP_READ, 0, &mapped_texture)))
++        if (SUCCEEDED(__maphr))
+         {
+             D3D10_TEXTURE2D_DESC desc;
+             ID3D10Texture2D *replacement;
+@@ -675,7 +725,12 @@
+         goto end;
+     }
+ 
+-    if (FAILED(hr = ID3D10Texture2D_Map(render_target->readback_texture, 0, D3D10_MAP_READ, 0, &mapped_texture)))
++    {
++        NEUTRON_WIC_STAGE("  wicPRESENT 3 Map READ (fallback path)");
++        hr = ID3D10Texture2D_Map(render_target->readback_texture, 0, D3D10_MAP_READ, 0, &mapped_texture);
++        NEUTRON_WIC_STAGE_END();
++    }
++    if (FAILED(hr))
+     {
+         ERR("Failed to map readback texture, hr %#lx.\n", hr);
+         IWICBitmapLock_Release(bitmap_lock);

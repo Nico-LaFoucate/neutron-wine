@@ -1,0 +1,140 @@
+neutron-zzzzzzzzzi-winewayland-sync-lock-state
+
+winewayland: sync Wine's toggle-key state with the compositor's locked modifiers.
+
+SYMPTOM (user, during a live editing session): Caps Lock in Premiere was INVERTED relative to
+the rest of the desktop -- typing came out in the wrong case, and stayed wrong for the life of
+the process. Toggling Caps Lock inside the app could not fix it, because that flips both
+states at once and preserves the inversion.
+
+CAUSE. winewayland tracked Caps Lock and Num Lock only by watching key events, and it receives
+key events only while a Wine window holds keyboard focus. Toggle Caps Lock with anything else
+focused -- a browser, a terminal, the desktop -- and the two states diverge permanently.
+keyboard_handle_modifiers() received mods_locked from the compositor on every modifier change
+and threw it away, under a standing upstream FIXME:
+
+    set_current_xkb_group(xkb_group);
+
+    /* FIXME: Sync wine modifier state with XKB modifier state. */
+
+FIX: compare Wine's toggle bit against xkb's XKB_STATE_MODS_LOCKED for Caps and Num, and when
+they disagree, send the key so Wine's own machinery flips its state. This is deliberately the
+same shape winex11.drv has used for years (update_lock_state / adjust_lock_state in its
+keyboard.c), including leading with the RELEASE when the key is physically held, so a
+synthetic press is never fabricated on top of a real one.
+
+Hooked into the modifiers handler rather than wl_keyboard.enter on purpose: the compositor
+always sends a modifiers event immediately after enter, so one site covers both focus changes
+and mid-session toggles, and there is no second code path to keep in sync.
+
+Num Lock had the identical defect and is fixed by the same loop; the user had simply not hit
+it yet.
+
+Verified live: toggle Caps Lock with another window focused, return to Premiere -- state now
+matches the desktop, in both directions. No stray toggles observed while typing (the sync
+fires only when the two states actually disagree).
+
+Upstream-worthy: this closes the FIXME rather than working around it, and affects every
+winewayland user of every application.
+
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -31,6 +31,8 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
++#include <xkbcommon/xkbcommon-names.h>
++
+ #include "waylanddrv.h"
+ #include "wine/debug.h"
+ #include "wine/server.h"
+@@ -895,16 +897,79 @@
+     NtUserSendHardwareInput(hwnd, 0, &input, 0);
+ }
+ 
++/* NEUTRON: sync Wine's toggle-key state with the compositor's LOCKED modifiers.
++ *
++ * winewayland tracked Caps Lock and Num Lock only by watching the key events it receives --
++ * and it receives them only while a Wine window holds keyboard focus. Toggle Caps Lock with
++ * anything else focused and Wine stays inverted relative to the desktop, which the user hit
++ * in Premiere: typing came out in the wrong case until the app was restarted. Toggling it
++ * again inside the app cannot help, because that flips both states at once.
++ *
++ * This is the FIXME that stood immediately below: "Sync wine modifier state with XKB modifier
++ * state." winex11.drv has done it for years (update_lock_state / adjust_lock_state in its
++ * keyboard.c) and this is deliberately the same shape: compare Wine's toggle bit against the
++ * server's locked state and, when they disagree, send the key so Wine's own machinery flips
++ * it. Doing it here also covers focus changes, because the compositor always sends a
++ * modifiers event straight after wl_keyboard.enter. */
++static void wayland_sync_lock_state(HWND hwnd)
++{
++    static const struct
++    {
++        const char *xkb_name;
++        WORD vkey;
++        WORD scan;
++        DWORD flags;
++    }
++    locks[] =
++    {
++        { XKB_MOD_NAME_CAPS, VK_CAPITAL, 0x3a, 0 },
++        { XKB_MOD_NAME_NUM,  VK_NUMLOCK, 0x45, KEYEVENTF_EXTENDEDKEY },
++    };
++    struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    BYTE keystate[256];
++    unsigned int i;
++
++    if (!NtUserGetAsyncKeyboardState(keystate)) return;
++
++    for (i = 0; i < ARRAY_SIZE(locks); ++i)
++    {
++        INPUT input = {0};
++        BOOL locked;
++
++        pthread_mutex_lock(&keyboard->mutex);
++        locked = keyboard->xkb_state && xkb_state_mod_name_is_active(keyboard->xkb_state,
++                locks[i].xkb_name, XKB_STATE_MODS_LOCKED) > 0;
++        pthread_mutex_unlock(&keyboard->mutex);
++
++        if (!(keystate[locks[i].vkey] & 0x01) == !locked) continue;
++
++        TRACE("adjusting %s: wine=%d compositor=%d\n", locks[i].xkb_name,
++              !!(keystate[locks[i].vkey] & 0x01), locked);
++
++        input.type = INPUT_KEYBOARD;
++        input.ki.wVk = locks[i].vkey;
++        input.ki.wScan = locks[i].scan;
++        /* If the key is physically held right now, lead with the release -- the ordering
++         * winex11 uses, so we never fabricate a press on top of a real one. */
++        input.ki.dwFlags = locks[i].flags;
++        if (keystate[locks[i].vkey] & 0x80) input.ki.dwFlags |= KEYEVENTF_KEYUP;
++        NtUserSendHardwareInput(hwnd, 0, &input, 0);
++        input.ki.dwFlags ^= KEYEVENTF_KEYUP;
++        NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    }
++}
++
+ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
+                                       uint32_t serial, uint32_t mods_depressed,
+                                       uint32_t mods_latched, uint32_t mods_locked,
+                                       uint32_t xkb_group)
+ {
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
++    HWND hwnd;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+-    if (!wayland_keyboard_get_focused_hwnd()) return;
++    if (!(hwnd = wayland_keyboard_get_focused_hwnd())) return;
+ 
+     TRACE("serial=%u mods_depressed=%#x mods_latched=%#x mods_locked=%#x xkb_group=%d stub!\n",
+           serial, mods_depressed, mods_latched, mods_locked, xkb_group);
+@@ -916,7 +981,7 @@
+ 
+     set_current_xkb_group(xkb_group);
+ 
+-    /* FIXME: Sync wine modifier state with XKB modifier state. */
++    wayland_sync_lock_state(hwnd);
+ }
+ 
+ static void keyboard_handle_repeat_info(void *data, struct wl_keyboard *wl_keyboard,
