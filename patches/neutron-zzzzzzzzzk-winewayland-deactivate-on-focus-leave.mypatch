@@ -1,0 +1,114 @@
+winewayland: tell the application when it stops being the foreground app.
+
+Wine windows never learned they had lost focus. keyboard_handle_enter() has always propagated
+ACTIVATION (it posts WM_WAYLAND_SET_FOREGROUND); nothing propagated DEACTIVATION, so once a
+window had been focused it stayed the foreground window forever. In place of that half was a
+one-line "FIXME: update foreground window as well".
+
+MEASURED with a foreground probe before writing any code: 40 s of clicking between Lightroom and
+a native browser produced not one foreground change -- Wine still named Lightroom's main frame
+throughout. Anything an application does on losing focus therefore never happened: dimming
+inactive chrome, closing menus, pausing background work.
+
+POSTED, not sent, and that is load-bearing: an in-app focus change arrives as leave(old) followed
+by enter(new), so by the time the message is handled the enter has already set focused_hwnd and
+the handler can tell an in-app change from a real deactivation. Deactivating on every leave would
+fight the enter that follows it, and this project has already paid for an activation ping-pong
+once (Lightroom's mask popups, ~500 activations/sec, app hung).
+
+Shaped after winex11.drv's focus_out(), which has done exactly this for years: ignore it unless
+the window really is the foreground one, cancel any modal mode, and only then hand the foreground
+to the desktop window -- never when the focus merely moved to another of our own windows.
+
+⚠️ This fixes a real gap but was NOT the cause of the Lightroom overlay bug it was written for
+(see the click-through-overlay patch): with this in place the foreground demonstrably moves to
+the desktop and the overlay still did not sink.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -71,6 +71,7 @@
+     WM_WAYLAND_INIT_DISPLAY_DEVICES = WM_WINE_FIRST_DRIVER_MSG,
+     WM_WAYLAND_CONFIGURE,
+     WM_WAYLAND_SET_FOREGROUND,
++    WM_WAYLAND_KILL_FOREGROUND,
+     /* NEUTRON: the toplevel surface entered a wl_output (wparam = output global_id); the
+      * window thread repositions the Win32 window onto that output's monitor so per-monitor
+      * DPI applies. */
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -858,7 +858,32 @@
+      * and for any key repetition to stop. */
+     release_all_keys(hwnd);
+ 
+-    /* FIXME: update foreground window as well */
++    /* NEUTRON: tell the application it is no longer the foreground app.
++     *
++     * This is the FIXME that stood here. keyboard_handle_enter has always propagated
++     * ACTIVATION (it posts WM_WAYLAND_SET_FOREGROUND); nothing propagated DEACTIVATION, so a
++     * Wine window stayed the foreground window forever once it had been focused. MEASURED with
++     * a foreground probe: 40 s of clicking between Lightroom and a native browser produced not
++     * one foreground change -- Wine still named Lightroom's main frame throughout.
++     *
++     * Anything an application does on losing focus therefore never happened: dimming inactive
++     * chrome, closing menus, pausing, and -- the user-visible report that started this -- hiding
++     * its WS_EX_TOPMOST overlays. Lightroom's filmstrip bezel is a layered topmost overlay it
++     * keeps up while it believes it is active, so it floated above every other application on
++     * the desktop, including non-Wine ones.
++     *
++     * POSTED, not sent, and that is load-bearing: an in-app focus change arrives as leave(old)
++     * followed by enter(new), so by the time this message is handled the enter has already set
++     * keyboard->focused_hwnd and the handler can tell the two cases apart. Deactivating on every
++     * leave would fight the enter that follows it -- and this project has already paid for an
++     * activation ping-pong once, when force-foregrounding Lightroom's mask popups produced ~500
++     * activations/sec and hung the app (neutron-lrc-mask-attach-storm).
++     *
++     * Shaped after winex11.drv's focus_out(), which has done exactly this for years: ignore it
++     * unless the window really is the foreground one, cancel any modal mode, and only then hand
++     * the foreground to the desktop window -- and never when the focus merely moved to another
++     * of our own windows. */
++    NtUserPostMessage(hwnd, WM_WAYLAND_KILL_FOREGROUND, 0, 0);
+ }
+ 
+ static void send_right_control(HWND hwnd, uint32_t state)
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1160,6 +1160,39 @@
+         ERR( "neutron-wlsetfg: winewayland foregrounding hwnd=%p\n", hwnd );
+         NtUserSetForegroundWindowInternal(hwnd);
+         return 0;
++    case WM_WAYLAND_KILL_FOREGROUND:
++    {
++        HWND focused;
++
++        /* Did the focus simply move to another of OUR windows? The matching enter has already
++         * been processed by the time this posted message runs, so a non-NULL focus means an
++         * in-app change and there is nothing to deactivate. winex11 asks the same question as
++         * is_current_process_focused(). */
++        pthread_mutex_lock(&process_wayland.keyboard.mutex);
++        focused = process_wayland.keyboard.focused_hwnd;
++        pthread_mutex_unlock(&process_wayland.keyboard.mutex);
++        /* NEUTRON diag: this handler has three early exits and its only voice was a TRACE on a
++         * channel nobody enables, so a no-op looked identical to never running. */
++        ERR("neutron-wlkillfg: hwnd=%p focused=%p fg=%p style=%08x -> %s\n", hwnd, focused,
++            NtUserGetForegroundWindow(), (unsigned)NtUserGetWindowLongW(hwnd, GWL_STYLE),
++            focused ? "SKIP (in-app focus change)" :
++            hwnd != NtUserGetForegroundWindow() ? "SKIP (not the foreground window)" : "DEACTIVATING");
++        if (focused) return 0;
++
++        /* Messages sent below may themselves change the foreground window, so re-check rather
++         * than trusting the state we saw when the leave arrived. */
++        if (hwnd != NtUserGetForegroundWindow()) return 0;
++
++        if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
++            send_message(hwnd, WM_CANCELMODE, 0, 0);
++
++        if (hwnd == NtUserGetForegroundWindow())
++        {
++            TRACE("lost focus to another client, handing foreground to the desktop\n");
++            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
++        }
++        return 0;
++    }
+     /* NEUTRON drag-and-drop: sent from the wayland event thread so that the OLE drop delivery
+      * happens HERE, on the window's own thread -- the one with a COM apartment. */
+     case WM_WAYLAND_DND_ENTER:

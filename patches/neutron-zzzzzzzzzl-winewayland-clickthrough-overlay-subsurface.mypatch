@@ -1,0 +1,59 @@
+winewayland: click-through decorative overlays are subsurfaces, not xdg_popups.
+
+SYMPTOM (Lightroom Classic): the shading Lightroom draws over its filmstrip floated above every
+other application on the desktop, including non-Wine ones. Click over to a browser and Lightroom's
+overlay stayed on top of it.
+
+WS_EX_LAYERED|WS_EX_TRANSPARENT is the same pair this file already uses to give a window an empty
+input region -- it cannot be clicked -- and WS_EX_NOACTIVATE says it must never become the active
+window. Nothing that can be neither clicked nor activated is a menu; it is chrome the application
+paints over its own frame. Such a window must be stacked WITH its parent, so it is a subsurface.
+
+An xdg_popup is a semi-detached surface the compositor stacks above the parent and it stays there.
+On Windows WS_EX_TOPMOST really is absolute in the z-order, so the application is right to keep
+the overlay up; Wayland has no such concept, so the only honest mapping is to stack it with the
+window it decorates.
+
+⚠️ Fixing the deactivation path first PROVED this is not an activation bug -- see the companion
+patch. The foreground moves to the desktop as it should and the overlay still did not sink.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -639,6 +639,29 @@
+ /***********************************************************************
+  *           WAYLAND_WindowPosChanged
+  */
++/* NEUTRON: is this window a click-through decorative overlay rather than a menu?
++ *
++ * WS_EX_LAYERED|WS_EX_TRANSPARENT is the same pair this file already uses to give a window an
++ * empty input region -- it cannot be clicked -- and WS_EX_NOACTIVATE says it must never become
++ * the active window. Nothing that can be neither clicked nor activated is a menu; it is chrome
++ * the application paints over its own frame.
++ *
++ * Such a window must be a SUBSURFACE of its owner, not an xdg_popup. A popup is a semi-detached
++ * surface the compositor stacks above the parent, and it stays there: Lightroom's filmstrip bezel
++ * (1210x796, layered+transparent+topmost, owned by AgWinMainFrame) floated above every other
++ * application on the desktop, including non-Wine ones, and did not sink when Lightroom lost focus.
++ *
++ * ⚠️ Fixing the deactivation path FIRST proved this is not an activation bug: with
++ * WM_WAYLAND_KILL_FOREGROUND in place the foreground demonstrably moves to the desktop when the
++ * user clicks another application (verified with a foreground probe), the handler logs
++ * DEACTIVATING, and the bezel still does not sink -- because on Windows WS_EX_TOPMOST really is
++ * absolute in the z-order, so the application is right to keep it up. Wayland has no such
++ * concept, so the only honest mapping is to stack it with its parent. */
++static BOOL neutron_is_clickthrough_overlay(HWND hwnd)
++{
++    DWORD ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    return (ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT) && (ex & WS_EX_NOACTIVATE);
++}
+ 
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
+@@ -737,6 +760,7 @@
+      * sub-window) as a subsurface of its owner, rather than briefly flashing as
+      * a standalone toplevel (which showed as a ghost second window). */
+     if (owner_surface && owner_surface->xdg_surface &&
++        !neutron_is_clickthrough_overlay(hwnd) &&
+         !(data->wayland_surface &&
+           data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE) &&
+         !((owner_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&

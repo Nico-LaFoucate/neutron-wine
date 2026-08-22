@@ -1,0 +1,74 @@
+DIAGNOSTIC ONLY (NEUTRON_WL_DIAG=1) -- subsurface geometry, three stages.
+
+Answers "is this subsurface in the right place, the right size, and does it hold pixels?" without
+guessing. Written for the Lightroom filmstrip overlays and immediately worth it: it showed the
+position and size were perfect and the surface simply had no buffer, killing a compositor-clipping
+theory that would otherwise have cost several builds.
+
+  neutron-subpos   window rect, parent rect, scale, and the position handed to
+                   wl_subsurface_set_position
+  neutron-subsize  the wp_viewport destination size
+  neutron-subshm   the SHM buffer size and the source rectangle sampled out of it
+
+An hwnd that logs subpos with no following subshm is an EMPTY surface: positioned, sized,
+committed, drawing nothing.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -854,6 +854,7 @@
+  */
+ static BOOL wayland_surface_get_frame_spill_rect(struct wayland_surface *surface,
+                                                  RECT *rect);
++static BOOL neutron_wl_surf_diag(void);
+ 
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+@@ -936,6 +937,13 @@
+                                wl_fixed_from_int(win_height));
+     }
+ 
++    if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE && neutron_wl_surf_diag())
++        ERR("neutron-subshm: hwnd=%p buffer=%dx%d win=%dx%d source=%dx%d\n",
++            surface->hwnd, shm_buffer->width, shm_buffer->height,
++            (int)(surface->window.rect.right - surface->window.rect.left),
++            (int)(surface->window.rect.bottom - surface->window.rect.top),
++            win_width, win_height);
++
+     surface->content_width = win_width;
+     surface->content_height = win_height;
+ }
+@@ -1390,6 +1398,21 @@
+ 
+         TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
+ 
++        if (neutron_wl_surf_diag())
++            ERR("neutron-subpos: hwnd=%p win=(%d,%d)-(%d,%d) %dx%d parent=%p pwin=(%d,%d)-(%d,%d) %dx%d "
++                "scale=%.4f local=%d,%d -> pos=%d,%d\n",
++                surface->hwnd,
++                (int)surface->window.rect.left, (int)surface->window.rect.top,
++                (int)surface->window.rect.right, (int)surface->window.rect.bottom,
++                (int)(surface->window.rect.right - surface->window.rect.left),
++                (int)(surface->window.rect.bottom - surface->window.rect.top),
++                surface->toplevel_hwnd,
++                (int)toplevel_surface->window.rect.left, (int)toplevel_surface->window.rect.top,
++                (int)toplevel_surface->window.rect.right, (int)toplevel_surface->window.rect.bottom,
++                (int)(toplevel_surface->window.rect.right - toplevel_surface->window.rect.left),
++                (int)(toplevel_surface->window.rect.bottom - toplevel_surface->window.rect.top),
++                surface->window.scale, local_x, local_y, x, y);
++
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
+         /* NEUTRON: place above the toplevel's client (Vulkan) surface ONLY when that
+          * client surface is genuinely a SIBLING — i.e. currently attached to THIS
+@@ -1468,7 +1491,11 @@
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         if (!surface->wl_subsurface) break; /* surface role has been cleared */
+-        wayland_surface_reconfigure_subsurface(surface);        break;
++        wayland_surface_reconfigure_subsurface(surface);
++        if (neutron_wl_surf_diag())
++            ERR("neutron-subsize: hwnd=%p win=%dx%d scale=%.4f -> viewport-dest=%dx%d\n",
++                surface->hwnd, win_width, win_height, surface->window.scale, width, height);
++        break;
+     }
+ 
+     wayland_surface_reconfigure_size(surface, width, height);

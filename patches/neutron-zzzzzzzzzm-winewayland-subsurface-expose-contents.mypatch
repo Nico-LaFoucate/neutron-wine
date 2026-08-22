@@ -1,0 +1,79 @@
+winewayland: re-flush a subsurface's contents after it is given its role.
+
+SYMPTOM (Lightroom Classic): of the two identical shading overlays at the ends of the filmstrip,
+the right one was completely absent -- not clipped, not misplaced, simply not drawn -- while the
+left one rendered correctly.
+
+wayland_surface_clear_role() ends with wl_surface_attach(NULL) and content_width = 0, so a window
+that is hidden and shown again starts from an EMPTY surface and needs the window surface flushed
+back into it. xdg surfaces get that for free: xdg_surface_handle_configure() ends with
+NtUserExposeWindowSurface(), commented "in case there is content that we weren't able to flush
+before due to the lack of the initial configure".
+
+A subsurface has no xdg_surface, so no configure ever arrives and that expose never fires. It
+therefore shows nothing at all until the application happens to repaint it for its own reasons.
+
+MEASURED: the two overlays were identical in every respect -- both 50x142, both viewport 29x84,
+both 128x256 buffers, both well inside the parent surface. The right one was hidden, re-shown, and
+never attached a buffer again for the remaining 1800 lines of the log; the left one got repainted
+for unrelated reasons and did. Pure luck of which one the application touched again. With this
+patch every role assignment on an empty surface is followed by a buffer attach, and both render.
+
+Self-limiting: gated on content_width == 0, so it only fires at a surface that is currently
+drawing nothing, and wayland_surface_make_subsurface() early-returns for a surface that is already
+a subsurface of the same parent, leaving its contents (and this gate) untouched.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -303,7 +303,8 @@
+ 
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *toplevel_surface,
+-                                                    struct wayland_surface *owner_surface)
++                                                    struct wayland_surface *owner_surface,
++                                                    BOOL *needs_expose)
+ {
+     struct wayland_client_surface *client = data->client_surface;
+     struct wayland_surface *surface;
+@@ -408,6 +409,15 @@
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         wayland_surface_make_subsurface(surface, toplevel_surface);
++        /* NEUTRON: a subsurface has no xdg_surface, so the initial-configure expose at the end of
++         * xdg_surface_handle_configure() -- the one that flushes content we could not flush
++         * before the role existed -- never runs for it. Ask for the same expose here whenever the
++         * surface has no contents, which after wayland_surface_clear_role() (every hide) is
++         * always. Without it a hidden-then-shown subsurface stays an EMPTY surface: it is
++         * positioned, sized and committed, and draws nothing at all until the application
++         * repaints it for its own reasons. Costs one repaint of a surface that is currently
++         * blank, and self-limits -- content_width is non-zero once anything has been attached. */
++        if (needs_expose && !surface->content_width) *needs_expose = TRUE;
+         break;
+     case WAYLAND_SURFACE_ROLE_POPUP:
+         wayland_surface_make_popup(surface, owner_surface, &data->rects.window);
+@@ -666,6 +676,7 @@
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
++    BOOL needs_expose = FALSE;
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL;
+     struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
+     struct wayland_client_surface *client;
+@@ -834,12 +845,16 @@
+             data->wayland_surface = NULL;
+         }
+     }
+-    else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface))
++    else if (wayland_win_data_create_wayland_surface(data, toplevel_surface, owner_surface,
++                                                     &needs_expose))
+     {
+         wayland_win_data_update_wayland_state(data);
+     }
+ 
+     wayland_win_data_release(data);
++
++    /* Outside the win_data lock, matching xdg_surface_handle_configure(). */
++    if (needs_expose) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+ }
+ 
+ static void wayland_configure_window(HWND hwnd)
