@@ -1,0 +1,32 @@
+--- a/dlls/mshtml/htmldoc.c
++++ b/dlls/mshtml/htmldoc.c
+@@ -1462,8 +1462,27 @@
+     nsres = nsIDOMHTMLDocument_Open(This->html_document, NULL, NULL, NULL,
+             get_context_from_document(This->dom_document), 0, &tmp);
+     if(NS_FAILED(nsres)) {
+-        ERR("Open failed: %08lx\n", nsres);
+-        return E_FAIL;
++        /* NEUTRON neutron-open-recover: hand back the window anyway, never a NULL out-param.
++         *
++         * Gecko can refuse document.open() for reasons Trident has no equivalent of -- in the
++         * case this fixes, its per-document mTooDeepWriteRecursion latch, which trips once the
++         * internal write depth passes 20 and is never cleared because the flag lives on the
++         * nsHTMLDocument that open() reuses. Windows apps are therefore not written against this
++         * failure: Lightroom Classic ignores the HRESULT entirely and calls Release() on the
++         * out-param, so returning E_FAIL with *pomWindowResult = NULL crashes the whole
++         * application the moment its About box opens.
++         *
++         * Returning the window matches what the success path below does and what Trident would
++         * have done. The document content will be wrong -- the writes that poisoned it still
++         * fail -- but a wrong document is recoverable and a dead process is not.
++         *
++         * ⚠️ This is deliberately a CRASH fix, not a cause fix. The cause is the leaked write
++         * level inside Gecko; see wiki TODO P1k. */
++        ERR("neutron-open-recover: Gecko Open failed (%08lx) -- returning the window rather than "
++            "a NULL out-param, which apps that skip the HRESULT check dereference\n", nsres);
++        *pomWindowResult = (IDispatch*)&This->window->base.outer_window->base.IHTMLWindow2_iface;
++        IHTMLWindow2_AddRef(&This->window->base.outer_window->base.IHTMLWindow2_iface);
++        return S_OK;
+     }
+ 
+     if(tmp)
