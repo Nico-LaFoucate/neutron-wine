@@ -1,0 +1,45 @@
+d2d1: say once when a shaped layer mask engages the stencil
+
+A smoke test where the new stencil path never executes and one where it executes
+correctly produce identical-looking apps. Without a marker, "Premiere looks fine" is
+not evidence that the path was exercised -- it is equally consistent with the path
+never running, which is a much weaker result than it appears.
+
+One ERR, once per process, naming the target size.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -3325,6 +3325,15 @@
+             && d2d_device_context_ensure_stencil(context))
+     {
+         unsigned int slot = context->layer_depth;
++        static LONG announced;
++
++        /* One line, once per process: a smoke test where this path never runs and one where it
++         * runs correctly look identical otherwise, and "looks fine" is not evidence that the new
++         * code was exercised. */
++        if (!InterlockedExchange(&announced, 1))
++            ERR("neutron-stencil: shaped layer mask engaged (target %ux%u) -- "
++                "masks now stencilled rather than clipped to their bounds\n",
++                context->pixel_size.width, context->pixel_size.height);
+ 
+         d2d_device_context_stencil_mask(context, layer_parameters->geometricMask,
+                 &layer_parameters->maskTransform, +1);
+@@ -4532,6 +4541,15 @@
+             && d2d_device_context_ensure_stencil(context))
+     {
+         unsigned int slot = context->layer_depth;
++        static LONG announced;
++
++        /* One line, once per process: a smoke test where this path never runs and one where it
++         * runs correctly look identical otherwise, and "looks fine" is not evidence that the new
++         * code was exercised. */
++        if (!InterlockedExchange(&announced, 1))
++            ERR("neutron-stencil: shaped layer mask engaged (target %ux%u) -- "
++                "masks now stencilled rather than clipped to their bounds\n",
++                context->pixel_size.width, context->pixel_size.height);
+ 
+         d2d_device_context_stencil_mask(context, layer_parameters->geometricMask,
+                 &layer_parameters->maskTransform, +1);
