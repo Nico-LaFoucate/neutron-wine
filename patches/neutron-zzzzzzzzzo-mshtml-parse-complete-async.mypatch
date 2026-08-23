@@ -1,0 +1,104 @@
+mshtml: deliver the end-of-parse notifications from the message loop, not inline
+
+Lightroom Classic's About box rendered empty (and, before the previous patch,
+crashed) because its 224 open->write->close cycles NEST instead of running in
+sequence. Measured in its own +mshtml trace: the stack address of open()'s
+arguments falls by exactly 3,136 bytes on every call -- 0x10DF40, 0x10D200,
+0x10C4C0 ... 0x055480, 739 KB never unwound -- and the lines before each one are
+close() -> EndLoad -> run_end_load -> parse_complete -> FireNavigateComplete2 ->
+LrC's handler -> open(). So each cycle starts inside the previous cycle's
+close(), Gecko's document write depth climbs one level per cycle instead of
+returning to zero, and past NS_MAX_DOCUMENT_WRITE_DEPTH (20) the sticky
+mTooDeepWriteRecursion latch fails every remaining write.
+
+Native MSHTML parses on a worker thread and delivers DocumentComplete /
+NavigateComplete2 / the readystate change from the message loop, so the host's
+handler always starts on a fresh stack. run_end_load() called parse_complete()
+inline and said so itself ("This should be done in the worker thread that parses
+HTML, but we don't have such thread"). Post it through the task queue that
+already carries set_progress_proc, and take the readystate lock -- Wine's own
+mechanism for this, used by navigate.c and xmlhttprequest.c -- around the
+interactive transition, which is the other callback a host can re-enter from.
+
+Verified by A/B in preserved-fixes/harnesses/mshtml-openclose-host.c, driving
+LrC's real 8,822-byte credits page from the notification exactly as LrC does:
+
+  before   max nesting 40 (capped)   first write failure at cycle 21
+  after    max nesting  1            no failures in 200 cycles
+
+21 is LrC's number too. Flat loops of the same 200 cycles always passed, which
+is why thirteen earlier harness variants missed it -- the nesting was the bug.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/mshtml/mutation.c
++++ b/dlls/mshtml/mutation.c
+@@ -289,6 +289,43 @@
+     /* FIXME: IE7 calls EnableModelless(TRUE), EnableModelless(FALSE) and sets interactive state here */
+ }
+ 
++/* NEUTRON neutron-parse-complete-async: run parse_complete() off the message loop.
++ *
++ * Native MSHTML parses on its own thread and fires DocumentComplete / NavigateComplete2 / the
++ * readystate change from the message loop, so a host handler that drives the control further --
++ * Lightroom Classic's About box calls document.open() again -- always starts on a fresh stack.
++ * Calling parse_complete() inline from close() instead lets the host re-enter without ever
++ * unwinding: LrC nests 224 open/write/close cycles that way, 739 KB of stack, and Gecko's
++ * document write depth climbs one level per cycle until its mTooDeepWriteRecursion latch trips
++ * at depth 20 and every subsequent write fails. Posting it is what native does. */
++static void parse_complete_proc(task_t *_task)
++{
++    docobj_task_t *task = (docobj_task_t*)_task;
++
++    parse_complete(task->doc);
++}
++
++static void parse_complete_destr(task_t *_task)
++{
++    docobj_task_t *task = (docobj_task_t*)_task;
++
++    IUnknown_Release(task->doc->outer_unk);
++}
++
++static void async_parse_complete(HTMLDocumentObj *doc)
++{
++    docobj_task_t *task;
++
++    if(!(task = malloc(sizeof(*task)))) {
++        parse_complete(doc);
++        return;
++    }
++
++    task->doc = doc;
++    IUnknown_AddRef(doc->outer_unk);
++    push_task(&task->header, parse_complete_proc, parse_complete_destr, doc->task_magic);
++}
++
+ static nsresult run_end_load(HTMLDocumentNode *This, nsISupports *arg1, nsISupports *arg2)
+ {
+     HTMLDocumentObj *doc_obj = This->doc_obj;
+@@ -305,16 +342,21 @@
+          * This should be done in the worker thread that parses HTML,
+          * but we don't have such thread (Gecko parses HTML for us).
+          */
+-        IUnknown_AddRef(doc_obj->outer_unk);
+-        parse_complete(doc_obj);
+-        IUnknown_Release(doc_obj->outer_unk);
++        async_parse_complete(doc_obj);
+     }
+ 
+     bind_event_scripts(This);
+ 
+     if(This->window == window && window->base.outer_window) {
+         window->dom_interactive_time = get_time_stamp();
++        /* NEUTRON neutron-parse-complete-async: the readystate change is the other callback the
++         * host can see from in here, and a host that drives the control from it re-enters just as
++         * hard. Wine already has the lock for exactly this -- navigate.c and xmlhttprequest.c use
++         * it around synchronous work -- and it posts the notification instead of calling it, while
++         * still updating window->readystate immediately. */
++        window->base.outer_window->readystate_locked++;
+         set_ready_state(window->base.outer_window, READYSTATE_INTERACTIVE);
++        window->base.outer_window->readystate_locked--;
+     }
+     IHTMLWindow2_Release(&window->base.IHTMLWindow2_iface);
+     return NS_OK;
