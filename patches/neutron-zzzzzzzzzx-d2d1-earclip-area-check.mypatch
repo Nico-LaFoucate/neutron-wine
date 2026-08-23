@@ -1,0 +1,85 @@
+d2d1: assert area conservation in the ear-clip fallback
+
+The test gap this closes: a subtly wrong triangulation is INVISIBLE. Filled opaquely,
+overlapping triangles paint exactly the same pixels as a correct triangulation, so two
+wrong versions of d2d_ear_clip_contains passed every harness and were caught only by
+watching Premiere's recovery counts collapse -- three app runs for something that
+should fail in seconds.
+
+Synthetic geometry cannot close it. Four shape families were tried -- a comb at the
+measured failing dimensions, a box with duplicate and exactly-collinear vertices, a fan
+converging geometrically on a tangent, and a polygon with a reflex vertex sitting
+exactly on a candidate ear's chord -- and a deliberately broken build passes all four.
+Their on-edge points are collinear, so they are dropped before containment ever sees
+them. Premiere's shapes remain the only ones that discriminate.
+
+So assert the invariant instead of trying to reproduce the input. A correct
+triangulation of a simple polygon covers it exactly once, so the emitted triangles must
+sum to the polygon's own area: overlap pushes the sum above it, a stranded vertex pulls
+it below. Both are silent in pixels and loud in arithmetic. area2 is already computed
+for winding, and cross IS twice each face's area, so the check costs one add per face.
+
+It runs on the fallback path only, and -- unlike any harness -- it watches the REAL
+geometry in every app. A future change that corrupts the triangulation announces itself
+in an ordinary log rather than silently drawing wrong shapes.
+
+Also adds preserved-fixes/harnesses/d2d-earclip-strict.c (neutron repo), which fills at
+alpha 0.5 so double-composited pixels are detectable, and keeps the four shapes as
+regression cover even though they do not discriminate this particular bug.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3002,6 +3002,7 @@
+ {
+     const struct d2d_figure *figure = NULL;
+     size_t i, n = 0, remaining, cursor, stalled;
++    double emitted2 = 0.0;          /* NEUTRON AREA CHECK: twice the area of the faces emitted */
+     UINT16 *poly;
+     double area2 = 0.0;
+     BOOL ccw;
+@@ -3182,6 +3183,7 @@
+         face->v[0] = poly[prev];
+         face->v[1] = poly[cursor];
+         face->v[2] = poly[next];
++        emitted2 += fabs(cross);        /* NEUTRON AREA CHECK: cross IS twice this face's area */
+ 
+         memmove(&poly[cursor], &poly[cursor + 1], (remaining - cursor - 1) * sizeof(*poly));
+         --remaining;
+@@ -3191,10 +3193,35 @@
+ 
+     {
+         struct d2d_face *face = &geometry->fill.faces[geometry->fill.face_count++];
++        const D2D1_POINT_2F *fa = &sorted[poly[0]], *fb = &sorted[poly[1]], *fc = &sorted[poly[2]];
+ 
+         face->v[0] = poly[0];
+         face->v[1] = poly[1];
+         face->v[2] = poly[2];
++        emitted2 += fabs(((double)fb->x - fa->x) * ((double)fc->y - fa->y)
++                       - ((double)fb->y - fa->y) * ((double)fc->x - fa->x));
++    }
++
++    /* 🚨 NEUTRON AREA CHECK -- the invariant that makes this algorithm testable.
++     *
++     * A correct triangulation of a simple polygon covers it exactly once: the emitted triangles
++     * must sum to the polygon's own area. Overlapping triangles push the sum ABOVE it; a stranded
++     * vertex or a skipped region pulls it BELOW. Both are otherwise invisible -- filling opaquely
++     * paints identical pixels either way, which is why two wrong versions of
++     * d2d_ear_clip_contains passed every harness and were caught only by Premiere.
++     *
++     * This runs on the fallback path only (a few hundred times a session) and, unlike a harness,
++     * it also watches the REAL geometry in any app, so a subtly wrong triangulation announces
++     * itself in the log instead of silently drawing a wrong shape. */
++    if (fabs(area2) > 0.0)
++    {
++        double err = fabs(fabs(area2) - emitted2) / fabs(area2);
++
++        if (err > 1e-3)
++            ERR("neutron-earclip: AREA MISMATCH %.4f%% -- polygon %.3f, triangles %.3f, %lu faces "
++                "from %lu vertices. The triangulation does not cover the polygon exactly once.\n",
++                err * 100.0, fabs(area2) / 2.0, emitted2 / 2.0,
++                (long)geometry->fill.face_count, (long)n);
+     }
+ 
+     /* ERR for the same reason as the decline above: bounded by CDT failures (a few dozen a session),
