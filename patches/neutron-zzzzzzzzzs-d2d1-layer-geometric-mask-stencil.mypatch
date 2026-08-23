@@ -1,0 +1,403 @@
+d2d1: honour a layer's geometric mask by stencilling it, not by taking its bounds
+
+PushLayer clipped to the mask's BOUNDING BOX. For Premiere that is fine -- its masks
+are dirty regions that decompose into disjoint rectangles, which the mask_rects path
+already scissors exactly. For a mask that is a genuine SHAPE there was nothing, and
+the box let a fill flood it.
+
+Lightroom's Develop histogram is exactly that case, and it is why the panel drew as
+flat blocks of colour. Measured with the NEUTRON_GREENFILL probe: Adobe fills the
+whole 414x160 box four times, once per channel --
+
+    grey  0.741,0.741,0.741 a=1.00 -> 0.765,0.765,0.765 a=1.00
+    red   0.816,0.176,0.176 a=0.70 -> a=0.90
+    green 0.208,0.569,0.290 a=0.70 -> a=0.90
+    blue  0.071,0.373,0.737 a=0.70 -> a=0.90
+
+-- and never draws a curve. The shape comes entirely from the layer mask, so each
+channel flooded its curve's bounding rectangle.
+
+So render the mask into a stencil buffer and test against it. The mask pass reuses
+the existing geometry tessellation with colour writes masked off, which is the same
+code that already draws those curves' outlines correctly.
+
+⚠️ The increment must be conditional (StencilFunc EQUAL, not ALWAYS). A filled
+geometry is tessellated triangles plus separate curve spans, and those can cover one
+pixel twice; with ALWAYS that pixel counts 2 for a single mask, the EQUAL test then
+rejects it, and the mask develops holes along precisely its curved edges. Gating the
+increment means a second cover finds the pixel already promoted.
+
+Nesting falls out: each mask promotes pixels from depth d to d+1 and the test passes
+only at the current depth, so overlapping masks intersect. Push writes before
+incrementing and Pop unwrites before decrementing, so both reference stencil_depth.
+
+Verified in preserved-fixes/harnesses/d2d-layermask-probe.c, which fills a whole rect
+through a triangle mask:
+    inside 255 / outside 0                  mask honoured (was 255/255)
+    after PopLayer, outside 127             stencil unwound -- later drawing unmasked
+    nested both 255 / triangle-only 0       nested masks intersect
+and d2d-gradient-probe.c is unchanged, so the unmasked path did not move.
+
+The bounding-box clip is kept as a valid superset so the cheap scissor still does most
+of the rejection, and the rectangle path is untouched: the stencil only engages when
+mask_rects found nothing.
+
+⚠️ Known limitation: a stencil is binary, so the mask edge is hard where real D2D
+antialiases it. That is a large improvement on a bounding box; revisit only on a
+measured complaint about mask edges.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -687,6 +687,31 @@
+      * The over-cap warning is now printed UNCONDITIONALLY (it was behind
+      * NEUTRON_D2D_OPTRACE): it fires about once an hour at worst, and needing a diagnostic
+      * build to discover a silently-wrong clip is how this stayed open from July to August. */
++    /* NEUTRON PATH-MASK STENCIL: the mask_rects path above handles masks that decompose into
++     * disjoint rectangles (Premiere's dirty regions). A mask that is a genuine SHAPE cannot, and
++     * used to fall back to its bounding box -- which is why Lightroom's Develop histogram drew as
++     * flat blocks of colour: it masks each channel to its curve, then fills the whole 414x160 box,
++     * and the fill flooded the curve's bounding rectangle.
++     *
++     * For those, render the mask into a stencil buffer and test against it on every subsequent
++     * draw. Nesting falls out of INCR/DECR with the test at the current depth.
++     *
++     * ⚠️ A stencil is binary, so the mask edge is hard where real D2D antialiases it. That is a
++     * large improvement on a bounding box and a small regression on a perfect mask; revisit only
++     * with a measured complaint about mask edges, not on principle. */
++    ID3D11Texture2D *stencil_tex;
++    ID3D11DepthStencilView *stencil_dsv;
++    unsigned int stencil_w, stencil_h;
++    ID3D11DepthStencilState *stencil_state_incr;
++    ID3D11DepthStencilState *stencil_state_decr;
++    ID3D11DepthStencilState *stencil_state_test;
++    ID3D11BlendState *stencil_bs_nocolour;
++    unsigned int stencil_depth;         /* how many path masks are currently in force */
++    int stencil_pass;                   /* +1 = writing a mask, -1 = unwriting, 0 = normal draw */
++    ID2D1Geometry *stencil_mask[64];    /* kept so PopLayer can unwrite exactly what it wrote */
++    D2D1_MATRIX_3X2_F stencil_mask_transform[64];
++    unsigned char layer_stencilled[64];
++
+     D2D1_RECT_F mask_rects[256];
+     unsigned mask_rect_count;
+     unsigned mask_owner;        /* layer index that installed the list, +1 (0 = none) */
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -880,6 +880,119 @@
+         LeaveCriticalSection(context->cs);
+ }
+ 
++
++/* NEUTRON PATH-MASK STENCIL ------------------------------------------------------------------
++ * Create (or resize) the stencil buffer used to mask draws to a layer's geometric mask. Cleared
++ * to zero on creation; INCR/DECR keep it balanced from there, so it never needs clearing again
++ * within a frame. */
++static BOOL d2d_device_context_ensure_stencil(struct d2d_device_context *context)
++{
++    ID3D11DeviceContext1 *d3d_context;
++    D3D11_DEPTH_STENCIL_DESC ds_desc;
++    D3D11_TEXTURE2D_DESC tex_desc;
++    D3D11_BLEND_DESC blend_desc;
++    HRESULT hr;
++
++    if (context->stencil_tex && context->stencil_w == context->pixel_size.width
++            && context->stencil_h == context->pixel_size.height)
++        return TRUE;
++
++    if (context->stencil_dsv)
++    {
++        ID3D11DepthStencilView_Release(context->stencil_dsv);
++        context->stencil_dsv = NULL;
++    }
++    if (context->stencil_tex)
++    {
++        ID3D11Texture2D_Release(context->stencil_tex);
++        context->stencil_tex = NULL;
++    }
++
++    if (!context->pixel_size.width || !context->pixel_size.height)
++        return FALSE;
++
++    memset(&tex_desc, 0, sizeof(tex_desc));
++    tex_desc.Width = context->pixel_size.width;
++    tex_desc.Height = context->pixel_size.height;
++    tex_desc.MipLevels = 1;
++    tex_desc.ArraySize = 1;
++    tex_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
++    tex_desc.SampleDesc.Count = 1;
++    tex_desc.Usage = D3D11_USAGE_DEFAULT;
++    tex_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
++    if (FAILED(hr = ID3D11Device1_CreateTexture2D(context->d3d_device, &tex_desc, NULL,
++            &context->stencil_tex)))
++    {
++        WARN("neutron-stencil: CreateTexture2D failed, hr %#lx -- masks fall back to bounds.\n", hr);
++        context->stencil_tex = NULL;
++        return FALSE;
++    }
++    if (FAILED(hr = ID3D11Device1_CreateDepthStencilView(context->d3d_device,
++            (ID3D11Resource *)context->stencil_tex, NULL, &context->stencil_dsv)))
++    {
++        WARN("neutron-stencil: CreateDepthStencilView failed, hr %#lx.\n", hr);
++        ID3D11Texture2D_Release(context->stencil_tex);
++        context->stencil_tex = NULL;
++        return FALSE;
++    }
++    context->stencil_w = context->pixel_size.width;
++    context->stencil_h = context->pixel_size.height;
++
++    if (!context->stencil_state_test)
++    {
++        memset(&ds_desc, 0, sizeof(ds_desc));
++        ds_desc.DepthEnable = FALSE;
++        ds_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
++        ds_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
++        ds_desc.StencilEnable = TRUE;
++        ds_desc.StencilReadMask = 0xff;
++        ds_desc.StencilWriteMask = 0xff;
++
++        /* Writing a mask: promote a pixel from the current depth to the next, and write no colour.
++         *
++         * ⚠️ The comparison must be EQUAL, not ALWAYS. A filled geometry is drawn as tessellated
++         * triangles plus separate curve spans, and those can cover the same pixel twice; with
++         * ALWAYS that pixel would count 2 for ONE mask, the EQUAL test below would then reject it,
++         * and the mask would have holes exactly along its curved edges -- which is the whole of
++         * the histogram. Gating on EQUAL(depth) means the second cover finds the pixel already
++         * promoted and leaves it alone. */
++        ds_desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
++        ds_desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
++        ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_INCR_SAT;
++        ds_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
++        ds_desc.BackFace = ds_desc.FrontFace;
++        ID3D11Device1_CreateDepthStencilState(context->d3d_device, &ds_desc,
++                &context->stencil_state_incr);
++
++        /* Unwriting is the same trick in reverse: only pixels still at the layer's own depth are
++         * demoted, so a doubly-covered pixel is not demoted twice. */
++        ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_DECR_SAT;
++        ds_desc.BackFace = ds_desc.FrontFace;
++        ID3D11Device1_CreateDepthStencilState(context->d3d_device, &ds_desc,
++                &context->stencil_state_decr);
++
++        /* drawing through a mask: pass only where every enclosing mask covered the pixel */
++        ds_desc.StencilWriteMask = 0;
++        ds_desc.FrontFace.StencilPassOp = D3D11_STENCIL_OP_KEEP;
++        ds_desc.FrontFace.StencilFunc = D3D11_COMPARISON_EQUAL;
++        ds_desc.BackFace = ds_desc.FrontFace;
++        ID3D11Device1_CreateDepthStencilState(context->d3d_device, &ds_desc,
++                &context->stencil_state_test);
++
++        memset(&blend_desc, 0, sizeof(blend_desc));
++        blend_desc.RenderTarget[0].BlendEnable = FALSE;
++        blend_desc.RenderTarget[0].RenderTargetWriteMask = 0;
++        ID3D11Device1_CreateBlendState(context->d3d_device, &blend_desc,
++                &context->stencil_bs_nocolour);
++    }
++
++    ID3D11Device1_GetImmediateContext1(context->d3d_device, &d3d_context);
++    ID3D11DeviceContext1_ClearDepthStencilView(d3d_context, context->stencil_dsv,
++            D3D11_CLEAR_STENCIL, 1.0f, 0);
++    ID3D11DeviceContext1_Release(d3d_context);
++    return TRUE;
++}
++
+ static void d2d_device_context_draw(struct d2d_device_context *render_target, enum d2d_shape_type shape_type,
+         ID3D11Buffer *ib, unsigned int index_count, ID3D11Buffer *vb, unsigned int vb_stride,
+         struct d2d_brush *brush, struct d2d_brush *opacity_brush)
+@@ -939,7 +1052,17 @@
+     }
+     ID3D11DeviceContext1_RSSetScissorRects(context, 1, &scissor_rect);
+     ID3D11DeviceContext1_RSSetState(context, render_target->rs);
+-    ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv, NULL);
++    /* NEUTRON PATH-MASK STENCIL: bind the stencil when a shaped mask is in force, or when this
++     * draw IS the mask being written. Everything else keeps the original NULL depth-stencil. */
++    if (render_target->stencil_pass && render_target->stencil_dsv)
++        ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv,
++                render_target->stencil_dsv);
++    else if (render_target->stencil_depth && render_target->stencil_dsv)
++        ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv,
++                render_target->stencil_dsv);
++    else
++        ID3D11DeviceContext1_OMSetRenderTargets(context, 1, &render_target->target.bitmap->rtv, NULL);
++
+     if (brush)
+     {
+         ID3D11DeviceContext1_OMSetBlendState(context, render_target->bs, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+@@ -949,6 +1072,31 @@
+     {
+         ID3D11DeviceContext1_OMSetBlendState(context, NULL, NULL, D3D11_DEFAULT_SAMPLE_MASK);
+     }
++
++    if (render_target->stencil_pass && render_target->stencil_dsv)
++    {
++        /* the mask pass touches the stencil only -- no colour, and the test must not exclude the
++         * pixels it is about to claim */
++        ID3D11DeviceContext1_OMSetBlendState(context, render_target->stencil_bs_nocolour, NULL,
++                D3D11_DEFAULT_SAMPLE_MASK);
++        /* Both passes reference stencil_depth, because of when each is called:
++         *   PushLayer  writes while stencil_depth == d   -> promote pixels at d to d+1
++         *   PopLayer   unwrites while stencil_depth == d+1 -> demote pixels at d+1 back to d
++         * Push increments after writing and Pop decrements after unwriting, so in both cases the
++         * value to match is exactly stencil_depth. */
++        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_pass > 0
++                ? render_target->stencil_state_incr : render_target->stencil_state_decr,
++                render_target->stencil_depth);
++    }
++    else if (render_target->stencil_depth && render_target->stencil_dsv)
++    {
++        ID3D11DeviceContext1_OMSetDepthStencilState(context, render_target->stencil_state_test,
++                render_target->stencil_depth);
++    }
++    else
++    {
++        ID3D11DeviceContext1_OMSetDepthStencilState(context, NULL, 0);
++    }
+     if (opacity_brush)
+         d2d_brush_bind_resources(opacity_brush, render_target, 1);
+ 
+@@ -1385,6 +1533,24 @@
+         unsigned int i, j, k;
+ 
+         d2d_clip_stack_cleanup(&context->clip_stack);
++        /* NEUTRON PATH-MASK STENCIL */
++        for (i = 0; i < ARRAY_SIZE(context->stencil_mask); ++i)
++        {
++            if (context->stencil_mask[i])
++                ID2D1Geometry_Release(context->stencil_mask[i]);
++        }
++        if (context->stencil_dsv)
++            ID3D11DepthStencilView_Release(context->stencil_dsv);
++        if (context->stencil_tex)
++            ID3D11Texture2D_Release(context->stencil_tex);
++        if (context->stencil_state_incr)
++            ID3D11DepthStencilState_Release(context->stencil_state_incr);
++        if (context->stencil_state_decr)
++            ID3D11DepthStencilState_Release(context->stencil_state_decr);
++        if (context->stencil_state_test)
++            ID3D11DepthStencilState_Release(context->stencil_state_test);
++        if (context->stencil_bs_nocolour)
++            ID3D11BlendState_Release(context->stencil_bs_nocolour);
+         IDWriteRenderingParams_Release(context->default_text_rendering_params);
+         if (context->text_rendering_params)
+             IDWriteRenderingParams_Release(context->text_rendering_params);
+@@ -3103,6 +3269,34 @@
+     *tag2 = render_target->drawing_state.tag2;
+ }
+ 
++
++/* NEUTRON PATH-MASK STENCIL: write (dir=+1) or unwrite (dir=-1) a mask geometry into the stencil.
++ * Reuses the ordinary geometry tessellation -- the same code that already draws the histogram's
++ * curve outlines correctly -- with colour writes masked off. */
++static void d2d_device_context_stencil_mask(struct d2d_device_context *context,
++        ID2D1Geometry *mask, const D2D1_MATRIX_3X2_F *mask_transform, int dir)
++{
++    D2D1_MATRIX_3X2_F saved = context->drawing_state.transform;
++    struct d2d_geometry *geometry;
++
++    if (!(geometry = unsafe_impl_from_ID2D1Geometry(mask)))
++        return;
++
++    if (mask_transform)
++    {
++        D2D1_MATRIX_3X2_F m = *mask_transform;
++
++        d2d_matrix_multiply(&m, &saved);        /* mask space -> world space */
++        context->drawing_state.transform = m;
++    }
++
++    context->stencil_pass = dir;
++    d2d_device_context_fill_geometry(context, geometry, NULL, NULL);
++    context->stencil_pass = 0;
++
++    context->drawing_state.transform = saved;
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *iface,
+         const D2D1_LAYER_PARAMETERS *layer_parameters, ID2D1Layer *layer)
+ {
+@@ -3116,6 +3310,30 @@
+     if (layer_parameters)
+         d2d_device_context_push_layer_clip(context, &layer_parameters->contentBounds,
+                 layer_parameters->geometricMask, &layer_parameters->maskTransform);
++
++    /* NEUTRON PATH-MASK STENCIL: the clip above is the mask's BOUNDING BOX, correct only when the
++     * mask is that rectangle or decomposed into mask_rects. When it is a genuine shape --
++     * Lightroom masks each histogram channel to its curve, then fills the whole box -- the box
++     * lets the fill flood it. Stencil the shape as well and test every draw inside the layer
++     * against it. The box clip stays: a valid superset, and the cheap scissor still does most of
++     * the rejection. */
++    if (context->layer_depth < ARRAY_SIZE(context->layer_stencilled))
++        context->layer_stencilled[context->layer_depth] = 0;
++    if (layer_parameters && layer_parameters->geometricMask && !context->mask_rect_count
++            && context->layer_depth < ARRAY_SIZE(context->stencil_mask)
++            && context->target.type == D2D_TARGET_BITMAP
++            && d2d_device_context_ensure_stencil(context))
++    {
++        unsigned int slot = context->layer_depth;
++
++        d2d_device_context_stencil_mask(context, layer_parameters->geometricMask,
++                &layer_parameters->maskTransform, +1);
++        context->stencil_mask[slot] = layer_parameters->geometricMask;
++        ID2D1Geometry_AddRef(context->stencil_mask[slot]);
++        context->stencil_mask_transform[slot] = layer_parameters->maskTransform;
++        context->layer_stencilled[slot] = 1;
++        ++context->stencil_depth;
++    }
+     ++context->layer_depth;
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+@@ -3139,6 +3357,23 @@
+     if (context->layer_depth)
+         --context->layer_depth;
+ 
++    /* NEUTRON PATH-MASK STENCIL: unwrite exactly the geometry this layer wrote. */
++    if (context->layer_depth < ARRAY_SIZE(context->layer_stencilled)
++            && context->layer_stencilled[context->layer_depth])
++    {
++        unsigned int slot = context->layer_depth;
++
++        /* Unwrite FIRST: the reference value used by the draw is context->stencil_depth, and the
++         * pixels to demote are the ones sitting at the depth this layer claimed. */
++        d2d_device_context_stencil_mask(context, context->stencil_mask[slot],
++                &context->stencil_mask_transform[slot], -1);
++        if (context->stencil_depth)
++            --context->stencil_depth;
++        ID2D1Geometry_Release(context->stencil_mask[slot]);
++        context->stencil_mask[slot] = NULL;
++        context->layer_stencilled[slot] = 0;
++    }
++
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         d2d_command_list_pop_layer(context->target.command_list);
+ }
+@@ -4282,6 +4517,30 @@
+     if (layer_parameters)
+         d2d_device_context_push_layer_clip(context, &layer_parameters->contentBounds,
+                 layer_parameters->geometricMask, &layer_parameters->maskTransform);
++
++    /* NEUTRON PATH-MASK STENCIL: the clip above is the mask's BOUNDING BOX, correct only when the
++     * mask is that rectangle or decomposed into mask_rects. When it is a genuine shape --
++     * Lightroom masks each histogram channel to its curve, then fills the whole box -- the box
++     * lets the fill flood it. Stencil the shape as well and test every draw inside the layer
++     * against it. The box clip stays: a valid superset, and the cheap scissor still does most of
++     * the rejection. */
++    if (context->layer_depth < ARRAY_SIZE(context->layer_stencilled))
++        context->layer_stencilled[context->layer_depth] = 0;
++    if (layer_parameters && layer_parameters->geometricMask && !context->mask_rect_count
++            && context->layer_depth < ARRAY_SIZE(context->stencil_mask)
++            && context->target.type == D2D_TARGET_BITMAP
++            && d2d_device_context_ensure_stencil(context))
++    {
++        unsigned int slot = context->layer_depth;
++
++        d2d_device_context_stencil_mask(context, layer_parameters->geometricMask,
++                &layer_parameters->maskTransform, +1);
++        context->stencil_mask[slot] = layer_parameters->geometricMask;
++        ID2D1Geometry_AddRef(context->stencil_mask[slot]);
++        context->stencil_mask_transform[slot] = layer_parameters->maskTransform;
++        context->layer_stencilled[slot] = 1;
++        ++context->stencil_depth;
++    }
+     ++context->layer_depth;
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
