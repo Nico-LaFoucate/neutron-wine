@@ -1,0 +1,117 @@
+diag: d2d1 green-fill probe — names the brush behind Lightroom's histogram blocks
+
+Gated on NEUTRON_GREENFILL=1. Logs fills whose brush is green-dominant, and dumps
+the stops of any gradient brush, at FillRectangle/FillRoundedRectangle/FillGeometry.
+
+What it measured, in two runs:
+  * the histogram box is a LINEAR gradient fill over (2,2)-(416,162), 28 repaints
+  * ZERO green solid fills anywhere in the session
+  * Adobe fills that box FOUR times, once per channel, and never draws a curve:
+        grey  0.741,0.741,0.741 a=1.00 -> 0.765,0.765,0.765 a=1.00
+        red   0.816,0.176,0.176 a=0.70 -> a=0.90
+        green 0.208,0.569,0.290 a=0.70 -> a=0.90
+        blue  0.071,0.373,0.737 a=0.70 -> a=0.90
+
+Which is what pointed at the layer mask, since the shape has to come from somewhere.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1834,6 +1834,68 @@
+     ID2D1RectangleGeometry_Release(geometry);
+ }
+ 
++/* NEUTRON neutron-greenfill (diagnostic, NEUTRON_GREENFILL=1): who paints the green block in
++ * Lightroom's Develop histogram?
++ *
++ * The panel shows a flat green rectangle over a flat light-grey one where the filled RGB channel
++ * regions belong. Flat green is equally the signature of an uninitialised GPU surface and of a
++ * brush the app really did ask for, and those have completely different fixes -- so log the fills
++ * whose own brush colour is green, with the rect, and let the app's request speak for itself.
++ * Deliberately narrow: an unfiltered fill log from a Develop session is unreadable. */
++static void neutron_greenfill( struct d2d_device_context *context, const char *op,
++                               const D2D1_RECT_F *rect, ID2D1Brush *iface )
++{
++    static int armed = -1;
++    struct d2d_brush *brush;
++
++    if (armed < 0)
++    {
++        WCHAR v[8];
++        armed = GetEnvironmentVariableW( L"NEUTRON_GREENFILL", v, ARRAY_SIZE(v) ) > 0;
++        ERR( "neutron-greenfill: gate armed=%d\n", armed );
++    }
++    if (!armed || !iface)
++        return;
++
++    brush = unsafe_impl_from_ID2D1Brush( iface );
++    if (!brush)
++        return;
++
++    if (brush->type == D2D_BRUSH_TYPE_SOLID)
++    {
++        const D2D1_COLOR_F *c = &brush->u.solid.color;
++
++        /* green-dominant, and not merely a grey */
++        if (c->g > 0.25f && c->g > c->r * 1.3f && c->g > c->b * 1.3f)
++            ERR( "neutron-greenfill: %s SOLID rgba=%.3f,%.3f,%.3f,%.3f opacity=%.3f rect=%s\n",
++                 op, c->r, c->g, c->b, c->a, brush->opacity, debug_d2d_rect_f(rect) );
++    }
++    else
++    {
++        /* MEASURED: the histogram box is a LINEAR gradient over (2,2)-(416,162). A harness that
++         * drives Wine's linear gradient directly renders correct smooth ramps, so the colours in
++         * the brush are the open question -- dump the app's own stops rather than guess. */
++        if (brush->type == D2D_BRUSH_TYPE_LINEAR && brush->u.linear.gradient)
++        {
++            const struct d2d_gradient *g = brush->u.linear.gradient;
++            unsigned int i;
++
++            ERR( "neutron-greenfill: %s LINEAR stops=%u start=(%.1f,%.1f) end=(%.1f,%.1f) "
++                 "opacity=%.3f rect=%s\n", op, g->stop_count,
++                 brush->u.linear.start.x, brush->u.linear.start.y,
++                 brush->u.linear.end.x, brush->u.linear.end.y,
++                 brush->opacity, debug_d2d_rect_f(rect) );
++            for (i = 0; i < g->stop_count && i < 8; ++i)
++                ERR( "neutron-greenfill:     stop[%u] pos=%.3f rgba=%.3f,%.3f,%.3f,%.3f\n",
++                     i, g->stops[i].position, g->stops[i].color.r, g->stops[i].color.g,
++                     g->stops[i].color.b, g->stops[i].color.a );
++        }
++        else
++            ERR( "neutron-greenfill: %s brush_type=%d opacity=%.3f rect=%s\n",
++                 op, brush->type, brush->opacity, debug_d2d_rect_f(rect) );
++    }
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_FillRectangle(ID2D1DeviceContext6 *iface,
+         const D2D1_RECT_F *rect, ID2D1Brush *brush)
+ {
+@@ -1843,6 +1905,8 @@
+     ID2D1RectangleGeometry *geometry;
+     HRESULT hr;
+ 
++    neutron_greenfill(context, "FillRectangle", rect, brush);
++
+     TRACE("iface %p, rect %s, brush %p.\n", iface, debug_d2d_rect_f(rect), brush);
+ 
+     neutron_dr_add(context, rect); /* NEUTRON DIRTYRECTS */
+@@ -1899,6 +1963,8 @@
+     NEUTRON_API_TIME();
+     struct d2d_device_context *render_target = impl_from_ID2D1DeviceContext(iface);
+     neutron_op(render_target, NEUTRON_OP_FILLROUNDEDRECTANGLE);
++
++    neutron_greenfill(render_target, "FillRoundedRectangle", NULL, brush);
+     ID2D1RoundedRectangleGeometry *geometry;
+     HRESULT hr;
+ 
+@@ -2344,6 +2410,9 @@
+     neutron_op(context, NEUTRON_OP_FILLGEOMETRY);
+     struct d2d_brush *brush_impl = unsafe_impl_from_ID2D1Brush(brush);
+ 
++    /* The histogram body is geometry, not a rectangle -- this is the call that matters most. */
++    neutron_greenfill(context, "FillGeometry", NULL, brush);
++
+     TRACE("iface %p, geometry %p, brush %p, opacity_brush %p.\n", iface, geometry, brush, opacity_brush);
+ 
+     neutron_dr_add_clip(context); /* NEUTRON DIRTYRECTS: geometry extent unknown -> clip superset */
