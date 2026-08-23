@@ -1,0 +1,95 @@
+d2d1: handle pinch points in ear clipping, and settle that the last 4 declines are correct
+
+TWO RESULTS, one fix and one closed question.
+
+1. PINCH POINTS (fix). A polygon that visits one coordinate twice -- a cusp, routine in
+   glyph and icon outlines -- has a vertex lying on every candidate ear's boundary by
+   definition, so contains() reports it and the ear is rejected. When every convex
+   vertex is half of a pinched pair, no ear is found and a clippable polygon is
+   declined. A diagnostic naming the blocker of each convex ear showed 21 of 21 blocked
+   by a duplicate of one of the ear's OWN vertices, none by a genuine interior point,
+   none zero-area -- e.g. two entries both at (2.1339,2.2596), each blocking the other.
+
+   A vertex that IS a corner of the ear cannot obstruct that ear, so skip it. Compare
+   COORDINATES: `sorted` does not merge these, so an index comparison never fires (tried
+   -- declines stayed at exactly 4). Measured clean: 317 recoveries, zero AREA MISMATCH.
+
+   ⚠️ This is a NAMED degeneracy, not the blanket containment tolerance reverted twice
+   above. The geometric test is untouched for every other point.
+
+2. THE LAST 4 DECLINES ARE CORRECT BEHAVIOUR (closed). With pinches handled, three of
+   the four showed "0 convex, N reflex" -- impossible for a simple polygon -- which
+   suggested the remainder had been left wound the other way. Re-measuring its
+   orientation and retrying DOES clear every decline: 222/222 recovered, 100%. The area
+   assert then showed what that produced:
+
+       AREA MISMATCH  12.80%   polygon 35.837, triangles  40.423
+       AREA MISMATCH  62.80%   polygon 23.181, triangles  37.738
+       AREA MISMATCH 730.16%   polygon 18.834, triangles 156.355
+       AREA MISMATCH 287.72%   polygon 72.101, triangles 279.551
+
+   -- the last covering eight times the polygon. Those remainders are not lobes, they
+   are genuinely self-intersecting; forcing an earless polygon to clip emits overlap.
+   Reverted, with the numbers recorded at the decline site.
+
+   ⇒ Declining is the contract and the right answer: a missing shape beats a wrong one.
+   Fixing those four needs a different triangulator, not a change to this one.
+
+⭐ Note what did the work here: the AREA MISMATCH assert added in zzzzzzzzzx. Every count
+looked perfect -- 222/222, zero declines -- and the output was garbage. Without it this
+would have shipped as a triumph.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3138,6 +3138,28 @@
+         for (i = 0; ear && i < remaining; ++i)
+         {
+             if (i == prev || i == cursor || i == next) continue;
++            /* 🚨 PINCH POINTS. A polygon that visits one coordinate twice -- a cusp, routine in
++             * glyph and icon outlines -- has a vertex lying on every candidate ear's boundary by
++             * definition, so contains() reports it (correctly) and the ear is rejected. When every
++             * convex vertex is half of a pinched pair, no ear is ever found and a clippable
++             * polygon is declined.
++             *
++             * MEASURED: of the last four declines a session, 21 of 21 blocked ears were blocked by
++             * a duplicate of one of the ear's OWN vertices, none by a genuine interior point --
++             * e.g. two entries both at (2.1339,2.2596), each blocking the other's ear.
++             *
++             * A vertex that IS a corner of the ear cannot obstruct that ear, so skip it. Compare
++             * COORDINATES: `sorted` does not merge these, so an index comparison never fires (tried
++             * -- declines stayed at exactly 4). This is a named degeneracy, not the blanket
++             * tolerance reverted twice above; the geometric test is untouched for every other
++             * point, and overlap is caught by the AREA MISMATCH assert below. */
++            {
++                const D2D1_POINT_2F *q = &sorted[poly[i]];
++
++                if ((q->x == a->x && q->y == a->y) || (q->x == b->x && q->y == b->y)
++                        || (q->x == c->x && q->y == c->y))
++                    continue;
++            }
+             if (d2d_ear_clip_contains(a, b, c, &sorted[poly[i]])) ear = FALSE;
+         }
+ 
+@@ -3149,6 +3171,20 @@
+                  * ERR, not WARN: this and the success line below are the only two observable
+                  * outcomes of this function, and having them at WARN/TRACE cost a whole build --
+                  * both counts read as zero and said nothing about whether the code had even run. */
++                /* ⛔ DO NOT RE-WIND THE REMAINDER AND RETRY HERE. Tried 2026-08-23: clipping at a
++                 * pinch can leave a lobe wound the other way, orientation is measurable, and
++                 * re-measuring it does clear every remaining decline -- 222/222 recovered. The
++                 * area assert then showed what that actually produced:
++                 *     AREA MISMATCH  12.80%   polygon 35.837, triangles  40.423
++                 *     AREA MISMATCH  62.80%   polygon 23.181, triangles  37.738
++                 *     AREA MISMATCH 730.16%   polygon 18.834, triangles 156.355
++                 *     AREA MISMATCH 287.72%   polygon 72.101, triangles 279.551
++                 * the last covering eight times the polygon. These remainders are not lobes, they
++                 * are genuinely self-intersecting, and forcing an earless polygon to clip emits
++                 * overlap.
++                 *
++                 * ⇒ THESE DECLINES ARE CORRECT. The contract is to decline rather than guess, and a
++                 * missing shape beats a wrong one. Fixing them needs a different triangulator. */
+                 ERR("Ear clipping found no ear in %lu vertices; not a simple polygon.\n", (long)remaining);
+                 /* NEUTRON DIAG: "not a simple polygon" is a conclusion, not an observation -- the
+                  * loop declines for ANY full pass without an ear, which a near-collinear sliver
