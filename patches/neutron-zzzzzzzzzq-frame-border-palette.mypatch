@@ -1,0 +1,66 @@
+win32u: the window frame follows the border colours, not the button palette
+
+Same coupling as the caption buttons, one layer out. Three pieces of the non-client
+paint took their colour from the classic button palette:
+
+  handle_nc_paint   draw_rect_edge(EDGE_RAISED)  -- highlight is COLOR_BTNHIGHLIGHT
+  draw_nc_frame     the WS_DLGFRAME|WS_THICKFRAME band -- COLOR_3DFACE
+  draw_nc_caption   the 1px pen under the caption      -- COLOR_3DFACE
+
+They only ever looked right because the prefix theme darkened the whole classic
+palette -- and that is exactly what had to stop, because a dark COLOR_BTNFACE makes
+every application's own labels unreadable (Lightroom's About box renders black text
+on it). With the button palette back at Windows' values, those three drew a white
+outline around every window: the border this decoration work exists to remove.
+
+They are all frame chrome, so they now take COLOR_ACTIVEBORDER/COLOR_INACTIVEBORDER
+and the caption colour, which is what a theme is meant to set for this. The raised
+3D bevel becomes a flat 1px border, consistent with the rest of the CSD decoration.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -1121,7 +1121,13 @@
+ 
+         if (ex_style & (WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE)) color = COLOR_3DFACE;
+         else if (ex_style & WS_EX_STATICEDGE) color = COLOR_WINDOWFRAME;
+-        else if (style & (WS_DLGFRAME|WS_THICKFRAME)) color = COLOR_3DFACE;
++        /* NEUTRON neutron-frame-border-palette: the window FRAME follows the border colours, not
++         * the button palette. It was COLOR_3DFACE, which only looked right because the prefix
++         * theme darkened the whole classic palette -- and that darkened COLOR_BTNFACE for every
++         * app, which is what made Lightroom's About labels black-on-near-black. The border
++         * colours are the ones a theme is actually meant to set for this. */
++        else if (style & (WS_DLGFRAME|WS_THICKFRAME))
++            color = active ? COLOR_ACTIVEBORDER : COLOR_INACTIVEBORDER;
+         else color = COLOR_WINDOWFRAME;
+         NtGdiSelectBrush( hdc, get_sys_color_brush( color ));
+ 
+@@ -1508,7 +1514,10 @@
+     HPEN prev_pen;
+     HMENU sys_menu;
+     BOOL gradient = FALSE;
+-    UINT pen_color = COLOR_3DFACE;
++    /* NEUTRON neutron-frame-border-palette: the line under the caption is caption chrome, so it
++     * takes the caption colour and disappears into the title bar instead of drawing a light
++     * hairline across it. */
++    UINT pen_color = active ? COLOR_ACTIVECAPTION : COLOR_INACTIVECAPTION;
+     int len;
+ 
+     if ((ex_style & (WS_EX_STATICEDGE|WS_EX_CLIENTEDGE|WS_EX_DLGMODALFRAME)) == WS_EX_STATICEDGE)
+@@ -1716,7 +1725,14 @@
+     if (has_static_outer_frame( ex_style ))
+         draw_rect_edge( hdc, &rect, BDR_SUNKENOUTER, BF_RECT | BF_ADJUST, 1 );
+     else if (has_big_frame( style, ex_style ))
+-        draw_rect_edge( hdc, &rect, EDGE_RAISED, BF_RECT | BF_ADJUST, 1 );
++    {
++        /* NEUTRON neutron-frame-border-palette: a flat border, not a raised 3D bevel. The bevel
++         * highlight is COLOR_BTNHIGHLIGHT -- pure white at Windows' values -- so on a dark CSD
++         * frame it draws exactly the white outline this decoration work exists to remove. */
++        fill_rect( hdc, &rect, get_sys_color_brush( active ? COLOR_ACTIVEBORDER
++                                                           : COLOR_INACTIVEBORDER ));
++        InflateRect( &rect, -1, -1 );
++    }
+ 
+     draw_nc_frame( hdc, &rect, active, style, ex_style );
+ 
