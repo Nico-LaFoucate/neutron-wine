@@ -1,0 +1,97 @@
+user32: caption buttons take their colours from the caption palette, not the buttons
+
+The flat caption buttons drew their hover/pressed shades from COLOR_BTNHIGHLIGHT /
+COLOR_BTNSHADOW and their glyph from COLOR_BTNTEXT. That forced anyone theming the
+title bar dark -- which is what Collider's prefix theme does, so Wine's CSD matches
+Adobe's dark UI -- to darken the entire classic button palette along with it.
+
+Real Windows never darkens those. COLOR_3DFACE stays 0xF0F0F0 even in dark mode, so
+applications are entitled to treat it as a light surface and pair it with their own
+dark text. Lightroom's About box does exactly that: it sets black text on its labels
+and leaves the background to the system, so with ButtonFace at 43 43 43 the labels
+came out black on near-black. Measured with preserved-fixes/harnesses/sysface-static-bg.c,
+which prints what a plain static actually paints:
+
+  prefix palette      COLOR_BTNFACE= 43  43  43   static paints  43  43  43
+  Windows ButtonFace  COLOR_BTNFACE=240 240 240   static paints 240 240 240
+
+Deriving the shades from COLOR_ACTIVECAPTION keeps the buttons matched to whatever the
+title bar is -- and always moves away from it, so it works on a light caption too --
+and frees ButtonFace/ButtonText to go back to their Windows values.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/user32/nonclient.c
++++ b/dlls/user32/nonclient.c
+@@ -210,6 +210,29 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON neutron-caption-palette: hover/pressed shades and the glyph colour come from the
++ * CAPTION palette, not the button palette.
++ *
++ * They used to be COLOR_BTNHIGHLIGHT / COLOR_BTNSHADOW / COLOR_BTNTEXT, which forced anyone
++ * theming the title bar to darken the whole classic button palette as well -- and real Windows
++ * never darkens those, not even in dark mode (COLOR_3DFACE stays 0xF0F0F0). Apps are entitled to
++ * treat COLOR_BTNFACE as a light surface and pair it with their own dark text: Lightroom's About
++ * box does exactly that, and its labels came out black-on-near-black. Deriving the shades from
++ * COLOR_ACTIVECAPTION keeps the buttons matched to whatever the title bar is, and frees the
++ * button palette to stay at its Windows values. */
++static COLORREF caption_shade( COLORREF c, int amount )
++{
++    int r = GetRValue( c ), g = GetGValue( c ), b = GetBValue( c );
++    int lum = (r * 299 + g * 587 + b * 114) / 1000;
++    int d = lum < 128 ? amount : -amount;   /* always move AWAY from the caption colour */
++
++    r += d; g += d; b += d;
++    if (r < 0) r = 0; else if (r > 255) r = 255;
++    if (g < 0) g = 0; else if (g > 255) g = 255;
++    if (b < 0) b = 0; else if (b > 255) b = 255;
++    return RGB( r, g, b );
++}
++
+ /* Neutron: flat caption button (the main window's _ [] X). Relocated from win32u's
+  * draw_frame_caption so custom-icon rendering (which needs user-mode imaging) can
+  * hook here later. No classic 3D bevel: a released, non-hot button is filled with
+@@ -220,7 +243,7 @@
+ static void user_draw_caption_button( HDC hdc, enum NONCLIENT_BUTTON_TYPE type,
+                                       RECT rect, BOOL down, BOOL grayed, BOOL hot )
+ {
+-    static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
++static const WCHAR marlettW[] = {'M','a','r','l','e','t','t',0};
+     BOOL is_close = (type == CAPTION_CLOSE_BUTTON);
+     int w = rect.right - rect.left, h = rect.bottom - rect.top;
+     int small_diam = w < h ? w : h;
+@@ -247,9 +270,9 @@
+     if (is_close && (hot || down))
+         bg = down ? RGB( 176, 30, 32 ) : RGB( 232, 17, 35 );
+     else if (down)
+-        bg = GetSysColor( COLOR_BTNSHADOW );
++        bg = caption_shade( GetSysColor( COLOR_ACTIVECAPTION ), 34 );
+     else if (hot)
+-        bg = GetSysColor( COLOR_BTNHIGHLIGHT );
++        bg = caption_shade( GetSysColor( COLOR_ACTIVECAPTION ), 18 );
+     else
+         bg = GetSysColor( COLOR_ACTIVECAPTION );
+     brush = CreateSolidBrush( bg );
+@@ -267,9 +290,9 @@
+     xc = (sq.left + sq.right) / 2;
+     yc = (sq.top + sq.bottom) / 2;
+ 
+-    if (grayed)                       text_color = GetSysColor( COLOR_BTNSHADOW );
++    if (grayed)                       text_color = GetSysColor( COLOR_INACTIVECAPTIONTEXT );
+     else if (is_close && (hot || down)) text_color = RGB( 255, 255, 255 );
+-    else                              text_color = GetSysColor( COLOR_BTNTEXT );
++    else                              text_color = GetSysColor( COLOR_CAPTIONTEXT );
+ 
+     lf.lfHeight = -(small_diam - 2);
+     lf.lfWeight = FW_NORMAL;
+@@ -285,7 +308,7 @@
+ 
+     if (grayed)   /* classic inactive drop-shadow */
+     {
+-        SetTextColor( hdc, GetSysColor( COLOR_BTNHIGHLIGHT ) );
++        SetTextColor( hdc, caption_shade( GetSysColor( COLOR_ACTIVECAPTION ), 24 ) );
+         ExtTextOutW( hdc, xc - size.cx / 2 + 1, yc - size.cy / 2 + 1, 0, NULL, str, 1, NULL );
+     }
+     SetTextColor( hdc, text_color );
