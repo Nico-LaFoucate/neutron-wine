@@ -1,0 +1,111 @@
+d2d1: drop near-collinear ears by a relative test, not an exact zero
+
+The ear-clip fallback still declined 37 times a session in Premiere, each time
+reporting "not a simple polygon". That was a wrong conclusion drawn from a symptom:
+the loop declines whenever a full pass finds no ear, and it labelled that
+non-simplicity. Dumping what actually remained shows the polygons ARE simple --
+
+    v0 (0.0000,7.5000) cross=3.38813179e-20    v3 (0.0000,7.5000) cross=1.0493703e-12
+    v1 (0.0000,7.5000) cross=3.04931861e-20    v4 (0.0000,7.4995) cross=7.8792424e-12
+    v2 (0.0000,7.5000) cross=2.30392962e-19    v5 (0.0000,7.4991) cross=3.58016915e-11
+
+-- a tail of near-duplicate points converging on a tangent, from a finely flattened
+curve. Every one is a degenerate sliver and every one survived `cross == 0.0`.
+
+cross is twice the triangle area and equals |ab||ac|sin(theta), so dividing by the two
+edge lengths gives sin(theta): a scale-free measure of how far the vertex sits off the
+line. Drop at 1e-7, where the vertex deviates by less than a millionth of a pixel on
+these 15 px shapes. Same area-preserving justification the exact test already had, with
+the tolerance the measured data requires.
+
+MEASURED, same app, same actions:
+    before   239 CDT failures, 202 recovered, 37 declined   (85%)
+    after    400 CDT failures, 396 recovered,  4 declined   (99%)
+
+A declined geometry renders NOTHING, so those are shapes that were silently absent.
+
+The four survivors are a different failure and are left alone deliberately: their cross
+products climb geometrically (1e-19 -> 5e-4, each ~8x the last), so past the threshold
+they are legitimately non-collinear, and no ear is found because in a fan of near-tangent
+points every candidate ear has other vertices lying on its edges. Fixing that means
+tolerancing d2d_ear_clip_contains, which can emit overlapping triangles -- a different
+trade, not worth making silently for the last 1%.
+
+The decline dump is kept: it is bounded by the declines themselves, and it is what turned
+"not a simple polygon" from an assertion into a measurement.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3083,13 +3083,36 @@
+          * A collinear vertex contributes no area and is simply redundant: drop it without emitting
+          * a triangle. This also covers a retrace spike (A->B->A), where dropping B is likewise
+          * area-preserving. */
+-        if (cross == 0.0)
++        /* 🚨 ...and EXACTLY zero is not the test. The clip still declined 37 times a session in
++         * Premiere, always reporting "not a simple polygon" -- which was a wrong inference from
++         * "no ear found". Dumping what remained (2026-08-23) showed the polygons ARE simple:
++         *
++         *     v0 (0.0000,7.5000) cross=3.38813179e-20     v3 (0.0000,7.5000) cross=1.0493703e-12
++         *     v1 (0.0000,7.5000) cross=3.04931861e-20     v4 (0.0000,7.4995) cross=7.8792424e-12
++         *     v2 (0.0000,7.5000) cross=2.30392962e-19     v5 (0.0000,7.4991) cross=3.58016915e-11
++         *
++         * a tail of near-duplicate points converging on a tangent, from a finely flattened curve.
++         * Every cross is a degenerate sliver, and every one survives `== 0.0`.
++         *
++         * So test RELATIVELY. cross is twice the triangle's area and equals |ab||ac|sin(theta), so
++         * dividing by the edge lengths gives sin(theta) directly: a scale-free measure of how far
++         * b sits off the line ac. At 1e-7 the vertex deviates by under 1e-7 of an edge length --
++         * on these 15 px shapes, a millionth of a pixel. Dropping it is area-preserving to well
++         * inside float precision, which is the same justification the exact test had; it is not a
++         * loosening into guesswork, it is the same rule with the tolerance the data requires. */
+         {
+-            memmove(&poly[cursor], &poly[cursor + 1], (remaining - cursor - 1) * sizeof(*poly));
+-            --remaining;
+-            stalled = 0;
+-            if (cursor >= remaining) cursor = 0;
+-            continue;
++            double ab = hypot((double)b->x - a->x, (double)b->y - a->y);
++            double ac = hypot((double)c->x - a->x, (double)c->y - a->y);
++            double scale = ab * ac;
++
++            if (cross == 0.0 || (scale > 0.0 && fabs(cross) <= 1e-7 * scale) || scale == 0.0)
++            {
++                memmove(&poly[cursor], &poly[cursor + 1], (remaining - cursor - 1) * sizeof(*poly));
++                --remaining;
++                stalled = 0;
++                if (cursor >= remaining) cursor = 0;
++                continue;
++            }
+         }
+ 
+         ear = ccw ? cross > 0.0 : cross < 0.0;
+@@ -3109,6 +3132,27 @@
+                  * outcomes of this function, and having them at WARN/TRACE cost a whole build --
+                  * both counts read as zero and said nothing about whether the code had even run. */
+                 ERR("Ear clipping found no ear in %lu vertices; not a simple polygon.\n", (long)remaining);
++                /* NEUTRON DIAG: "not a simple polygon" is a conclusion, not an observation -- the
++                 * loop declines for ANY full pass without an ear, which a near-collinear sliver
++                 * also produces (the collinear drop above tests cross == 0.0 EXACTLY). Print what
++                 * is actually left so the two can be told apart: genuine self-intersection, or
++                 * degenerate slivers we could drop. Bounded by the decline itself, a few dozen a
++                 * session at worst. */
++                {
++                    size_t d;
++
++                    for (d = 0; d < remaining && d < 12; ++d)
++                    {
++                        const D2D1_POINT_2F *pa = &sorted[poly[(d + remaining - 1) % remaining]];
++                        const D2D1_POINT_2F *pb = &sorted[poly[d]];
++                        const D2D1_POINT_2F *pc = &sorted[poly[(d + 1) % remaining]];
++                        double cr = (double)(pb->x - pa->x) * (pc->y - pa->y)
++                                  - (double)(pb->y - pa->y) * (pc->x - pa->x);
++
++                        ERR("  neutron-earclip: v%lu (%.4f,%.4f) cross=%.9g%s\n", (long)d, pb->x, pb->y,
++                            cr, (pb->x == pa->x && pb->y == pa->y) ? "  DUPLICATE of previous" : "");
++                    }
++                }
+                 geometry->fill.face_count = 0;
+                 free(poly);
+                 return FALSE;
