@@ -1,0 +1,109 @@
+Revert: d2d1 ear-clip containment must keep blocking on-edge points
+
+Two attempts at tolerancing d2d_ear_clip_contains, both measured regressions in
+Premiere against a 396/400 recovery baseline:
+
+  attempt 1  zero each d within tolerance of its edge, before the sign test
+             -> 0/232. Zeroing REMOVES the evidence that a point is outside: an
+                outside point has mixed signs, and zeroing one collapses it to a
+                single sign, which reads as "contained". Every ear blocked.
+  attempt 2  keep the sign test, then require the point to be inside by a margin
+             -> 0/313, and declining at FOUR vertices remaining with large crosses
+                (0.03-1.5) -- well-formed vertices, not slivers. Letting an on-edge
+                point through admits an ear that strands it outside the shrinking
+                polygon; the corruption accumulates and the tail has no ear at all.
+
+So the function's comment is wrong and its code is right. `!(neg && pos)` reports a
+point exactly on an edge as CONTAINED, and that is load-bearing: these polygons are
+full of collinear and duplicate points, and blocking those ears is what keeps the
+remaining polygon simple as it shrinks. The comment has been replaced with the two
+results so this is not attempted a third time.
+
+The four declines a session remain open. They are a real defect -- those geometries
+render nothing -- but whatever fixes them, it is not loosening this test.
+
+Kept from the reverted commit, both independently verified:
+  * the path-mask guard resolving lazy tessellation before reading face_count
+  * NEUTRON_FORCE_EARCLIP=1, which is how the next attempt should be tested first
+
+⚠️ Note the harness does NOT discriminate here: forced, the comb and circle render
+correctly under all three versions of the containment test. It catches a dead
+fallback, not a subtly wrong one. Premiere's shapes remain the only witness for that,
+which is worth fixing before anyone tries again.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -2966,51 +2966,35 @@
+ static BOOL d2d_ear_clip_contains(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b,
+         const D2D1_POINT_2F *c, const D2D1_POINT_2F *p)
+ {
+-    double d1, d2, d3, lab, lbc, lca, longest, eps, dist;
++    double d1, d2, d3;
+     BOOL neg, pos;
+ 
+     d1 = ((double)p->x - b->x) * ((double)a->y - b->y) - ((double)a->x - b->x) * ((double)p->y - b->y);
+     d2 = ((double)p->x - c->x) * ((double)b->y - c->y) - ((double)b->x - c->x) * ((double)p->y - c->y);
+     d3 = ((double)p->x - a->x) * ((double)c->y - a->y) - ((double)c->x - a->x) * ((double)p->y - a->y);
+ 
+-    /* 🚨 ...and EXACTLY on the edge is not the test either -- but the FIRST attempt at that got
+-     * the logic backwards and is worth recording, because it looked reasonable and destroyed the
+-     * whole fallback: zeroing a d to mean "on the edge" REMOVES the evidence that a point is
+-     * outside. A point clearly outside has mixed signs; zero one of them and it can collapse to a
+-     * single sign, which !(neg && pos) then reads as CONTAINED. Measured effect: recovery went
+-     * from 396/400 to 0/232 -- every ear blocked, the fallback dead.
+-     *
+-     * The tolerance has to be applied to the CONCLUSION, not the inputs. Mixed signs still mean
+-     * outside. Otherwise the point is inside or on the boundary, and it should only block the ear
+-     * if it is inside by a real margin: |d| for an edge is twice the area of (p, edge), so |d|
+-     * divided by that edge's length is p's perpendicular distance from it. Require that distance
+-     * to exceed a millionth of the triangle's longest edge.
+-     *
+-     * This also makes the function do what its own comment always claimed. `!(neg && pos)` returns
+-     * CONTAINED for a point exactly on an edge (one d is zero, the others share a sign), so
+-     * on-edge vertices were blocking ears despite the comment saying they did not -- which is
+-     * precisely what jammed the last four declines a session: fans of curve samples where every
+-     * candidate ear has its neighbours sitting on its edges. */
+     neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+     pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+ 
+-    if (neg && pos)
+-        return FALSE;               /* unambiguously outside */
+-
+-    lab = hypot((double)a->x - b->x, (double)a->y - b->y);
+-    lbc = hypot((double)b->x - c->x, (double)b->y - c->y);
+-    lca = hypot((double)c->x - a->x, (double)c->y - a->y);
+-    longest = lab > lbc ? lab : lbc;
+-    if (lca > longest) longest = lca;
+-    eps = 1e-7 * longest;
+-
+-    /* perpendicular distance to the nearest of the three edges */
+-    dist = DBL_MAX;
+-    if (lab > 0.0 && fabs(d1) / lab < dist) dist = fabs(d1) / lab;
+-    if (lbc > 0.0 && fabs(d2) / lbc < dist) dist = fabs(d2) / lbc;
+-    if (lca > 0.0 && fabs(d3) / lca < dist) dist = fabs(d3) / lca;
+-
+-    return dist > eps;              /* inside, but only blocks if it is properly inside */
++    /* ⛔ DO NOT "FIX" THIS TO MATCH THE COMMENT BELOW IT. Tried twice, 2026-08-23, both regressions
++     * measured in Premiere against a 396/400 baseline:
++     *
++     *   attempt 1  zero each d within tolerance of its edge, before the sign test
++     *              -> 0/232. Zeroing REMOVES the evidence a point is outside: an outside point has
++     *                 mixed signs, and zeroing one collapses it to a single sign = "contained".
++     *   attempt 2  keep the sign test, then require the point to be inside by a margin
++     *              -> 0/313, and now declining at FOUR vertices remaining with large crosses
++     *                 (0.03-1.5), i.e. well-formed vertices. Letting an on-edge point through
++     *                 admits an ear that strands it outside the shrinking polygon; the corruption
++     *                 accumulates and the tail has no ear at all.
++     *
++     * So the comment is wrong and the code is right: `!(neg && pos)` DOES report a point exactly on
++     * an edge as contained, and that is load-bearing -- these polygons are full of collinear and
++     * duplicate points, and blocking those ears is what keeps the remaining polygon simple.
++     *
++     * The four declines a session this was chasing are a real but separate defect. Whatever fixes
++     * them, it is not loosening this test. */
++    return !(neg && pos);
+ }
+ 
+ static BOOL d2d_path_geometry_ear_clip(struct d2d_geometry *geometry,
