@@ -1,0 +1,28 @@
+win32u: the rule under the menu bar takes the menu bar's colour, not COLOR_3DFACE
+
+The last survivor of the same coupling. draw_menu_bar drew a 1px line along the
+bottom of the menu bar with a COLOR_3DFACE pen, which was invisible only because the
+prefix theme darkened the whole classic palette. With the button family back at
+Windows' values it drew a white rule across the top of every menued window --
+user-reported on Lightroom, right under File/Edit/Library.
+
+It is menu chrome, so it now uses COLOR_MENUBAR/COLOR_MENU, which the theme sets
+alongside the menu background it sits against.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -2756,7 +2756,11 @@
+ 
+     fill_rect( hdc, rect, get_sys_color_brush( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+ 
+-    NtGdiSelectPen( hdc, get_sys_color_pen( COLOR_3DFACE ));
++    /* NEUTRON neutron-frame-border-palette: the rule under the menu bar takes the menu bar's own
++     * colour, not COLOR_3DFACE. It was only ever invisible because the prefix theme darkened the
++     * whole classic palette; with the button family back at Windows' values it drew a white line
++     * across the top of every menued window. */
++    NtGdiSelectPen( hdc, get_sys_color_pen( flat_menu ? COLOR_MENUBAR : COLOR_MENU ));
+     NtGdiMoveTo( hdc, rect->left, rect->bottom, NULL );
+     NtGdiLineTo( hdc, rect->right, rect->bottom );
+ 
