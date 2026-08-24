@@ -1,0 +1,126 @@
+d2d1: always-on frame census — and two EndDraw optimisations measured DEAD
+
+EndDraw was the #1 line in the cumulative profile and the standing plan was to skip its
+GPU readback when nothing was drawn. Measuring first killed that idea and a second one,
+for the cost of two runs instead of two implementations.
+
+  skip readback when nothing was drawn      0.1% of EndDraws are empty (11 of 8,705)
+  skip the acquire UPLOAD when the app
+  clears the whole target first             2.1% clear-first (299 of 14,337)
+
+⇒ Premiere redraws PARTIALLY into retained content, which is exactly why the time-ruler
+fix had to add the seed upload in the first place. Both round trips are load-bearing.
+
+⭐ AND EndDraw IS NOT WORTH CHASING ANYWAY. The July note ranked it #1 by CUMULATIVE
+time, which is not the same as per-frame share:
+
+    app draw                     33.0ms/frame
+      EndDraw                     2.57ms   (289.6us x 3,556)   <- 7.8% of the frame
+      BeginDraw                   1.27ms   (142.8us x 3,556)
+      CreateWicBitmapRenderTarget 0.63ms   ( 71.3us x 3,552)
+      top-8 entry points          8.1ms    <- the other ~25ms is diffuse
+
+Driving EndDraw to zero moves 59.3ms/frame to 56.7ms: 18 fps -> 17.6 fps.
+
+What the numbers DO show: those three lines are one object's lifecycle, and there are
+~9 offscreen render targets per frame each paying ~500us of it. Acquiring one UPLOADS
+the whole bitmap (seed_from_bitmap -> UpdateSubresource) and EndDraw reads it back --
+an upload/download pair per target per frame, which is July's "36 GPU round-trips". The
+lever is the NUMBER of targets, not the cost of one round trip, and that is Premiere's
+choice rather than ours.
+
+Ceiling worth knowing before anyone spends more here: the frame is 59.3ms of which
+33.0ms is inside d2d1. Making d2d1 entirely free caps the timeline at ~38 fps.
+
+The census stays: one unconditional increment per drawing call (and per Clear, which
+mutates the target but does not go through neutron_op), reported only under
+NEUTRON_D2D_PERF=1. ⚠️ Its reset is unconditional on purpose -- the neighbouring
+per-frame reset is gated, and a counter that only resets under a diagnostic would report
+every frame as non-empty.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -749,6 +749,8 @@
+     float nc_l, nc_t, nc_r, nc_b;
+     int nb_valid, nc_valid;
+     unsigned nb_ops;
++    unsigned neutron_draw_ops;   /* NEUTRON: always-on drawing-call count since BeginDraw */
++    unsigned neutron_clear_first; /* NEUTRON: this frame's first op was a Clear */
+     /* NEUTRON op-trace: did the app CLEAR this frame, and over what clip? A frame that
+      * clears the panel and then draws almost nothing is the app wiping its own content --
+      * not us erasing it. Reset with the unions at BeginDraw. */
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -115,6 +115,15 @@
+ /* NEUTRON op-trace: count one primitive by type for this frame. */
+ static void neutron_op(struct d2d_device_context *context, enum neutron_op_id id)
+ {
++    /* NEUTRON EMPTY-FRAME CENSUS: an ALWAYS-ON count of drawing calls since BeginDraw. The
++     * op-trace histogram above it is gated, so it cannot answer whether a production skip would
++     * ever fire. One increment per drawing entry point is nothing beside the call it accompanies.
++     *
++     * WHY: EndDraw is now the #1 cost (277us x 4,115 calls) and it is a CPU<->GPU readback sync.
++     * The standing proposal is to skip that readback when nothing was drawn -- but that is only
++     * worth building if such frames actually occur, which nobody has measured. */
++    ++context->neutron_draw_ops;
++
+     if (neutron_optrace() && id < NEUTRON_OP_COUNT)
+     {
+         context->nb_hist[id]++;
+@@ -3558,6 +3567,13 @@
+ 
+     TRACE("iface %p, colour %p.\n", iface, colour);
+ 
++    /* ⚠️ A Clear MUTATES the target, so it counts as drawing. It does not go through neutron_op(),
++     * and without this a clear-only frame would look empty -- and any readback skip built on that
++     * would publish stale pixels. */
++    if (!context->neutron_draw_ops)
++        context->neutron_clear_first = 1;   /* NEUTRON: this frame opened with a Clear */
++    ++context->neutron_draw_ops;
++
+     neutron_dr_add_clip(context); /* NEUTRON DIRTYRECTS: Clear fills the clip (or full RT) */
+     if (neutron_dirtyrects() || neutron_dcdirect())   /* NEUTRON op-trace: record the wipe */
+     {
+@@ -3653,6 +3669,11 @@
+ 
+     TRACE("iface %p.\n", iface);
+ 
++    /* ⚠️ Reset UNCONDITIONALLY -- the block below is gated, and a counter that only resets when a
++     * diagnostic is enabled would accumulate across frames and report every frame as non-empty. */
++    context->neutron_draw_ops = 0;
++    context->neutron_clear_first = 0;
++
+     if (neutron_dirtyrects() || neutron_dcdirect()) /* NEUTRON: reset per-frame drawn/clip unions */
+     {
+         context->nb_valid = 0;
+@@ -3701,6 +3722,28 @@
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+         return context->error.code;
+ 
++    {
++        static unsigned empty, drew, seq;
++
++        static unsigned clearfirst;
++
++        if (context->neutron_draw_ops) ++drew; else ++empty;
++        if (context->neutron_clear_first) ++clearfirst;
++        /* ⭐ THE QUESTION THIS RUN ANSWERS. Acquiring a WIC target UPLOADS the whole bitmap to the
++         * GPU (seed_from_bitmap -> UpdateSubresource), so retained content survives a partial
++         * redraw. When the app's FIRST act is to clear the whole target, that upload is pure
++         * waste -- every pixel is about to be overwritten. ~9 targets per frame each pay an
++         * upload at acquire and a readback at EndDraw; killing the wasted uploads removes one GPU
++         * round trip per target per frame. Worth building only if apps really do clear first. */
++        if (neutron_perf() && ((seq++) & 0xFF) == 0)
++            ERR("neutron-emptyframe: empty=%u drew=%u (%.1f%% empty) | CLEAR-FIRST=%u of %u"
++                " (%.1f%%) target=%d %ux%u\n", empty, drew,
++                100.0 * empty / (empty + drew ? empty + drew : 1),
++                clearfirst, empty + drew,
++                100.0 * clearfirst / (empty + drew ? empty + drew : 1),
++                (int)context->target.type, context->pixel_size.width, context->pixel_size.height);
++    }
++
+     if (context->ops && context->ops->device_context_present)
+     {
+         if (FAILED(hr = context->ops->device_context_present(context->outer_unknown)))
