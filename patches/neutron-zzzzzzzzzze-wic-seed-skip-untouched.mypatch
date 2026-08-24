@@ -1,0 +1,266 @@
+d2d1/windowscodecs: skip the seed upload when the bitmap comes back untouched — 18 -> 25 fps
+
+Acquiring a WIC render target uploads the whole bitmap so a partial redraw keeps what was
+already there (the time-ruler fix). A whole-process profile of a zoomed Premiere timeline
+showed what that costs: memcpy is 11.85% of ALL samples -- one function, identified by
+its code shape since the names would not resolve -- and our seed upload alone ran at
+~750 MB/s, every frame, forever.
+
+It is nearly always redundant. With the render-target pool now hitting 99.4%, a target is
+handed back the SAME bitmap it published last time in 99.8% of acquisitions (25,537
+against 64), and its texture still holds those pixels.
+
+"Untouched" has to be answered by the bitmap, never assumed: the application can write it
+through IWICBitmap::Lock between our publish and the next acquisition, and skipping then
+publishes stale pixels -- the same failure the seed was added to fix. So windowscodecs now
+counts every path that can put new pixels in a bitmap (a write lock, an attached GPU
+source) and exposes the count through INeutronWicGpuBitmap3. Same bitmap AND same
+generation means nobody has been in since we looked.
+
+⭐ THE COUNTER EARNS ITS KEEP: 85.1% of acquisitions skip, not the 99.8% that share a
+bitmap pointer. The other ~15% really had been rewritten, and a pointer-only check --
+which is what this would have been without windowscodecs' help -- would have published
+stale pixels every one of those times.
+
+MEASURED, same app and same actions:
+
+    seed upload      ~750 MB/s  ->  ~130 MB/s
+    frame gap        53.9ms     ->  39.1ms
+    timeline         18 fps     ->  25 fps
+    app draw         28.3ms     ->  28.7ms   (unchanged -- see below)
+
+⭐ The gain is entirely OUTSIDE d2d1: 25.6ms/frame of non-d2d1 time became 10.4ms. That is
+the point -- the copying lived in ucrtbase's memcpy, which d2d1's own per-entry-point
+accounting cannot see. A profile that only measured d2d1 would have called this frame
+"28ms of drawing" and found nothing to fix.
+
+Fails SAFE on every uncertainty: an unseen bitmap, a windowscodecs without v3 (runtimes are
+assembled from individually staged DLLs), or any error -- all fall through and seed.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -835,22 +835,56 @@
+      * d2d_wic_render_target_seed_from_bitmap). The clear stays as the fallback for
+      * when there is no bitmap to seed from, since publishing the previous tenant's
+      * pixels would be worse than publishing nothing. */
+-    /* NEUTRON SEED CENSUS: is this target being re-acquired for the SAME bitmap it published last
+-     * time? Then its texture already holds those pixels and this upload -- ~750 MB/s measured, and
+-     * most of the 11.85%% of process samples sitting in memcpy -- is redundant.
++    /* 🚨 SKIP THE SEED when this target is handed back the SAME bitmap, untouched.
+      *
+-     * ⚠️ Placed HERE, in reset_state, not in init: init runs only for a NEW target, and with the
+-     * pool now hitting 99.4%% that is almost never. Instrumenting it reported a single sample for a
+-     * whole session while the uploads carried on at full rate. */
++     * Acquiring a target uploads the whole bitmap so a partial redraw keeps what was already
++     * there (the time-ruler fix). MEASURED in a zoomed Premiere timeline: ~750 MB/s of upload,
++     * in a process where memcpy is 11.85%% of all samples -- and 99.8%% of acquisitions hand the
++     * target back the very bitmap it published last time (25,537 against 64). Its texture still
++     * holds those pixels, so the upload reproduces what is already there.
++     *
++     * "Untouched" must be answered by the bitmap, not assumed: the application can write it
++     * through IWICBitmap::Lock at any point between our publish and this acquisition, and
++     * skipping then would publish stale pixels -- the same failure the seed was added to fix.
++     * INeutronWicGpuBitmap3 (wine/neutron_wicgpu.h) counts every write path. Same pointer AND the
++     * same generation means nobody has been in since we looked.
++     *
++     * ⚠️ Fails SAFE on every uncertainty: a bitmap we have not seen before, a windowscodecs
++     * without v3 (DLLs are staged individually), or any error -- all fall through and seed. */
+     {
+-        static unsigned same, different, seq;
++        INeutronWicGpuBitmap3 *gen_iface;
++        ULONG gen = 0;
++        BOOL untouched = FALSE;
+ 
+-        if (rt->bitmap == rt->pool_last_bitmap) ++same; else ++different;
+-        if (neutron_perf() && ((seq++) & 0xFF) == 0)
+-            ERR("neutron-seed: SAME bitmap %u, different %u (%.1f%% same) %ux%u\n",
+-                same, different, 100.0 * same / (same + different ? same + different : 1),
+-                rt->width, rt->height);
++        if (rt->bitmap && SUCCEEDED(IWICBitmap_QueryInterface(rt->bitmap,
++                &IID_INeutronWicGpuBitmap3, (void **)&gen_iface)))
++        {
++            if (SUCCEEDED(gen_iface->lpVtbl->GetWriteGeneration(gen_iface, &gen)))
++                untouched = rt->bitmap == rt->pool_last_bitmap
++                        && rt->pool_last_gen_valid && gen == rt->pool_last_gen;
++            gen_iface->lpVtbl->Release(gen_iface);
++            rt->pool_last_gen = gen;
++            rt->pool_last_gen_valid = TRUE;
++        }
++        else
++        {
++            rt->pool_last_gen_valid = FALSE;
++        }
+         rt->pool_last_bitmap = rt->bitmap;
++
++        if (neutron_perf())
++        {
++            static unsigned skipped, seeded, seq;
++
++            if (untouched) ++skipped; else ++seeded;
++            if (((seq++) & 0xFF) == 0)
++                ERR("neutron-seed: skipped %u, seeded %u (%.1f%% skipped) %ux%u\n",
++                    skipped, seeded, 100.0 * skipped / (skipped + seeded ? skipped + seeded : 1),
++                    rt->width, rt->height);
++        }
++
++        if (untouched)
++            return;     /* texture already holds this bitmap's pixels */
+     }
+ 
+     if (d2d_wic_render_target_seed_from_bitmap(rt))
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -71,7 +71,11 @@
+      * a pristine bitmap has nothing to retain, so it can skip the full-surface seed upload
+      * (see INeutronWicGpuBitmap2 in wine/neutron_wicgpu.h). */
+     BOOL pristine;
++    /* NEUTRON v3: bumped by anything that can put new pixels in this bitmap, so a consumer can
++     * tell "untouched since I last looked" from "rewritten". See wine/neutron_wicgpu.h. */
++    ULONG write_gen;
+     INeutronWicGpuBitmap2 INeutronWicGpuBitmap2_iface;
++    INeutronWicGpuBitmap3 INeutronWicGpuBitmap3_iface;
+ } BitmapImpl;
+ 
+ typedef struct BitmapLockImpl {
+@@ -342,6 +346,10 @@
+     {
+         *ppv = &This->INeutronWicGpuBitmap2_iface;
+     }
++    else if (IsEqualIID(&IID_INeutronWicGpuBitmap3, iid))
++    {
++        *ppv = &This->INeutronWicGpuBitmap3_iface;
++    }
+     else
+     {
+         if (IsEqualIID(&IID_CMetaBitmapRenderTarget, iid))
+@@ -541,7 +549,10 @@
+ 
+     /* NEUTRON: a write lock hands out a raw pointer, so assume it is used. */
+     if (flags & WICBitmapLockWrite)
++    {
+         This->pristine = FALSE;
++        ++This->write_gen;     /* NEUTRON v3 */
++    }
+ 
+     result = malloc(sizeof(BitmapLockImpl));
+     if (!result)
+@@ -651,7 +662,7 @@
+     /* NEUTRON: an attached source is content, and stays content after it materialises into
+      * This->data -- so this is a permanent transition out of pristine, not a state that
+      * follows gpu_ops. */
+-    if (ops) This->pristine = FALSE;
++    if (ops) { This->pristine = FALSE; ++This->write_gen; }   /* NEUTRON v3 */
+     LeaveCriticalSection(&This->cs);
+ 
+     if (ops)
+@@ -715,6 +726,51 @@
+     neutron_wicgpu2_IsPristine,
+ };
+ 
++
++static inline BitmapImpl *impl_from_INeutronWicGpuBitmap3(INeutronWicGpuBitmap3 *iface)
++{
++    return CONTAINING_RECORD(iface, BitmapImpl, INeutronWicGpuBitmap3_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE neutron_wicgpu3_QueryInterface(INeutronWicGpuBitmap3 *iface,
++        REFIID iid, void **out)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap3(iface);
++    return IWICBitmap_QueryInterface(&This->IWICBitmap_iface, iid, out);
++}
++
++static ULONG STDMETHODCALLTYPE neutron_wicgpu3_AddRef(INeutronWicGpuBitmap3 *iface)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap3(iface);
++    return IWICBitmap_AddRef(&This->IWICBitmap_iface);
++}
++
++static ULONG STDMETHODCALLTYPE neutron_wicgpu3_Release(INeutronWicGpuBitmap3 *iface)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap3(iface);
++    return IWICBitmap_Release(&This->IWICBitmap_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE neutron_wicgpu3_GetWriteGeneration(INeutronWicGpuBitmap3 *iface,
++        ULONG *gen)
++{
++    BitmapImpl *This = impl_from_INeutronWicGpuBitmap3(iface);
++
++    if (!gen) return E_POINTER;
++    EnterCriticalSection(&This->cs);
++    *gen = This->write_gen;
++    LeaveCriticalSection(&This->cs);
++    return S_OK;
++}
++
++static const INeutronWicGpuBitmap3Vtbl neutron_wicgpu3_vtbl =
++{
++    neutron_wicgpu3_QueryInterface,
++    neutron_wicgpu3_AddRef,
++    neutron_wicgpu3_Release,
++    neutron_wicgpu3_GetWriteGeneration,
++};
++
+ static const IWICBitmapVtbl BitmapImpl_Vtbl = {
+     BitmapImpl_QueryInterface,
+     BitmapImpl_AddRef,
+@@ -1089,6 +1145,7 @@
+      * pixels; one we calloc'd is transparent black and has nothing worth retaining. */
+     This->pristine = (view == NULL);
+     This->INeutronWicGpuBitmap2_iface.lpVtbl = &neutron_wicgpu2_vtbl;
++    This->INeutronWicGpuBitmap3_iface.lpVtbl = &neutron_wicgpu3_vtbl;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+     This->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": BitmapImpl.lock");
+ 
+--- a/include/wine/neutron_wicgpu.h
++++ b/include/wine/neutron_wicgpu.h
+@@ -134,6 +134,46 @@
+     const INeutronWicGpuBitmap2Vtbl *lpVtbl;
+ };
+ 
++/* ---------------------------------------------------------------------------------------
++ * v3: "has anyone written this bitmap since I last looked?"
++ *
++ * v2 answers "never written at all", which covers freshly created bitmaps. This covers the
++ * far more common case: a bitmap that HAS content, drawn into repeatedly, frame after frame.
++ *
++ * MEASURED in a zoomed Premiere timeline: the pool hands a render target back for the SAME
++ * bitmap it published last time in 99.8% of acquisitions (25,537 against 64), and each
++ * acquisition re-uploads the whole surface -- ~750 MB/s of memcpy, against a process where
++ * memcpy is 11.85% of all samples. That upload is redundant whenever the texture still holds
++ * what it published and nobody has written the bitmap since.
++ *
++ * "Nobody" has to include every path that hands out writable pixels: a write lock, and an
++ * attached GPU source. Both bump the counter. A caller compares the value it saw at its last
++ * acquisition; equal means untouched, anything else means seed.
++ *
++ * Separate IID again, for the reason v2 gives: DLLs are staged into runtimes individually,
++ * so a missing v3 must fail QueryInterface and leave the caller seeding unconditionally --
++ * the old, correct, slower behaviour.
++ * {6e657574-726f-6e03-77-69-63-67-70-75-30-33} -- "neutron" + "wicgpu03". */
++DEFINE_GUID(IID_INeutronWicGpuBitmap3, 0x6e657574,0x726f,0x6e03,0x77,0x69,0x63,0x67,0x70,0x75,0x30,0x33);
++
++typedef struct INeutronWicGpuBitmap3 INeutronWicGpuBitmap3;
++
++typedef struct INeutronWicGpuBitmap3Vtbl
++{
++    HRESULT (STDMETHODCALLTYPE *QueryInterface)(INeutronWicGpuBitmap3 *iface, REFIID iid, void **out);
++    ULONG   (STDMETHODCALLTYPE *AddRef)(INeutronWicGpuBitmap3 *iface);
++    ULONG   (STDMETHODCALLTYPE *Release)(INeutronWicGpuBitmap3 *iface);
++
++    /* Monotonically increasing; bumped by anything that can put new pixels in the bitmap.
++     * Never reset, so a wrap is the only false "unchanged" and it takes 2^32 writes. */
++    HRESULT (STDMETHODCALLTYPE *GetWriteGeneration)(INeutronWicGpuBitmap3 *iface, ULONG *gen);
++} INeutronWicGpuBitmap3Vtbl;
++
++struct INeutronWicGpuBitmap3
++{
++    const INeutronWicGpuBitmap3Vtbl *lpVtbl;
++};
++
+ #define INeutronWicGpuBitmap_QueryInterface(p,a,b) (p)->lpVtbl->QueryInterface(p,a,b)
+ #define INeutronWicGpuBitmap_AddRef(p)             (p)->lpVtbl->AddRef(p)
+ #define INeutronWicGpuBitmap_Release(p)            (p)->lpVtbl->Release(p)
