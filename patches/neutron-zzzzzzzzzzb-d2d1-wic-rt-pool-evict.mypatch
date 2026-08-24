@@ -1,0 +1,152 @@
+d2d1: evict from the WIC render-target pool when it is full
+
+The pool had no eviction policy. It filled with 24 arbitrary early targets and then
+refused every later one, so the shape actually in demand could never get in -- a cache
+permanently occupied by its coldest entries.
+
+MEASURED before (Premiere, heavy timeline zoom, NEUTRON_D2D_PERF=1):
+
+    hits 49  misses 8,656   (0.6% hit)     pool pinned at 24/24
+    put: kept 97  dropped_full 8,608       nearly all of them 3255x98
+
+The misses kept asking for 3255x98 while 8,608 targets OF THAT EXACT SHAPE were
+destroyed on release for want of a slot. Every miss rebuilt a device context and two
+textures: CreateWicBitmapRenderTarget was 918ms in 3,840 calls, 239us each, the #2 cost
+in the whole profile, against 3,759 EndDraws -- about one full rebuild per draw.
+
+The list is newest-at-head, so evict the tail: least recently parked. A hot working set
+now displaces cold entries instead of being locked out by them.
+
+MEASURED after, same app and same actions:
+
+    hits 15,276  misses 85   (99.4% hit)   dropped_full 0
+    CreateWicBitmapRenderTarget  #2 239us/call -> #4 79us/call
+    app draw per frame           45,992us -> 28,310us   (-38%)
+    timeline                     15 fps   -> 18 fps
+
+⚠️ Not a transformation, and the profile says why: EndDraw is now #1 alone at 277us x
+4,115 calls. That is the CPU<->GPU readback sync -- fixed latency per round trip, not
+size-dependent (1151us measured on a 32x16 surface in July) -- and it is untouched by
+this change.
+
+The hit/miss census that found this is kept, behind NEUTRON_D2D_PERF=1.
+
+⚠️ Recorded because it cost a detour: the pool is NOT dead code. A grep for `pool_rtv *=`
+finds only NULL assignments and looks damning; the real one passes &render_target->pool_rtv
+as an out-parameter to CreateRenderTargetView. Grep for the ADDRESS-OF too.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -830,6 +830,20 @@
+         list_remove(&found->pool_entry);
+         --factory->wic_rt_pool_size;
+     }
++    /* NEUTRON WIC RT POOL CENSUS: CreateWicBitmapRenderTarget is the #2 cost in a zoomed
++     * Premiere timeline -- 918ms in 3,840 calls, 239us each, against 3,759 EndDraws. At 239us
++     * average almost every call must be MISSING this pool and rebuilding a context and two
++     * textures. Whether that is shape churn (exact width/height/format/alpha/usage match) or the
++     * 24-slot cap thrashing decides the fix, and the two need different ones. Count it. */
++    {
++        static unsigned hit, miss, seq;
++
++        if (found) ++hit; else ++miss;
++        if (neutron_perf() && ((seq++) & 0x1FF) == 0)
++            ERR("neutron-wicpool: hits=%u misses=%u (%.1f%% hit) pool=%u/%u  request %ux%u fmt=%d\n",
++                hit, miss, 100.0 * hit / (hit + miss ? hit + miss : 1),
++                factory->wic_rt_pool_size, D2D_WIC_RT_POOL_MAX, width, height, (int)format);
++    }
+     LeaveCriticalSection(&factory->cs);
+ 
+     if (!found)
+@@ -841,6 +855,7 @@
+     return found;
+ }
+ 
++static void d2d_wic_render_target_pool_destroy(struct d2d_wic_render_target *rt);
+ /* Returns TRUE when the target has been parked for reuse instead of destroyed. */
+ static BOOL d2d_wic_render_target_pool_put(struct d2d_wic_render_target *rt)
+ {
+@@ -855,12 +870,49 @@
+     factory = unsafe_impl_from_ID2D1Factory((ID2D1Factory *)rt->pool_factory);
+ 
+     EnterCriticalSection(&factory->cs);
++    /* 🚨 EVICT WHEN FULL -- refusing was the whole bug.
++     *
++     * The pool filled with 24 arbitrary early targets and then refused every later one, so the
++     * shape actually in demand could never get in. MEASURED in a zoomed Premiere timeline before
++     * this change: 49 hits against 8,656 misses (0.6%), pool pinned at 24/24, and 8,608 targets
++     * DISCARDED on release as full -- nearly all of them the same 3255x98 shape the misses kept
++     * asking for. The result was a full rebuild per draw: CreateWicBitmapRenderTarget 918ms in
++     * 3,840 calls, the #2 cost in the whole profile.
++     *
++     * The list is newest-at-head, so the tail is the least recently parked: drop that one and take
++     * its slot. A hot working set now displaces cold entries instead of being locked out by them,
++     * which is what a cache is supposed to do. */
++    if (factory->wic_rt_pool_size >= D2D_WIC_RT_POOL_MAX)
++    {
++        struct list *oldest = list_tail(&factory->wic_rt_pool);
++
++        if (oldest)
++        {
++            struct d2d_wic_render_target *victim = LIST_ENTRY(oldest,
++                    struct d2d_wic_render_target, pool_entry);
++
++            list_remove(&victim->pool_entry);
++            --factory->wic_rt_pool_size;
++            d2d_wic_render_target_pool_destroy(victim);
++        }
++    }
++
+     if (factory->wic_rt_pool_size < D2D_WIC_RT_POOL_MAX)
+     {
+         list_add_head(&factory->wic_rt_pool, &rt->pool_entry);
+         ++factory->wic_rt_pool_size;
+         pooled = TRUE;
+     }
++    /* ...and how often a target is thrown away because the pool is FULL, which is the other
++     * half of the question: a full pool that still misses means shape churn, not capacity. */
++    {
++        static unsigned kept, dropped, seq2;
++
++        if (pooled) ++kept; else ++dropped;
++        if (neutron_perf() && ((seq2++) & 0x1FF) == 0)
++            ERR("neutron-wicpool: put kept=%u dropped_full=%u  %ux%u\n",
++                kept, dropped, rt->width, rt->height);
++    }
+     LeaveCriticalSection(&factory->cs);
+ 
+     if (pooled)
+@@ -872,6 +924,17 @@
+     return pooled;
+ }
+ 
++/* Destroy one parked target. Caller holds factory->cs and has already unlinked it. */
++static void d2d_wic_render_target_pool_destroy(struct d2d_wic_render_target *rt)
++{
++    if (rt->pool_rtv)
++        ID3D10RenderTargetView_Release(rt->pool_rtv);
++    ID3D10Texture2D_Release(rt->readback_texture);
++    IUnknown_Release(rt->dxgi_inner);
++    IDXGISurface_Release(rt->dxgi_surface);
++    free(rt);
++}
++
+ void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory)
+ {
+     struct d2d_wic_render_target *rt, *rt2;
+@@ -879,12 +942,7 @@
+     LIST_FOR_EACH_ENTRY_SAFE(rt, rt2, &factory->wic_rt_pool, struct d2d_wic_render_target, pool_entry)
+     {
+         list_remove(&rt->pool_entry);
+-        if (rt->pool_rtv)
+-            ID3D10RenderTargetView_Release(rt->pool_rtv);
+-        ID3D10Texture2D_Release(rt->readback_texture);
+-        IUnknown_Release(rt->dxgi_inner);
+-        IDXGISurface_Release(rt->dxgi_surface);
+-        free(rt);
++        d2d_wic_render_target_pool_destroy(rt);
+     }
+     factory->wic_rt_pool_size = 0;
+ }
