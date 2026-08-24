@@ -1,0 +1,95 @@
+diagnostics: gate the window show/hide/reparent probes properly
+
+The first pass gated neutron_log_shown() and missed that "neutron-show:" has a SECOND,
+independent emitter in show_window(). Measured on the 11.10-60 smoke run: Photoshop
+still logged 315 of those lines while Premiere and Lightroom logged none, because only
+PS walks the OWL dock hierarchy that site traces.
+
+⭐ Grep for the MESSAGE, not the function, when gating a diagnostic.
+
+Now behind one shared gate (NEUTRON_SHOW_TRACE), measured per session:
+    436  show_window "neutron-show:"        (Photoshop)
+    530  NtUserSetParent "neutron-reparent" (Photoshop; 124 LrC, 106 Premiere)
+    160  apply_window_pos "NEUTRON-AWP"     (Lightroom; already sampled 1-in-256)
+
+⚠️ Both of the newly gated sites have REAL BEHAVIOUR after the log -- the reparent block
+handles Owl.Orphanage, and neutron_on_window_hidden() dismisses the welcome window so
+Photoshop's File->New docks. Only the ERR is gated in each; an early return would have
+silently disabled a shipped fix. That trap has now come up twice in this cleanup.
+
+Left alone deliberately:
+  * comctl32 trackbar "unknown msg" (1473 lines in Lightroom) and header -- UPSTREAM
+    Wine errors, not our probes. Silencing upstream diagnostics could hide real gaps.
+  * nvcuda "neutron-2d" (842 lines in Premiere) -- built outside this repo, in
+    ~/nvidia-libs. Verified separately that the prefix's nvcuda IS the gated build
+    (NEUTRON_CUDA_PLAYBACK_EXPERIMENT present), which is the one that matters: the
+    ungated diag build crashes CUDA exports.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -34,6 +34,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ 
++static BOOL neutron_show_trace(void);  /* NEUTRON: one gate for the show/hide/reparent probes */
++
+ #define USER_HANDLE_TO_INDEX(hwnd) ((LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1)
+ #define USER_HANDLE_FROM_INDEX(index, generation) UlongToHandle( (index << 1) + FIRST_USER_HANDLE + (generation << 16) )
+ 
+@@ -644,7 +646,9 @@
+         for (i = 0; i < l; i++) cb[i] = (char)cw[i]; cb[l] = 0;
+         l = NtUserGetClassName( parent, FALSE, &pn ); if (l < 0 || l >= 64) l = 0;
+         for (i = 0; i < l; i++) pb[i] = (char)pw[i]; pb[l] = 0;
+-        ERR( "neutron-reparent: hwnd=%p class=%s -> parent=%p class=%s\n", hwnd, cb, parent, pb );
++        /* ⚠️ Gate the LOG ONLY -- the Owl.Orphanage handling below is real behaviour. */
++        if (neutron_show_trace())
++            ERR( "neutron-reparent: hwnd=%p class=%s -> parent=%p class=%s\n", hwnd, cb, parent, pb );
+         {
+             static const char orph[] = "Owl.Orphanage";
+             int k; for (k = 0; orph[k] && pb[k] == orph[k]; k++);
+@@ -2622,7 +2626,8 @@
+                                         get_driver_window_surface( new_surface, raw_dpi ) );
+         {
+             static unsigned neutron_awp_n;
+-            if (((neutron_awp_n++) & 0xFF) == 0)
++            /* Sampled 1-in-256 already, which still left 160 lines in one Lightroom session. */
++            if (neutron_show_trace() && ((neutron_awp_n++) & 0xFF) == 0)
+                 ERR("NEUTRON-AWP hwnd=%p toplevel=%p swp=%08x win=(%d,%d,%d,%d) old=(%d,%d,%d,%d)\n",
+                     hwnd, toplevel, swp_flags,
+                     (int)new_rects->window.left, (int)new_rects->window.top,
+@@ -5257,10 +5262,19 @@
+ 
+ /* NEUTRON diag: log when a substantial window becomes visible, with class/size/root, so we can
+    see per-make whether PS shows the doc canvas early (make-1) or defers it (~make-5). */
++/* NEUTRON RELEASE HYGIENE: one cached gate for every window show/hide probe. */
++static BOOL neutron_show_trace(void)
++{
++    static int on = -1;
++
++    if (on < 0) { const char *e = getenv( "NEUTRON_SHOW_TRACE" ); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++
+ static void neutron_log_shown( HWND hwnd, const char *via )
+ {
+-    /* NEUTRON RELEASE HYGIENE: 154 lines in one measured Premiere session. Gated at the helper so
+-     * every call site is covered, and it also skips the class-name lookup when off. */
++    /* 154 lines in one measured Premiere session. Gated at the helper so every call site is
++     * covered, and it also skips the class-name lookup when off. */
+     static int on = -1;
+     WCHAR bufW[64];
+     char buf[64];
+@@ -5430,6 +5444,11 @@
+ 
+     TRACE( "hwnd=%p, cmd=%d, was_visible %d\n", hwnd, cmd, was_visible );
+ 
++    /* ⚠️ A SECOND emitter, independent of neutron_log_shown(). Gating only that helper left this
++     * one live: Photoshop still logged 315 lines while Premiere and Lightroom logged none, because
++     * only PS walks the OWL dock hierarchy this traces. Grep for the MESSAGE, not the function,
++     * when gating a diagnostic. */
++    if (neutron_show_trace())
+     {   /* NEUTRON-show: trace shows/hides of the OWL dock hierarchy + doc/float windows via ANY call path
+            (IAT, GetProcAddress, or direct NtUserShowWindow) to find why the doc never docks into OWL.TabGroup. */
+         WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
