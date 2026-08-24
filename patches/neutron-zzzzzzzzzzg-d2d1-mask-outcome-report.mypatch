@@ -1,0 +1,333 @@
+d2d1: report the layer-mask outcome, not the rect decomposition's opinion
+
+The mask diagnostics were lying, and lying in the direction that costs time.
+
+install_mask_rects() logs "bounding box in force" whenever it declines to
+decompose a mask into scissor rects. But declining is not the outcome:
+PushLayer then tries the path stencil, which since the histogram work carries
+almost all of those masks exactly. A 2026-08-13 Premiere capture holds 668
+FILLMODE=ALTERNATE lines and 436 non-rectangle lines, every one of them
+reading as a live correctness hole -- and the wiki's standing P1 theory for
+the vanishing tool buttons rested on exactly those lines.
+
+Measured with a new harness (preserved-fixes/harnesses/d2d-alternate-hole-probe.c)
+on 11.10-61, three ALTERNATE geometry groups used as layer masks:
+
+  n=2 rect ring    -> mask_rects decomposes into 4 scissors   hole preserved
+  n=3, two holes   -> declines, logs "bounding box in force"  hole preserved (stencil)
+  diamond ring     -> declines, logs "bounding box in force"  hole preserved (stencil)
+
+So the ALTERNATE hole is already closed. Only the message was wrong.
+
+The reason is now recorded on the context and reported by PushLayer once the
+stencil decision is known:
+
+  stencilled     -> MASKSTENCIL <reason> ... the bounding box is NOT in force
+                    (optrace-gated; this is the normal, correct case)
+  not stencilled -> MASKFALLBACK <reason> ... BOUNDING BOX IN FORCE
+                    (unconditional for the first 16, then counted -- this one
+                     is the real defect and must not need a debug flag to see)
+
+The single-shape case (a mask that is not a geometry group at all -- Lightroom's
+histogram curves) was silent in both directions before and is now reported the
+same way.
+
+Both PushLayer entry points carried a verbatim copy of the stencil block; they
+are one helper now. Wiring one and forgetting the other only shows up in
+whichever app happens to use the other vtbl.
+
+Adds NEUTRON_D2D_STENCIL=0. Operationally it answers "is the stencil doing
+this?" on a user's box without a rebuild. Methodologically it is the only way
+to exercise the BOUNDING-BOX-IN-FORCE branch: with the stencil on, every mask
+the probe can build is carried, so that branch would have shipped never having
+run once. With it off the probe floods 3/3 and the branch fires on exactly the
+two cases whose pixels actually flood -- message and pixels agree.
+
+Verified against d2d-layermask-probe, d2d-greenfill-selftest, d2d-earclip-probe,
+d2d-earclip-strict and d2d-gradient-probe: no change.
+
+Also fixes a double count found next door: the ID2D1DeviceContext PushLayer
+called neutron_op(NEUTRON_OP_PUSHLAYER) twice, so the op census reported
+double the PushLayers for any app on that vtbl while the ID2D1RenderTarget
+entry point counted once. That census is the ops-per-present table that
+cracked the WIC retained-content bug.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -219,6 +219,23 @@
+ 
+ /* NEUTRON LAYER-MASK RECTS (env NEUTRON_D2D_MASKRECTS, default ON, 0 to disable): scissor
+  * draws inside a layer to the mask's individual rectangles rather than their bounding box. */
++/* NEUTRON: kill switch for the path-mask stencil (NEUTRON_D2D_STENCIL=0 -> off).
++ * Two reasons it exists. Operationally, the stencil is the newest and most invasive thing in the
++ * layer path, and turning it off without a rebuild is the fastest way to answer "is the stencil
++ * doing this?" on a user's box. Methodologically, it is the ONLY way to exercise the
++ * bounding-box-in-force branch of the mask report: with the stencil on, every mask the probe can
++ * construct is carried, so that branch would ship having never once run. */
++static inline BOOL neutron_stencil(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        v = (GetEnvironmentVariableA("NEUTRON_D2D_STENCIL", buf, sizeof(buf)) && buf[0] == '0') ? 0 : 1;
++    }
++    return v;
++}
++
+ static inline BOOL neutron_maskrects(void)
+ {
+     static int v = -1;
+@@ -715,6 +732,14 @@
+     D2D1_RECT_F mask_rects[256];
+     unsigned mask_rect_count;
+     unsigned mask_owner;        /* layer index that installed the list, +1 (0 = none) */
++    /* NEUTRON: why the rect decomposition declined this layer's mask, recorded rather than
++     * logged. The old code logged "bounding box in force" AT the decline -- but the decline is
++     * not the outcome: PushLayer then tries the path stencil, which usually carries the mask
++     * exactly. A 2026-08-13 Premiere capture is full of those lines (668 ALTERNATE, 436
++     * non-rectangle) and every one of them reads as a live correctness hole that isn't. Hold the
++     * reason until the stencil decision is known, then report what ACTUALLY happened. */
++    const char *mask_declined;  /* static string, NULL = the mask was representable */
++    unsigned mask_declined_n;   /* member count that went with it */
+     unsigned last_op;           /* NEUTRON op-trace: most recent primitive id */
+     /* NEUTRON REGION READBACK: a persistent staging texture for pulling just the drawn
+      * region back to the CPU, instead of IDXGISurface1::GetDC copying the WHOLE surface
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -403,6 +403,15 @@
+     return count;
+ }
+ 
++/* NEUTRON: record WHY the rect decomposition declined a mask. Deliberately not logged here --
++ * see mask_declined in d2d1_private.h. The reason must be a string literal; it outlives the call. */
++static void d2d_device_context_mask_declined(struct d2d_device_context *context,
++        const char *reason, unsigned n)
++{
++    context->mask_declined = reason;
++    context->mask_declined_n = n;
++}
++
+ /* NEUTRON LAYER-MASK RECTS: if a layer's geometric mask is a WINDING geometry group of
+  * disjoint rectangles -- a dirty region -- record the pieces in device pixels so each draw
+  * inside the layer can be scissored to them individually. Clipping to the bounding box
+@@ -424,9 +433,16 @@
+     BOOL ok = TRUE;
+ 
+     if (!neutron_maskrects() || context->mask_owner)
+-        return FALSE;
++        return FALSE;   /* not a decline: an ancestor layer already installed the rect list */
+     if (FAILED(ID2D1Geometry_QueryInterface(mask, &IID_ID2D1GeometryGroup, (void **)&group)))
++    {
++        /* A single shape rather than a group -- Lightroom's histogram curves are these. There is
++         * nothing to decompose, so the stencil is the ONLY thing standing between the mask and a
++         * plain bounding-box clip. Record it so the report below can say which of those two
++         * actually happened; before, this path was silent either way. */
++        d2d_device_context_mask_declined(context, "mask is a single shape, not a geometry group", 1);
+         return FALSE;
++    }
+ 
+     n = ID2D1GeometryGroup_GetSourceGeometryCount(group);
+     fillmode = ID2D1GeometryGroup_GetFillMode(group);
+@@ -453,18 +469,15 @@
+          * (one occurrence in a 76-minute editing capture), so it cannot spam a log. Everything
+          * else in this block stays behind NEUTRON_D2D_OPTRACE, because the non-rectangle case
+          * fires thousands of times per session. */
+-        if (n > ARRAY_SIZE(srcs))
+-            ERR("neutron-dr: MASKFALLBACK OVER-CAP n=%u (limit %u) -- bounding box in force; "
+-                "raise mask_rects[] in d2d1_private.h\n", n, (unsigned)ARRAY_SIZE(srcs));
++        d2d_device_context_mask_declined(context,
++                n > ARRAY_SIZE(srcs) ? "OVER-CAP (raise mask_rects[] in d2d1_private.h)"
++                                     : "FILLMODE=ALTERNATE (a hole; the bbox would over-include it)",
++                n);
+ 
+         if (neutron_optrace())
+         {
+             static LONG dumps;
+ 
+-            if (n <= ARRAY_SIZE(srcs))
+-                ERR("neutron-dr: MASKFALLBACK FILLMODE=ALTERNATE n=%u -- bounding box in force "
+-                    "(a hole; the bbox over-includes it)\n", n);
+-
+             if (n && n <= ARRAY_SIZE(srcs) && InterlockedIncrement(&dumps) <= 8)
+             {
+                 ID2D1Geometry *dump[ARRAY_SIZE(context->mask_rects)] = {0};
+@@ -586,8 +599,7 @@
+     }
+     if (!ok || !count)
+     {
+-        if (neutron_optrace())
+-            ERR("neutron-dr: MASKFALLBACK non-rectangle member (n=%u) -- bounding box in force\n", n);
++        d2d_device_context_mask_declined(context, "non-rectangle member", n);
+         return FALSE;
+     }
+ 
+@@ -600,9 +612,7 @@
+ 
+         if (count != 2 || !(fc = d2d_mask_rects_from_alternate_pair(&rects[0], &rects[1], frame)))
+         {
+-            if (neutron_optrace())
+-                ERR("neutron-dr: MASKFALLBACK ALTERNATE pair not a hole (count=%u) -- bounding box in force\n",
+-                        count);
++            d2d_device_context_mask_declined(context, "ALTERNATE pair is not a hole", count);
+             return FALSE;
+         }
+         if (neutron_optrace())
+@@ -620,8 +630,7 @@
+             if (rects[i].left < rects[j].right && rects[j].left < rects[i].right
+                     && rects[i].top < rects[j].bottom && rects[j].top < rects[i].bottom)
+             {
+-                if (neutron_optrace())
+-                    ERR("neutron-dr: MASKFALLBACK overlapping pieces (n=%u) -- bounding box in force\n", count);
++                d2d_device_context_mask_declined(context, "overlapping pieces", count);
+                 return FALSE;
+             }
+         }
+@@ -3327,29 +3336,24 @@
+     context->drawing_state.transform = saved;
+ }
+ 
+-static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *iface,
+-        const D2D1_LAYER_PARAMETERS *layer_parameters, ID2D1Layer *layer)
++/* NEUTRON PATH-MASK STENCIL: the layer clip is the mask's BOUNDING BOX, correct only when the
++ * mask is that rectangle or was decomposed into mask_rects. When it is a genuine shape --
++ * Lightroom masks each histogram channel to its curve, then fills the whole box -- the box lets
++ * the fill flood it. Stencil the shape as well and test every draw inside the layer against it.
++ * The box clip stays: a valid superset, and the cheap scissor still does most of the rejection.
++ *
++ * Both ID2D1DeviceContext::PushLayer and the older ID2D1RenderTarget::PushLayer land here. They
++ * used to carry a verbatim copy of this each; wiring one and forgetting the other is a bug that
++ * only shows up in whichever app happens to use the other vtbl. One copy now. */
++static void d2d_device_context_push_layer_stencil(struct d2d_device_context *context,
++        const D2D1_LAYER_PARAMETERS *layer_parameters)
+ {
+-    NEUTRON_API_TIME();
+-    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+-    neutron_op(context, NEUTRON_OP_PUSHLAYER);
++    BOOL stencilled = FALSE;
+ 
+-    TRACE("iface %p, layer_parameters %p, layer %p.\n", iface, layer_parameters, layer);
+-
+-    neutron_op(context, NEUTRON_OP_PUSHLAYER);
+-    if (layer_parameters)
+-        d2d_device_context_push_layer_clip(context, &layer_parameters->contentBounds,
+-                layer_parameters->geometricMask, &layer_parameters->maskTransform);
+-
+-    /* NEUTRON PATH-MASK STENCIL: the clip above is the mask's BOUNDING BOX, correct only when the
+-     * mask is that rectangle or decomposed into mask_rects. When it is a genuine shape --
+-     * Lightroom masks each histogram channel to its curve, then fills the whole box -- the box
+-     * lets the fill flood it. Stencil the shape as well and test every draw inside the layer
+-     * against it. The box clip stays: a valid superset, and the cheap scissor still does most of
+-     * the rejection. */
+     if (context->layer_depth < ARRAY_SIZE(context->layer_stencilled))
+         context->layer_stencilled[context->layer_depth] = 0;
+-    if (layer_parameters && layer_parameters->geometricMask && !context->mask_rect_count
++    if (neutron_stencil()
++            && layer_parameters && layer_parameters->geometricMask && !context->mask_rect_count
+             && context->layer_depth < ARRAY_SIZE(context->stencil_mask)
+             && context->target.type == D2D_TARGET_BITMAP
+             && d2d_device_context_mask_is_stencillable(layer_parameters->geometricMask)
+@@ -3373,7 +3377,62 @@
+         context->stencil_mask_transform[slot] = layer_parameters->maskTransform;
+         context->layer_stencilled[slot] = 1;
+         ++context->stencil_depth;
++        stencilled = TRUE;
++    }
++
++    /* Now -- and only now -- is the outcome known. Report what happened, not what the rect
++     * decomposition wanted. Declining to decompose is NOT a defect if the stencil then carries
++     * the mask exactly; saying "bounding box in force" there sent a reader hunting a closed bug.
++     * The genuinely defective case is the other branch: no rects AND no stencil means the layer
++     * really is clipped to the mask's bounding box, so a fill inside it can wipe content the
++     * mask excludes. That one is worth saying out loud, but it is also potentially per-frame, so
++     * cap it and count the rest. */
++    if (context->mask_declined)
++    {
++        if (stencilled)
++        {
++            if (neutron_optrace())
++                ERR("neutron-dr: MASKSTENCIL %s (n=%u) -- no rect decomposition, but the path "
++                    "stencil carries this mask; the bounding box is NOT in force\n",
++                    context->mask_declined, context->mask_declined_n);
++        }
++        else
++        {
++            static LONG shouted, suppressed;
++
++            if (InterlockedIncrement(&shouted) <= 16)
++                ERR("neutron-dr: MASKFALLBACK %s (n=%u) -- BOUNDING BOX IN FORCE (no rects, no "
++                    "stencil): a fill inside this layer can wipe content the mask excludes\n",
++                    context->mask_declined, context->mask_declined_n);
++            else if (InterlockedIncrement(&suppressed) == 1)
++                ERR("neutron-dr: MASKFALLBACK further occurrences suppressed -- "
++                    "set NEUTRON_D2D_OPTRACE=1 for all of them\n");
++            else if (neutron_optrace())
++                ERR("neutron-dr: MASKFALLBACK %s (n=%u) -- BOUNDING BOX IN FORCE\n",
++                    context->mask_declined, context->mask_declined_n);
++        }
++        context->mask_declined = NULL;
+     }
++}
++
++static void STDMETHODCALLTYPE d2d_device_context_PushLayer(ID2D1DeviceContext6 *iface,
++        const D2D1_LAYER_PARAMETERS *layer_parameters, ID2D1Layer *layer)
++{
++    NEUTRON_API_TIME();
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++
++    TRACE("iface %p, layer_parameters %p, layer %p.\n", iface, layer_parameters, layer);
++
++    /* NEUTRON: counted ONCE. This was counted twice here and once in the ID2D1RenderTarget
++     * PushLayer below, so the op census reported double the PushLayers for any app on the modern
++     * vtbl and the two entry points disagreed. That census is the table that cracked the WIC
++     * retained-content bug -- an inflated count in it misleads exactly the same way. */
++    neutron_op(context, NEUTRON_OP_PUSHLAYER);
++    if (layer_parameters)
++        d2d_device_context_push_layer_clip(context, &layer_parameters->contentBounds,
++                layer_parameters->geometricMask, &layer_parameters->maskTransform);
++
++    d2d_device_context_push_layer_stencil(context, layer_parameters);
+     ++context->layer_depth;
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
+@@ -4592,39 +4651,7 @@
+         d2d_device_context_push_layer_clip(context, &layer_parameters->contentBounds,
+                 layer_parameters->geometricMask, &layer_parameters->maskTransform);
+ 
+-    /* NEUTRON PATH-MASK STENCIL: the clip above is the mask's BOUNDING BOX, correct only when the
+-     * mask is that rectangle or decomposed into mask_rects. When it is a genuine shape --
+-     * Lightroom masks each histogram channel to its curve, then fills the whole box -- the box
+-     * lets the fill flood it. Stencil the shape as well and test every draw inside the layer
+-     * against it. The box clip stays: a valid superset, and the cheap scissor still does most of
+-     * the rejection. */
+-    if (context->layer_depth < ARRAY_SIZE(context->layer_stencilled))
+-        context->layer_stencilled[context->layer_depth] = 0;
+-    if (layer_parameters && layer_parameters->geometricMask && !context->mask_rect_count
+-            && context->layer_depth < ARRAY_SIZE(context->stencil_mask)
+-            && context->target.type == D2D_TARGET_BITMAP
+-            && d2d_device_context_mask_is_stencillable(layer_parameters->geometricMask)
+-            && d2d_device_context_ensure_stencil(context))
+-    {
+-        unsigned int slot = context->layer_depth;
+-        static LONG announced;
+-
+-        /* One line, once per process: a smoke test where this path never runs and one where it
+-         * runs correctly look identical otherwise, and "looks fine" is not evidence that the new
+-         * code was exercised. */
+-        if (!InterlockedExchange(&announced, 1))
+-            ERR("neutron-stencil: shaped layer mask engaged (target %ux%u) -- "
+-                "masks now stencilled rather than clipped to their bounds\n",
+-                context->pixel_size.width, context->pixel_size.height);
+-
+-        d2d_device_context_stencil_mask(context, layer_parameters->geometricMask,
+-                &layer_parameters->maskTransform, +1);
+-        context->stencil_mask[slot] = layer_parameters->geometricMask;
+-        ID2D1Geometry_AddRef(context->stencil_mask[slot]);
+-        context->stencil_mask_transform[slot] = layer_parameters->maskTransform;
+-        context->layer_stencilled[slot] = 1;
+-        ++context->stencil_depth;
+-    }
++    d2d_device_context_push_layer_stencil(context, layer_parameters);
+     ++context->layer_depth;
+ 
+     if (context->target.type == D2D_TARGET_COMMAND_LIST)
