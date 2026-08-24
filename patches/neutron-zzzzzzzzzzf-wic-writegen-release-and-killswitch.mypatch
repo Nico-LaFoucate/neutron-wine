@@ -1,0 +1,115 @@
+windowscodecs: bump the write generation on RELEASE, and never skip while a lock is held
+
+The v3 counter bumped only when a write lock was ACQUIRED. An application that takes one
+lock and keeps writing through the raw pointer bumps it once and never again, so its
+bitmap looks untouched forever -- and a consumer skipping the seed on that basis serves
+the pixels from before the writes.
+
+Now the generation also bumps on release, so any lock/unlock cycle is visible, and
+GetWriteGeneration reports ~0u while a write lock is OUTSTANDING: pixels that may be
+changing right now can never be matched, so the caller must seed.
+
+Adds NEUTRON_WIC_SEED_SKIP=0 to disable the skip entirely. A correctness-sensitive
+optimisation spanning two DLLs should be A/B-able on a live application without a
+rebuild.
+
+⭐ WHICH IS HOW THE SUSPECTED REGRESSION WAS CLEARED. The user reported the leading edge
+of the timeline's audio track coming up empty while scrolling, its waveform arriving a
+moment later -- exactly what a stale skip looks like. With the switch OFF the artifact was
+identical, so it is pre-existing (Premiere renders waveforms asynchronously) and not ours.
+The hardening above stands on its own merits regardless.
+
+⚠️ AND IT CORRECTS A NUMBER. The 18 -> 25 fps reported for the seed skip compared two
+different sessions. Measured properly, same session and same scrolling:
+
+    skip on     87.6% skipped    96 MB/s upload    24 fps
+    skip off     0.0% skipped   796 MB/s upload    22 fps
+
+So +2 fps, not +7. The copy reduction (-88%) is the solid, session-independent result;
+the frame rate depends on how hard the timeline is being scrolled.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -855,8 +855,21 @@
+         INeutronWicGpuBitmap3 *gen_iface;
+         ULONG gen = 0;
+         BOOL untouched = FALSE;
++        static int enabled = -1;
+ 
+-        if (rt->bitmap && SUCCEEDED(IWICBitmap_QueryInterface(rt->bitmap,
++        /* NEUTRON kill switch: NEUTRON_WIC_SEED_SKIP=0 restores the unconditional seed. This is a
++         * correctness-sensitive optimisation over an interface between two DLLs -- being able to
++         * A/B it on a live app without a rebuild is worth one env read. */
++        if (enabled < 0)
++        {
++            char buf[8];
++            enabled = (GetEnvironmentVariableA("NEUTRON_WIC_SEED_SKIP", buf, sizeof(buf))
++                    && buf[0] == '0') ? 0 : 1;
++            if (!enabled)
++                ERR("neutron-seed: NEUTRON_WIC_SEED_SKIP=0 -- seeding unconditionally\n");
++        }
++
++        if (enabled && rt->bitmap && SUCCEEDED(IWICBitmap_QueryInterface(rt->bitmap,
+                 &IID_INeutronWicGpuBitmap3, (void **)&gen_iface)))
+         {
+             if (SUCCEEDED(gen_iface->lpVtbl->GetWriteGeneration(gen_iface, &gen)))
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -74,6 +74,7 @@
+     /* NEUTRON v3: bumped by anything that can put new pixels in this bitmap, so a consumer can
+      * tell "untouched since I last looked" from "rewritten". See wine/neutron_wicgpu.h. */
+     ULONG write_gen;
++    ULONG write_locks_held;   /* NEUTRON v3: outstanding write locks; never skip while non-zero */
+     INeutronWicGpuBitmap2 INeutronWicGpuBitmap2_iface;
+     INeutronWicGpuBitmap3 INeutronWicGpuBitmap3_iface;
+ } BitmapImpl;
+@@ -131,7 +132,26 @@
+     {
+         LONG prev_val = This->lock, new_val;
+         if (prev_val == -1)
++        {
+             new_val = 0;
++            /* 🚨 NEUTRON v3: bump on RELEASE of a write lock, not only on acquire.
++             *
++             * A write lock hands out a raw pointer and the application may hold it while it keeps
++             * writing -- one acquire, then any amount of new content. Counting only acquisitions
++             * made such a bitmap look untouched forever, and a consumer that skips its upload on
++             * that basis shows the pixels from before the writes.
++             *
++             * MEASURED SYMPTOM (Premiere, 2026-08-24): scrolling the timeline left the leading
++             * edge of the audio track empty, its waveform arriving a moment later -- exactly a
++             * region the app had written through a held lock while we believed it unchanged.
++             *
++             * Bumping here means the generation differs across any lock/unlock cycle, held or
++             * not. Consumers must also refuse to skip while a write lock is OUTSTANDING, which is
++             * what write_locks_held below is for. */
++            ++This->write_gen;
++            if (This->write_locks_held)
++                --This->write_locks_held;
++        }
+         else
+             new_val = prev_val - 1;
+         if (prev_val == InterlockedCompareExchange(&This->lock, new_val, prev_val))
+@@ -551,7 +571,8 @@
+     if (flags & WICBitmapLockWrite)
+     {
+         This->pristine = FALSE;
+-        ++This->write_gen;     /* NEUTRON v3 */
++        ++This->write_gen;              /* NEUTRON v3 */
++        ++This->write_locks_held;       /* ...and no skipping while it is outstanding */
+     }
+ 
+     result = malloc(sizeof(BitmapLockImpl));
+@@ -758,7 +779,9 @@
+ 
+     if (!gen) return E_POINTER;
+     EnterCriticalSection(&This->cs);
+-    *gen = This->write_gen;
++    /* An outstanding write lock means pixels may be changing RIGHT NOW, so report a value the
++     * caller cannot match: it must seed. */
++    *gen = This->write_locks_held ? ~0u : This->write_gen;
+     LeaveCriticalSection(&This->cs);
+     return S_OK;
+ }
