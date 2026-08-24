@@ -1,0 +1,137 @@
+d2d1: measure our own memory traffic in the WIC path
+
+A whole-process profile of a zoomed Premiere timeline (perf + LBR, PE modules resolved
+through +loaddll because Wine maps them anonymously) shows the 26ms per frame OUTSIDE
+d2d1 is not Adobe's UI code at all:
+
+    22.83%  nvcuda.dll        CUDA / driver
+    15.96%  ucrtbase_orig     <- 11.85% of ALL samples is ONE function
+    15.78%  ntdll.dll
+     5.77%  dvacore.dll       Adobe's own code
+
+That one function is memcpy -- identified from its code shape (ERMSB feature-bit tests,
+rep movsb, overlap check, alignment prologue), since the export names would not resolve.
+So an eighth of the process is moving memory, and the LBR chain names both Adobe's
+UIFramework/dvaui and our d2d1/d3d11 around it -- not decisive either way.
+
+So measure ours directly. Per acquisition a WIC target is copied twice: seed_from_bitmap
+uploads the whole bitmap so retained content survives a partial redraw, and EndDraw
+reads it back. Measured:
+
+    readback      0.0 MB/s   <- the earlier read-through work genuinely eliminated it
+    seed upload  ~750 MB/s   <- ours, every frame
+
+And the seed is nearly always redundant: with the pool now at 99.4% hit rate, a target is
+re-acquired for the SAME bitmap it published last time in 99.8% of cases (25,537 vs 64).
+Its texture already holds those pixels.
+
+⚠️ Not yet acted on, because skipping the seed is only safe with an invalidation path:
+the application can write the bitmap through IWICBitmap::Lock(WICBitmapLockWrite) between
+our publish and the next acquire, and skipping then would publish stale pixels -- the same
+class of bug the seed was added to fix (the Premiere time ruler drawing blank).
+
+⚠️ Recorded because it cost a run: the census was first placed in
+d2d_wic_render_target_init, which since the pool fix runs almost never -- it reported ONE
+sample for a whole session while the uploads continued at full rate. The hot path is
+d2d_wic_render_target_reset_state. A counter that logs once while its subject runs
+thousands of times is measuring the wrong place.
+
+Both censuses are gated behind NEUTRON_D2D_PERF=1.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -436,6 +436,43 @@
+  *
+  * Seeding the texture from the bitmap makes the target retained the way the API
+  * says it is. Failure is non-fatal: it leaves the old blank-start behaviour. */
++
++/* NEUTRON COPY CENSUS: how much of the frame is OUR memory traffic?
++ *
++ * A whole-process profile of a zoomed timeline puts 11.85%% of ALL samples in one function --
++ * ucrtbase's memcpy (identified from its ERMSB/rep-movsb shape, not its name). The LBR chain names
++ * both Adobe's UIFramework/dvaui and our d2d1/d3d11 around it, which is not decisive.
++ *
++ * But our WIC path moves each surface TWICE per acquisition: seed_from_bitmap uploads the whole
++ * bitmap so retained content survives a partial redraw, and EndDraw memcpys it back row by row.
++ * At the measured ~9 targets/frame that is a lot of bytes. Count them and compare against the
++ * profile instead of guessing. */
++static void neutron_wic_bytes(size_t down, size_t up)
++{
++    static LONG64 total_down, total_up;
++    static ULONGLONG t0;
++    ULONGLONG now;
++
++    if (!neutron_perf())
++        return;
++
++    InterlockedExchangeAdd64(&total_down, down);
++    InterlockedExchangeAdd64(&total_up, up);
++
++    now = GetTickCount64();
++    if (!t0) t0 = now;
++    if (now - t0 >= 5000)
++    {
++        double secs = (now - t0) / 1000.0;
++
++        ERR("neutron-wiccopy: readback %.1f MB/s, seed upload %.1f MB/s (%.1f MB/s total)\n",
++            total_down / 1048576.0 / secs, total_up / 1048576.0 / secs,
++            (total_down + total_up) / 1048576.0 / secs);
++        total_down = total_up = 0;
++        t0 = now;
++    }
++}
++
+ /* Returns TRUE when the texture now holds the bitmap's pixels. FALSE means the caller must
+  * fall back to clearing: either there was nothing to seed from, or the bitmap is pristine
+  * (transparent) and a clear is both correct and free. */
+@@ -488,6 +525,7 @@
+         {
+             ID3D10Resource_GetDevice(resource, &device);
+             ID3D10Device_UpdateSubresource(device, resource, 0, NULL, data, pitch, 0);
++            neutron_wic_bytes(0, (size_t)pitch * rt->height);
+             ID3D10Device_Release(device);
+             ID3D10Resource_Release(resource);
+         }
+@@ -687,6 +725,7 @@
+     for (i = 0; i < render_target->height; ++i)
+     {
+         memcpy(dst, src, render_target->bpp * render_target->width);
++        neutron_wic_bytes(render_target->bpp * render_target->width, 0);
+ 
+         /* NEUTRON TIMEBAR PIXEL CENSUS: the paint test proved these strips reach the
+          * screen intact, so whatever is missing is missing INSIDE the surface. Count
+@@ -796,6 +835,24 @@
+      * d2d_wic_render_target_seed_from_bitmap). The clear stays as the fallback for
+      * when there is no bitmap to seed from, since publishing the previous tenant's
+      * pixels would be worse than publishing nothing. */
++    /* NEUTRON SEED CENSUS: is this target being re-acquired for the SAME bitmap it published last
++     * time? Then its texture already holds those pixels and this upload -- ~750 MB/s measured, and
++     * most of the 11.85%% of process samples sitting in memcpy -- is redundant.
++     *
++     * ⚠️ Placed HERE, in reset_state, not in init: init runs only for a NEW target, and with the
++     * pool now hitting 99.4%% that is almost never. Instrumenting it reported a single sample for a
++     * whole session while the uploads carried on at full rate. */
++    {
++        static unsigned same, different, seq;
++
++        if (rt->bitmap == rt->pool_last_bitmap) ++same; else ++different;
++        if (neutron_perf() && ((seq++) & 0xFF) == 0)
++            ERR("neutron-seed: SAME bitmap %u, different %u (%.1f%% same) %ux%u\n",
++                same, different, 100.0 * same / (same + different ? same + different : 1),
++                rt->width, rt->height);
++        rt->pool_last_bitmap = rt->bitmap;
++    }
++
+     if (d2d_wic_render_target_seed_from_bitmap(rt))
+     {
+         /* texture now matches the bitmap; nothing further to do */
+@@ -1226,6 +1283,7 @@
+     else
+         render_target->pool_context = NULL;
+ 
++
+     render_target->bitmap = bitmap;
+     IWICBitmap_AddRef(bitmap);
+ 
