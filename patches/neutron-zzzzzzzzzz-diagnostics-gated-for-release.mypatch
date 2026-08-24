@@ -1,0 +1,142 @@
+diagnostics: gate the high-volume probes behind env vars for release
+
+Measured in one Premiere session: 1,600 of 4,215 log lines were our own ERR probes.
+Gated, not deleted -- each is how something was traced and will be wanted again.
+
+    230  d2d1   "Ear-clipped N vertices into M faces"   -> NEUTRON_D2D_OPTRACE
+     48  d2d1   the per-vertex dump at a decline        -> NEUTRON_D2D_OPTRACE
+    242  win32u WH_SHELL delivery                       -> NEUTRON_SHELL_TRACE
+    154  win32u neutron-show: window shown              -> NEUTRON_SHOW_TRACE
+     55  win32u neutron-diag: HIDE                      -> NEUTRON_SHOW_TRACE
+     26  dwrite NEUTRON trimsign                        -> NEUTRON_DWRITE_TRACE
+
+Deliberately left UNCONDITIONAL, because a user's log must carry them:
+  * "found no ear ... not a simple polygon" -- a shape that will not render at all
+  * "AREA MISMATCH"                          -- a shape rendering WRONGLY, otherwise silent
+  * "neutron-stencil: shaped layer mask engaged" -- one line per process
+  * MASKFALLBACK OVER-CAP -- already unconditional by an earlier deliberate decision
+
+⚠️ One trap worth recording: neutron_on_window_hidden() is NOT only a diagnostic -- it also
+dismisses the welcome window so Photoshop's File->New docks on the first try. Gating it with
+an early return would have silently disabled that fix. Only its ERR is gated; the behaviour
+runs unchanged. neutron_log_shown() was checked and IS purely diagnostic, so it is gated at
+the top of the helper, which also skips its class-name lookup when off.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3192,6 +3192,7 @@
+                  * is actually left so the two can be told apart: genuine self-intersection, or
+                  * degenerate slivers we could drop. Bounded by the decline itself, a few dozen a
+                  * session at worst. */
++                if (neutron_optrace())
+                 {
+                     size_t d;
+ 
+@@ -3260,9 +3261,13 @@
+                 (long)geometry->fill.face_count, (long)n);
+     }
+ 
+-    /* ERR for the same reason as the decline above: bounded by CDT failures (a few dozen a session),
+-     * and it is the only positive evidence that this path works. */
+-    ERR("Ear-clipped %lu vertices into %lu faces (%lu collinear dropped).\n",
++    /* NEUTRON RELEASE HYGIENE: this fires on EVERY fallback -- 230 lines in one measured Premiere
++     * session, the single largest source of ERR spam in a shipped runtime. It is positive evidence
++     * that the path works, which is worth having on demand, so it moves behind NEUTRON_D2D_OPTRACE
++     * rather than being deleted. The two things a user's log must always carry stay unconditional:
++     * the DECLINE (a shape that will not render) and AREA MISMATCH (a shape rendering wrongly). */
++    if (neutron_optrace())
++        ERR("Ear-clipped %lu vertices into %lu faces (%lu collinear dropped).\n",
+             (long)n, (long)geometry->fill.face_count,
+             (long)(n - 2 - geometry->fill.face_count));
+     free(poly);
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -35,6 +35,18 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dwrite);
+ 
++/* NEUTRON: one env check, cached, for the dwrite probes that would otherwise ship as ERR spam. */
++static inline BOOL neutron_dwrite_trace(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        v = (GetEnvironmentVariableA("NEUTRON_DWRITE_TRACE", buf, sizeof(buf)) && buf[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
+ HMODULE dwrite_module = 0;
+ static IDWriteFactory7 *shared_factory;
+ static void release_shared_factory(IDWriteFactory7 *factory);
+@@ -1606,7 +1618,10 @@
+     TRACE("%p, %p, %p.\n", iface, format, trimming_sign);
+ 
+     hr = create_trimmingsign(iface, format, trimming_sign);
+-    ERR("NEUTRON trimsign format=%p hr=%#lx sign=%p\n", format, hr,
++    /* NEUTRON RELEASE HYGIENE: fires per ellipsis trimming sign -- 26 lines in one measured
++     * Premiere session and far more in Lightroom. Gated, not deleted. */
++    if (neutron_dwrite_trace())
++        ERR("NEUTRON trimsign format=%p hr=%#lx sign=%p\n", format, hr,
+         trimming_sign ? *trimming_sign : NULL);
+     return hr;
+ }
+--- a/dlls/win32u/hook.c
++++ b/dlls/win32u/hook.c
+@@ -482,7 +482,14 @@
+ 
+ LRESULT call_hooks( INT id, INT code, WPARAM wparam, LPARAM lparam, size_t lparam_size )
+ {
+-    if (id == WH_SHELL) ERR( "neutron-shell: deliver WH_SHELL code=%d hwnd=%p\n", code, (HWND)wparam );
++    /* NEUTRON RELEASE HYGIENE: 242 lines in one measured Premiere session. Gated, not deleted --
++     * it is how the shell-hook delivery path was traced. */
++    if (id == WH_SHELL)
++    {
++        static int on = -1;
++        if (on < 0) { const char *e = getenv( "NEUTRON_SHELL_TRACE" ); on = (e && e[0] == '1') ? 1 : 0; }
++        if (on) ERR( "neutron-shell: deliver WH_SHELL code=%d hwnd=%p\n", code, (HWND)wparam );
++    }
+     return call_message_hooks( id, code, wparam, lparam, lparam_size, 0, FALSE );
+ }
+ 
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5259,12 +5259,17 @@
+    see per-make whether PS shows the doc canvas early (make-1) or defers it (~make-5). */
+ static void neutron_log_shown( HWND hwnd, const char *via )
+ {
++    /* NEUTRON RELEASE HYGIENE: 154 lines in one measured Premiere session. Gated at the helper so
++     * every call site is covered, and it also skips the class-name lookup when off. */
++    static int on = -1;
+     WCHAR bufW[64];
+     char buf[64];
+     UNICODE_STRING name;
+     RECT rc;
+     HWND root;
+     int len, i;
++    if (on < 0) { const char *e = getenv( "NEUTRON_SHOW_TRACE" ); on = (e && e[0] == '1') ? 1 : 0; }
++    if (!on) return;
+     rc.left = rc.top = rc.right = rc.bottom = 0;
+     get_client_rect( hwnd, &rc, get_thread_dpi() );
+     if (rc.right - rc.left < 200 || rc.bottom - rc.top < 200) return;  /* skip small controls */
+@@ -5316,8 +5321,15 @@
+     if (neutron_class_is( hwnd, neutron_welcome_class )) return;  /* don't recurse on our own hide */
+     rc.left = rc.top = rc.right = rc.bottom = 0;
+     get_client_rect( hwnd, &rc, get_thread_dpi() );
+-    ERR( "neutron-diag: HIDE hwnd=%p size=%ldx%ld\n", hwnd,
+-         (long)(rc.right - rc.left), (long)(rc.bottom - rc.top) );
++    /* ⚠️ Gate the LOG ONLY. This function also dismisses the welcome window so Photoshop's
++     * File->New docks on the first try -- an early return here would silently disable that. */
++    {
++        static int hide_on = -1;
++        if (hide_on < 0) { const char *e = getenv( "NEUTRON_SHOW_TRACE" ); hide_on = (e && e[0] == '1') ? 1 : 0; }
++        if (hide_on)
++            ERR( "neutron-diag: HIDE hwnd=%p size=%ldx%ld\n", hwnd,
++                 (long)(rc.right - rc.left), (long)(rc.bottom - rc.top) );
++    }
+     if (rc.right - rc.left < 400 || rc.bottom - rc.top < 300) return;  /* substantial workspace window */
+     root = NtUserGetAncestor( hwnd, GA_ROOT );
+     if (!root) return;
