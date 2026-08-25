@@ -57,6 +57,9 @@ TREE="$(cd "$TREE" && pwd)"
 # comparison cannot tell you WHICH of the two is wrong. This one can.
 # ---------------------------------------------------------------------------
 _inf="$TREE/share/wine/wine.inf"
+if [ ! -f "$_inf" ]; then
+    echo "package: NOTE - no share/wine/wine.inf in the tree; base-drift gate skipped." >&2
+fi
 if [ -f "$_inf" ]; then
     _same=0; _diff=0; _difflist=""
     for _other in "$HOME"/.local/share/neutron/runtimes/neutron-wine-*/share/wine/wine.inf; do
@@ -67,6 +70,14 @@ if [ -f "$_inf" ]; then
              _difflist="$_difflist $(basename "$(dirname "$(dirname "$(dirname "$_other")")")")"
         fi
     done
+    if [ "$_same" -eq 0 ] && [ "$_diff" -eq 0 ]; then
+        # ⛔ SAY SO. The first run of this gate compared against a runtime dir that did not exist
+        # yet (the version being packaged is not installed until after packaging), so every
+        # comparison was skipped and the gate printed NOTHING -- indistinguishable from "all
+        # clear". A gate that cannot run must never look like a gate that passed.
+        echo "package: ⚠️  base-drift gate had NOTHING to compare against (no other runtime" >&2
+        echo "   installed). This build's base is UNVERIFIED, not verified." >&2
+    fi
     if [ "$_same" -eq 0 ] && [ "$_diff" -gt 0 ]; then
         echo "package: ⛔ BASE DRIFT — this build's wine.inf matches NO installed runtime ($_diff differ)." >&2
         echo "   The base tree changed under us. Investigate before shipping; do NOT pin the mtime." >&2
