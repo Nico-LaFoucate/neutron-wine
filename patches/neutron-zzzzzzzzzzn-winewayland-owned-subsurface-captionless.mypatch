@@ -1,0 +1,47 @@
+winewayland: scope the owned-subsurface rule to CAPTION-LESS windows
+
+A wl_subsurface is positioned by US -- that is the entire point of the previous
+commit, and what makes cross-window coordinates exact again. But it also means
+the COMPOSITOR cannot move it. So anything the user drags by a title bar must
+stay an xdg_toplevel, and a caption is exactly that signal.
+
+The first cut converted EVERY managed owned window, which would have taken
+Photoshop's Image Size, Preferences, Export Settings and every other owned
+dialog with it -- windows people move constantly. That was casting far wider
+than the defect needed.
+
+The discriminator came from the user, describing the panel the fix was written
+for: "This panel can't move and was never designed to move." A caption-less
+owned tool window has nothing to lose by becoming a subsurface; a captioned
+dialog has everything to lose. Captioned owned windows stay the business of
+NEUTRON_DOCK_OWNED, which is opt-in for precisely that reason.
+
+Also folds in the user's verification of the previous commit: hide/reshow of the
+Button Editor works correctly, so the empty-subsurface trap from the Lightroom
+filmstrip work does not bite here.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -780,11 +780,21 @@
+         if (neutron_owned_subsurface() && managed && !owner && toplevel == hwnd)
+         {
+             HWND gwowner = NtUserGetWindowRelative( hwnd, GW_OWNER );
++            DWORD st = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+ 
+             /* GW_OWNER is NULL for exactly the windows this is meant to catch; owner_hint is the
+              * value win32u actually passed us and it is correct. */
+             if (!gwowner) gwowner = owner_hint;
+-            if (gwowner && gwowner != hwnd && NtUserIsWindowVisible( gwowner ))
++
++            /* ⛔ CAPTION-LESS ONLY. A subsurface is positioned by us, which is the whole point --
++             * but it also means the COMPOSITOR cannot move it, so anything the user drags by a
++             * title bar must stay an xdg_toplevel. A caption is exactly that signal. The user, on
++             * the panel this was written for: "This panel can't move and was never designed to
++             * move" -- so it loses nothing, while Image Size / Preferences / Export Settings keep
++             * the behaviour people expect. Captioned owned windows remain the business of
++             * NEUTRON_DOCK_OWNED above, which is opt-in for that reason. */
++            if (gwowner && gwowner != hwnd && !(st & WS_CAPTION) &&
++                NtUserIsWindowVisible( gwowner ))
+             {
+                 ERR( "neutron-ownedsub: hwnd=%p (style=%08x ex=%08x) -> SUBSURFACE of owner=%p "
+                      "so its position is ours to set, not the compositor's\n",
