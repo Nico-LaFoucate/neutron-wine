@@ -1,0 +1,58 @@
+winewayland: NEUTRON_PEN_GEOM=1 — dump every term of the pen's screen mapping
+
+The trace that root-caused the pen drag-targeting offset. Per pen sample it
+prints the hwnd, the surface-local coords, the surface scale, the driver's
+surface rect, win32u's authoritative window rect, and the computed screen
+point — so the coordinate SPACE of each term is visible instead of inferred.
+
+It killed three of my theories in one run and produced the answer:
+
+  * the pen arithmetic is EXACT — 0 of 2499 samples deviate from
+    screen == round(surf*scale) + left;
+  * the driver's surface rect and win32u's window rect agree EXACTLY, so
+    neither is stale;
+  * but the computed position JUMPED (-491,-125) as the pen crossed from
+    Premiere's main window into a panel, with 4 ms between samples.
+
+Solving for continuity puts the panel's true origin at (2398.5,1204.9) where
+Wine's rect says (1907,1080) — the compositor had moved that popup and Wine
+never learned. See xdg_popup_handle_configure(): it stores the compositor's
+placement in surface->pending.x/y, which nothing in the driver ever reads.
+
+--- a/dlls/winewayland.drv/wayland_tablet.c
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -238,6 +238,34 @@
+          * on the old behaviour deliberately so that test stayed clean, and then not revisited.
+          * Shared helper now -- see wayland_clamp_rounding_overshoot() in wayland_pointer.c. */
+         wayland_clamp_rounding_overshoot(&screen, window_rect);
++        /* NEUTRON PEN GEOM (NEUTRON_PEN_GEOM=1): which coordinate SPACE is each term in?
++         * The pen is physically on the Cintiq, which win32u places at x=3840..5760 -- yet a
++         * 2026-08-25 capture had every computed pen position at x=0..3205, i.e. inside the OTHER
++         * monitor's range, while the cursor still tracked the pen correctly on screen. Faithful
++         * injection (cursor == injected, 686/688) does NOT mean the position is right; it means
++         * we are asking for exactly the wrong place. Dump every input to the sum so the space
++         * mismatch is visible instead of inferred. */
++        {
++            const char *pg = getenv("NEUTRON_PEN_GEOM");
++            if (pg && pg[0] == '1')
++            {
++                /* Compare the DRIVER's surface rect against win32u's authoritative window rect
++                 * for the same hwnd. A 2026-08-25 capture showed the computed pen position
++                 * JUMPING 546 px sideways as the pen crossed from Premiere's main window into a
++                 * panel, with no matching physical motion -- and the pen arithmetic itself exact
++                 * on all 2499 samples (screen == round(surf*scale)+left). So one of the two
++                 * window rects disagrees with the other; this says which. */
++                RECT wr = {0};
++                NtUserGetWindowRect(hwnd, &wr, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++                ERR("neutron-pengeom: hwnd=%p surf=(%.3f,%.3f) scale=%.4f "
++                    "surf_rect=(%d,%d)-(%d,%d) win32u_rect=(%d,%d)-(%d,%d) -> screen=(%d,%d)\n",
++                    hwnd, wl_fixed_to_double(x), wl_fixed_to_double(y), surface->window.scale,
++                    (int)window_rect->left, (int)window_rect->top,
++                    (int)window_rect->right, (int)window_rect->bottom,
++                    (int)wr.left, (int)wr.top, (int)wr.right, (int)wr.bottom,
++                    (int)screen.x, (int)screen.y);
++            }
++        }
+         wayland_win_data_release(window_data);
+         /* NEUTRON: record; the mouse MOVE is injected in wayland_wintab_frame after
+          * the packet, so per-sample mouse+packet stay paired and ordered. */
