@@ -1,0 +1,108 @@
+d2d1: record the WIC seed state at the OUTCOME, not at the intent
+
+Premiere's splash screen rendered its left half as a WHITE BOX for 1-2 seconds
+before correcting itself. User-confirmed cause and fix.
+
+d2d_wic_render_target_reset_state() recorded "this texture holds this bitmap's
+pixels" -- pool_last_bitmap / pool_last_gen / pool_last_gen_valid -- BEFORE
+attempting the seed:
+
+    rt->pool_last_gen = gen;
+    rt->pool_last_gen_valid = TRUE;
+    ...
+    if (seed_from_bitmap(rt)) { }
+    else if (rt->pool_rtv)    { ClearRenderTargetView(...); }   <-- texture CLEARED
+
+When the seed fails the texture is cleared instead, and the record still claims
+a match. The next time that pooled target is handed the same bitmap with an
+unchanged write generation, the skip fires and it publishes the CLEARED
+texture. It only corrected itself when the app happened to redraw the region --
+hence "white for a second or two, then fine".
+
+Now the record happens once the outcome is known: set on a successful seed,
+explicitly forgotten on the clear path, and forgotten on the third path too
+(seed failed with no RTV to clear) where we genuinely do not know what the
+texture holds.
+
+⭐ SAME MISTAKE AS THE MASK VERDICT EARLIER TODAY, in a different file. device.c
+logged "bounding box in force" at the DECLINE, before the stencil had a chance
+to carry the mask. Here the seed bookkeeping recorded success at the INTENT.
+Both are state written before the thing it describes has happened.
+RULE: record/report at the OUTCOME, never at the intent.
+
+⚠️ Shipped in 11.10-61, so it is not a 62 regression -- a pooled WIC target
+publishing a cleared texture is exactly the class of defect that produces
+intermittent blank UI regions, and may account for sightings attributed
+elsewhere. 11.10-62's tarball predates this fix and must be repackaged.
+
+Confirmed with NEUTRON_WIC_SEED_SKIP=0 first (splash correct => the skip was
+the cause), then with the fix and the optimisation left ON (splash correct).
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -851,9 +851,11 @@
+      *
+      * ⚠️ Fails SAFE on every uncertainty: a bitmap we have not seen before, a windowscodecs
+      * without v3 (DLLs are staged individually), or any error -- all fall through and seed. */
++    ULONG gen = 0;
++    BOOL have_gen = FALSE;
++
+     {
+         INeutronWicGpuBitmap3 *gen_iface;
+-        ULONG gen = 0;
+         BOOL untouched = FALSE;
+         static int enabled = -1;
+ 
+@@ -876,14 +878,16 @@
+                 untouched = rt->bitmap == rt->pool_last_bitmap
+                         && rt->pool_last_gen_valid && gen == rt->pool_last_gen;
+             gen_iface->lpVtbl->Release(gen_iface);
+-            rt->pool_last_gen = gen;
+-            rt->pool_last_gen_valid = TRUE;
+-        }
+-        else
+-        {
+-            rt->pool_last_gen_valid = FALSE;
++            have_gen = TRUE;
+         }
+-        rt->pool_last_bitmap = rt->bitmap;
++        /* ⛔ Do NOT record "the texture holds this bitmap's pixels" here. That is not known yet --
++         * the seed below can FAIL, and the failure path CLEARS the texture instead. Recording it
++         * up front is what put a white box on Premiere's splash for 1-2 s (2026-08-25): seed
++         * fails -> texture cleared -> bookkeeping still says "matches" -> the next reuse of this
++         * target with the same bitmap and an unchanged generation SKIPS the seed and publishes the
++         * cleared texture. It only corrected itself when the app happened to redraw.
++         * The record now happens after the outcome is known -- same rule as the mask verdict in
++         * device.c: report/record at the OUTCOME, never at the intent. */
+ 
+         if (neutron_perf())
+         {
+@@ -902,13 +906,27 @@
+ 
+     if (d2d_wic_render_target_seed_from_bitmap(rt))
+     {
+-        /* texture now matches the bitmap; nothing further to do */
++        /* The texture now genuinely holds this bitmap's pixels -- NOW it is true, so now record
++         * it. A later reuse may legitimately skip the seed on the strength of this. */
++        rt->pool_last_bitmap = rt->bitmap;
++        rt->pool_last_gen = gen;
++        rt->pool_last_gen_valid = have_gen;
+     }
+     else if (rt->pool_rtv)
+     {
+         ID3D10Texture2D_GetDevice(rt->readback_texture, &device);
+         ID3D10Device_ClearRenderTargetView(device, rt->pool_rtv, clear_colour);
+         ID3D10Device_Release(device);
++        /* The texture holds the CLEAR COLOUR, not this bitmap. Anything remembered about a
++         * previous tenant is now false -- forget it, or the next reuse skips a seed it needs. */
++        rt->pool_last_bitmap = NULL;
++        rt->pool_last_gen_valid = FALSE;
++    }
++    else
++    {
++        /* Seed failed and there was nothing to clear: we have no idea what the texture holds. */
++        rt->pool_last_bitmap = NULL;
++        rt->pool_last_gen_valid = FALSE;
+     }
+ }
+ 
