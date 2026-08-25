@@ -44,6 +44,39 @@ if [ ! -d "$TREE" ] || { [ ! -x "$TREE/bin/wine" ] && [ ! -x "$TREE/bin/wine64" 
     exit 1
 fi
 TREE="$(cd "$TREE" && pwd)"
+
+# ---------------------------------------------------------------------------
+# BASE-DRIFT GATE. `share/wine/wine.inf` is GENERATED from wine.inf.in at build time, so it is a
+# faithful fingerprint of the base tree the build actually saw. Compare it against EVERY installed
+# runtime, not just the newest.
+#
+# Why plural: cutting 11.10-62 its wine.inf differed from 61's, I compared only those two and
+# concluded upstream had drifted. It had not — 62 is byte-identical to 45, 58, 59 and 60, and *61*
+# was the outlier: an incremental `make` on a tree wine-tkg had already partially reverted in its
+# exit cleanup, so wine.inf regenerated from partially-staged source. A single-predecessor
+# comparison cannot tell you WHICH of the two is wrong. This one can.
+# ---------------------------------------------------------------------------
+_inf="$TREE/share/wine/wine.inf"
+if [ -f "$_inf" ]; then
+    _same=0; _diff=0; _difflist=""
+    for _other in "$HOME"/.local/share/neutron/runtimes/neutron-wine-*/share/wine/wine.inf; do
+        [ -f "$_other" ] || continue
+        case "$_other" in *"neutron-wine-$VERSION/"*) continue ;; esac
+        if cmp -s "$_inf" "$_other"; then _same=$((_same+1))
+        else _diff=$((_diff+1))
+             _difflist="$_difflist $(basename "$(dirname "$(dirname "$(dirname "$_other")")")")"
+        fi
+    done
+    if [ "$_same" -eq 0 ] && [ "$_diff" -gt 0 ]; then
+        echo "package: ⛔ BASE DRIFT — this build's wine.inf matches NO installed runtime ($_diff differ)." >&2
+        echo "   The base tree changed under us. Investigate before shipping; do NOT pin the mtime." >&2
+        exit 4
+    fi
+    if [ "$_diff" -gt 0 ]; then
+        echo "package: NOTE — wine.inf matches $_same installed runtime(s) and differs from $_diff:$_difflist" >&2
+        echo "   Matching the majority is the healthy case; the ones that differ are the suspect builds." >&2
+    fi
+fi
 echo "packaging Wine tree: $TREE"
 echo "release:             $NAME  (base: $WINE_BASE)"
 
