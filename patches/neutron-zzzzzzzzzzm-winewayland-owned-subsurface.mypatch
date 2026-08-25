@@ -1,0 +1,108 @@
+winewayland: make an owned, managed window a SUBSURFACE of its owner
+
+On Windows the app owns every window's position, so converting a point from one
+window into another is exact. Wayland never tells a client where an
+xdg_toplevel is, so Wine assumes the position Win32 asked for while the
+compositor puts it somewhere else -- and any drag CROSSING two toplevels is off
+by that constant difference.
+
+Measured on Premiere 2026-08-25: dragging a button out of the Button Editor
+onto the Program Monitor bar drops a constant few px to the right. Nothing else
+in the app is affected, because no other drag crosses two toplevels. The user's
+narrowing ("only that specific panel") is what made this findable.
+
+Wine's input path is provably innocent -- with preserved-fixes/harnesses/
+msgcoord.c the compositor-drawn cursor is correct, WM_MOUSEMOVE coordinates
+convert back to GetCursorPos(), and button-DOWN and button-UP are exact. The
+fault is the assumed ORIGIN of one window, not the coordinates.
+
+A wl_subsurface is the one Wayland surface whose position the CLIENT sets
+(wl_subsurface_set_position), so making an owned window a subsurface of its
+owner restores the Windows model exactly: Wine states the position and that IS
+the position. No inference, no compositor placement to discover, no drift.
+
+The existing NEUTRON_DOCK_OWNED rule already embeds owned managed windows this
+way but cannot fire here, for two reasons both visible in NEUTRON_POPUP_TRACE:
+
+  * the Button Editor reports GW_OWNER = NULL, while the owner_hint win32u
+    hands us is perfectly valid (owner_hint=0x10112 in every trace line);
+  * it carries no WS_CAPTION -- style 0x96000000, a WS_POPUP tool window
+    (WS_EX_NOACTIVATE|TOOLWINDOW|TOPMOST).
+
+So: fall back to owner_hint when GW_OWNER is NULL, and do not require a
+caption. Scope is owned + managed + visible owner; menus and other transients
+are UNMANAGED and never reach this code, so they keep their popup path.
+
+Gated NEUTRON_OWNED_SUBSURFACE (default ON, =0 restores the old toplevel).
+
+⚠️ Wider than one panel by design -- it reclassifies a whole window category,
+so floating tool palettes across the suite take this path. Known pitfall from
+the Lightroom filmstrip work: a re-shown subsurface comes back EMPTY, because
+the initial-configure repaint a toplevel gets has no subsurface equivalent.
+Hide/reshow is therefore a required test, not an optional one.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -301,6 +301,15 @@
+     NtUserSetThreadDpiAwarenessContext(context);
+ }
+ 
++/* NEUTRON: see the OWNED-SUBSURFACE block in WAYLAND_WindowPosChanged. Default ON; set
++ * NEUTRON_OWNED_SUBSURFACE=0 to fall back to an independent xdg_toplevel. */
++static BOOL neutron_owned_subsurface(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *toplevel_surface,
+                                                     struct wayland_surface *owner_surface,
+@@ -744,6 +753,46 @@
+                 toplevel = gwowner;
+             }
+         }
++
++        /* NEUTRON OWNED-SUBSURFACE (NEUTRON_OWNED_SUBSURFACE=0 to disable).
++         *
++         * WHY. On Windows the APP owns every window's position, so converting a point from one
++         * window to another is exact. Wayland never tells a client where an xdg_toplevel is, so
++         * Wine has to assume the position Win32 asked for while the compositor puts it somewhere
++         * else -- and any drag CROSSING two toplevels is then off by that constant difference.
++         * Measured on Premiere 2026-08-25: dragging a button out of the Button Editor onto the
++         * Program Monitor bar drops a constant few px right, and nothing else in the app is
++         * affected because no other drag crosses two toplevels. The input path itself is provably
++         * clean (cursor, WM_MOUSEMOVE, button-down and button-up all exact).
++         *
++         * A wl_subsurface is the one Wayland surface whose position the CLIENT sets --
++         * wl_subsurface_set_position() -- so making an owned window a subsurface of its owner
++         * restores the Windows model exactly: Wine states the position, and that IS the position.
++         * No inference, no compositor placement to discover, no drift.
++         *
++         * Why the dock_owned rule above cannot do it: the Button Editor reports
++         * GW_OWNER = NULL (while the owner_hint handed to us is perfectly valid), and it carries
++         * NO WS_CAPTION -- style 0x96000000, a WS_POPUP tool window
++         * (WS_EX_NOACTIVATE|TOOLWINDOW|TOPMOST). Both of that rule's tests miss it.
++         *
++         * Scope: owned + managed + visible owner. Menus and other transients are unmanaged and
++         * never reach here, so they keep their popup path. */
++        if (neutron_owned_subsurface() && managed && !owner && toplevel == hwnd)
++        {
++            HWND gwowner = NtUserGetWindowRelative( hwnd, GW_OWNER );
++
++            /* GW_OWNER is NULL for exactly the windows this is meant to catch; owner_hint is the
++             * value win32u actually passed us and it is correct. */
++            if (!gwowner) gwowner = owner_hint;
++            if (gwowner && gwowner != hwnd && NtUserIsWindowVisible( gwowner ))
++            {
++                ERR( "neutron-ownedsub: hwnd=%p (style=%08x ex=%08x) -> SUBSURFACE of owner=%p "
++                     "so its position is ours to set, not the compositor's\n",
++                     hwnd, (unsigned)NtUserGetWindowLongW( hwnd, GWL_STYLE ),
++                     (unsigned)NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), gwowner );
++                toplevel = gwowner;
++            }
++        }
+     }
+ 
+     /* GPU windows (splash screens, GL/Vulkan content) carry a client surface;
