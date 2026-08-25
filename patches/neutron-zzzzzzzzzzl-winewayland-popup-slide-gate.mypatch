@@ -1,0 +1,77 @@
+winewayland: gate the popup slide adoption OFF by default, and log its decision
+
+Measured on Premiere 2026-08-25 (NEUTRON_POPUP_TRACE=1), the adoption added in
+the previous commit is not ready to ship:
+
+  * of 13 popups, 8 were already correct (delta 0,0);
+  * three were moved by +-1 px -- round(round(device/scale)*scale) cannot
+    round-trip at scale 1.6979, so it chases quantisation noise;
+  * one oscillated: moved (1173,-996), then straight back (-1173,996),
+    contained only by the 3-adoption cap.
+
+And it does not fix the symptom it was written for. The Premiere Button Editor
+-- the ONE panel where the user sees the drag offset -- is an xdg_TOPLEVEL by
+the time the drag happens, not a popup, so this code never runs for it:
+
+    owner_surf=0x5555...  -> XDG_POPUP
+    owner_surf=(nil)      -> XDG_TOPLEVEL    (owner_hint=0x10112 still valid)
+
+Keep it in-tree, gated (NEUTRON_POPUP_SLIDE=1), because the underlying defect
+is real -- the compositor's placement genuinely is discarded -- and the
+measurement is worth preserving. Shipping it on would be shipping churn for no
+user-visible gain.
+
+The decision is now logged on the existing NEUTRON_POPUP_TRACE gate, including
+the no-op case: "we did nothing" is the result that matters when a fix appears
+to change nothing.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -887,6 +887,19 @@
+     HWND owner;
+     double scale;
+ 
++    /* NEUTRON: DEFAULT OFF (NEUTRON_POPUP_SLIDE=1 to enable). Measured on Premiere 2026-08-25 this
++     * adoption is NOT ready: of 13 popups it moved three by +-1 px (round(round(dev/scale)*scale)
++     * cannot round-trip at scale 1.6979, so it chases quantisation noise) and it put one into a
++     * visible oscillation -- (1173,-996) then (-1173,996) straight back, contained only by the
++     * 3-adoption cap. It also does NOT fix what it was written for: the Premiere Button Editor is
++     * an xdg_TOPLEVEL by the time the drag happens, not a popup, so this code never even runs for
++     * the reported symptom. Keeping it in-tree and gated preserves the measurement; shipping it on
++     * would be shipping churn for no user-visible gain. */
++    {
++        static int on = -1;
++        if (on < 0) { const char *e = getenv("NEUTRON_POPUP_SLIDE"); on = (e && e[0] == '1') ? 1 : 0; }
++        if (!on) return;
++    }
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface) || !wayland_surface_is_popup(surface) ||
+         !surface->popup_slide_pending)
+@@ -923,11 +936,23 @@
+     off_x = (int)round(slide_x * scale);
+     off_y = (int)round(slide_y * scale);
+ 
+-    if (owner_rect.left + off_x == cur.left && owner_rect.top + off_y == cur.top) return;
++    {
++        /* Reuse the existing NEUTRON_POPUP_TRACE gate: the question "is this window even a popup,
++         * and did we adopt anything?" has to be answerable without turning on the whole
++         * waylanddrv channel. Logs the no-op case too -- "we did nothing" is the result that
++         * matters when a fix appears to change nothing. */
++        static int pt = -1;
++        if (pt < 0) { const char *e = getenv("NEUTRON_POPUP_TRACE"); pt = (e && e[0]=='1') ? 1 : 0; }
++        if (pt)
++            ERR("neutron-slide: hwnd=%p owner=%p slide=(%d,%d) scale=%.4f -> owner+(%d,%d)=(%d,%d) "
++                "win32 had (%d,%d) %s\n", hwnd, owner, slide_x, slide_y, scale, off_x, off_y,
++                (int)(owner_rect.left + off_x), (int)(owner_rect.top + off_y),
++                (int)cur.left, (int)cur.top,
++                (owner_rect.left + off_x == cur.left && owner_rect.top + off_y == cur.top)
++                    ? "-- ALREADY THERE, no move" : "-- MOVING");
++    }
+ 
+-    TRACE("popup %p: compositor slid it to owner+(%d,%d) = (%d,%d), Win32 had (%d,%d)\n",
+-          hwnd, off_x, off_y, (int)(owner_rect.left + off_x), (int)(owner_rect.top + off_y),
+-          (int)cur.left, (int)cur.top);
++    if (owner_rect.left + off_x == cur.left && owner_rect.top + off_y == cur.top) return;
+ 
+     NtUserSetWindowPos(hwnd, 0, owner_rect.left + off_x, owner_rect.top + off_y, 0, 0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
