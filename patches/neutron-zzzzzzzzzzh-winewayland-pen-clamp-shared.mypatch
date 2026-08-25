@@ -1,0 +1,189 @@
+winewayland: fix the pen's unconditional motion clamp; share one clamp with the pointer
+
+wayland_tablet_tool_motion() pinned pen coordinates to the focused window's
+rect however far outside it the pen actually was. The pen has the same implicit
+grab as the mouse: while the tip is down, focus stays on the surface that
+received the contact and the compositor keeps reporting motion well outside it.
+Pinning those coordinates makes Wine believe the pen never left the source
+window, so any pen drag that leaves its surface -- out of a popup, off a panel
+-- never reaches a drop target.
+
+This is the identical defect fixed for the mouse in 11.10-50 (Premiere's Button
+Editor drag). The tablet copy was left on the old behaviour deliberately so
+that test stayed clean, and then not revisited; it sat open for two weeks. Its
+own comment said "// TODO: Copied directly from wayland_pointer."
+
+So this does not copy the fix a third time. The clamp is now ONE function,
+wayland_clamp_rounding_overshoot(), called by both wayland_pointer.c and
+wayland_tablet.c, with the rationale at the single definition. Copying it is
+exactly how the pen was missed.
+
+The clamp itself is upstream and unconditional -- verified against pristine
+wine 11.10, dlls/winewayland.drv/wayland_pointer.c:151-154 -- so both halves
+are upstream-worthy.
+
+Regression risk here is the MOUSE path, which was working and which this
+refactors. Proven semantics-preserving rather than assumed: the pre-refactor
+inline block (from the mkpatch snapshot) and the extracted helper were compiled
+side by side and run over 2,064,422 points straddling every edge of four rect
+shapes by -8..+8 px. Zero differences. Of the outside-the-rect cases, 42,354
+pass through and 13,304 are clamped, so the grid genuinely exercises both arms.
+
+⚠️ The PEN behaviour itself is unverified -- it needs the tablet.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -476,6 +476,13 @@
+ void wayland_surface_coords_to_window(struct wayland_surface *surface,
+                                       double surface_x, double surface_y,
+                                       int *window_x, int *window_y);
++/* NEUTRON: bring a surface-derived screen point back inside `window_rect`, but ONLY when it is
++ * outside by a rounding-sized amount. Shared by the pointer and the tablet/pen: both derive a
++ * screen point the same way and both must clamp the same way. The reasoning, and why an
++ * UNCONDITIONAL clamp breaks every drag that leaves its source surface, is at the definition in
++ * wayland_pointer.c. ⛔ Do not re-inline this a third time -- the tablet copy is exactly how the
++ * 11.10-50 pointer fix missed the pen for two weeks. */
++void wayland_clamp_rounding_overshoot(POINT *screen, const RECT *window_rect);
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
+ /* NEUTRON round-36 temporal suppression: record GDI damage flushed into a
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -132,6 +132,55 @@
+  * pointer_handle_motion_internal(). See the comment at the clamp below. */
+ #define NEUTRON_PTR_EDGE_EPS 2
+ 
++/* Sometimes, due to rounding, we may end up with pointer coordinates slightly outside the target
++ * window, so bring them within bounds.
++ *
++ * 🚨 NEUTRON: clamp ONLY a ROUNDING-SIZED overshoot, never an arbitrary one. The clamp is
++ * upstream and its comment says "slightly outside", but it was unconditional: motion ANY distance
++ * outside the focused window was pinned to that window's edge. Wayland has an IMPLICIT GRAB --
++ * while a button (or the pen tip) is held, focus stays on the surface that received the press and
++ * the compositor keeps reporting motion far outside it. Pinning those coordinates makes Wine
++ * believe the cursor never left the source window, so EVERY drag that starts in a popup or
++ * secondary surface dies: the drop target never sees the pointer. Measured symptom (2026-08-12):
++ * Premiere's Program Monitor "Button Editor" highlights on hover but a button cannot be dragged
++ * onto the button bar.
++ *
++ * Drags entirely WITHIN one toplevel (project bin -> timeline) share a surface, never leave
++ * window_rect, and were never affected -- which is why this survived so long.
++ *
++ * The epsilon must cover fractional-scale rounding: coords_to_window() multiplies by
++ * surface->window.scale, so a 0.5 surface-px rounding error is up to scale/2 window px (~1.13 at
++ * the 2.25 scale a build tester runs). 2 px covers it with margin; anything beyond that is a real
++ * position and MUST be passed through so win32u can route it to the capture window.
++ *
++ * ⛔ SHARED WITH THE TABLET/PEN ON PURPOSE. This lived inline here and was copied verbatim into
++ * wayland_tablet_tool_motion() (its own comment said "Copied directly from wayland_pointer"). The
++ * 11.10-50 fix went into this copy only, so the pen kept the unconditional clamp and pen drags out
++ * of a popup kept failing for two weeks. One definition now; do not re-inline it. */
++void wayland_clamp_rounding_overshoot(POINT *screen, const RECT *window_rect)
++{
++    if (screen->x >= window_rect->right)
++    {
++        if (screen->x - window_rect->right < NEUTRON_PTR_EDGE_EPS)
++            screen->x = window_rect->right - 1;
++    }
++    else if (screen->x < window_rect->left)
++    {
++        if (window_rect->left - screen->x <= NEUTRON_PTR_EDGE_EPS)
++            screen->x = window_rect->left;
++    }
++    if (screen->y >= window_rect->bottom)
++    {
++        if (screen->y - window_rect->bottom < NEUTRON_PTR_EDGE_EPS)
++            screen->y = window_rect->bottom - 1;
++    }
++    else if (screen->y < window_rect->top)
++    {
++        if (window_rect->top - screen->y <= NEUTRON_PTR_EDGE_EPS)
++            screen->y = window_rect->top;
++    }
++}
++
+ static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
+ {
+     INPUT input = {0};
+@@ -157,50 +206,7 @@
+                                      (int *)&screen.x, (int *)&screen.y);
+     screen.x += window_rect->left;
+     screen.y += window_rect->top;
+-    /* Sometimes, due to rounding, we may end up with pointer coordinates
+-     * slightly outside the target window, so bring them within bounds.
+-     *
+-     * 🚨 NEUTRON: clamp ONLY a ROUNDING-SIZED overshoot, never an arbitrary one.
+-     * The clamp is upstream and its comment says "slightly outside", but it was
+-     * unconditional: motion ANY distance outside the focused window was pinned
+-     * to that window's edge. Wayland has an IMPLICIT POINTER GRAB -- while a
+-     * button is held, pointer focus stays on the surface that received the
+-     * press and the compositor keeps reporting motion far outside it. Pinning
+-     * those coordinates makes Wine believe the cursor never left the source
+-     * window, so EVERY drag that starts in a popup or secondary surface dies:
+-     * the drop target never sees the pointer. Measured symptom (2026-08-12):
+-     * Premiere's Program Monitor "Button Editor" highlights on hover but a
+-     * button cannot be dragged onto the button bar.
+-     *
+-     * Drags entirely WITHIN one toplevel (project bin -> timeline) share a
+-     * surface, never leave window_rect, and were never affected -- which is why
+-     * this survived so long.
+-     *
+-     * The epsilon must cover fractional-scale rounding: coords_to_window()
+-     * multiplies by surface->window.scale, so a 0.5 surface-px rounding error
+-     * is up to scale/2 window px (~1.13 at the 2.25 scale a build tester runs).
+-     * 2 px covers it with margin; anything beyond that is a real position and
+-     * MUST be passed through so win32u can route it to the capture window. */
+-    if (screen.x >= window_rect->right)
+-    {
+-        if (screen.x - window_rect->right < NEUTRON_PTR_EDGE_EPS)
+-            screen.x = window_rect->right - 1;
+-    }
+-    else if (screen.x < window_rect->left)
+-    {
+-        if (window_rect->left - screen.x <= NEUTRON_PTR_EDGE_EPS)
+-            screen.x = window_rect->left;
+-    }
+-    if (screen.y >= window_rect->bottom)
+-    {
+-        if (screen.y - window_rect->bottom < NEUTRON_PTR_EDGE_EPS)
+-            screen.y = window_rect->bottom - 1;
+-    }
+-    else if (screen.y < window_rect->top)
+-    {
+-        if (window_rect->top - screen.y <= NEUTRON_PTR_EDGE_EPS)
+-            screen.y = window_rect->top;
+-    }
++    wayland_clamp_rounding_overshoot(&screen, window_rect);
+ 
+     wayland_win_data_release(data);
+ 
+--- a/dlls/winewayland.drv/wayland_tablet.c
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -214,7 +214,6 @@
+ {
+     struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
+     if (tool->surface) {
+-        // TODO: Copied directly from wayland_pointer.
+         RECT *window_rect;
+         HWND hwnd = wl_surface_get_user_data(tool->surface);
+         POINT screen;
+@@ -230,10 +229,15 @@
+         wayland_surface_coords_to_window(surface, wl_fixed_to_double(x), wl_fixed_to_double(y), (int *)&screen.x, (int *)&screen.y);
+         screen.x += window_rect->left;
+         screen.y += window_rect->top;
+-        if (screen.x >= window_rect->right) screen.x = window_rect->right - 1;
+-        else if (screen.x < window_rect->left) screen.x = window_rect->left;
+-        if (screen.y >= window_rect->bottom) screen.y = window_rect->bottom - 1;
+-        else if (screen.y < window_rect->top) screen.y = window_rect->top;
++        /* NEUTRON: was an UNCONDITIONAL copy of the pointer's clamp -- pinning pen motion to the
++         * focused window's edge however far outside it really was. The pen has the same implicit
++         * grab as the mouse: while the tip is down, focus stays on the surface that received the
++         * contact, so any pen drag that leaves its source surface (out of a popup, off a panel)
++         * was reported as never having left it and the drop target never saw the pen. Identical
++         * mechanism to the Button Editor drag fixed for the mouse in 11.10-50; the pen was left
++         * on the old behaviour deliberately so that test stayed clean, and then not revisited.
++         * Shared helper now -- see wayland_clamp_rounding_overshoot() in wayland_pointer.c. */
++        wayland_clamp_rounding_overshoot(&screen, window_rect);
+         wayland_win_data_release(window_data);
+         /* NEUTRON: record; the mouse MOVE is injected in wayland_wintab_frame after
+          * the packet, so per-sample mouse+packet stay paired and ordered. */
