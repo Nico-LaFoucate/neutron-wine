@@ -1,0 +1,212 @@
+winewayland: adopt the position the compositor gives a slid popup
+
+popup_create_positioner() asks for CONSTRAINT_ADJUSTMENT_SLIDE_X|SLIDE_Y, so a
+menu or panel near a screen edge is deliberately nudged back into view. The
+compositor then reports where it actually put it via xdg_popup.configure.
+
+We threw that answer away. The x,y of every wayland_surface_config was copied
+pending -> processing -> current and read by NOTHING (grep the whole driver:
+the fields are only ever assigned or struct-copied), while surface->window.rect
+kept the position Win32 had ASKED for.
+
+Both absolute-input paths map through window.rect:
+
+    screen = surface_local * scale + window.rect origin
+
+so pointer AND tablet were wrong by exactly the slide distance for anything
+over a slid popup. Measured on Premiere 2026-08-25 with NEUTRON_PEN_GEOM=1: a
+pen crossing from the main window into a panel jumped 491x125 device px
+(289x74 logical) with 4 ms between samples -- physically impossible, and the
+pen arithmetic was exact on all 2499 samples (screen == round(surf*scale)+left)
+with the driver's surface rect and win32u's window rect agreeing exactly. The
+only thing left that could be wrong was the origin, and it was.
+
+Fix: post WM_WAYLAND_POPUP_SLIDE to the window's own thread and move the Win32
+window to where the compositor put it. Windows does the same adjustment for a
+menu that will not fit and GetWindowRect reports the ADJUSTED position, so this
+is faithful behaviour rather than a workaround.
+
+POSTED, never sent: the poster is the single event-reader thread that drains
+the socket for every surface in the process, and a synchronous call into a busy
+UI thread from there is exactly the deadlock that froze Premiere for five
+minutes after a drag-and-drop (INCIDENTS.md 2026-08-13).
+
+The handler reads everything it needs under win_data_mutex and RELEASES it
+before calling NtUserSetWindowPos, which takes the user lock and re-enters
+wayland_win_data_get -- the round-34 ABBA deadlock.
+
+Bounded to 3 adoptions per popup: moving the window makes Wine rebuild the
+positioner from the new position, giving the compositor a fresh chance to
+slide it. The normal case converges in one step (we move exactly where it
+asked), so the cap costs nothing and makes an oscillation impossible.
+
+⚠️ This changes behaviour for EVERY popup, so menus and dropdowns across all
+apps are in scope for regression testing, as is the Photoshop dock.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -95,6 +95,9 @@
+     WM_WAYLAND_DND_DRAG,
+     WM_WAYLAND_DND_LEAVE,
+     WM_WAYLAND_DND_DROP,
++    /* NEUTRON: the compositor SLID this popup to keep it on-screen; adopt the position it
++     * actually gave us. Posted (never sent) from the event-reader thread. */
++    WM_WAYLAND_POPUP_SLIDE,
+ };
+ 
+ enum wayland_surface_config_state
+@@ -403,6 +406,20 @@
+     };
+ 
+     struct wayland_surface_config pending, requested, processing, current;
++    /* NEUTRON POPUP SLIDE: where the COMPOSITOR actually put this popup, surface-local and
++     * relative to the owner, straight from xdg_popup.configure.
++     *
++     * We ask for sliding explicitly -- popup_create_positioner() sets
++     * CONSTRAINT_ADJUSTMENT_SLIDE_X|SLIDE_Y so a menu near a screen edge is nudged back into
++     * view -- and the compositor tells us where it ended up. Until 2026-08-25 that answer was
++     * dropped: the x,y of every wayland_surface_config was copied pending->processing->current
++     * and never read by anything. window.rect kept the position Win32 ASKED for, so every
++     * absolute-input mapping (pointer AND tablet: both do surface_local*scale + window.rect
++     * origin) was off by exactly the slide distance. Measured on Premiere: a pen crossing into
++     * a slid panel jumped 491x125 device px (289x74 logical) with 4 ms between samples. */
++    int32_t popup_slide_x, popup_slide_y;
++    BOOL popup_slide_pending;
++    unsigned int popup_slide_applied;   /* bounded: a move re-anchors the popup, see window.c */
+     /* the last xdg_surface window geometry set on this surface */
+     RECT geometry;
+     BOOL resizing;
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -47,6 +47,7 @@
+ {
+     struct wayland_surface *surface;
+     BOOL should_post = FALSE, initial_configure = FALSE;
++    BOOL post_popup_slide = FALSE;
+     struct wayland_win_data *data;
+     HWND hwnd = private;
+ 
+@@ -96,12 +97,26 @@
+         surface->pending.serial = serial;
+         surface->processing = surface->pending;
+         surface->processing.processed = TRUE;
++        /* NEUTRON POPUP SLIDE: remember where the compositor actually put us, and ask the
++         * window's own thread to adopt it. POSTED, never sent -- this is the single
++         * event-reader thread that drains the socket for every surface in the process, and a
++         * synchronous call into a busy UI thread from here is precisely the deadlock that froze
++         * Premiere for five minutes after a drag-and-drop (INCIDENTS.md 2026-08-13). */
++        if (surface->processing.x != surface->current.x ||
++            surface->processing.y != surface->current.y)
++        {
++            surface->popup_slide_x = surface->processing.x;
++            surface->popup_slide_y = surface->processing.y;
++            surface->popup_slide_pending = TRUE;
++            post_popup_slide = TRUE;
++        }
+         memset(&surface->pending, 0, sizeof(surface->pending));
+     }
+ 
+     wayland_win_data_release(data);
+ 
+     if (should_post) NtUserPostMessage(hwnd, WM_WAYLAND_CONFIGURE, 0, 0);
++    if (post_popup_slide) NtUserPostMessage(hwnd, WM_WAYLAND_POPUP_SLIDE, 0, 0);
+ 
+     /* Flush the window surface in case there is content that we weren't
+      * able to flush before due to the lack of the initial configure. */
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -856,6 +856,83 @@
+     if (needs_expose) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
+ }
+ 
++/* NEUTRON POPUP SLIDE: adopt the position the compositor actually gave this popup.
++ *
++ * popup_create_positioner() asks for CONSTRAINT_ADJUSTMENT_SLIDE_X|SLIDE_Y, so a menu or panel
++ * near a screen edge is deliberately nudged back on-screen; xdg_popup.configure then reports
++ * where it ended up, relative to the owner and in surface-local units. That answer used to be
++ * thrown away -- the x,y of every wayland_surface_config was copied along the
++ * pending->processing->current chain and read by nothing -- while window.rect kept the position
++ * Win32 had ASKED for. Both absolute-input paths map through window.rect
++ * (surface_local * scale + origin), so pointer and pen alike were wrong by the slide distance.
++ * Measured on Premiere 2026-08-25: a pen crossing into a slid panel jumped 491x125 device px.
++ *
++ * Windows does the same adjustment for a menu that will not fit, and GetWindowRect reports the
++ * ADJUSTED position -- so moving the Win32 window to match is the faithful behaviour, not a
++ * workaround.
++ *
++ * Runs on the window's OWN thread (posted, never sent -- the poster is the single event-reader
++ * thread that drains the socket for every surface in the process).
++ *
++ * ⚠️ BOUNDED. Moving the window makes Wine rebuild the positioner from the new position, which
++ * gives the compositor a fresh chance to slide it; a popup wedged against an edge could ping-pong
++ * forever. Converges in one step in the normal case (we move exactly where it asked), so a small
++ * cap costs nothing and makes an oscillation impossible. */
++static void wayland_popup_adopt_slide(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++    int slide_x, slide_y, off_x, off_y;
++    RECT owner_rect, cur;
++    HWND owner;
++    double scale;
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if (!(surface = data->wayland_surface) || !wayland_surface_is_popup(surface) ||
++        !surface->popup_slide_pending)
++    {
++        wayland_win_data_release(data);
++        return;
++    }
++    surface->popup_slide_pending = FALSE;
++    if (surface->popup_slide_applied >= 3)
++    {
++        WARN("popup %p slid %u times already; not chasing it further\n",
++             hwnd, surface->popup_slide_applied);
++        wayland_win_data_release(data);
++        return;
++    }
++    surface->popup_slide_applied++;
++    slide_x = surface->popup_slide_x;
++    slide_y = surface->popup_slide_y;
++    scale = surface->window.scale;
++    owner = surface->owner_hwnd;
++    /* ⛔ Everything the user lock needs is read HERE. NtUserSetWindowPos takes the user lock and
++     * flushes the window surface, which re-enters wayland_win_data_get -- calling it while we
++     * hold win_data_mutex is the round-34 ABBA deadlock (see wayland_surface.c). */
++    wayland_win_data_release(data);
++
++    if (!owner) return;
++    if (!NtUserGetWindowRect(owner, &owner_rect, NtUserGetWinMonitorDpi(owner, MDT_RAW_DPI)))
++        return;
++    if (!NtUserGetWindowRect(hwnd, &cur, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI)))
++        return;
++
++    /* surface-local (relative to the owner) -> window px, the inverse of the
++     * wayland_surface_coords_from_window() the positioner offset went out through. */
++    off_x = (int)round(slide_x * scale);
++    off_y = (int)round(slide_y * scale);
++
++    if (owner_rect.left + off_x == cur.left && owner_rect.top + off_y == cur.top) return;
++
++    TRACE("popup %p: compositor slid it to owner+(%d,%d) = (%d,%d), Win32 had (%d,%d)\n",
++          hwnd, off_x, off_y, (int)(owner_rect.left + off_x), (int)(owner_rect.top + off_y),
++          (int)cur.left, (int)cur.top);
++
++    NtUserSetWindowPos(hwnd, 0, owner_rect.left + off_x, owner_rect.top + off_y, 0, 0,
++                       SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
++}
++
+ static void wayland_configure_window(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+@@ -1188,6 +1265,10 @@
+     case WM_WAYLAND_CONFIGURE:
+         wayland_configure_window(hwnd);
+         return 0;
++
++    case WM_WAYLAND_POPUP_SLIDE:
++        wayland_popup_adopt_slide(hwnd);
++        return 0;
+     case WM_WAYLAND_OUTPUT_CHANGE:
+         wayland_window_output_change(hwnd, (UINT)wp);
+         return 0;
