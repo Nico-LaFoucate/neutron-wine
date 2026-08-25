@@ -1,0 +1,65 @@
+winewayland: NEUTRON_GEOM_TRACE=1 — dump every input to the monitor rect
+
+Added chasing a pen drag whose drop landed 30-60 px off. A probe showed Wine
+publishing DISPLAY1 as (0,0)-(2262,1272) but DISPLAY2's ORIGIN as 3840 -- a
+logical extent against a physical origin, with a 1578 px phantom gap between
+the two monitors. Static reading could not reconcile it (the rect is built from
+current_mode, and so is the arrangement), so measure both at once.
+
+The trace immediately settled it, and it EXONERATES this driver:
+
+  DP-1      arranged=(0,0)      mode=3840x2160  logical=(0,0) 2259x1271
+                                            -> rc_monitor=(0,0)-(3840,2160)
+  HDMI-A-1  arranged=(3840,159) mode=1920x1080  logical=(2259,94) 1920x1080
+                                            -> rc_monitor=(3840,159)-(5760,1239)
+
+Everything winewayland publishes is in one consistent unit system (physical),
+and the arrangement is exactly right: rel_x = 2259/2259 = 1.0, so the Cintiq
+lands at DP-1's physical width, 3840.
+
+The mixing happens ABOVE us, in win32u's per-monitor DPI mapping
+(monitor_get_rect -> map_dpi_rect, upstream, untouched by our patch set). It
+scales each monitor's rect -- ORIGIN INCLUDED -- by that monitor's OWN dpi. DP-1
+(scale ~1.698) shrinks 3840->2262; the Cintiq (scale 1.0) is passed through, so
+its origin stays at 3840 in a desktop whose first monitor now ends at 2262. The
+layout tears apart: virtual screen 5760x1272 against a real desktop of 4182x1272.
+
+Needs MIXED per-monitor fractional scaling to reproduce. On a uniform-scale
+desktop every monitor divides by the same factor and the layout stays coherent,
+which is why this has gone unnoticed.
+
+Reproducer kept as preserved-fixes/harnesses/desktop-geometry-probe.c: monitor
+rects must tile the virtual screen with no gaps.
+
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -315,6 +315,29 @@
+             output_info->x + output_info->output->current_mode->width,
+             output_info->y + output_info->output->current_mode->height);
+ 
++    /* NEUTRON GEOM TRACE (NEUTRON_GEOM_TRACE=1): dump every input to the monitor rect in one
++     * line per output. A probe showed Wine publishing DISPLAY1 as (0,0)-(2262,1272) but
++     * DISPLAY2's ORIGIN as 3840 -- logical extent against a physical origin, with a 1578 px
++     * phantom gap between them. Reading the code could not reconcile that (the rect is built
++     * from current_mode, and so is the arrangement), so measure both at once instead of
++     * guessing which one is in which unit. */
++    {
++        /* getenv, not GetEnvironmentVariableA: this is the UNIX half of the driver (ELF), where
++         * the Win32 API is not linkable. The opposite of the PE-builtin trap where getenv()
++         * silently never fires. */
++        const char *gt = getenv("NEUTRON_GEOM_TRACE");
++        if (gt && gt[0] == '1')
++            ERR("neutron-geom: %s arranged=(%d,%d) mode=%dx%d logical=(%d,%d) %dx%d "
++                "-> rc_monitor=(%d,%d)-(%d,%d)\n",
++                output_info->output->name, output_info->x, output_info->y,
++                output_info->output->current_mode ? output_info->output->current_mode->width : -1,
++                output_info->output->current_mode ? output_info->output->current_mode->height : -1,
++                output_info->output->logical_x, output_info->output->logical_y,
++                output_info->output->logical_w, output_info->output->logical_h,
++                (int)monitor.rc_monitor.left, (int)monitor.rc_monitor.top,
++                (int)monitor.rc_monitor.right, (int)monitor.rc_monitor.bottom);
++    }
++
+     /* We don't have a direct way to get the work area in Wayland. But under
+      * server-side decorations the compositor reserves a titlebar at the top of
+      * each toplevel, so a maximized window's content is shorter than the monitor
