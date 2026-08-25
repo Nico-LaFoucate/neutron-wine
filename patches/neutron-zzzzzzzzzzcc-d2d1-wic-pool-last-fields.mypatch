@@ -1,0 +1,51 @@
+d2d1: declare the WIC seed-skip pool fields that were never captured into a patch
+
+`pool_last_bitmap`, `pool_last_gen` and `pool_last_gen_valid` are used by
+neutron-zzzzzzzzzzd (copy census) and neutron-zzzzzzzzzze (seed skip), but no
+patch in the set ever DECLARED them. They were added straight to the working
+tree during the 11.10-60/61 work and never emitted.
+
+Nothing caught it because the build tree lives in /tmp and persisted: every
+build after that point was an incremental make on an already-patched tree.
+11.10-58/59/60/61 were all built that way. When a reboot wiped /tmp on
+2026-08-25, the first true from-scratch prepare produced:
+
+    wic_render_target.c:877: error: 'struct d2d_wic_render_target' has no
+    member named 'pool_last_gen_valid'
+
+⇒ 11.10-61 -- the runtime ALREADY SENT to the build tester -- could not be
+rebuilt from the repository. The shipped binary was correct; the source of
+truth was not. This is precisely the failure mode PS2026-PERFECT.md warns
+about: "fixes live only in the dev tree, never captured into release patches."
+
+_valid is not redundant: it distinguishes "generation 0" from "we never
+obtained one", without which the first reuse of a never-written bitmap
+compares 0 == 0 and wrongly reports the bitmap untouched, skipping a seed that
+was actually needed.
+
+Ordered before zzzzzzzzzzd, the first patch that uses the fields.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -807,6 +807,21 @@
+     unsigned int pool_usage;
+     ID3D10RenderTargetView *pool_rtv;
+     ID2D1DeviceContext *pool_context;
++    /* NEUTRON SEED SKIP: the last bitmap this pooled target was handed, and that bitmap's write
++     * generation at the time. If a target is reused for the SAME bitmap and the bitmap has not
++     * been written since, its backing texture already holds those pixels and re-seeding it is a
++     * full-surface upload for nothing. _valid distinguishes "generation 0" from "we never got
++     * one" -- without it the first reuse of a never-written bitmap compares 0 == 0 and wrongly
++     * claims untouched. See d2d_wic_render_target_reset_state() and INeutronWicGpuBitmap3.
++     *
++     * 🚨 These three were added to the working tree during the 11.10-60/61 work and NEVER
++     * captured into a patch. The tree lived in /tmp, so every build after that reused it and
++     * nobody noticed; when a reboot wiped /tmp on 2026-08-25 the patch set no longer compiled
++     * (`wic_render_target.c:877: has no member named 'pool_last_gen_valid'`) and 11.10-61 -- the
++     * runtime already SENT to the build tester -- could not be rebuilt from the repo. */
++    IWICBitmap *pool_last_bitmap;
++    ULONG pool_last_gen;
++    BOOL pool_last_gen_valid;
+ 
+     IDXGISurface *dxgi_surface;
+     ID2D1RenderTarget *dxgi_target;

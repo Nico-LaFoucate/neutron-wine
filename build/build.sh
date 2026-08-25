@@ -65,6 +65,23 @@ for _cfg in "$TKGDIR/customization.cfg" "$TKGDIR/wine-tkg-profiles/advanced-cust
 done
 
 # 4. Build (non-makepkg flow). Output lands in src/<flavor>-build/.
+#
+# 🚨 PIN THE COLLATION. wine-tkg applies userpatches in whatever order the shell globs them, which
+# uses LC_COLLATE. Our entire `neutron-zzz…` naming scheme encodes APPLY ORDER and assumes C
+# collation (byte order, punctuation significant). Under the machine's en_US.UTF-8 locale
+# punctuation is IGNORED, which REVERSES pairs that differ only by a separator:
+#
+#   C            : neutron-zzzzzzzzzz-diagnostics-gated-for-release  then  neutron-zzzzzzzzzza-show-trace-gate
+#   en_US.UTF-8  : neutron-zzzzzzzzzza-show-trace-gate               then  neutron-zzzzzzzzzz-diagnostics-gated-for-release
+#
+# The second patch REFACTORS code the first one introduces, so the reversed order fails
+# ("Hunk #4 FAILED at 5262") and the whole prepare aborts. This bit on 2026-08-25, the first
+# from-scratch prepare after a reboot wiped /tmp — earlier builds reused an already-patched tree
+# and never re-applied, so it stayed hidden. `mkpatch.sh emit` had been WARNING about this exact
+# pair for weeks ("order differs between collations AND hunks are close").
+#
+# LC_COLLATE only affects sort/glob order, so this cannot change what gets compiled.
+export LC_COLLATE=C
 cd "$TKGDIR"
 ./non-makepkg-build.sh
 
