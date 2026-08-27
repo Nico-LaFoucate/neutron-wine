@@ -1,0 +1,62 @@
+winewayland: gate the SC_MOVE decline -- it caused the half-white splash
+
+Patch zzp (11.10-64) had two halves: the caption widening, which was gated, and
+the SC_MOVE decline, which was NOT. Turning the feature off therefore did not
+restore the old behaviour, and the ungated half went out to every user.
+
+Bisected with a screenshot harness that measures white coverage of the splash
+area during startup (the fault lasts about one frame in fourteen, which is why
+eyeballing missed it):
+
+    11.10-63   0.0% white   clean
+    11.10-64  73.6% white   broken
+    11.10-65  72.9% white   broken, with every subsurface gate OFF
+
+64's only engine change over 63 is zzp, and the gated half was off in the 65
+run, so the ungated SC_MOVE decline is what is left. Also ruled out by
+measurement, not assumption: the seed-skip path from the previous splash bug
+(TODO.md P1o) is NOT involved -- 72.9% with it on and 72.9% with it off.
+
+Now behind NEUTRON_SYSCOMMAND_DECLINE, default OFF, which is 11.10-63's
+behaviour exactly. It stays available because a captioned subsurface cannot be
+dragged without it, and that is needed for the docked-or-floating panel work.
+
+RULE, restated because it just cost a release: every behaviour change in this
+driver gets its own gate. An ungated change cannot be A/B'd, cannot be reverted
+by a tester, and hides inside the feature it shipped with.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -377,6 +377,23 @@
+  * dialog class; 1302 did not and none was. The extension panel this whole line of work exists for
+  * does NOT carry it, so excluding them costs the feature nothing. Exposed as its own gate purely
+  * so the effect can be isolated on a tester's machine. */
++/* NEUTRON: decline SC_MOVE/SC_SIZE when we did NOT hand the interaction to the compositor,
++ * so win32u runs its own move loop. Added ungated in 11.10-64 to make a captioned subsurface
++ * draggable -- and 11.10-64 is exactly where the Premiere splash started rendering its left half
++ * white. Bisected 2026-08-27 with a screenshot harness: 63 = 0.0% white, 64 = 73.6%, 65 = 72.9%
++ * with every subsurface gate OFF, and 64's only engine change over 63 is this patch. The caption
++ * half is gated and off, so this ungated half is what is left.
++ *
++ * ⛔ Every behaviour change in this driver must be gated. This one was not, which is why turning
++ * off the feature it belongs to did not restore the old behaviour. Default OFF = 11.10-63's
++ * behaviour exactly. */
++static BOOL neutron_syscommand_decline(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_SYSCOMMAND_DECLINE"); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++
+ static BOOL neutron_owned_subsurface_modal(void)
+ {
+     static int on = -1;
+@@ -1636,6 +1653,8 @@
+                 /* NEUTRON: claim it only when the COMPOSITOR now owns the interaction. */
+                 ret = 0;
+             }
++            /* gated: without the gate this restores 11.10-63's unconditional claim */
++            if (!neutron_syscommand_decline()) ret = 0;
+             pthread_mutex_unlock(&process_wayland.seat.mutex);
+             wayland_win_data_release(data);
+             /* NEUTRON: ret stays -1 when we did NOT hand the move/resize to the compositor.
