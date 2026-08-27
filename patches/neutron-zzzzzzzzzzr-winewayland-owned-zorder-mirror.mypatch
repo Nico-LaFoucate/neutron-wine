@@ -1,0 +1,126 @@
+winewayland: mirror win32 z-order for promoted OWNED windows (gated, default off)
+
+Bug A of the 11.10-64 regression: a captioned owned window promoted to a
+subsurface SINKS behind the Program Monitor, and menus inside it sink behind it
+in turn. The build tester established there is no style discriminator -- the
+plugin windows and the extension panel are the same class -- so narrowing the
+promotion cannot fix it.
+
+The cause is that the existing win32-z-order mirror never saw these windows.
+Phase A (neutron_zorder_collect) walks GW_CHILD, and an owned window is not a
+child. Phase B (neutron_restack_apply) only matches client_surface, and a
+promoted owned window's subsurface is its MAIN wayland_surface. Missed on both
+counts, so nothing ever restacked them: a fresh wl_subsurface starts on top and
+then stays wherever later siblings leave it.
+
+Phase A now also collects the toplevel's owned windows, appended last = top of
+the bottom-to-top order, which is the Win32 rule. The desktop walk stays in
+phase A, the USER-lock phase; it must never move into phase B, which runs under
+win_data_mutex.
+
+Phase B now accepts a promoted owned window's own subsurface as an orderable
+sibling, with the same sibling-validity test the rest of the function uses, and
+function-scope storage for the synthesized record -- a loop local would be a
+use-after-scope, since cs_of[] is dereferenced later in the apply loop.
+
+DEFAULT OFF (NEUTRON_OWNED_ZORDER=1). This edits the most heavily-tuned path in
+the driver and a place_above against a non-sibling is a FATAL protocol error --
+compositor disconnect, app killed -- which is strictly worse than the bug it
+fixes. It ships off so it can be A/B'd on the machine that can see the symptom:
+there are no VST plugins here and z-order is not visible in a log, so I cannot
+verify it on this box and will not pretend otherwise.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2275,6 +2275,29 @@
+     return v;
+ }
+ 
++/* NEUTRON: mirror win32 z-order for PROMOTED OWNED WINDOWS too, not just child client surfaces.
++ *
++ * Bug A of the 11.10-64 regression (build tester 2026-08-27): a captioned owned window promoted to
++ * a subsurface SINKS behind the Program Monitor, and menus inside it sink behind it in turn. The
++ * cause is that this mirror never saw those windows -- phase A walks GW_CHILD, and an owned window
++ * is not a child; phase B only matches `client_surface`, and a promoted owned window's subsurface
++ * is its MAIN wayland_surface. Missed on both counts, so nothing ever restacked them: a fresh
++ * wl_subsurface starts on top and then stays wherever later siblings leave it.
++ *
++ * In Win32 an owned window always floats above its owner and the owner's children, so they belong
++ * at the TOP of the bottom-to-top list.
++ *
++ * ⛔ DEFAULT OFF. This edits the most heavily-tuned path in the driver, and a place_above against
++ * a non-sibling is a FATAL protocol error (compositor disconnect = the app is killed), which is
++ * strictly worse than the bug. It ships off so it can be A/B'd on the machine that can actually
++ * see the symptom -- there are no VST plugins on the dev box and z-order is not visible in a log. */
++static BOOL neutron_owned_zorder(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_ZORDER"); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++
+ /* phase A: build the bottom-to-top win32 order of a toplevel's tree.
+  * USER-LOCK calls only -- must be called WITHOUT win_data_mutex held. */
+ static void neutron_zorder_collect_rec(HWND hwnd, struct neutron_zlist *zl, const POINT *origin)
+@@ -2311,6 +2334,28 @@
+     NtUserGetWindowRect(toplevel, &tr, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
+     origin.x = tr.left; origin.y = tr.top;
+     neutron_zorder_collect_rec(toplevel, zl, &origin);
++
++    /* NEUTRON: then the toplevel's OWNED windows, which are not children and so were invisible to
++     * the walk above. Appended last = top of the bottom-to-top order, which is the Win32 rule
++     * (an owned window floats above its owner and the owner's children). USER-LOCK phase, so the
++     * desktop walk is safe here and must never move into phase B. */
++    if (neutron_owned_zorder())
++    {
++        HWND desk = NtUserGetDesktopWindow(), w;
++        for (w = NtUserGetWindowRelative(desk, GW_CHILD); w && zl->count < NEUTRON_ZMAX;
++             w = NtUserGetWindowRelative(w, GW_HWNDNEXT))
++        {
++            RECT wr = {0};
++            if (w == toplevel) continue;
++            if (NtUserGetWindowRelative(w, GW_OWNER) != toplevel) continue;
++            if (!NtUserIsWindowVisible(w)) continue;
++            zl->cef_host[zl->count] = FALSE;
++            NtUserGetWindowRect(w, &wr, NtUserGetWinMonitorDpi(w, MDT_RAW_DPI));
++            OffsetRect(&wr, -origin.x, -origin.y);
++            zl->rect[zl->count] = wr;
++            zl->hwnd[zl->count++] = w;
++        }
++    }
+ }
+ 
+ /* order cache: skip wl traffic when the applied order is unchanged.
+@@ -2354,6 +2399,7 @@
+     struct wayland_win_data *tdata = wayland_win_data_get_nolock(toplevel);
+     struct wayland_surface *tsurf = tdata ? tdata->wayland_surface : NULL;
+     struct wayland_client_surface *cs_of[NEUTRON_ZMAX];
++    struct wayland_client_surface owned_slots[NEUTRON_ZMAX];  /* see the owned-window branch below */
+     BOOL below[NEUTRON_ZMAX];
+     HWND applied[NEUTRON_ZMAX];
+     struct wl_surface *prev;
+@@ -2384,6 +2430,24 @@
+     {
+         struct wayland_win_data *d = (zl->hwnd[i] == toplevel) ? tdata : wayland_win_data_get_nolock(zl->hwnd[i]);
+         struct wayland_client_surface *cs = d ? d->client_surface : NULL;
++        /* NEUTRON: a PROMOTED OWNED WINDOW has no client_surface -- its subsurface is its own
++         * main wayland_surface. Treat it as an orderable sibling so it can be restacked, which
++         * is what stops it sinking behind the Program Monitor. Same sibling-validity test as
++         * below: only ever reference a surface attached to THIS parent, because place_above on a
++         * non-sibling is fatal. */
++        if (!cs && neutron_owned_zorder() && d && d->wayland_surface &&
++            d->wayland_surface->wl_subsurface && d->wayland_surface->wl_surface &&
++            d->wayland_surface->toplevel_hwnd == toplevel)
++        {
++            /* ⛔ FUNCTION-SCOPE storage, not a loop local: cs_of[] keeps this pointer and is
++             * dereferenced in the apply loop below, so a block-scoped struct here would be a
++             * use-after-scope on every promoted owned window. */
++            memset(&owned_slots[n], 0, sizeof(owned_slots[n]));
++            owned_slots[n].wl_subsurface = d->wayland_surface->wl_subsurface;
++            owned_slots[n].wl_surface = d->wayland_surface->wl_surface;
++            owned_slots[n].toplevel_wl_surface = tsurf->wl_surface;
++            cs = &owned_slots[n];
++        }
+         if (!cs || !cs->wl_subsurface || !cs->wl_surface) continue;
+         if (cs->toplevel_wl_surface != tsurf->wl_surface) continue; /* not our sibling */
+         cs_of[n] = cs;
