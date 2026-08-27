@@ -30,6 +30,14 @@ fixes. It ships off so it can be A/B'd on the machine that can see the symptom:
 there are no VST plugins here and z-order is not visible in a log, so I cannot
 verify it on this box and will not pretend otherwise.
 
+MEASURED CORRECTION before shipping: with only NEUTRON_OWNED_ZORDER=1 a live
+Premiere session logged 347 owned-window promotions and ZERO restack lines --
+the entire phase A/B mirror sits behind NEUTRON_NATIVE_STACK, which is off by
+default, so this fix was inert. Either gate now arms the mirror. Nearly shipped
+a fix that provably does nothing; the standing rule to prove the flag reached
+the code is what caught it.
+
+
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
 @@ -2275,6 +2275,29 @@
@@ -124,3 +132,27 @@ verify it on this box and will not pretend otherwise.
          if (!cs || !cs->wl_subsurface || !cs->wl_surface) continue;
          if (cs->toplevel_wl_surface != tsurf->wl_surface) continue; /* not our sibling */
          cs_of[n] = cs;
+@@ -2536,7 +2600,13 @@
+     /* NEUTRON round-35 native stacking, phase A (user-lock queries, PRE-lock):
+      * collect the toplevel's win32 z-order so phase B can mirror it in the
+      * wl_subsurface stack without any user-lock call under win_data_mutex. */
+-    if (neutron_native_stack() && toplevel && visible)
++    /* NEUTRON: OWNED_ZORDER needs this mirror to actually run. Measured 2026-08-27 on a live
++     * Premiere session: with only NEUTRON_OWNED_ZORDER=1 the log carried 347 owned-window
++     * promotions and ZERO restack lines -- the whole phase A/B path sits behind
++     * NEUTRON_NATIVE_STACK, which is off by default, so the owned-window fix was inert. Nearly
++     * shipped a fix that provably does nothing; the "prove the flag reached the code" rule is
++     * what caught it. Either gate now arms the mirror. */
++    if ((neutron_native_stack() || neutron_owned_zorder()) && toplevel && visible)
+         neutron_zorder_collect(toplevel, &zl);
+ 
+     if (((neutron_dbg_n++) & 0xFF) == 0)
+@@ -2627,7 +2697,7 @@
+         /* NEUTRON round-35 native stacking, phase B (under win_data_mutex, NO
+          * user-lock calls): mirror the collected win32 z-order in the
+          * wl_subsurface stack (order cache no-ops when unchanged). */
+-        if (neutron_native_stack() && zl.count)
++        if ((neutron_native_stack() || neutron_owned_zorder()) && zl.count)
+             neutron_restack_apply(toplevel, &zl);
+     }
+     else if (neutron_keepclient() && toplevel && parent_visible)
