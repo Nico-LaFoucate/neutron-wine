@@ -117,16 +117,7 @@ actually stops sinking is a visual result only the operator can confirm.
  /* phase A: build the bottom-to-top win32 order of a toplevel's tree.
   * USER-LOCK calls only -- must be called WITHOUT win_data_mutex held. */
  static void neutron_zorder_collect_rec(HWND hwnd, struct neutron_zlist *zl, const POINT *origin)
-@@ -2311,6 +2334,8 @@
-     NtUserGetWindowRect(toplevel, &tr, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
-     origin.x = tr.left; origin.y = tr.top;
-     neutron_zorder_collect_rec(toplevel, zl, &origin);
-+
-+    }
- }
- 
- /* order cache: skip wl traffic when the applied order is unchanged.
-@@ -2354,6 +2379,7 @@
+@@ -2354,6 +2377,7 @@
      struct wayland_win_data *tdata = wayland_win_data_get_nolock(toplevel);
      struct wayland_surface *tsurf = tdata ? tdata->wayland_surface : NULL;
      struct wayland_client_surface *cs_of[NEUTRON_ZMAX];
@@ -134,7 +125,7 @@ actually stops sinking is a visual result only the operator can confirm.
      BOOL below[NEUTRON_ZMAX];
      HWND applied[NEUTRON_ZMAX];
      struct wl_surface *prev;
-@@ -2402,6 +2428,29 @@
+@@ -2402,6 +2426,29 @@
          if (zl->hwnd[i] == toplevel) top_idx = (int)n; else child_clients++;
          n++;
      }
@@ -164,7 +155,7 @@ actually stops sinking is a visual result only the operator can confirm.
      /* ...plus (a) the toplevel's OWN client surface when it hosts >=1 child client
       * subsurface (black container signature; belt-and-braces -- z-order alone
       * already puts content children above it). */
-@@ -2536,7 +2585,13 @@
+@@ -2536,7 +2583,13 @@
      /* NEUTRON round-35 native stacking, phase A (user-lock queries, PRE-lock):
       * collect the toplevel's win32 z-order so phase B can mirror it in the
       * wl_subsurface stack without any user-lock call under win_data_mutex. */
@@ -179,7 +170,7 @@ actually stops sinking is a visual result only the operator can confirm.
          neutron_zorder_collect(toplevel, &zl);
  
      if (((neutron_dbg_n++) & 0xFF) == 0)
-@@ -2627,7 +2682,7 @@
+@@ -2627,7 +2680,7 @@
          /* NEUTRON round-35 native stacking, phase B (under win_data_mutex, NO
           * user-lock calls): mirror the collected win32 z-order in the
           * wl_subsurface stack (order cache no-ops when unchanged). */
