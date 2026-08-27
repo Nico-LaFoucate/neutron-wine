@@ -1,0 +1,137 @@
+winewayland: let a captioned owned window be a subsurface AND still be draggable
+
+The extension-panel docking bug (build tester, RC1 week day 1) is the Button
+Editor root cause again, one condition away: a captioned owned window keeps a
+valid owner_hint, is called managed because it has a caption, and becomes its
+own xdg_toplevel. Wayland never tells a toplevel where it is, so a dock drag
+crosses two independently placed surfaces and the drop lands somewhere the app
+is not looking. Their NEUTRON_POPUP_TRACE capture shows it exactly:
+
+    hwnd=0x50250 st=86cc0000 managed=1
+    owner_hint=0x300f2 gwowner=0x300f2 owner_surf=(nil) toplevel=0x50250
+
+The caption exclusion added in ...zzn was correct for the reason it gave -- a
+subsurface is positioned by US, so the COMPOSITOR cannot move it, and anything
+dragged by a title bar must stay a toplevel. But that reason is a consequence of
+THIS driver's own SC_MOVE handling, not a property of Wayland.
+
+WAYLAND_SysCommand sets ret = 0 for any window with wayland_win_data, while only
+actually issuing xdg_toplevel_move when wayland_surface_is_toplevel(). Returning
+0 means "handled" (win32u's defwnd.c: `if (!user_driver->pSysCommand(...)) return 0;`),
+so for a subsurface the driver swallows SC_MOVE and does nothing at all: the
+window becomes completely undraggable. That is what the caption rule was really
+protecting against.
+
+Decline it instead. When the surface is not a toplevel we return -1, win32u runs
+its own sys_command_size_move() loop, and the resulting SetWindowPos flows through
+the driver as a normal position update -- which for a subsurface is
+wl_subsurface_set_position, i.e. exactly the coordinates we already control. The
+window moves, and it moves under OUR control rather than the compositor's, which
+is the Windows model this whole line of work has been restoring.
+
+With that in place the caption exclusion has nothing left to protect, so owned
+captioned windows adopt their owner like caption-less ones. Photoshop's Image
+Size / Preferences / Export Settings keep their drag; the extension panel gains
+a coordinate space its host can hit.
+
+Gated: NEUTRON_OWNED_SUBSURFACE_CAPTIONED=0 restores the ...zzn behaviour without
+a rebuild, so this is A/B-able on a tester's machine like every other gate.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -301,6 +301,16 @@
+ static BOOL neutron_owned_subsurface(void)
+ {
+     static int on = -1;
+     if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE"); on = (e && e[0] == '0') ? 0 : 1; }
+     return on;
+ }
+ 
++/* NEUTRON: include CAPTIONED owned windows in the owned-subsurface rule. Default ON since
++ * 2026-08-27, once WAYLAND_SysCommand stopped swallowing SC_MOVE for non-toplevels (without that,
++ * a captioned subsurface could not be dragged at all). Set to 0 for caption-less-only. */
++static BOOL neutron_owned_subsurface_captioned(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_CAPTIONED"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -889,6 +889,7 @@
+     if (command == SC_MOVE || command == SC_SIZE)
+     {
+         if ((data = wayland_win_data_get(hwnd)))
+         {
+             pthread_mutex_lock(&process_wayland.seat.mutex);
+             wl_seat = process_wayland.seat.wl_seat;
+             if (wl_seat && (surface = data->wayland_surface) &&
+                 wayland_surface_is_toplevel(surface) && button_serial)
+             {
+                 if (command == SC_MOVE)
+                 {
+                     xdg_toplevel_move(surface->xdg_toplevel, wl_seat, button_serial);
+                 }
+                 else if (command == SC_SIZE)
+                 {
+                     xdg_toplevel_resize(surface->xdg_toplevel, wl_seat, button_serial,
+                                         hittest_to_resize_edge(wparam & 0x0f));
+                 }
++                ret = 0;   /* the compositor owns this move/resize from here */
+             }
+             pthread_mutex_unlock(&process_wayland.seat.mutex);
+             wayland_win_data_release(data);
+-            ret = 0;
++            /* NEUTRON: ret stays -1 when we did NOT hand the interaction to the compositor.
++             * This block used to claim EVERY window with wayland_win_data, including surfaces
++             * that are not toplevels -- and win32u treats 0 as "handled" (defwnd.c), so a
++             * SUBSURFACE swallowed SC_MOVE and could not be dragged at all. Declining lets
++             * win32u run sys_command_size_move(), whose SetWindowPos reaches us as an ordinary
++             * position update; for a subsurface that is wl_subsurface_set_position, the
++             * coordinates we already own. This is what makes a captioned owned window safe to
++             * turn into a subsurface below. */
+         }
+     }
+ 
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -780,21 +780,29 @@
+         if (neutron_owned_subsurface() && managed && !owner && toplevel == hwnd)
+         {
+             HWND gwowner = NtUserGetWindowRelative( hwnd, GW_OWNER );
+             DWORD st = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+ 
+             /* GW_OWNER is NULL for exactly the windows this is meant to catch; owner_hint is the
+              * value win32u actually passed us and it is correct. */
+             if (!gwowner) gwowner = owner_hint;
+ 
+-            /* ⛔ CAPTION-LESS ONLY. A subsurface is positioned by us, which is the whole point --
+-             * but it also means the COMPOSITOR cannot move it, so anything the user drags by a
+-             * title bar must stay an xdg_toplevel. A caption is exactly that signal. The user, on
+-             * the panel this was written for: "This panel can't move and was never designed to
+-             * move" -- so it loses nothing, while Image Size / Preferences / Export Settings keep
+-             * the behaviour people expect. Captioned owned windows remain the business of
+-             * NEUTRON_DOCK_OWNED above, which is opt-in for that reason. */
+-            if (gwowner && gwowner != hwnd && !(st & WS_CAPTION) &&
+-                NtUserIsWindowVisible( gwowner ))
++            /* CAPTIONED OWNED WINDOWS ARE INCLUDED as of 2026-08-27. The previous rule excluded
++             * them because a subsurface cannot be moved by the COMPOSITOR -- true, but the reason
++             * that mattered was WAYLAND_SysCommand claiming SC_MOVE for every window and then
++             * doing nothing for a non-toplevel, which left such a window undraggable. That is
++             * fixed above: we now decline, win32u runs its own move loop, and the SetWindowPos it
++             * produces becomes wl_subsurface_set_position. So a captioned owned window can be a
++             * subsurface AND still be dragged.
++             *
++             * What this buys: an owned window gets a coordinate space its owner can actually hit,
++             * which is what a dock drag needs. Premiere's extension panel could not be docked at
++             * all while it was an independent toplevel (build tester, 2026-08-27, and the same
++             * root cause as the Button Editor).
++             *
++             * Kill switch: NEUTRON_OWNED_SUBSURFACE_CAPTIONED=0 restores caption-less-only. */
++            if (gwowner && gwowner != hwnd && NtUserIsWindowVisible( gwowner ) &&
++                (!(st & WS_CAPTION) || neutron_owned_subsurface_captioned()))
+             {
+                 ERR( "neutron-ownedsub: hwnd=%p (style=%08x ex=%08x) -> SUBSURFACE of owner=%p "
+                      "so its position is ours to set, not the compositor's\n",
