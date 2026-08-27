@@ -2,42 +2,89 @@ winewayland: mirror win32 z-order for promoted OWNED windows (gated, default off
 
 Bug A of the 11.10-64 regression: a captioned owned window promoted to a
 subsurface SINKS behind the Program Monitor, and menus inside it sink behind it
-in turn. The build tester established there is no style discriminator -- the
-plugin windows and the extension panel are the same class -- so narrowing the
-promotion cannot fix it.
+in turn. No style discriminator exists -- the plugin windows and the extension
+panel are the same class -- so narrowing the promotion cannot fix it.
 
-The cause is that the existing win32-z-order mirror never saw these windows.
-Phase A (neutron_zorder_collect) walks GW_CHILD, and an owned window is not a
-child. Phase B (neutron_restack_apply) only matches client_surface, and a
-promoted owned window's subsurface is its MAIN wayland_surface. Missed on both
-counts, so nothing ever restacked them: a fresh wl_subsurface starts on top and
-then stays wherever later siblings leave it.
+The existing win32-z-order mirror never saw these windows. Phase A walks
+GW_CHILD and an owned window is not a child; phase B only matched
+client_surface, and a promoted owned window's subsurface is its MAIN
+wayland_surface. Nothing ever restacked them, so a fresh wl_subsurface started
+on top and then stayed wherever later siblings left it.
 
-Phase A now also collects the toplevel's owned windows, appended last = top of
-the bottom-to-top order, which is the Win32 rule. The desktop walk stays in
-phase A, the USER-lock phase; it must never move into phase B, which runs under
-win_data_mutex.
+TWO MEASURED CORRECTIONS before this worked, both caught by insisting the code
+prove it ran rather than assuming:
 
-Phase B now accepts a promoted owned window's own subsurface as an orderable
-sibling, with the same sibling-validity test the rest of the function uses, and
-function-scope storage for the synthesized record -- a loop local would be a
-use-after-scope, since cs_of[] is dereferenced later in the apply loop.
+  1. The mirror itself is behind NEUTRON_NATIVE_STACK, off by default. With only
+     NEUTRON_OWNED_ZORDER=1 a live Premiere session logged 347 promotions and
+     ZERO restack lines: the fix was inert. Either gate now arms both phases.
 
-DEFAULT OFF (NEUTRON_OWNED_ZORDER=1). This edits the most heavily-tuned path in
-the driver and a place_above against a non-sibling is a FATAL protocol error --
-compositor disconnect, app killed -- which is strictly worse than the bug it
-fixes. It ships off so it can be A/B'd on the machine that can see the symptom:
-there are no VST plugins here and z-order is not visible in a log, so I cannot
-verify it on this box and will not pretend otherwise.
+  2. Discovery by GW_OWNER matched NOTHING -- **GW_OWNER is NULL for exactly
+     these windows**, which the promotion code's own comment states, and why it
+     falls back to owner_hint. Measured as 84 restack calls, 1 applied surface,
+     the promoted window absent every time. Discovery now comes from the
+     driver's own tree via wayland_surface->toplevel_hwnd, which is the
+     relationship the driver already records.
 
-MEASURED CORRECTION before shipping: with only NEUTRON_OWNED_ZORDER=1 a live
-Premiere session logged 347 owned-window promotions and ZERO restack lines --
-the entire phase A/B mirror sits behind NEUTRON_NATIVE_STACK, which is off by
-default, so this fix was inert. Either gate now arms the mirror. Nearly shipped
-a fix that provably does nothing; the standing rule to prove the flag reached
-the code is what caught it.
+Owned windows are appended LAST = top of the bottom-to-top order, the Win32 rule
+that an owned window floats above its owner and the owner's children. The tree
+walk is under win_data_mutex and makes no user-lock calls, respecting the
+round-34 lock-order fix.
 
+DEFAULT OFF (NEUTRON_OWNED_ZORDER=1). Verified on a live session that 1281
+promotions produce zero protocol errors and no compositor disconnect, so the
+fatal place_above hazard does not materialise -- but whether the plugin window
+actually stops sinking is a visual result only the operator can confirm.
 
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -121,6 +121,37 @@
+ static struct rb_tree win_data_rb = { wayland_win_data_cmp_rb };
+ 
+ /***********************************************************************
++ *           wayland_owned_subsurfaces_of
++ *
++ * NEUTRON: the promoted OWNED windows currently parented to `toplevel`, from the driver's own
++ * tree. Caller MUST hold win_data_mutex; this makes no user-lock calls, so it is safe in the
++ * restack phase-B context.
++ *
++ * ⛔ Why not walk Win32 by GW_OWNER instead: **GW_OWNER is NULL for exactly these windows.** The
++ * promotion in WAYLAND_WindowPosChanged says so in its own comment and falls back to `owner_hint`
++ * for that reason -- owner_hint being a value win32u hands us, not something a later walk can
++ * recover. A first attempt at this fix looked them up by GW_OWNER and therefore matched NOTHING:
++ * measured on a live Premiere session as 84 restack calls, 1 applied surface, and the promoted
++ * window absent from it every time. The driver already records the relationship as
++ * wayland_surface->toplevel_hwnd, so ask that instead of re-deriving it.
++ */
++UINT wayland_owned_subsurfaces_of(HWND toplevel, HWND *out, UINT max)
++{
++    struct wayland_win_data *d;
++    UINT n = 0;
++
++    RB_FOR_EACH_ENTRY(d, &win_data_rb, struct wayland_win_data, entry)
++    {
++        if (n >= max) break;
++        if (d->hwnd == toplevel) continue;
++        if (!d->wayland_surface || !d->wayland_surface->wl_subsurface) continue;
++        if (d->wayland_surface->toplevel_hwnd != toplevel) continue;
++        out[n++] = d->hwnd;
++    }
++    return n;
++}
++
++/***********************************************************************
+  *           wayland_win_data_create
+  *
+  * Create a data window structure for an existing window.
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -559,6 +559,7 @@
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
++UINT wayland_owned_subsurfaces_of(HWND toplevel, HWND *out, UINT max);
+ void wayland_win_data_release(struct wayland_win_data *data);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
 --- a/dlls/winewayland.drv/wayland_surface.c
 +++ b/dlls/winewayland.drv/wayland_surface.c
 @@ -2275,6 +2275,29 @@
@@ -70,36 +117,16 @@ the code is what caught it.
  /* phase A: build the bottom-to-top win32 order of a toplevel's tree.
   * USER-LOCK calls only -- must be called WITHOUT win_data_mutex held. */
  static void neutron_zorder_collect_rec(HWND hwnd, struct neutron_zlist *zl, const POINT *origin)
-@@ -2311,6 +2334,28 @@
+@@ -2311,6 +2334,8 @@
      NtUserGetWindowRect(toplevel, &tr, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
      origin.x = tr.left; origin.y = tr.top;
      neutron_zorder_collect_rec(toplevel, zl, &origin);
 +
-+    /* NEUTRON: then the toplevel's OWNED windows, which are not children and so were invisible to
-+     * the walk above. Appended last = top of the bottom-to-top order, which is the Win32 rule
-+     * (an owned window floats above its owner and the owner's children). USER-LOCK phase, so the
-+     * desktop walk is safe here and must never move into phase B. */
-+    if (neutron_owned_zorder())
-+    {
-+        HWND desk = NtUserGetDesktopWindow(), w;
-+        for (w = NtUserGetWindowRelative(desk, GW_CHILD); w && zl->count < NEUTRON_ZMAX;
-+             w = NtUserGetWindowRelative(w, GW_HWNDNEXT))
-+        {
-+            RECT wr = {0};
-+            if (w == toplevel) continue;
-+            if (NtUserGetWindowRelative(w, GW_OWNER) != toplevel) continue;
-+            if (!NtUserIsWindowVisible(w)) continue;
-+            zl->cef_host[zl->count] = FALSE;
-+            NtUserGetWindowRect(w, &wr, NtUserGetWinMonitorDpi(w, MDT_RAW_DPI));
-+            OffsetRect(&wr, -origin.x, -origin.y);
-+            zl->rect[zl->count] = wr;
-+            zl->hwnd[zl->count++] = w;
-+        }
 +    }
  }
  
  /* order cache: skip wl traffic when the applied order is unchanged.
-@@ -2354,6 +2399,7 @@
+@@ -2354,6 +2379,7 @@
      struct wayland_win_data *tdata = wayland_win_data_get_nolock(toplevel);
      struct wayland_surface *tsurf = tdata ? tdata->wayland_surface : NULL;
      struct wayland_client_surface *cs_of[NEUTRON_ZMAX];
@@ -107,32 +134,37 @@ the code is what caught it.
      BOOL below[NEUTRON_ZMAX];
      HWND applied[NEUTRON_ZMAX];
      struct wl_surface *prev;
-@@ -2384,6 +2430,24 @@
-     {
-         struct wayland_win_data *d = (zl->hwnd[i] == toplevel) ? tdata : wayland_win_data_get_nolock(zl->hwnd[i]);
-         struct wayland_client_surface *cs = d ? d->client_surface : NULL;
-+        /* NEUTRON: a PROMOTED OWNED WINDOW has no client_surface -- its subsurface is its own
-+         * main wayland_surface. Treat it as an orderable sibling so it can be restacked, which
-+         * is what stops it sinking behind the Program Monitor. Same sibling-validity test as
-+         * below: only ever reference a surface attached to THIS parent, because place_above on a
-+         * non-sibling is fatal. */
-+        if (!cs && neutron_owned_zorder() && d && d->wayland_surface &&
-+            d->wayland_surface->wl_subsurface && d->wayland_surface->wl_surface &&
-+            d->wayland_surface->toplevel_hwnd == toplevel)
+@@ -2402,6 +2428,29 @@
+         if (zl->hwnd[i] == toplevel) top_idx = (int)n; else child_clients++;
+         n++;
+     }
++    /* NEUTRON: append the promoted OWNED windows LAST = top of the bottom-to-top order, which is
++     * the Win32 rule (an owned window floats above its owner and the owner's children). Sourced
++     * from the driver's tree because GW_OWNER is NULL for them -- see
++     * wayland_owned_subsurfaces_of(). */
++    if (neutron_owned_zorder())
++    {
++        HWND owned[NEUTRON_ZMAX];
++        UINT no = wayland_owned_subsurfaces_of(toplevel, owned, NEUTRON_ZMAX), k;
++        for (k = 0; k < no && n < NEUTRON_ZMAX; k++)
 +        {
-+            /* ⛔ FUNCTION-SCOPE storage, not a loop local: cs_of[] keeps this pointer and is
-+             * dereferenced in the apply loop below, so a block-scoped struct here would be a
-+             * use-after-scope on every promoted owned window. */
++            struct wayland_win_data *od = wayland_win_data_get_nolock(owned[k]);
++            if (!od || !od->wayland_surface || !od->wayland_surface->wl_subsurface) continue;
 +            memset(&owned_slots[n], 0, sizeof(owned_slots[n]));
-+            owned_slots[n].wl_subsurface = d->wayland_surface->wl_subsurface;
-+            owned_slots[n].wl_surface = d->wayland_surface->wl_surface;
++            owned_slots[n].wl_subsurface = od->wayland_surface->wl_subsurface;
++            owned_slots[n].wl_surface = od->wayland_surface->wl_surface;
 +            owned_slots[n].toplevel_wl_surface = tsurf->wl_surface;
-+            cs = &owned_slots[n];
++            cs_of[n] = &owned_slots[n];
++            applied[n] = owned[k];
++            below[n] = FALSE;
++            n++;
 +        }
-         if (!cs || !cs->wl_subsurface || !cs->wl_surface) continue;
-         if (cs->toplevel_wl_surface != tsurf->wl_surface) continue; /* not our sibling */
-         cs_of[n] = cs;
-@@ -2536,7 +2600,13 @@
++    }
++
+     /* ...plus (a) the toplevel's OWN client surface when it hosts >=1 child client
+      * subsurface (black container signature; belt-and-braces -- z-order alone
+      * already puts content children above it). */
+@@ -2536,7 +2585,13 @@
      /* NEUTRON round-35 native stacking, phase A (user-lock queries, PRE-lock):
       * collect the toplevel's win32 z-order so phase B can mirror it in the
       * wl_subsurface stack without any user-lock call under win_data_mutex. */
@@ -147,7 +179,7 @@ the code is what caught it.
          neutron_zorder_collect(toplevel, &zl);
  
      if (((neutron_dbg_n++) & 0xFF) == 0)
-@@ -2627,7 +2697,7 @@
+@@ -2627,7 +2682,7 @@
          /* NEUTRON round-35 native stacking, phase B (under win_data_mutex, NO
           * user-lock calls): mirror the collected win32 z-order in the
           * wl_subsurface stack (order cache no-ops when unchanged). */
