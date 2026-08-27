@@ -1,0 +1,91 @@
+winewayland: captioned-owned promotion defaults OFF, and never takes modal frames
+
+Shipped ON in 11.10-64 and regressed two things within a day (build tester,
+2026-08-27). It was written for ONE extension panel and promoted 929 windows in
+a session, because Premiere's VST plugin windows and its dialogs are captioned
+owned windows too.
+
+  A. Plugin windows SINK behind the Program Monitor, and menus inside them sink
+     behind the plugin. A subsurface is restacked only by us, and nothing
+     restacks these -- they are owned windows, so the existing z-order mirror
+     (neutron_zorder_collect, which walks GW_CHILD) never sees them, and it only
+     matches client_surface anyway.
+  B. A file-browse dialog never appears and Premiere WEDGES in its modal loop.
+
+B is fixed here: WS_EX_DLGMODALFRAME separates the failures perfectly. The
+tester's census -- 597 promotions carried the bit and every one was a dialog
+class, 1302 did not and none was -- and the extension panel does NOT carry it,
+so excluding modal frames costs the feature nothing. Exposed as its own gate
+(NEUTRON_OWNED_SUBSURFACE_MODAL, default off) purely so the effect can be
+isolated on a tester's machine.
+
+A is NOT fixed. The tester established that the plugin windows and the extension
+panel are the same window class (st=86cc0000/96cc0000 ex=00000180), so no style
+rule can separate them; it needs real z-order propagation into
+wl_subsurface.place_above/below. That is a deeper change than belongs in a
+same-day hotfix to a path that already documents a FATAL "incorrect sibling"
+protocol hazard.
+
+So the default returns to OFF. Docking one panel is a convenience; sinking every
+plugin window and freezing on a file dialog is not a trade to make on someone's
+working machine. The operator's position was explicit that a trade-off is not an
+acceptable outcome -- this is not one, it is a safe default while the real fix
+is built.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -316,8 +316,40 @@
+  * restriction was really protecting against. Set to 0 for caption-less-only. */
+ static BOOL neutron_owned_subsurface_captioned(void)
+ {
++    /* ⛔ DEFAULT OFF as of 2026-08-27, one day after it shipped ON in 11.10-64.
++     *
++     * It was written for one extension panel and it promoted 929 windows in a session -- because
++     * Premiere's VST plugin windows and its dialogs are captioned owned windows too. Two severe
++     * regressions followed (build tester, same day):
++     *   A. plugin windows SINK behind the Program Monitor, and menus inside them sink behind the
++     *      plugin. A subsurface is restacked only by us, and nothing was restacking these.
++     *   B. a file-browse dialog never appears and Premiere WEDGES in its modal loop.
++     *
++     * B is fixed below by excluding modal-framed windows. A is NOT fixed: the tester established
++     * that the plugin windows and the extension panel are the SAME window class
++     * (st=86cc0000/96cc0000 ex=00000180), so no style rule can separate them -- it needs real
++     * z-order propagation into wl_subsurface.place_above/below, which is a deeper change than
++     * belongs in a same-day hotfix to a function that already documents a FATAL "incorrect
++     * sibling" protocol hazard.
++     *
++     * So the default goes back to OFF. Docking one panel is a convenience; sinking every plugin
++     * window and freezing on a file dialog is not a trade we get to make on someone's working
++     * machine. Set to 1 to opt in. */
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_CAPTIONED"); on = (e && e[0] == '0') ? 0 : 1; }
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_CAPTIONED"); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++
++/* NEUTRON: also promote MODAL-FRAMED owned windows (WS_EX_DLGMODALFRAME). Default OFF -- these
++ * are the ones that wedge Premiere when they become subsurfaces and never present. The build
++ * tester's census separates them perfectly: 597 promotions carried the bit and every one was a
++ * dialog class; 1302 did not and none was. The extension panel this whole line of work exists for
++ * does NOT carry it, so excluding them costs the feature nothing. Exposed as its own gate purely
++ * so the effect can be isolated on a tester's machine. */
++static BOOL neutron_owned_subsurface_modal(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_MODAL"); on = (e && e[0] == '1') ? 1 : 0; }
+     return on;
+ }
+ 
+@@ -811,7 +843,12 @@
+              * Editor root cause again, one condition away.
+              *
+              * Kill switch: NEUTRON_OWNED_SUBSURFACE_CAPTIONED=0 restores caption-less-only. */
++            /* WS_EX_DLGMODALFRAME is the discriminator for the freeze (bug B): a modal dialog
++             * that becomes a subsurface and never presents leaves the app in its modal loop
++             * forever. Caption-less windows are unaffected by this test and keep their fix. */
+             if (gwowner && gwowner != hwnd && NtUserIsWindowVisible( gwowner ) &&
++                !((NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ) & WS_EX_DLGMODALFRAME) &&
++                  !neutron_owned_subsurface_modal()) &&
+                 (!(st & WS_CAPTION) || neutron_owned_subsurface_captioned()))
+             {
+                 ERR( "neutron-ownedsub: hwnd=%p (style=%08x ex=%08x) -> SUBSURFACE of owner=%p "
