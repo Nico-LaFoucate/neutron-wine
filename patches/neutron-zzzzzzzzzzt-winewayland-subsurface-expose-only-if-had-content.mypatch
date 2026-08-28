@@ -1,0 +1,113 @@
+winewayland: expose a re-shown subsurface only if it has HELD content before
+
+SYMPTOM (Premiere Pro): the splash screen came up with its left half a white box for
+1-2 seconds before filling in correctly. Intermittent by eye -- 4 of 6 watched launches
+on this machine -- on an IDENTICAL command line.
+
+CAUSE, and it is ours. Patch zzzzzzzzzm (2026-08-23) fixed Lightroom's filmstrip overlay:
+a subsurface has no xdg_surface, so it never receives the initial-configure expose, and a
+hidden-then-re-shown subsurface stays empty until the app repaints for its own reasons. It
+requests that expose on every role change to a surface with content_width == 0.
+
+content_width is also zero for a surface that is BRAND NEW. Premiere's splash is two
+windows -- a 766x517 WS_EX_LAYERED parent and a separate 320x500 WS_EX_NOACTIVATE #32770
+popup covering its left 42% -- and the popup is created already visible. So the expose
+fired 3 ms after the surface was allocated, flushed a window surface the application had
+not painted into, and published an empty buffer. Premiere's real paint landed 2.7 s later.
+For those 2.7 s the compositor was faithfully showing the emptiness we handed it.
+
+MEASURED (trace, run 193948):
+    39231.151  clear_role                                    content_width = 0
+    39231.151  make_subsurface                               expose requested here
+    39231.154  CreateWindowSurface + copy (0,0)-(640,896)    the ALLOCATION, published
+    39231.910  copy (0,0)-(640,896)                          still blank
+    39233.885  copy (0,0)-(544,849)                          the app's REAL first paint
+
+FIX: ever_had_content, set wherever content is actually attached and never cleared --
+unlike content_width, which clear_role() zeroes on every hide. The expose is now requested
+only for a surface that has held content and lost it, which is exactly Lightroom's case and
+excludes a never-painted new surface.
+
+RESULT: 4 of 6 launches bad before, 5 of 5 clean after, at default settings.
+Kill switch NEUTRON_SUBSURFACE_EXPOSE=0 disables the expose entirely (pre-zzzzzzzzzm
+behaviour) for A/B.
+
+⚠️ METHOD NOTE. The fault fires on EVERY launch; only the application's paint latency
+varies. That is why it presented as intermittent, and why single-sample A/Bs against it --
+63 vs 65, CLI vs menu launch, several gates -- all returned noise and were withdrawn. Two
+clean launches is what "confirmed" the previous, unrelated splash fix on 2026-08-25 against
+the same ~2-in-3 coin flip. Require a streak.
+
+⛔ Two gates were also found to be NO-OPS for this window: NEUTRON_OWNED_SUBSURFACE=0 does
+not stop it becoming a subsurface (wine's own owner path does that), and zero
+neutron-ownedsub / neutron-dock lines appear in any splash launch, so the owned-subsurface
+patches zzm/zzn/zzp/zzq are cleared of this. Prove a gate changed behaviour before reading
+anything into its result.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -425,6 +425,10 @@
+     BOOL resizing;
+     struct wayland_window_config window;
+     int content_width, content_height;
++    /* NEUTRON: has this surface EVER held content? content_width is zeroed by
++     * wayland_surface_clear_role() on every hide, so it cannot distinguish "was drawn, hidden,
++     * re-shown" from "brand new, never painted". This one is never cleared. */
++    BOOL ever_had_content;
+     HCURSOR hcursor;
+ };
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -953,6 +953,7 @@
+ 
+     surface->content_width = win_width;
+     surface->content_height = win_height;
++    surface->ever_had_content = TRUE;
+ }
+ 
+ /**********************************************************************
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -334,6 +334,15 @@
+ 
+ /* NEUTRON: see the OWNED-SUBSURFACE block in WAYLAND_WindowPosChanged. Default ON; set
+  * NEUTRON_OWNED_SUBSURFACE=0 to fall back to an independent xdg_toplevel. */
++/* NEUTRON: kill switch for the subsurface expose introduced 2026-08-23 (patch zzzzzzzzzm).
++ * NEUTRON_SUBSURFACE_EXPOSE=0 restores the pre-patch behaviour. Default on. */
++static BOOL neutron_subsurface_expose(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_SUBSURFACE_EXPOSE"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
+ static BOOL neutron_owned_subsurface(void)
+ {
+     static int on = -1;
+@@ -517,7 +526,24 @@
+          * positioned, sized and committed, and draws nothing at all until the application
+          * repaints it for its own reasons. Costs one repaint of a surface that is currently
+          * blank, and self-limits -- content_width is non-zero once anything has been attached. */
+-        if (needs_expose && !surface->content_width) *needs_expose = TRUE;
++        /* NEUTRON 2026-08-27: ...AND only for a surface that HAS held content before.
++         *
++         * The original condition (!content_width alone) also caught BRAND-NEW surfaces the
++         * application has not painted into yet, and the expose then published an empty buffer.
++         * Premiere's splash is a caption-less #32770 popup covering the left 42% of the splash
++         * and is created already visible: the expose fired 3 ms after the surface existed while
++         * the app's real paint did not land for another 2.7 s, so the left half of the splash was
++         * white for that whole time. MEASURED on this machine: 4 of 6 launches bad before the
++         * change, 5 of 5 clean after, at default settings.
++         *
++         * ⚠️ The fault is present on EVERY launch -- only the app's paint latency varies, which is
++         * why it looked intermittent and why single-launch A/Bs against it returned pure noise.
++         *
++         * ever_had_content survives clear_role, so Lightroom's hidden-then-re-shown filmstrip
++         * overlay -- the case this expose exists for -- still gets it. */
++        if (needs_expose && neutron_subsurface_expose() &&
++            !surface->content_width && surface->ever_had_content)
++            *needs_expose = TRUE;
+         break;
+     case WAYLAND_SURFACE_ROLE_POPUP:
+         wayland_surface_make_popup(surface, owner_surface, &data->rects.window);

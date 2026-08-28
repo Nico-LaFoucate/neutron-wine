@@ -1,0 +1,100 @@
+winewayland: verify sibling validity for OWNED windows in the z-order mirror
+
+Premiere died with NO Wine backtrace -- the log simply stops mid-frame -- whenever the user
+clicked away from the app with NEUTRON_OWNED_ZORDER=1. The only evidence is the compositor's:
+
+    wl_display#1: error 1: invalid arguments for xdg_popup#222.reposition
+    kwin_wayland: invalid object (84), type (wl_surface), message reposition(3ou)
+    kwin_wayland: error in client communication (pid 2445092)
+
+⭐ A FATAL WAYLAND PROTOCOL ERROR PRODUCES NO WINE-LEVEL CRASH EVIDENCE. Nothing in the wine log
+names it; `journalctl --user` and the `wl_display#1: error` line are all there is. The reported
+message is also NOT necessarily the culprit -- a malformed request corrupts the stream and the
+compositor reports the mis-parse of a LATER, well-formed one. Two hours went into the popup
+reposition path, which turned out to be entirely correct.
+
+CAUSE. neutron_restack_apply() sources owned windows from wayland_owned_subsurfaces_of(), which
+matches on wayland_surface->toplevel_hwnd -- an HWND. An HWND stays equal across a
+destroy/recreate of the toplevel's wl_surface (defocus, docking, any role change), so the
+subsurface remained a child of the OLD wl_surface while `prev` in the placement loop was a sibling
+of the NEW one. wl_subsurface.place_above against a non-sibling is fatal.
+
+The client-surface loop twenty lines above already guards exactly this:
+
+    if (cs->toplevel_wl_surface != tsurf->wl_surface) continue; /* not our sibling */
+
+The owned loop had no equivalent -- it ASSERTED the relationship instead of checking it:
+
+    owned_slots[n].toplevel_wl_surface = tsurf->wl_surface;
+
+FIX: record subsurface_parent (the actual parent wl_surface) in wayland_surface_make_subsurface(),
+clear it in wayland_surface_clear_role() with the rest of the role, and compare it in the owned
+loop. An HWND cannot answer a question about wl_surface identity; only the pointer can.
+
+MEASURED: crash 2/2 in the configuration (owned-subsurface-captioned +
+NEUTRON_SYSCOMMAND_DECLINE=1 + owned-zorder), 0/2 after, same gestures. With the mirror OFF the
+same session never crashed, which is what isolated it.
+
+⚠️ SEPARATE, STILL OPEN: this does not fix owned windows sinking behind the Program Monitor. The
+mirror computes orders containing only ONE OR TWO surfaces (9 restack applications against 1369
+owned promotions in one session) and the Program Monitor is absent from them, so the plugin is
+correctly placed on top of a stack that does not contain the surface it needs to be above. The
+client-surface loop's own staleness guard silently DROPS such surfaces instead of crashing --
+same root class, opposite symptom. Next step is to log the skip reason in that loop.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -402,6 +402,11 @@
+         {
+             struct wl_subsurface *wl_subsurface;
+             HWND toplevel_hwnd;
++            /* NEUTRON: the wl_surface this subsurface is ACTUALLY a child of. toplevel_hwnd is an
++             * HWND and survives the parent's wl_surface being destroyed and recreated, so it
++             * cannot answer "is this still a sibling of that surface?" -- and place_above against
++             * a non-sibling is a FATAL protocol error that kills the connection. */
++            struct wl_surface *subsurface_parent;
+         };
+     };
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -615,6 +615,7 @@
+ 
+     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     surface->toplevel_hwnd = parent->hwnd;
++    surface->subsurface_parent = parent->wl_surface;
+ 
+     /* Present contents independently of the parent surface. */
+     wl_subsurface_set_desync(surface->wl_subsurface);
+@@ -840,6 +841,7 @@
+         }
+ 
+         surface->toplevel_hwnd = 0;
++        surface->subsurface_parent = NULL;
+         break;
+     }
+ 
+@@ -1890,6 +1892,7 @@
+     UINT count;
+ };
+ 
++
+ /* ---- NEUTRON round-36 TEMPORAL SUPPRESSION (issues: CEF/CEP blank + invisible-
+  * until-hover). Windows composes bitblt presents and GDI paints TEMPORALLY into
+  * one surface: the latest painter wins per pixel. Native subsurfaces break that:
+@@ -2439,6 +2442,15 @@
+         {
+             struct wayland_win_data *od = wayland_win_data_get_nolock(owned[k]);
+             if (!od || !od->wayland_surface || !od->wayland_surface->wl_subsurface) continue;
++            /* NEUTRON sibling-validity, matching the client-surface loop above. Selection came
++             * from toplevel_hwnd, an HWND -- which stays equal across a destroy/recreate of the
++             * toplevel's wl_surface (defocus, docking, any role change). The subsurface is then
++             * still a child of the OLD surface while `prev` below is a sibling of the NEW one,
++             * and wl_subsurface.place_above against a non-sibling is FATAL: kwin answers
++             * "error in client communication" and Premiere dies with no Wine backtrace at all.
++             * MEASURED 2026-08-27: crashes on clicking off the app, only with NEUTRON_OWNED_ZORDER
++             * on; identical gate set minus the mirror survives the same gesture. */
++            if (od->wayland_surface->subsurface_parent != tsurf->wl_surface) continue;
+             memset(&owned_slots[n], 0, sizeof(owned_slots[n]));
+             owned_slots[n].wl_subsurface = od->wayland_surface->wl_subsurface;
+             owned_slots[n].wl_surface = od->wayland_surface->wl_surface;

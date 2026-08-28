@@ -1,0 +1,157 @@
+win32u: a menu command id of -1 or -2 is a valid id, not a sentinel
+
+Premiere Pro's panel menu items "Undock Panel" and "Undock Panel Group" were completely dead:
+clicking either did nothing AND left the menu open, while every other item in the same menu worked.
+No WM_COMMAND, no window activity, no error, and nothing in Adobe's own logs.
+
+CAUSE. Premiere gives those two commands the ids
+    0xffffffff  (-1)   "Undock Panel"
+    0xfffffffe  (-2)   "Undock Panel Group"
+wID is a UINT, so both are perfectly legal. But exec_focused_item() multiplexes the executed
+item's wID with two sentinels on one INT return -- -1 "nothing executed", -2 "a popup was shown" --
+and both callers then test the VALUE:
+
+    menu_button_up():   if (executedMenuId == -1 || executedMenuId == -2) return -1;
+    track_menu():       exit_menu = remove = executed_menu_id != -1;
+                        if (executed_menu_id == -1) executed_menu_id = 0;
+
+So a command id of -1 collapses to "keep tracking": the item never dispatches, the menu does not
+even close, and NtUserTrackPopupMenuEx reports 0 (cancelled). -2 takes the same route via
+menu_button_up. Any application using -1 or -2 as a menu command id loses those items entirely.
+
+FIX: report execution OUT OF BAND. exec_focused_item() takes a `BOOL *executed`, set only on the
+real execution path; menu_button_up() threads it through; track_menu() keeps one sticky
+`item_executed` and uses it for the exit decision and for the final -1 -> 0 mapping instead of
+comparing the id. No sentinel value can then collide with a real command id.
+
+MEASURED. Before: both items inert, menu stays open. After: both work. Operator-confirmed on
+Premiere Pro 25.3 with a plugin docked as a tab.
+
+⭐ HOW IT WAS FOUND, because the symptom pointed everywhere else first. Five theories died --
+the drag overlay's surface role, a stray button-up, pointer-focus starvation, capture theft, and a
+refcount drop -- three of them on evidence I had CREATED myself (instructing the operator to hold
+still and then reading the resulting focus gap; twice mistaking the operator's own dragging for
+Premiere's behaviour). What actually cracked it was a window-timeline run bracketed by explicit
+"ready" / "done" marks from the operator, which showed ZERO window activity for the click, plus
+two free questions: "does the menu close?" (no) and "do other items work?" (yes). Those three
+facts together said the command was never dispatched, and the command ids did the rest.
+
+⛔ Adobe's own logs are useless for this class of bug: with CreateLogFilesThatDoNotExist=true the
+log carries only codec warnings, and Trace Database.txt registers no workspace/drover/UI category
+at all. Adobe instruments its media pipeline heavily and its docking layer not at all.
+
+⚠️ This is an UPSTREAM Wine bug, not Neutron-specific, and it touches the code path taken by every
+menu click. Worth reporting upstream.
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -3463,8 +3463,22 @@
+  * that no menu item was executed, -2 if a popup is shown;
+  * Have to receive the flags for the NtUserTrackPopupMenuEx options to avoid
+  * sending unwanted message.
++ *
++ * NEUTRON: `executed` reports execution OUT OF BAND, because the return value cannot.
++ * wID is a UINT and -1/-2 are perfectly legal command ids, but this function and both of its
++ * callers used those two values as sentinels for "nothing executed" / "a popup was shown". An
++ * application whose command id happens to be -1 or -2 therefore had its click silently dropped:
++ * menu_button_up() mapped it back to -1, the tracking loop reads -1 as "keep tracking", so the
++ * menu does not even close, and TrackPopupMenuEx reports 0 (cancelled).
++ *
++ * MEASURED 2026-08-27 on Premiere Pro: its panel-menu commands use the ids
++ *   0xffffffff (-1)   "Undock Panel"
++ *   0xfffffffe (-2)   "Undock Panel Group"
++ * Both items were completely dead -- the menu stayed open, no WM_COMMAND, no error anywhere --
++ * while every other item in the same menu worked. Operator-confirmed: correct item highlights,
++ * item not greyed, menu will not close.
+  */
+-static INT exec_focused_item( MTRACKER *pmt, HMENU handle, UINT flags )
++static INT exec_focused_item( MTRACKER *pmt, HMENU handle, UINT flags, BOOL *executed )
+ {
+     struct menu_item *item;
+     struct menu *menu = unsafe_menu_ptr( handle );
+@@ -3486,6 +3500,8 @@
+     if ((item->fState & (MF_GRAYED | MF_DISABLED)) || (item->fType & MF_SEPARATOR))
+         return -1;
+ 
++    if (executed) *executed = TRUE;
++
+     /* If TPM_RETURNCMD is set you return the id, but
+        do not send a message to the owner */
+     if (!(flags & TPM_RETURNCMD))
+@@ -3579,8 +3595,10 @@
+  * the selected item was not a popup. Else open the popup.
+  * A -1 return value indicates that we go on with menu tracking.
+  *
++ * NEUTRON: `executed` is threaded through so a command id of -1 or -2 is not mistaken for
++ * "keep tracking" -- see exec_focused_item().
+  */
+-static INT menu_button_up( MTRACKER *pmt, HMENU pt_menu, UINT flags )
++static INT menu_button_up( MTRACKER *pmt, HMENU pt_menu, UINT flags, BOOL *executed )
+ {
+     TRACE( "%p hmenu=%p\n", pmt, pt_menu );
+ 
+@@ -3600,8 +3618,8 @@
+ 
+             if (!(ptmenu->items[pos].fType & MF_POPUP))
+             {
+-                INT executedMenuId = exec_focused_item( pmt, pt_menu, flags );
+-                if (executedMenuId == -1 || executedMenuId == -2) return -1;
++                INT executedMenuId = exec_focused_item( pmt, pt_menu, flags, executed );
++                if (!(executed && *executed)) return -1;
+                 return executedMenuId;
+             }
+ 
+@@ -4093,6 +4111,7 @@
+ {
+     BOOL enter_idle_sent = FALSE;
+     int executed_menu_id = -1;
++    BOOL item_executed = FALSE;   /* NEUTRON: sticky; -1/-2 are legal command ids */
+     HWND capture_win;
+     struct menu *menu;
+     BOOL remove;
+@@ -4206,12 +4225,12 @@
+                     /* Check if a menu was selected by the mouse */
+                     if (hmenu)
+                     {
+-                        executed_menu_id = menu_button_up( &mt, hmenu, flags);
++                        executed_menu_id = menu_button_up( &mt, hmenu, flags, &item_executed );
+                         TRACE( "executed_menu_id %d\n", executed_menu_id );
+ 
+                         /* End the loop if executed_menu_id is an item ID
+                          * or if the job was done (executed_menu_id = 0). */
+-                        exit_menu = remove = executed_menu_id != -1;
++                        exit_menu = remove = item_executed || executed_menu_id != -1;
+                     }
+                     else
+                         /* No menu was selected by the mouse. If the function was called by
+@@ -4298,8 +4317,8 @@
+ 
+                     if (msg.wParam == '\r' || msg.wParam == ' ')
+                     {
+-                        executed_menu_id = exec_focused_item( &mt, mt.hCurrentMenu, flags );
+-                        exit_menu = executed_menu_id != -2;
++                        executed_menu_id = exec_focused_item( &mt, mt.hCurrentMenu, flags, &item_executed );
++                        exit_menu = item_executed || executed_menu_id != -2;
+                         break;
+                     }
+ 
+@@ -4313,8 +4332,8 @@
+                     else
+                     {
+                         select_item( mt.hOwnerWnd, mt.hCurrentMenu, pos, TRUE, 0 );
+-                        executed_menu_id = exec_focused_item( &mt,mt.hCurrentMenu, flags );
+-                        exit_menu = executed_menu_id != -2;
++                        executed_menu_id = exec_focused_item( &mt,mt.hCurrentMenu, flags, &item_executed );
++                        exit_menu = item_executed || executed_menu_id != -2;
+                     }
+                 }
+                 break;
+@@ -4366,7 +4385,7 @@
+     RtlSetLastWin32Error( ERROR_SUCCESS );
+     /* The return value is only used by NtUserTrackPopupMenuEx */
+     if (!(flags & TPM_RETURNCMD)) return TRUE;
+-    if (executed_menu_id == -1) executed_menu_id = 0;
++    if (!item_executed && executed_menu_id == -1) executed_menu_id = 0;
+     return executed_menu_id;
+ }
+ 

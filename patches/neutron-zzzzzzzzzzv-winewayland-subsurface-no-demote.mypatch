@@ -1,0 +1,106 @@
+winewayland: never DEMOTE a subsurface when its anchor cannot be computed
+
+Premiere's plugin and extension windows sank behind the Program Monitor the moment they were
+dragged or docked, recovering only when the user clicked away from the app and back. This is
+Bug A of the 11.10-64 regression and the reason owned-subsurface-captioned -- the fix that makes
+Premiere's panels dockable at all -- had to be defaulted OFF.
+
+CAUSE. wayland_surface_reconfigure()'s subsurface branch re-anchors the surface on EVERY
+reconfigure, and a drag or a dock IS a reconfigure:
+
+    if (toplevel_data->client_surface && <sibling check>)
+        wl_subsurface_place_above(surface->wl_subsurface, client_surface->wl_surface);
+    else
+        wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
+
+place_above(X) means "immediately above X", so the fallback places the window immediately above
+the PARENT -- the BOTTOM of the sibling stack, beneath the Program Monitor's own surface.
+
+MEASURED, and this is the part that was assumed for hours and turned out to be the whole answer:
+**Premiere's main toplevel has no client surface at all.**
+
+    NT-EV restack toplevel=0x10122 zlist=64 applied=2
+    NT-SKIP hwnd=0x10122 reason=no-client-surface (d=0x555586312410 cs=(nil) ...)
+
+The preferred branch can therefore NEVER be taken for this app, and every reconfigure demoted the
+window. It also silently undid the win32 z-order mirror, which is why NEUTRON_OWNED_ZORDER
+measured as "provably runs, changes nothing" -- the mirror placed the plugin on top and the next
+reconfigure put it back at the bottom.
+
+FIX: NEUTRON_SUBSURFACE_NO_DEMOTE=1 -- an anchor we cannot compute is simply not applied. The
+existing order stands and the z-order mirror owns stacking, which is the Windows model (the app
+owns z-order). A subsurface is already above its parent by default at creation, so nothing needs
+the fallback in order to become visible.
+
+RESULT, operator-confirmed: panels dock without sinking, and a VST3 plugin window dragged over
+the Program Monitor stays on top.
+
+REQUIRED SET for dockable panels (all four, they do not work apart):
+    NEUTRON_OWNED_SUBSURFACE_CAPTIONED=1   promote captioned owned windows
+    NEUTRON_SYSCOMMAND_DECLINE=1           or the window cannot be MOVED at all
+    NEUTRON_OWNED_ZORDER=1                 the mirror, which now actually sticks
+    NEUTRON_SUBSURFACE_NO_DEMOTE=1         this patch
+Defaults are unchanged pending a full working session.
+
+⛔ TWO WRONG FIXES ON THE WAY HERE, both from assuming instead of measuring:
+  * "place once per role assignment" -- froze the FIRST anchor, which is the bottom one, so it
+    made the sink permanent instead of intermittent.
+  * "re-run the mirror at role assignment" -- the mirror was never the problem; it was correct
+    and being undone.
+The measurement that settled it was one probe printing WHY each window was skipped.
+
+⚠️ STILL OPEN: undocking a panel does nothing at all. Unrelated to stacking.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -958,6 +958,30 @@
+     surface->ever_had_content = TRUE;
+ }
+ 
++/***********************************************************************
++ *          neutron_no_demote   (NEUTRON_SUBSURFACE_NO_DEMOTE=1 enables)
++ *
++ * The reconfigure path anchors a subsurface with wl_subsurface.place_above(X), which means
++ * "immediately above X". It prefers the toplevel's client (video) surface and falls back to the
++ * toplevel's own wl_surface -- and place_above(parent) is the BOTTOM of the sibling stack.
++ *
++ * MEASURED 2026-08-27: Premiere's main toplevel has NO client surface at all
++ * (NT-SKIP hwnd=0x10122 reason=no-client-surface), so the preferred branch can never be taken and
++ * every reconfigure -- including every drag and every dock -- demotes the promoted owned window
++ * beneath the Program Monitor's surface. The z-order mirror places it correctly and the next
++ * reconfigure undoes that, which is why the mirror measured as "runs, changes nothing".
++ *
++ * With this on, an anchor we cannot compute is simply not applied: the existing order stands and
++ * the win32 z-order mirror owns stacking, which is the Windows model. A subsurface is already
++ * above its parent by default at creation, so nothing needs the fallback to become visible.
++ */
++static BOOL neutron_no_demote(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_SUBSURFACE_NO_DEMOTE"); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++
+ /**********************************************************************
+  *          wayland_surface_config_is_compatible
+  *
+@@ -1420,7 +1444,7 @@
+         if (toplevel_data->client_surface &&
+             toplevel_data->client_surface->toplevel_wl_surface == toplevel_surface->wl_surface)
+             wl_subsurface_place_above(surface->wl_subsurface, toplevel_data->client_surface->wl_surface);
+-        else
++        else if (!neutron_no_demote())
+             wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
+         wl_surface_commit(toplevel_surface->wl_surface);
+ 
+@@ -2507,8 +2531,8 @@
+             logn++;
+             for (i = 0; i < n && off < (int)sizeof(buf) - 24; i++)
+                 off += snprintf(buf + off, sizeof(buf) - off, "%p%s ", applied[i], below[i] ? "(below)" : "");
+-            ERR("NT-EV restack toplevel=%p t=%u order-bottom-to-top: %s\n",
+-                toplevel, (unsigned)NtGetTickCount(), buf);
++            ERR("NT-EV restack toplevel=%p t=%u zlist=%u applied=%u order-bottom-to-top: %s\n",
++                toplevel, (unsigned)NtGetTickCount(), zl->count, n, buf);
+         }
+     }
+ }
