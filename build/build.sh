@@ -88,6 +88,13 @@ cd "$TKGDIR"
 echo
 echo "Built. The Neutron wine is under: $TKGDIR/src/*-build/wine"
 echo "Use it:  NEUTRON_WINE=\"$TKGDIR/src/<flavor>-build/wine\" neutron launch premiere"
+# NEUTRON: record that THIS version built successfully. package.sh refuses without it.
+# 2026-08-31: a build failed on a rejected patch and package.sh cheerfully packaged the STALE tree
+# from the previous version, producing a complete, correctly-checksummed "11.10-69" tarball that
+# was actually 11.10-68. Nothing in its output said so. Only checking build.sh's exit code caught
+# it. A checksum proves a file arrived intact, never that it contains what its name claims.
+printf '%s\n' "$(cat "$REPO/build/VERSION")" > "$WORK/.build-ok"
+
 echo
 echo "To cut a release, package the tree into a versioned tarball + manifest:"
 echo "  build/package.sh          # -> dist/  (see RELEASING.md)"

@@ -1,0 +1,91 @@
+winewayland: give a client surface's viewport a destination before anything can present
+
+Premiere's Program Monitor was grossly oversized on the FIRST fullscreen entry -- it spilled onto
+the neighbouring monitor and past the bottom of the desktop. The second and every later entry were
+correct, which is what made it look random.
+
+CAUSE. wp_viewport_set_destination() is what maps a client surface's buffer (device pixels) down to
+its logical size. It was only ever set from wayland_surface_reconfigure_client(), which runs when
+the client surface is ATTACHED -- and a GL client can present before that. With no destination the
+compositor shows the buffer 1:1, i.e. scale-times too large.
+
+MEASURED, from an ordinary +waylanddrv trace of a fullscreen entry:
+
+    4485.006  wayland_opengl_surface_create      GL drawable created
+    4485.037  wayland_drawable_flush             FIRST PRESENT -- no destination yet
+    4485.046  reconfigure_client 2259x1271       destination set, 9 ms too late
+
+A 3840 px buffer shown 1:1 on a 2259-wide logical output is 1.7x oversized. Only the first entry is
+affected because afterwards the viewport already carries a destination.
+
+FIX: set the destination in wayland_client_surface_create(), immediately after the viewport exists,
+from the window's own client rect. reconfigure_client refreshes it a few ms later as usual; the
+point is that it is never UNSET while a buffer is live.
+
+⭐ AND IT MUST BE THE COMPOSITOR'S SCALE, NOT raw_dpi/96. The first version of this used
+dpi/96 = 163/96 = 1.69792 and computed 2262x1272, which still overhung the output by 3 px --
+operator-visible as a few pixels spilling onto the next monitor. wp_fractional_scale quantises to
+1/120, so round(163 * 1.25) = 204 and 204/120 = 1.7 exactly, giving 3840*120/204 = 2259. That
+agrees with what reconfigure_client computes, so the initial value and the refresh no longer
+disagree. Operator-confirmed: correctly sized on the first fullscreen, no spill.
+
+⚠️ STILL OPEN (separate, same first-entry window): the GL surface is presented ONCE at creation
+before the application has rendered into it, so the first fullscreen can come up BLACK. Same shape
+as the splash bug fixed in zzzzzzzzzzt -- publishing a buffer the app has not drawn into. The
+oversize and the black were two faces of that single unconfigured first present; this patch fixes
+the geometry half only.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2783,6 +2783,51 @@
+     client->wp_viewport =
+         wp_viewporter_get_viewport(process_wayland.wp_viewporter,
+                                     client->wl_surface);
++    /* NEUTRON: give the viewport a destination IMMEDIATELY.
++     *
++     * The destination is what maps the buffer (device pixels) down to the surface's logical size.
++     * It was only ever set from wayland_surface_reconfigure_client(), which runs when the client
++     * surface is attached -- and a GL client can PRESENT BEFORE THAT. With no destination the
++     * compositor shows the buffer 1:1, i.e. scale-times too large.
++     *
++     * MEASURED 2026-08-31, Premiere's Program Monitor going fullscreen:
++     *     4485.006  GL drawable created
++     *     4485.037  wayland_drawable_flush          <- first present, NO destination yet
++     *     4485.046  reconfigure_client 2259x1271    <- destination set, 9 ms too late
++     * A 3840 px buffer shown 1:1 on a 2259-wide logical output spilled onto the second monitor and
++     * past the bottom. Only the FIRST fullscreen entry is affected -- afterwards the viewport
++     * already has a destination -- which is exactly what the operator reported.
++     *
++     * The scale here is derived the same way the surface's own scale is (raw monitor DPI / 96),
++     * so this matches what reconfigure_client will compute; it is a correct value, not a guess,
++     * and is refreshed by the normal path a few ms later regardless. */
++    if (client->wp_viewport)
++    {
++        UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
++        RECT r = {0};
++
++        if (dpi && NtUserGetClientRect(hwnd, &r, dpi))
++        {
++            /* Quantise to the 1/120 steps wp_fractional_scale uses, or we land a few px out.
++             * MEASURED: dpi 163 gives 163/96 = 1.69792 and 3840/1.69792 = 2262, but the
++             * compositor's scale is exactly 1.7 and its logical width is 2259 -- a 3 px overhang
++             * that spilled onto the neighbouring monitor. round(163 * 1.25) = 204, 204/120 = 1.7,
++             * and 3840 * 120 / 204 = 2259 exactly. Same arithmetic the surface itself ends up
++             * using, so this initial value now AGREES with what reconfigure_client computes. */
++            int scale120 = (dpi * 120 + 48) / 96;
++            int w = scale120 ? ((r.right - r.left) * 120 + scale120 / 2) / scale120 : 0;
++            int h = scale120 ? ((r.bottom - r.top) * 120 + scale120 / 2) / scale120 : 0;
++
++            if (w > 0 && h > 0)
++            {
++                wp_viewport_set_destination(client->wp_viewport, w, h);
++                ERR("neutron-vpinit: hwnd=%p initial viewport destination %dx%d (buffer %ldx%ld, "
++                    "dpi %u, scale120 %d) -- without this the first present is shown 1:1\n",
++                    hwnd, w, h, (long)(r.right - r.left), (long)(r.bottom - r.top), dpi, scale120);
++            }
++        }
++    }
++
+     if (!client->wp_viewport)
+     {
+         ERR("Failed to create client wp_viewport\n");

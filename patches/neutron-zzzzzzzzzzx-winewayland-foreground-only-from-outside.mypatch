@@ -1,0 +1,108 @@
+winewayland: only force the foreground for focus arriving from OUTSIDE the process
+
+Premiere's Program Monitor fullscreen was deaf to ordinary keys. Escape would not leave
+fullscreen, space would not play -- but Ctrl+Q still quit the app. Reported as "Escape does not
+exit fullscreen"; it is actually every ordinary key.
+
+CAUSE. KWin sends wl_keyboard.enter whenever a surface takes keyboard focus, INCLUDING when focus
+moves between two of the application's own windows. keyboard_handle_enter() turned every one of
+those into WM_WAYLAND_SET_FOREGROUND -> NtUserSetForegroundWindowInternal(). For an in-app move
+that overrides activation the application has just performed itself, and Premiere's key routing is
+left pointing where it was before we intervened. Accelerators survive because they are dispatched
+from the message loop and never depend on which window is active -- which is exactly why Ctrl+Q
+worked and made the keyboard path look healthy.
+
+The deactivation handler already asks this question and skips in-app changes ("SKIP (in-app focus
+change)"). The enter path never did. The two were asymmetric; this makes them agree.
+
+FIX: post the foreground only when the current foreground window does NOT belong to this process.
+External activation (clicking in from another application, alt-tab) is unaffected; in-app focus
+moves are left to the app.
+
+MEASURED. Before: keys dead on every fullscreen entry, in-app clicks do NOT repair it, only
+clicking another application and back does -- i.e. only a full WM_ACTIVATEAPP cycle. After: keys
+work immediately with no click, and normal activation still works (operator-verified: clicking in
+from another app, switching between Premiere windows, dialogs, menus).
+
+⭐ HOW IT WAS FOUND, because six theories died first. The report ruled out delivery, routing and
+focus churn, all correctly. What actually discriminated was cheap and behavioural:
+  * SPACE also does nothing -- so it is not an Escape bug, it is every window-routed key, and
+    accelerators are the exception that names the mechanism.
+  * an IN-APP click does NOT repair it while leaving the app and returning does -- which said the
+    repair needs WM_ACTIVATEAPP, and pointed straight at activation rather than input.
+  * +msg showed the difference between the two activations: entry produces a lone WM_NCACTIVATE,
+    the click produces WM_ACTIVATEAPP 0 then 1.
+⛔ Dead ends, each disproven with the gate PROVEN to have taken effect, not assumed: foreground
+loss to the desktop (that DEACTIVATING line is the operator's own click-away), the 1 px
+coords_to_window rounding, monitor geometry, SWP_NOSIZE suppressing WM_SIZE, and raw input (the
+app does not use it -- zero +rawinput lines).
+
+⚠️ STILL OPEN, separate bugs measured alongside this one:
+  1. The FIRST fullscreen entry is oversized (self-corrects on the next entry, or on play).
+     Independent of this fix.
+  2. Win32 reports DISPLAY2 as 3260x1834 @ (6520,270) when it is 1920x1080 -- size scaled by the
+     primary monitor's DPI, origin scaled TWICE. The known mixed-per-monitor-DPI bug, now with
+     exact numbers.
+  3. After clicking back into the app, clicking a panel highlights its border then immediately
+     deselects it. Noticed in the same session as this change and NOT yet established as
+     pre-existing -- treat as possibly introduced here until checked.
+
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -827,8 +827,55 @@
+          * skip the SetForegroundWindow post for it (compositor keyboard focus alone is
+          * harmless — the app just never wanted this popup to become the active window). */
+         DWORD ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++
++        /* NEUTRON: only force the foreground for focus arriving from OUTSIDE this process.
++         *
++         * KWin sends wl_keyboard.enter whenever a surface takes keyboard focus -- including when
++         * the focus merely moves between two of the application's OWN windows. Forcing
++         * SetForegroundWindow for those in-app moves overrides activation the app has just
++         * performed itself, and the app's key routing is left pointing at whatever it had chosen
++         * before we intervened.
++         *
++         * MEASURED 2026-08-31 on Premiere: entering the Program Monitor's fullscreen leaves the
++         * fullscreen window deaf to ORDINARY keys (space, escape) while accelerators (Ctrl+Q) keep
++         * working, because accelerators are dispatched from the message loop and never depend on
++         * which window is active. Keys were provably delivered to the correct window the whole
++         * time. Clicking another application and back fixed it; clicking inside Premiere did not --
++         * i.e. only a full WM_ACTIVATEAPP cycle repaired it. With this post suppressed the keys
++         * work immediately, with no click.
++         *
++         * The deactivation handler already asks exactly this question and skips in-app changes
++         * ("SKIP (in-app focus change)"); the enter path never did, so the two were asymmetric.
++         *
++         * Kill switch: NEUTRON_KBD_FOREGROUND=0 suppresses the post entirely (the probe that
++         * identified this); NEUTRON_KBD_FOREGROUND=2 restores the old unconditional behaviour. */
+         if (surface->window.managed && !(ex_style & WS_EX_NOACTIVATE))
+-            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
++        {
++            static int mode = -1;
++            HWND fg;
++            DWORD fg_pid = 0;
++
++            if (mode < 0)
++            {
++                const char *e = getenv("NEUTRON_KBD_FOREGROUND");
++                mode = e ? atoi(e) : 1;
++            }
++
++            fg = NtUserGetForegroundWindow();
++            if (fg) NtUserGetWindowThread(fg, &fg_pid);
++
++            if (mode == 0)
++                ERR("neutron-kbdfg: hwnd=%p SKIP (probe: post disabled)\n", hwnd);
++            else if (mode != 2 && fg_pid == GetCurrentProcessId())
++                ERR("neutron-kbdfg: hwnd=%p SKIP -- foreground %p is already ours, this is an "
++                    "in-app focus change and the app owns its own activation\n", hwnd, fg);
++            else
++            {
++                ERR("neutron-kbdfg: hwnd=%p FOREGROUNDING (focus arrived from outside; fg=%p)\n",
++                    hwnd, fg);
++                NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
++            }
++        }
+     }
+ 
+     wayland_win_data_release(data);

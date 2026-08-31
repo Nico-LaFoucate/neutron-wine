@@ -22,6 +22,30 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="$(cat "$REPO/build/VERSION")"
 WINE_BASE="$(cat "$REPO/build/WINE_BASE")"
+
+# NEUTRON: refuse to package a tree whose build did not succeed for THIS version.
+#
+# 2026-08-31: build.sh failed applying a patch and exited 1. package.sh then packaged the stale
+# tree left from the PREVIOUS version and produced a complete, correctly-checksummed
+# "neutron-wine-11.10-69.tar.xz" that actually contained 11.10-68. `sha256sum -c` said OK, the
+# file list looked right, and nothing anywhere said the build had failed -- it was caught only
+# because the build's exit code happened to be checked by hand. That is the 11.10-61 failure mode
+# reached by a different route, so it gets a GATE, not a rule in a document.
+#
+# ⭐ A checksum proves a file arrived intact. It never proves the file contains what its name says.
+_BUILD_OK="${NEUTRON_WINE_WORK:-$REPO/_work}/.build-ok"
+if [ ! -f "$_BUILD_OK" ]; then
+    echo "package.sh: no successful build recorded ($_BUILD_OK missing)." >&2
+    echo "  Run build/build.sh first. Without this, a tree left from an earlier version would be" >&2
+    echo "  packaged under the NEW version number and its checksum would verify perfectly." >&2
+    exit 1
+fi
+_BUILT="$(cat "$_BUILD_OK")"
+if [ "$_BUILT" != "$VERSION" ]; then
+    echo "package.sh: the last successful build was $_BUILT, but build/VERSION says $VERSION." >&2
+    echo "  Packaging now would ship the $_BUILT tree labelled $VERSION. Re-run build/build.sh." >&2
+    exit 1
+fi
 SLUG="${NEUTRON_REPO_SLUG:-Nico-LaFoucate/neutron-wine}"
 NAME="neutron-wine-$VERSION"
 DIST="$REPO/dist"
