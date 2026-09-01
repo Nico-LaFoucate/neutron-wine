@@ -1,0 +1,83 @@
+winewayland: kill switch for the initial viewport destination (NEUTRON_VIEWPORT_INIT=0)
+
+A build tester reports Premiere's splash and other dialogs rendering in the TOP-LEFT corner from
+11.10-69 onward -- every launch, 5/5 counted, not sporadic.
+
+Only two patches separate 68 from 69, and on the evidence neither should be able to cause it:
+
+  * zzzzzzzzzzx (keyboard foreground guard) -- ruled out BY EXPERIMENT on the tester's machine:
+    NEUTRON_KBD_FOREGROUND=2 restores the old unconditional behaviour (proven reaching the code by
+    a wlsetfg count that goes 0 -> 1), and the splash stayed top-left.
+  * zzzzzzzzzzy (this one) -- runs only inside wayland_client_surface_create(), which is called
+    only from opengl.c:109 and vulkan.c:50. No #32770 dialog gets a client surface on either
+    machine; both machines' logs were checked, with channel liveness proven in the same log.
+
+Everything else was eliminated too: only bin/neutron's version string changed in the shipped stack;
+win32u.so is byte-identical between the two releases; user32.dll differs by exactly 6 bytes at
+offsets 137-139 and 217-219 (PE timestamp + checksum), so the wine base did not move; the compositor
+placement policy is unset on both machines; both enumerate phantom WaylandOutputN entries, so that
+is normal driver behaviour and not a divergence; and the splash frame is a plain xdg_toplevel with
+an identical structure and identical logical size on both.
+
+⚠️ So the evidence says "neither patch" and the operator says "it started with 69". Rather than keep
+arguing from the code about what can reach a window, this adds the switch that settles it. This
+patch calls NtUserGetWinMonitorDpi() and NtUserGetClientRect() from inside client-surface creation
+during early GL setup -- win32u calls made from the driver, which this project has a standing
+lock-order rule about (round-34 ABBA). "Cannot touch it directly" is not "cannot affect it", and I
+have no basis for ruling out a global side effect on monitor/DPI state.
+
+NEUTRON_VIEWPORT_INIT=0 disables the initial destination, restoring 11.10-68 behaviour for this
+patch. Default on = shipped behaviour.
+
+  * splash centres with =0  -> this patch is the cause; the fix is to obtain the scale without
+    calling into win32u from here.
+  * splash still top-left   -> the runtime is exonerated entirely and the cause is in the install
+    or the prefix, not the engine.
+
+⛔ Note what this patch actually fixes, so it is not casually reverted: without it the first
+fullscreen entry is ~1.7x oversized, because the viewport destination is applied ~9 ms after the
+first frame is already on screen.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2754,6 +2754,31 @@
+     .present = wayland_client_surface_present,
+ };
+ 
++/* NEUTRON kill switch for the initial viewport destination (NEUTRON_VIEWPORT_INIT=0 disables).
++ *
++ * Added 2026-08-31 because a build tester saw Premiere's splash and other dialogs render in the
++ * TOP-LEFT corner starting with 11.10-69, every launch, 5/5 counted. Only two patches separate 68
++ * from 69 and neither should be able to do that: the keyboard-foreground guard was ruled out by
++ * experiment on their machine, and this one runs only inside wayland_client_surface_create(),
++ * which is called only from opengl.c and vulkan.c -- and no #32770 dialog gets a client surface on
++ * either machine.
++ *
++ * ⚠️ "Cannot touch it DIRECTLY" is not "cannot affect it". This code calls
++ * NtUserGetWinMonitorDpi() and NtUserGetClientRect() from inside client-surface creation, during
++ * early GL window setup. Those are win32u calls made from the driver, and this project has a
++ * standing lock-order rule about exactly that (round-34 ABBA). A switch is cheaper than another
++ * argument from the code about what can and cannot reach a window.
++ *
++ * If disabling this centres the splash, this patch is the cause and the fix is to obtain the scale
++ * without calling into win32u here. If it does not, the runtime is exonerated entirely and the
++ * cause is in the install or the prefix, not the engine. */
++static BOOL neutron_viewport_init(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_VIEWPORT_INIT"); on = (e && e[0] == '0') ? 0 : 1; }
++    return on;
++}
++
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd)
+ {
+     struct wayland_client_surface *client;
+@@ -2801,7 +2826,7 @@
+      * The scale here is derived the same way the surface's own scale is (raw monitor DPI / 96),
+      * so this matches what reconfigure_client will compute; it is a correct value, not a guess,
+      * and is refreshed by the normal path a few ms later regardless. */
+-    if (client->wp_viewport)
++    if (client->wp_viewport && neutron_viewport_init())
+     {
+         UINT dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
+         RECT r = {0};
