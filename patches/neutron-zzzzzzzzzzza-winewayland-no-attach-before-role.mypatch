@@ -1,0 +1,108 @@
+winewayland: never attach a buffer before the surface has an xdg role
+
+xdg-shell requires that a surface have no buffer attached when a role is assigned, and
+that nothing be committed before the first xdg_surface.configure. wayland_window_surface_flush
+did not check, so a WS_EX_LAYERED window -- whose content arrives via UpdateLayeredWindow
+BEFORE the window is shown -- attached a buffer while the surface was still roleless.
+
+Reproduced by the build tester 3/3 on 11.10-69 and -70 (Premiere's splash, hwnd 0x70246):
+
+  CreateWindowSurface  layered 1
+  clear_role           surface has NO role
+  attach_shm           <<< BUFFER ATTACHED
+  make_toplevel        <<< ROLE, 8 ms LATER
+
+The guard mirrors the existing wayland_window_can_commit() bail in the same function: return
+FALSE and let win32u retry. Verified on the dev box -- the attach now lands after make_toplevel,
+on the first configure, and costs exactly 2 deferrals for the splash (print capped at 20, so
+the count is exact, not sampled). Content still arrives 8 ms later; nothing is lost.
+
+Kill switch: NEUTRON_ROLE_GATE=0 restores the old unguarded flush.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -577,6 +577,7 @@
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
+ BOOL wayland_window_can_commit(HWND hwnd);
++BOOL wayland_window_surface_has_role(HWND hwnd);
+ 
+ /**********************************************************************
+  *          Wayland Keyboard
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1837,6 +1837,32 @@
+ /* NEUTRON M2: TRUE if a commit for this window would currently succeed. Lets the SHM flush
+  * skip the (tens-of-MB at 4K) buffer copies it would otherwise do and then discard, during the
+  * maximize/un-maximize transition when the xdg config isn't compatible yet. Read-only. */
++/***********************************************************************
++ *           wayland_window_surface_has_role
++ *
++ * NEUTRON: has this window's wayland surface been given an xdg role yet?
++ *
++ * A wl_surface with no role must not have a buffer attached -- xdg-shell requires the surface to be
++ * unmapped and buffer-less when the role is assigned, and forbids committing content before the
++ * first xdg_surface.configure. See role_guard.py for the measured violation this exists to stop.
++ *
++ * Returns TRUE when there is no surface at all, so windows the driver is not managing are
++ * unaffected and behave exactly as before.
++ */
++BOOL wayland_window_surface_has_role(HWND hwnd)
++{
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    BOOL has = TRUE;
++
++    if (!(data = wayland_win_data_get(hwnd))) return TRUE;
++    if ((surface = data->wayland_surface))
++        has = surface->role != WAYLAND_SURFACE_ROLE_NONE;
++    wayland_win_data_release(data);
++
++    return has;
++}
++
+ BOOL wayland_window_can_commit(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -448,6 +448,39 @@
+     if (!wayland_window_can_commit(window_surface->hwnd))
+         return FALSE;
+ 
++    /* NEUTRON: never attach a buffer to a surface that has no xdg role yet.
++     *
++     * MEASURED on a tester's machine 2026-09-01, 3/3 runs: for Premiere's LAYERED splash the chain
++     * CreateWindowSurface(layered=1) -> wayland_window_surface_flush -> wayland_surface_reconfigure
++     * -> wayland_surface_attach_shm ran ~8 ms BEFORE wayland_surface_make_toplevel. xdg-shell
++     * forbids that: the surface must be buffer-less when the role is assigned and must not commit
++     * before the first xdg_surface.configure.
++     *
++     * Layered windows are the ones that hit it because their content arrives via
++     * UpdateLayeredWindow BEFORE the window is shown, rather than via a paint afterwards.
++     *
++     * Same bail as can_commit above: win32u keeps the bounds dirty and flushes again once the role
++     * exists, so nothing is lost.
++     *
++     * Kill switch NEUTRON_ROLE_GATE=0 restores the old behaviour for A/B. */
++    {
++        static int gate = -1;
++        if (gate < 0)
++        {
++            const char *e = getenv("NEUTRON_ROLE_GATE");
++            gate = (e && e[0] == '0') ? 0 : 1;
++        }
++        if (gate && !wayland_window_surface_has_role(window_surface->hwnd))
++        {
++            static LONG deferred;
++            if (InterlockedIncrement(&deferred) <= 20)
++                ERR("neutron-rolegate: hwnd=%p DEFERRING flush -- surface has no xdg role yet "
++                    "(attaching now would violate xdg-shell); win32u will retry\n",
++                    window_surface->hwnd);
++            return FALSE;
++        }
++    }
++
+     surface_damage_region = NtGdiCreateRectRgn(rect->left + dirty->left, rect->top + dirty->top,
+                                                rect->left + dirty->right, rect->top + dirty->bottom);
+     if (!surface_damage_region)

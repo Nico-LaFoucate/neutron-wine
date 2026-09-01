@@ -1,0 +1,212 @@
+winewayland: the event-reader thread must hold no driver lock across a win32u call
+
+DEADLOCK, measured on a live frozen Premiere 2026-09-01 (open a plugin popup, dock it; frozen
+>6 min with no self-heal). eu-stack on the wedged process:
+
+  reader thread  waylanddrv_unix_read_events -> wl_display_dispatch_queue
+                 -> keyboard_handle_enter -> NtUserCallHwndParam -> blocked on mutex
+  UI thread      NtUserSetLayeredWindowAttributes -> wayland_window_surface_flush
+                 -> set_window_surface_contents -> wayland_win_data_get -> blocked on mutex
+
+keyboard_handle_enter held the win_data lock across four win32u calls, so the reader took
+win_data then wanted win32u while the UI thread held win32u and wanted win_data. A textbook
+lock-order inversion -- and it strands the wayland fd, because the reader is the only thread
+that drains it: buffer releases pile up unread (measured Recv-Q 7784, matching the 7768 in the
+2026-08 DnD stall) and the UI thread can never get the buffer it waits for. Neither side times
+out, which is why this outlasted the five-minute self-heal documented for the earlier stall.
+
+The fix captures the one field needed (surface->window.managed) under the lock, releases it,
+and does all win32u work with no driver lock held. This also closes the older
+NtUserGetWindowLongW(GWL_EXSTYLE) call from the mask-storm patch, latent since that fix.
+
+Also fixed: NEUTRON_KBD_FOREGROUND=0 now returns BEFORE GetForegroundWindow/GetWindowThread
+instead of making both calls and gating only the decision -- the switch was inert against
+anything in the query path, so it could not have A/B'd this.
+
+Verified live: neutron-kbdlock announces once from the reader thread, and the dock that
+reproduced the freeze now completes. ONE clean sample so far; reproduction rate not established.
+
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -791,6 +791,8 @@
+     struct wayland_keyboard *keyboard = &process_wayland.keyboard;
+     struct wayland_surface *surface;
+     struct wayland_win_data *data;
++    DWORD ex_style;
++    BOOL managed;
+     HWND hwnd;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+@@ -809,76 +811,108 @@
+     NtUserPostMessage(keyboard->focused_hwnd, WM_INPUTLANGCHANGEREQUEST, 0 /*FIXME*/,
+                       (LPARAM)keyboard_hkl);
+ 
++    /* NEUTRON: capture what we need from the driver data, then RELEASE THE LOCK before
++     * making any win32u call.
++     *
++     * DEADLOCK MEASURED 2026-09-01 on Premiere (opening a plugin popup and docking it, frozen
++     * >6 min, eu-stack on the live process):
++     *
++     *   reader thread  waylanddrv_unix_read_events -> wl_display_dispatch_queue
++     *                  -> keyboard_handle_enter -> NtUserCallHwndParam -> blocked
++     *   UI thread      NtUserSetLayeredWindowAttributes -> wayland_window_surface_flush
++     *                  -> set_window_surface_contents -> wayland_win_data_get -> blocked
++     *
++     * The reader took win_data then wanted win32u; the UI thread held win32u and wanted
++     * win_data. A textbook lock-order inversion, and it strands the wayland fd: the reader is
++     * the only thread that drains it, so buffer releases pile up unread (Recv-Q 7784) and the
++     * UI thread can never get the buffer it is waiting for. Neither side can time out.
++     *
++     * The rule this restores is already in the wiki: the event-reader thread must never make a
++     * blocking cross-thread call. Holding no driver lock across win32u makes that structural. */
+     if (!(data = wayland_win_data_get(hwnd))) return;
++    managed = (surface = data->wayland_surface) && surface->window.managed;
++    wayland_win_data_release(data);
++
++    if (!managed) return;
++
++    {
++        static int announced;
++        if (!InterlockedExchange(&announced, 1))
++            ERR("neutron-kbdlock: win32u queries now run OUTSIDE the win_data lock "
++                "(reader thread holds no driver lock across win32u)\n");
++    }
+ 
+-    if ((surface = data->wayland_surface))
++    /* TODO: Drop the internal message and call NtUserSetForegroundWindow
++     * directly once it's updated to not explicitly deactivate the old
++     * foreground window when both the old and new foreground windows
++     * are in the same non-current thread. */
++    /* NEUTRON: KWin sends wl_keyboard.enter to a surface whenever it maps (every
++     * xdg_toplevel gets keyboard focus on map). Translating that unconditionally
++     * into NtUserSetForegroundWindow fights the app's activation intent for
++     * non-activating tool popups (WS_EX_NOACTIVATE): LrC's mask-tool flyouts get
++     * force-activated on every map, the app immediately yanks foreground back to
++     * its main frame, and the two ping-pong ~500x/sec -- the Develop "mask storm"
++     * that hangs the app. A WS_EX_NOACTIVATE window must never be foregrounded, so
++     * skip the SetForegroundWindow post for it (compositor keyboard focus alone is
++     * harmless -- the app just never wanted this popup to become the active window). */
++    ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    if (ex_style & WS_EX_NOACTIVATE) return;
++
++    /* NEUTRON: only force the foreground for focus arriving from OUTSIDE this process.
++     *
++     * KWin sends wl_keyboard.enter whenever a surface takes keyboard focus -- including when
++     * the focus merely moves between two of the application's OWN windows. Forcing
++     * SetForegroundWindow for those in-app moves overrides activation the app has just
++     * performed itself, and the app's key routing is left pointing at whatever it had chosen
++     * before we intervened.
++     *
++     * MEASURED 2026-08-31 on Premiere: entering the Program Monitor's fullscreen leaves the
++     * fullscreen window deaf to ORDINARY keys (space, escape) while accelerators (Ctrl+Q) keep
++     * working, because accelerators are dispatched from the message loop and never depend on
++     * which window is active. Keys were provably delivered to the correct window the whole
++     * time. Clicking another application and back fixed it; clicking inside Premiere did not --
++     * i.e. only a full WM_ACTIVATEAPP cycle repaired it. With this post suppressed the keys
++     * work immediately, with no click.
++     *
++     * The deactivation handler already asks exactly this question and skips in-app changes
++     * ("SKIP (in-app focus change)"); the enter path never did, so the two were asymmetric.
++     *
++     * Kill switch: NEUTRON_KBD_FOREGROUND=0 suppresses the post entirely (the probe that
++     * identified this); NEUTRON_KBD_FOREGROUND=2 restores the old unconditional behaviour.
++     *
++     * NOTE: this gate is read BEFORE the queries below so that =0 skips the win32u calls too.
++     * Previously the queries ran unconditionally and only the decision was gated, which made
++     * the switch useless as an A/B for anything in the query path. */
+     {
+-        /* TODO: Drop the internal message and call NtUserSetForegroundWindow
+-         * directly once it's updated to not explicitly deactivate the old
+-         * foreground window when both the old and new foreground windows
+-         * are in the same non-current thread. */
+-        /* NEUTRON: KWin sends wl_keyboard.enter to a surface whenever it maps (every
+-         * xdg_toplevel gets keyboard focus on map). Translating that unconditionally
+-         * into NtUserSetForegroundWindow fights the app's activation intent for
+-         * non-activating tool popups (WS_EX_NOACTIVATE): LrC's mask-tool flyouts get
+-         * force-activated on every map, the app immediately yanks foreground back to
+-         * its main frame, and the two ping-pong ~500x/sec — the Develop "mask storm"
+-         * that hangs the app. A WS_EX_NOACTIVATE window must never be foregrounded, so
+-         * skip the SetForegroundWindow post for it (compositor keyboard focus alone is
+-         * harmless — the app just never wanted this popup to become the active window). */
+-        DWORD ex_style = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+-
+-        /* NEUTRON: only force the foreground for focus arriving from OUTSIDE this process.
+-         *
+-         * KWin sends wl_keyboard.enter whenever a surface takes keyboard focus -- including when
+-         * the focus merely moves between two of the application's OWN windows. Forcing
+-         * SetForegroundWindow for those in-app moves overrides activation the app has just
+-         * performed itself, and the app's key routing is left pointing at whatever it had chosen
+-         * before we intervened.
+-         *
+-         * MEASURED 2026-08-31 on Premiere: entering the Program Monitor's fullscreen leaves the
+-         * fullscreen window deaf to ORDINARY keys (space, escape) while accelerators (Ctrl+Q) keep
+-         * working, because accelerators are dispatched from the message loop and never depend on
+-         * which window is active. Keys were provably delivered to the correct window the whole
+-         * time. Clicking another application and back fixed it; clicking inside Premiere did not --
+-         * i.e. only a full WM_ACTIVATEAPP cycle repaired it. With this post suppressed the keys
+-         * work immediately, with no click.
+-         *
+-         * The deactivation handler already asks exactly this question and skips in-app changes
+-         * ("SKIP (in-app focus change)"); the enter path never did, so the two were asymmetric.
+-         *
+-         * Kill switch: NEUTRON_KBD_FOREGROUND=0 suppresses the post entirely (the probe that
+-         * identified this); NEUTRON_KBD_FOREGROUND=2 restores the old unconditional behaviour. */
+-        if (surface->window.managed && !(ex_style & WS_EX_NOACTIVATE))
++        static int mode = -1;
++        HWND fg;
++        DWORD fg_pid = 0;
++
++        if (mode < 0)
+         {
+-            static int mode = -1;
+-            HWND fg;
+-            DWORD fg_pid = 0;
+-
+-            if (mode < 0)
+-            {
+-                const char *e = getenv("NEUTRON_KBD_FOREGROUND");
+-                mode = e ? atoi(e) : 1;
+-            }
+-
+-            fg = NtUserGetForegroundWindow();
+-            if (fg) NtUserGetWindowThread(fg, &fg_pid);
+-
+-            if (mode == 0)
+-                ERR("neutron-kbdfg: hwnd=%p SKIP (probe: post disabled)\n", hwnd);
+-            else if (mode != 2 && fg_pid == GetCurrentProcessId())
+-                ERR("neutron-kbdfg: hwnd=%p SKIP -- foreground %p is already ours, this is an "
+-                    "in-app focus change and the app owns its own activation\n", hwnd, fg);
+-            else
+-            {
+-                ERR("neutron-kbdfg: hwnd=%p FOREGROUNDING (focus arrived from outside; fg=%p)\n",
+-                    hwnd, fg);
+-                NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
+-            }
++            const char *e = getenv("NEUTRON_KBD_FOREGROUND");
++            mode = e ? atoi(e) : 1;
+         }
+-    }
+ 
+-    wayland_win_data_release(data);
++        if (mode == 0)
++        {
++            ERR("neutron-kbdfg: hwnd=%p SKIP (probe: post disabled)\n", hwnd);
++            return;
++        }
++
++        fg = NtUserGetForegroundWindow();
++        if (fg) NtUserGetWindowThread(fg, &fg_pid);
++
++        if (mode != 2 && fg_pid == GetCurrentProcessId())
++            ERR("neutron-kbdfg: hwnd=%p SKIP -- foreground %p is already ours, this is an "
++                "in-app focus change and the app owns its own activation\n", hwnd, fg);
++        else
++        {
++            ERR("neutron-kbdfg: hwnd=%p FOREGROUNDING (focus arrived from outside; fg=%p)\n",
++                hwnd, fg);
++            NtUserPostMessage(hwnd, WM_WAYLAND_SET_FOREGROUND, 0, 0);
++        }
++    }
+ }
+ 
+ static void keyboard_handle_leave(void *data, struct wl_keyboard *wl_keyboard,
