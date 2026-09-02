@@ -1,0 +1,144 @@
+winewayland: every boolean gate reports its resolved value at first use
+
+11.10-73 shipped two behavioural changes -- the owned-subsurface demote fix and the gates
+defaulting ON -- that add ZERO strings to the driver. The build tester measured the complete
+strings delta 72->73 across both arches: 8 lines of assembler fragments, no new string-table
+entries. So there was no way to confirm from a log that a default had taken effect.
+
+That bit immediately. The tester stripped the four owned-subsurface switches from their
+neutron-env.conf so the new DEFAULTS would be exercised rather than their overrides -- correct
+method -- and thereby removed the only evidence of what was in force:
+
+  "If a panel sinks, I cannot distinguish a regression in the demote fix from a default that
+   never applied. That is precisely the void-test shape that cost three rounds in the splash
+   hunt."
+
+And 73 is the drop whose own notes made first-use banners standing policy, after their point that
+neutron-kbdlock printing at err on the default channel let them verify the deadlock fix from an
+ordinary log without re-running anything. Shipping it without one was the gap.
+
+neutron_gate(name, default) resolves a boolean gate, logs it once at err on the default channel,
+and reports whether the value came from the environment or the default:
+
+  neutron-gateresolved: NEUTRON_OWNED_SUBSURFACE_CAPTIONED = 1 (default)
+  neutron-gateresolved: NEUTRON_OWNED_ZORDER = 0 (environment)
+
+Converted: NEUTRON_OWNED_SUBSURFACE, _CAPTIONED, _MODAL, NEUTRON_OWNED_ZORDER,
+NEUTRON_SUBSURFACE_NO_DEMOTE, NEUTRON_ROLE_GATE. Each caller still caches its own result, so this
+is one line per gate per process.
+
+Validated both arms in a single launch: five gates reported (default) while an explicit
+NEUTRON_OWNED_ZORDER=0 reported (environment) -- so the source field can actually discriminate,
+rather than being a label that always says the same thing.
+
+⛔ The prefix is "neutron-gateresolved:", NOT "neutron-gate:". dcomp's blit suppressor already
+logs "neutron-gate:" every 2 seconds; sharing the prefix would bury these six one-shot lines in
+the exact grep a tester runs. Caught by grepping for the banners and getting the dcomp spam.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -578,6 +578,7 @@
+ void ensure_window_surface_contents(HWND hwnd);
+ BOOL wayland_window_can_commit(HWND hwnd);
+ BOOL wayland_window_surface_has_role(HWND hwnd);
++BOOL neutron_gate(const char *name, BOOL dflt);
+ 
+ /**********************************************************************
+  *          Wayland Keyboard
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -989,7 +989,7 @@
+      * bug. Doing nothing here is both protocol-safe and correct: a subsurface keeps its current
+      * stacking, and restack_apply owns the ordering. NEUTRON_SUBSURFACE_NO_DEMOTE=0 restores the
+      * old demote for A/B. */
+-    if (on < 0) { const char *e = getenv("NEUTRON_SUBSURFACE_NO_DEMOTE"); on = (e && e[0] == '0') ? 0 : 1; }
++    if (on < 0) on = neutron_gate("NEUTRON_SUBSURFACE_NO_DEMOTE", TRUE);
+     return on;
+ }
+ 
+@@ -2330,6 +2330,32 @@
+  * a non-sibling is a FATAL protocol error (compositor disconnect = the app is killed), which is
+  * strictly worse than the bug. It ships off so it can be A/B'd on the machine that can actually
+  * see the symptom -- there are no VST plugins on the dev box and z-order is not visible in a log. */
++/* NEUTRON: resolve a boolean gate and SAY SO, once, at err level on the default channel.
++ *
++ * 2026-09-02, build tester. 11.10-73 shipped two behavioural changes -- the demote fix and the
++ * owned-subsurface gates defaulting ON -- that add ZERO strings to the driver: the complete
++ * strings delta 72->73 across both arches was 8 lines of assembler fragments. With their
++ * neutron-env.conf stripped so the new DEFAULTS get exercised, there was then no way to confirm a
++ * default had applied: "If a panel sinks, I cannot distinguish a regression in the demote fix from
++ * a default that never applied. That is precisely the void-test shape that cost three rounds in
++ * the splash hunt."
++ *
++ * That drop is also the one whose notes made first-use banners standing policy, so shipping it
++ * without one was the gap. Printing the resolved value AND its source makes an ordinary launch log
++ * answer "did this gate take effect" with no tracing, no rebuild and no extra run.
++ *
++ * Each caller caches its own result, so this runs once per gate per process. */
++BOOL neutron_gate(const char *name, BOOL dflt)
++{
++    const char *e = getenv(name);
++    BOOL val = e ? (e[0] != '0') : dflt;
++
++    /* NOTE the prefix: dcomp's blit suppressor already logs "neutron-gate:" every 2 seconds, so a
++     * shared prefix would bury these six one-shot lines in the grep a tester actually runs. */
++    ERR("neutron-gateresolved: %s = %d (%s)\n", name, val, e ? "environment" : "default");
++    return val;
++}
++
+ static BOOL neutron_owned_zorder(void)
+ {
+     static int on = -1;
+@@ -2341,7 +2367,7 @@
+      * SUBSURFACE, so every toplevel looked like a subsurface and was excluded only by luck).
+      * Without this, promoted owned windows are never ordered at all. Kill switch:
+      * NEUTRON_OWNED_ZORDER=0. */
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_ZORDER"); on = (e && e[0] == '0') ? 0 : 1; }
++    if (on < 0) on = neutron_gate("NEUTRON_OWNED_ZORDER", TRUE);
+     return on;
+ }
+ 
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -355,7 +355,7 @@
+ static BOOL neutron_owned_subsurface(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE"); on = (e && e[0] == '0') ? 0 : 1; }
++    if (on < 0) on = neutron_gate("NEUTRON_OWNED_SUBSURFACE", TRUE);
+     return on;
+ }
+ 
+@@ -395,7 +395,7 @@
+      * What it buys: an owned window gets a coordinate space its owner can actually hit, which is
+      * what a dock drag needs -- an xdg_toplevel's position is the compositor's, never ours.
+      * Kill switch: NEUTRON_OWNED_SUBSURFACE_CAPTIONED=0. */
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_CAPTIONED"); on = (e && e[0] == '0') ? 0 : 1; }
++    if (on < 0) on = neutron_gate("NEUTRON_OWNED_SUBSURFACE_CAPTIONED", TRUE);
+     return on;
+ }
+ 
+@@ -425,7 +425,7 @@
+ static BOOL neutron_owned_subsurface_modal(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_MODAL"); on = (e && e[0] == '1') ? 1 : 0; }
++    if (on < 0) on = neutron_gate("NEUTRON_OWNED_SUBSURFACE_MODAL", FALSE);
+     return on;
+ }
+ 
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -465,11 +465,7 @@
+      * Kill switch NEUTRON_ROLE_GATE=0 restores the old behaviour for A/B. */
+     {
+         static int gate = -1;
+-        if (gate < 0)
+-        {
+-            const char *e = getenv("NEUTRON_ROLE_GATE");
+-            gate = (e && e[0] == '0') ? 0 : 1;
+-        }
++        if (gate < 0) gate = neutron_gate("NEUTRON_ROLE_GATE", TRUE);
+         if (gate && !wayland_window_surface_has_role(window_surface->hwnd))
+         {
+             static LONG deferred;
