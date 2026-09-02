@@ -1,0 +1,137 @@
+winewayland: default the SC_MOVE decline ON -- 11.10-73 shipped the conversion without it
+
+REGRESSION FIX. 11.10-73 defaulted three of the four owned-subsurface switches ON
+(CAPTIONED, OWNED_ZORDER, SUBSURFACE_NO_DEMOTE) and left out the fourth --
+NEUTRON_SYSCOMMAND_DECLINE -- which is the one that makes a converted window movable.
+
+WAYLAND_SysCommand claims SC_MOVE for every window with wayland data and then does nothing for a
+non-toplevel, so a captioned owned window promoted to a subsurface cannot be moved or resized at
+all. On the operator's machine Premiere's HOME SCREEN was unmovable, unresizable and a couple of
+pixels too wide from 11.10-73 onward. The build tester has been running this switch by hand since
+68, which is why their reports never showed it.
+
+Operator-confirmed today, three states:
+  CAPTIONED=0                     -> "sized right and movable and resizable"  (isolates the cause)
+  CAPTIONED on, DECLINE=1         -> "home screen is fixed, docking still works"
+  both at the new defaults        -> "home screen is fixed"
+
+WHY IT WAS OFF: 11.10-64 bisected the half-white splash to this patch (63: 0.0% white, 64: 73.6%).
+That cause was separately found and fixed afterwards in zzzzzzzzzzt (subsurface-expose), so the
+gating outlived its reason. Re-checked before flipping: FIVE labelled launches, operator-confirmed
+clean each time. That matters because the 64 fault fired on EVERY launch and only the paint latency
+varied -- five clean launches is inconsistent with it being back, where one would prove nothing.
+
+⛔ Do NOT re-verify the splash with splash-white-probe.py. It reports the densest white tile
+ANYWHERE on the desktop and cannot distinguish the splash from the main window painting in during
+load. It called this a 1-in-3 regression today; the operator identified the flagged tile as the main
+frame at (0,200) and the verdict was withdrawn. Ask the operator -- it is faster and it is right.
+
+Also in here, for the panel-deselect investigation (all default ON = unchanged behaviour):
+  NEUTRON_DEACTIVATE_ON_LEAVE=0  suppresses deactivation entirely
+  NEUTRON_DEACT_CANCELMODE=0     suppresses only the WM_CANCELMODE send
+  NEUTRON_DEACT_FOREGROUND=0     suppresses only the hand-off of foreground to the desktop window
+These are what isolated the deselect to a single line. NEUTRON_SYSCOMMAND_DECLINE also now reports
+itself through neutron_gate(), so a log shows what was in force.
+
+And a fix to a diagnostic that lied: the wlkillfg trace printed "-> DEACTIVATING" BEFORE the gates
+decided, so with a gate off it described something that never happened. It now says
+"DEACTIVATING (intent; gates below decide what actually runs)".
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -415,10 +415,53 @@
+  * ⛔ Every behaviour change in this driver must be gated. This one was not, which is why turning
+  * off the feature it belongs to did not restore the old behaviour. Default OFF = 11.10-63's
+  * behaviour exactly. */
++static BOOL neutron_deact_cancelmode(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_DEACT_CANCELMODE", TRUE);
++    return on;
++}
++
++static BOOL neutron_deact_foreground(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_DEACT_FOREGROUND", TRUE);
++    return on;
++}
++
++static BOOL neutron_gate_deactivate_on_leave(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_DEACTIVATE_ON_LEAVE", TRUE);
++    return on;
++}
++
+ static BOOL neutron_syscommand_decline(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_SYSCOMMAND_DECLINE"); on = (e && e[0] == '1') ? 1 : 0; }
++    /* NEUTRON: DEFAULT ON since 2026-09-02 (11.10-75). This is the other half of making a
++     * captioned owned window usable, and 11.10-73 shipped the conversion WITHOUT it: three of the
++     * four switches the build tester had been running since 68 were defaulted on, and this one --
++     * the one that makes a converted window movable -- was left off. WAYLAND_SysCommand claims
++     * SC_MOVE for every window with wayland data and then does nothing for a non-toplevel, so the
++     * Premiere home screen became unmovable, unresizable and a couple of px too wide. Operator,
++     * 2026-09-02: with CAPTIONED=0 it was "sized right and movable and resizable"; with
++     * CAPTIONED on and this switch on, "home screen is fixed, docking still works".
++     *
++     * It was gated off because 11.10-64 bisected the half-white splash to it (63: 0.0% white,
++     * 64: 73.6%). That cause was separately found and fixed afterwards in zzzzzzzzzzt (the
++     * subsurface-expose patch), so the gating outlived its reason. Re-checked before flipping:
++     * FIVE labelled launches, operator-confirmed clean each time. That matters because the 64
++     * fault fired on EVERY launch and only the paint latency varied -- so five clean launches is
++     * inconsistent with it being back, where one would prove nothing.
++     *
++     * ⛔ Do NOT re-verify this with splash-white-probe.py: it reports the densest white tile
++     * ANYWHERE on the desktop and cannot tell the splash from the main window painting in during
++     * load. It called this a 1-in-3 regression on 2026-09-02; the operator identified the tile as
++     * the main frame at (0,200) and the verdict was withdrawn. Ask the operator.
++     *
++     * Kill switch: NEUTRON_SYSCOMMAND_DECLINE=0. */
++    if (on < 0) on = neutron_gate("NEUTRON_SYSCOMMAND_DECLINE", TRUE);
+     return on;
+ }
+ 
+@@ -1527,17 +1570,37 @@
+         ERR("neutron-wlkillfg: hwnd=%p focused=%p fg=%p style=%08x -> %s\n", hwnd, focused,
+             NtUserGetForegroundWindow(), (unsigned)NtUserGetWindowLongW(hwnd, GWL_STYLE),
+             focused ? "SKIP (in-app focus change)" :
+-            hwnd != NtUserGetForegroundWindow() ? "SKIP (not the foreground window)" : "DEACTIVATING");
++            hwnd != NtUserGetForegroundWindow() ? "SKIP (not the foreground window)" :
++            "DEACTIVATING (intent; gates below decide what actually runs)");
+         if (focused) return 0;
+ 
++        /* NEUTRON: gate the deactivation itself, so "does losing foreground break the next click"
++         * can be answered without a rebuild. The operator reports a panel's selection border
++         * highlighting and then dropping, but ONLY after clicking away and back -- and the enter
++         * path is already ruled out by experiment (NEUTRON_KBD_FOREGROUND=0 changed nothing). This
++         * handler is what remains in that transition. Default ON = current behaviour; =0 restores
++         * the pre-zzzzzzzzzk state where Wine never told the app it had lost focus at all.
++         * ⚠️ =0 is a DIAGNOSTIC, not a fix: without it an application never learns it is no longer
++         * foreground, which is what this patch exists to correct. */
++        if (!neutron_gate_deactivate_on_leave())
++        {
++            ERR("neutron-wlkillfg: hwnd=%p DEACTIVATION SUPPRESSED (probe: "
++                "NEUTRON_DEACTIVATE_ON_LEAVE=0)\n", hwnd);
++            return 0;
++        }
++
+         /* Messages sent below may themselves change the foreground window, so re-check rather
+          * than trusting the state we saw when the leave arrived. */
+         if (hwnd != NtUserGetForegroundWindow()) return 0;
+ 
+-        if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE))
++        /* NEUTRON: the two halves of deactivation, separately gated. The operator's panel-deselect
++         * reproduces only after a refocus and is caused by this handler (proven: suppressing it
++         * entirely stops the drop), but "this handler" is two different actions and they fail
++         * differently. Split so one launch each says which. */
++        if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_MINIMIZE) && neutron_deact_cancelmode())
+             send_message(hwnd, WM_CANCELMODE, 0, 0);
+ 
+-        if (hwnd == NtUserGetForegroundWindow())
++        if (hwnd == NtUserGetForegroundWindow() && neutron_deact_foreground())
+         {
+             TRACE("lost focus to another client, handing foreground to the desktop\n");
+             NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
