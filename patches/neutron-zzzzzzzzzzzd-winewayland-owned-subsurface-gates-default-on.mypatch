@@ -1,0 +1,74 @@
+winewayland: enable the owned-subsurface gates by default
+
+NEUTRON_OWNED_SUBSURFACE_CAPTIONED and NEUTRON_OWNED_ZORDER now default ON; =0 disables.
+
+Both were off for real reasons, and both reasons are now fixed:
+
+  * CAPTIONED was turned off after 11.10-64, where promoting captioned owned windows sank
+    every plugin panel behind the Program Monitor and froze Premiere on a file dialog. The
+    sinking was the place_above(parent) demote fixed in zzzzzzzzzzzc -- place_above(parent)
+    means directly above the PARENT'S OWN CONTENT, i.e. the bottom of the sibling stack.
+    The file dialog is the modal case, excluded by neutron_owned_subsurface_modal().
+
+  * OWNED_ZORDER was off because place_above against a non-sibling is a FATAL protocol error
+    (kwin: "error in client communication", process dies with no Wine backtrace, measured
+    2026-08-27 and only with this gate on). Guarded twice now: the sibling-validity check in
+    restack_apply's owned branch, and the union role guard from zzzzzzzzzzzc.
+
+Evidence for flipping them, not just for the fixes:
+
+  * Build tester, 11.10-72, ordinary untraced session with these switches on: SIX consecutive
+    plugin-panel docks, no freeze; a File dialog opened and dismissed -- the other half of the
+    64 regression -- on the same switch set.
+  * Dev box, operator-confirmed: drag-to-dock lands on target ("drag lands on target now"),
+    and the panel no longer sinks behind the Program Monitor ("no sink").
+
+Without CAPTIONED an owned panel stays an independent xdg_toplevel, whose position is the
+compositor's and never ours, so a dock drag is off by the divergence between where Wine thinks
+the window is and where it actually is. Without OWNED_ZORDER promoted owned windows are never
+ordered at all and keep whatever stacking they were inserted with.
+
+⚠️ Known-not-established: six docks is a rate, not proof of absence; nothing was done to provoke
+the original deadlock race; no pre-fix contrast build was run. The operator also reports the panel
+still sinks behind the drop HIGHLIGHT specifically, which predates this change and is untouched.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2333,7 +2333,15 @@
+ static BOOL neutron_owned_zorder(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_ZORDER"); on = (e && e[0] == '1') ? 1 : 0; }
++    /* NEUTRON: DEFAULT ON since 2026-09-01 (11.10-73). Was OFF because place_above against a
++     * non-sibling is a FATAL protocol error -- kwin answers "error in client communication" and
++     * Premiere dies with no Wine backtrace (measured 2026-08-27, only with this on). Fixed twice
++     * over: the sibling-validity check in restack_apply's owned branch, and the union role guard
++     * (wl_subsurface/toplevel_hwnd alias xdg_toplevel/xdg_toplevel_icon when the role is not
++     * SUBSURFACE, so every toplevel looked like a subsurface and was excluded only by luck).
++     * Without this, promoted owned windows are never ordered at all. Kill switch:
++     * NEUTRON_OWNED_ZORDER=0. */
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_ZORDER"); on = (e && e[0] == '0') ? 0 : 1; }
+     return on;
+ }
+ 
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -385,7 +385,17 @@
+      * window and freezing on a file dialog is not a trade we get to make on someone's working
+      * machine. Set to 1 to opt in. */
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_CAPTIONED"); on = (e && e[0] == '1') ? 1 : 0; }
++    /* NEUTRON: DEFAULT ON since 2026-09-01 (11.10-73). Turned OFF after 11.10-64, where promoting
++     * captioned owned windows sank every plugin panel behind the Program Monitor and froze Premiere
++     * on a file dialog. Both blockers are fixed and operator-confirmed: the sinking was the
++     * place_above(parent) demote (neutron_no_demote), and the modal case is excluded by
++     * neutron_owned_subsurface_modal(). Build tester 2026-09-01 on 11.10-72 with these on: six
++     * consecutive plugin-panel docks, a File dialog opened and dismissed, no freeze. Dev box:
++     * drag-to-dock lands on target, no sink.
++     * What it buys: an owned window gets a coordinate space its owner can actually hit, which is
++     * what a dock drag needs -- an xdg_toplevel's position is the compositor's, never ours.
++     * Kill switch: NEUTRON_OWNED_SUBSURFACE_CAPTIONED=0. */
++    if (on < 0) { const char *e = getenv("NEUTRON_OWNED_SUBSURFACE_CAPTIONED"); on = (e && e[0] == '0') ? 0 : 1; }
+     return on;
+ }
+ 

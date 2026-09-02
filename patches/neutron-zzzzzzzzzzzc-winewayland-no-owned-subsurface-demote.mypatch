@@ -1,0 +1,104 @@
+winewayland: stop demoting owned subsurfaces to the bottom of the sibling stack
+
+Premiere's plugin panels sank behind the Program Monitor whenever they floated over it.
+
+wayland_surface_reconfigure() positions an owned subsurface and then restacks it:
+
+    if (toplevel_data->client_surface && <sibling check>)
+        wl_subsurface_place_above(surface->wl_subsurface, client_surface->wl_surface);
+    else if (!neutron_no_demote())
+        wl_subsurface_place_above(surface->wl_subsurface, toplevel_surface->wl_surface);
+
+The else branch was written as a safe fallback -- its comment says falling back to the
+parent "is always valid". It is valid protocol and the wrong semantics:
+wl_subsurface.place_above(parent) means DIRECTLY ABOVE THE PARENT'S OWN CONTENT, which is
+the BOTTOM of the sibling stack, not the top.
+
+Premiere's main frame has no client_surface of its own -- the client surfaces belong to
+CHILD hwnds -- so the first branch never fired and the demote ran on every reposition of
+the popup, dropping it beneath the Program Monitor's video subsurface.
+
+Measured on the dev box while the popup was visibly sinking:
+
+    zdiag  toplevel=0x10120 n=2 clients=1 | owned: found=1 nosub=0 badparent=0 added=1
+    stats  5s calls=100 applies=1
+
+neutron_restack_apply was doing its job -- it found the owned subsurface, its parent
+matched the toplevel's current wl_surface, and it placed it on top. It applied ONCE; its
+order cache then reported "unchanged" on every later call, so the per-reposition demote
+won every time.
+
+Doing nothing in that branch is both protocol-safe and correct: the subsurface keeps its
+stacking and restack_apply owns the ordering. So NEUTRON_SUBSURFACE_NO_DEMOTE now defaults
+ON; =0 restores the old demote for A/B.
+
+Operator-confirmed: "no sink".
+
+Also in here, found while measuring the above: wl_subsurface, toplevel_hwnd and
+subsurface_parent are UNION members sharing storage with the toplevel role's xdg_toplevel,
+xdg_toplevel_icon and decoration pointers. Both readers -- wayland_owned_subsurfaces_of()
+and restack_apply()'s owned branch -- dereferenced them without checking the role, so
+every toplevel appeared to have a wl_subsurface and its "toplevel_hwnd" was really an
+xdg_toplevel_icon pointer. Verified live: hwnd 0x10120, role=TOPLEVEL, printed
+subsurf=0x555594583ac0 top_hwnd=0x555594583b30. Toplevels were excluded only because that
+garbage never happened to equal the HWND being searched for -- and place_above against a
+non-sibling is a FATAL protocol error. Both now check the role first.
+
+⚠️ This fix only reaches the panels when NEUTRON_OWNED_SUBSURFACE_CAPTIONED=1 and
+NEUTRON_OWNED_ZORDER=1; both still default OFF.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -978,7 +978,18 @@
+ static BOOL neutron_no_demote(void)
+ {
+     static int on = -1;
+-    if (on < 0) { const char *e = getenv("NEUTRON_SUBSURFACE_NO_DEMOTE"); on = (e && e[0] == '1') ? 1 : 0; }
++    /* NEUTRON: DEFAULT ON since 2026-09-01. The guarded branch reads as a harmless fallback --
++     * "place above the parent, which is always valid" -- but wl_subsurface.place_above(parent)
++     * means DIRECTLY ABOVE THE PARENT'S OWN CONTENT, i.e. the BOTTOM of the sibling stack. For an
++     * owned window whose toplevel has no client_surface of its own (Premiere's main frame: the
++     * client surfaces belong to CHILD hwnds) the first branch never fires, so every reposition of
++     * the popup demoted it beneath the Program Monitor's video subsurface. neutron_restack_apply
++     * had already placed it correctly -- measured found=1 added=1 applies=1 -- and then its order
++     * cache reported "unchanged" forever, so the demotion always won. That is the panel-sinking
++     * bug. Doing nothing here is both protocol-safe and correct: a subsurface keeps its current
++     * stacking, and restack_apply owns the ordering. NEUTRON_SUBSURFACE_NO_DEMOTE=0 restores the
++     * old demote for A/B. */
++    if (on < 0) { const char *e = getenv("NEUTRON_SUBSURFACE_NO_DEMOTE"); on = (e && e[0] == '0') ? 0 : 1; }
+     return on;
+ }
+ 
+@@ -2465,7 +2476,11 @@
+         for (k = 0; k < no && n < NEUTRON_ZMAX; k++)
+         {
+             struct wayland_win_data *od = wayland_win_data_get_nolock(owned[k]);
+-            if (!od || !od->wayland_surface || !od->wayland_surface->wl_subsurface) continue;
++            /* union safety, as in wayland_owned_subsurfaces_of(): these fields alias the
++             * toplevel role's pointers when the role is not SUBSURFACE. */
++            if (!od || !od->wayland_surface ||
++                od->wayland_surface->role != WAYLAND_SURFACE_ROLE_SUBSURFACE ||
++                !od->wayland_surface->wl_subsurface) continue;
+             /* NEUTRON sibling-validity, matching the client-surface loop above. Selection came
+              * from toplevel_hwnd, an HWND -- which stays equal across a destroy/recreate of the
+              * toplevel's wl_surface (defocus, docking, any role change). The subsurface is then
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -144,7 +144,16 @@
+     {
+         if (n >= max) break;
+         if (d->hwnd == toplevel) continue;
+-        if (!d->wayland_surface || !d->wayland_surface->wl_subsurface) continue;
++        if (!d->wayland_surface) continue;
++        /* NEUTRON: wl_subsurface / toplevel_hwnd / subsurface_parent are UNION members shared with
++         * the toplevel role's xdg_toplevel / xdg_toplevel_icon / decoration pointers. Read on a
++         * non-subsurface they return those pointers reinterpreted -- so every toplevel looks like
++         * it has a wl_subsurface, and its "toplevel_hwnd" is really an xdg_toplevel_icon pointer.
++         * Toplevels were excluded only because that garbage never happened to equal the HWND we
++         * were looking for. Verified live 2026-09-01: hwnd 0x10120, role=TOPLEVEL, printed
++         * subsurf=0x555594583ac0 top_hwnd=0x555594583b30. Check the role before touching them. */
++        if (d->wayland_surface->role != WAYLAND_SURFACE_ROLE_SUBSURFACE) continue;
++        if (!d->wayland_surface->wl_subsurface) continue;
+         if (d->wayland_surface->toplevel_hwnd != toplevel) continue;
+         out[n++] = d->hwnd;
+     }
