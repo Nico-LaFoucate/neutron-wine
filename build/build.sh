@@ -26,6 +26,20 @@ TKGDIR="$TKG/wine-tkg-git"
 # 2. Pin the wine base/flavor (wine-11.10 staging + ntsync — see ../build/WINE_BASE).
 cp "$REPO/build/customization.cfg" "$TKGDIR/customization.cfg"
 
+# 2a. NEUTRON: build on DISK, not tmpfs.
+# Upstream wine-tkg hardcodes _build_in_tmpfs="true" and symlinks src -> /tmp/wine-tkg/src.
+# That makes builds fast but the tree evaporates on reboot: a full ~1h rebuild is then needed
+# for any change, and an incremental relink is impossible. It cost an hour on 2026-09-06 and
+# again on 09-07. Disk has terabytes; RAM does not. Idempotent (the pattern stops matching).
+if [ -L "$TKGDIR/src" ]; then
+    echo "neutron: removing the tmpfs src symlink ($(readlink "$TKGDIR/src"))"
+    rm -f "$TKGDIR/src"
+fi
+sed -i 's|^_build_in_tmpfs="true"$|_build_in_tmpfs="false"|' "$TKGDIR/non-makepkg-build.sh"
+grep -q '^_build_in_tmpfs="false"$' "$TKGDIR/non-makepkg-build.sh" \
+    || { echo "neutron: FAILED to disable tmpfs builds -- upstream may have changed line 43"; exit 1; }
+echo "neutron: build tree on disk -> $TKGDIR/src"
+
 # 3. Apply the Neutron patch set (wine-tkg applies every *.mypatch in userpatches).
 # Prune first: a stale *.mypatch left from a previous build (one we've since renamed
 # or dropped) would still be applied and can fail/conflict against the current set.
