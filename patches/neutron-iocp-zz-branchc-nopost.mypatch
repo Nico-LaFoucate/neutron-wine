@@ -1,0 +1,76 @@
+NEUTRON branch C (server/async.c): stop fabricating NULL-lpOverlapped IOCP packets
+
+Root cause (measured, 2026-09-06): an async completion with no APC and no APC
+context is a SYNCHRONOUS operation. On Windows every asynchronous op carries an
+OVERLAPPED, delivered to the server as async->data.apc_context and posted by the
+branch above; an apc_context==NULL completion is therefore always synchronous,
+and Windows posts NO completion-port packet for it. The original branch C posted
+one anyway (add_async_completion(async, 0, ...) = a packet whose lpOverlapped is
+NULL). Measured over an aescripts-manager session: 7898/7898 such packets were
+apc==0 apcctx==0 comp_flags==0 message-mode named-pipe (FD_TYPE_DEVICE) reads --
+NOT sockets, NOT a dropped overlapped. The x86 CLR's IOCP poll dereferences the
+NULL packet at clr!...+0x2C19A5 and faults (0xc0000005 -> COR_E_EXECUTIONENGINE
+0x80131506); Premiere's traffic is the same type, so no fd-type/comp_key gate can
+separate them -- there is no correct subset to post.
+
+Fix: retain the branch (it still fires, for the seam and diagnosis) but by default
+post NOTHING, matching Windows. The real read still completes for its actual
+waiter via wake_up()/set_fd_signaled below. NEUTRON_IOCP_BRANCHC_POST=1 restores
+the legacy fabricated packet solely for the Premiere home-screen A/B.
+
+Validated same-binary: CLR repro Iocp3 /platform:x86 SURVIVED 40s with 0 faults on
+default; with NEUTRON_IOCP_BRANCHC_POST=1 the crash returns at the identical IP.
+aescripts manager 45s startup+updater-IPC smoke: 7929 branch-C traversals, 0 posts,
+0 faults.
+
+--- a/server/async.c
++++ b/server/async.c
+@@ -622,23 +622,37 @@
+             {
+                 add_async_completion( async, async->data.apc_context, status, total );
+             }
+-            /* NEUTRON FIX: async I/O with no APC context whose fd is bound to a completion port
+-             * still needs an IOCP packet (Windows delivers it via the port association, not an
+-             * APC). libuv drives file reads off its IOCP with no APC context; without this the
+-             * packet is never queued and libuv's loop blocks forever (blank UXP home screen).
+-             * Reuses add_async_completion() (no-ops if the fd has no completion port). Honors
+-             * FILE_SKIP_COMPLETION_PORT_ON_SUCCESS like the path above. cvalue 0. */
++            /* NEUTRON 2026-09-06 (branch C, corrected): a completion with NO APC and NO APC
++             * context is a SYNCHRONOUS operation. On Windows every asynchronous op carries an
++             * OVERLAPPED, delivered here as async->data.apc_context -> the branch ABOVE; an
++             * apc_context==NULL completion is therefore always synchronous, and Windows posts
++             * NO completion-port packet for a synchronous op. The original branch C posted one
++             * anyway (add_async_completion(async, 0, ...) == a packet whose lpOverlapped is
++             * NULL). That is non-Windows on EVERY fd type (measured: 7898/7898 such packets in
++             * an aescripts-manager session were apc==0 apcctx==0 comp_flags==0 message-mode
++             * named-pipe reads), and the x86 CLR's IOCP poll dereferences the NULL packet and
++             * faults (clr!...+0x2C19A5, 0xc0000005 -> COR_E_EXECUTIONENGINE 0x80131506).
++             *
++             * There is no server-side subset of this case that is correct to post, because the
++             * only thing distinguishing "should post" from "must not post" on Windows is the
++             * presence of an OVERLAPPED, which is exactly apc_context (already handled above).
++             * So the branch is RETAINED (it still fires, for diagnosis and to keep the seam)
++             * but by default posts NOTHING, matching Windows. The env gate re-enables the old
++             * fabricated packet solely for the Premiere home-screen A/B (proving whether any
++             * libuv/UXP path ever depended on the spurious wakeup); it is never Windows-correct.
++             * The real read still completes for its actual waiter via wake_up()/set_fd_signaled
++             * below -- only the bogus port packet is suppressed. */
+             else if (!async->data.apc && !async->data.apc_context && async->fd &&
+                      (async->pending || !(async->comp_flags & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)))
+             {
+-                /* NEUTRON: debug trace OFF by default — this branch runs on every libuv/IOCP
+-                 * file-read completion, so an unconditional fprintf here spams stderr and drags
+-                 * playback (heavy decode I/O). Gate behind NEUTRON_IOCP_DEBUG (cached once). */
+                 static int neutron_iocp_dbg = -1;
++                static int neutron_branchc_post = -1;
+                 if (neutron_iocp_dbg < 0) neutron_iocp_dbg = getenv( "NEUTRON_IOCP_DEBUG" ) ? 1 : 0;
++                if (neutron_branchc_post < 0) neutron_branchc_post = getenv( "NEUTRON_IOCP_BRANCHC_POST" ) ? 1 : 0;
+                 if (neutron_iocp_dbg)
+-                    fprintf( stderr, "NEUTRON FIX v3: branchC fd=%p comp_key=%08x%08x iosb=%08x%08x user=%08x%08x apcctx=%08x%08x status=%08x total=%lx\n", async->fd, (unsigned int)((unsigned long long)async->comp_key >> 32), (unsigned int)(unsigned long long)async->comp_key, (unsigned int)((unsigned long long)async->data.iosb >> 32), (unsigned int)(unsigned long long)async->data.iosb, (unsigned int)((unsigned long long)async->data.user >> 32), (unsigned int)(unsigned long long)async->data.user, (unsigned int)((unsigned long long)async->data.apc_context >> 32), (unsigned int)(unsigned long long)async->data.apc_context, status, (unsigned long)total );
+-                add_async_completion( async, 0, status, total );
++                    fprintf( stderr, "NEUTRON FIX v4: branchC(%s) fd=%p comp_key=%08x%08x iosb=%08x%08x user=%08x%08x apcctx=%08x%08x status=%08x total=%lx\n", neutron_branchc_post ? "POST" : "nopost", async->fd, (unsigned int)((unsigned long long)async->comp_key >> 32), (unsigned int)(unsigned long long)async->comp_key, (unsigned int)((unsigned long long)async->data.iosb >> 32), (unsigned int)(unsigned long long)async->data.iosb, (unsigned int)((unsigned long long)async->data.user >> 32), (unsigned int)(unsigned long long)async->data.user, (unsigned int)((unsigned long long)async->data.apc_context >> 32), (unsigned int)(unsigned long long)async->data.apc_context, status, (unsigned long)total );
++                if (neutron_branchc_post)
++                    add_async_completion( async, 0, status, total );  /* legacy fabricated packet; A/B only */
+             }
+ 
+             if (async->event) set_event( async->event );
