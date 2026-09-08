@@ -1,0 +1,345 @@
+winewayland: keep the Win32 maximized window rect on a maximized configure.
+
+The Windows maximize model inflates the work area by the frame, so a maximized window's
+frame hangs off-screen and its CLIENT lands exactly on the work area. Measured on a build
+tester's 1920x1080 @ scale 1 with a 32px top panel (rcWork = (0,32)-(1920,1080)), win32u's
+get_min_max_info produces ptMaxSize 1928x1056 / ptMaxPosition -4,28 -- window
+(-4,28)-(1924,1084), which is correct. Photoshop 2026 answers WM_NCCALCSIZE itself and
+insets on that assumption.
+
+wayland_configure_window() then did SetRect(&rect, 0, 0, window_width, window_height) from
+the compositor's configure and threw that rect away: the window became (-4,28)-(1916,1076)
+while Photoshop kept client (0,31)-(1920,1079) -- a client not even contained in its own
+window. On screen the content began at (4,35) instead of (0,32), with a 4px non-client strip
+down the LEFT and 3 rows across the TOP and the client CUT on the right and bottom. The SSD
+frame add-back a few lines above does not help: it is gated on SERVER_SIDE decorations and
+Adobe runs CSD. Upstream Wine HEAD does the same thing, so this is inherited rather than a
+Neutron regression -- but it is a Windows-vs-Wine divergence, which makes it ours.
+
+A surface LARGER than the configure is exactly what the 11.10-77 geometry work is for: the
+xdg window geometry is the sub-rect the compositor pins to the maximized area, and
+wayland_surface_reconfigure_geometry() already computes (window rect n rcWork) clamped to
+the configure size. So keep the window rect whenever it ALREADY satisfies the maximize
+contract -- the part of it inside the work area is exactly the configured size -- by passing
+SWP_NOSIZE.
+
+Four parts:
+
+  #0  ASK IN THE RIGHT COORDINATE SPACE. surface->window.rect is RAW; NtUserGetMonitorInfo
+      answers in get_thread_dpi() and the driver thread is not per-monitor aware, so it
+      returned VIRT rects and both the new predicate and the 11.10-77 geometry code were
+      mixing spaces. MEASURED in one call on the dev box (3840x2160 @ 1.7, 32px panel):
+      DEFAULT ctx rcWork=(0,32)-(2262,1272), PER_MONITOR_AWARE rcWork=(0,54)-(3840,2160).
+      Against a raw window rect of (-7,48)-(3847,2167) the virt answer gives 2262x1224
+      (garbage); the raw answer gives 3840x2106, exactly the configure. No effect at scale 1.
+
+  #1  wayland_configure_window(): for a MAXIMIZED configure where win32u also has the window
+      maximized and (window n rcWork) == the configure size, add SWP_NOSIZE and keep the
+      frame-inflated rect. EXACT equality on purpose: it fires only where win32u and the
+      compositor already agree on the maximized area, and NOT for a window that is merely
+      oversized while maximized -- Premiere's self-maximized overhang window (WIN 3850x2116,
+      3840x2111 monitor, 2256px configure) keeps the old forced resize, so the frame-spill
+      crop and the 11.10-49 crop/maximize livelock are reached by the same path as before.
+
+  #4  wayland_surface_reconfigure_geometry(): round the window->surface conversion OUTWARD.
+      The subregion is a containment rect; rounding to nearest can leave it one px short of
+      the configure at a fractional scale, and the code then falls back to
+      SetRect(0, 0, current.width, current.height), anchoring the geometry at the surface's
+      top-left -- which puts the frame back on screen, i.e. the very defect being removed.
+      Measured here at scale 1.7: nearest gave 2259x1238 -> fallback -> geometry
+      (0,0)-(2259,1239); outward gives (4,3)-(2263,1242) = exactly 2259x1239 inside the
+      2267x1246 surface. Exact, hence unchanged, at scale 1.0.
+
+  diag  neutron-maxkeep: under NEUTRON_WL_DIAG=1, reported at the OUTCOME and for the no-op
+      case too, with the numbers the decision was made on.
+
+Kill switch NEUTRON_MAXKEEP_FIX=0 restores all of the above exactly (A/B with no rebuild).
+
+VERIFIED LOCALLY, dev box, psmimic reproducer (a custom-frame window that insets its client
+by the frame metrics when zoomed, as Photoshop does):
+  11.10-77 installed runtime : window (-4,28)-(2257,1269) client (0,32)-(2253,1265)  FAIL
+                               (client 9x7 short of the 2262x1240 work area)
+  with this patch            : window (-4,28)-(2266,1276) client (0,32)-(2262,1272)  PASS
+                               (client == work area), 3/3 runs; geometry (4,3)-(2263,1242)
+  NEUTRON_MAXKEEP_FIX=0      : back to (0,32)-(2253,1265) FAIL, same binary, 2/2 runs
+Restore and re-maximize still work. NOT verified with real Photoshop.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -579,6 +579,7 @@
+ BOOL wayland_window_can_commit(HWND hwnd);
+ BOOL wayland_window_surface_has_role(HWND hwnd);
+ BOOL neutron_gate(const char *name, BOOL dflt);
++BOOL neutron_maxkeep_fix(void);
+ 
+ /**********************************************************************
+  *          Wayland Keyboard
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <math.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
+@@ -1060,9 +1061,41 @@
+     HMONITOR hmonitor;
+     MONITORINFO mi;
+ 
++    /* NEUTRON maxkeep fix #0 (2026-09-08): ASK IN THE RIGHT COORDINATE SPACE.
++     *
++     * surface->window.rect is a RAW (physical-pixel) rect -- win32u hands the driver raw rects and
++     * takes them back through NtUserSetRawWindowPos. NtUserMonitorFromRect/NtUserGetMonitorInfo
++     * answer in get_thread_dpi(), and this thread is not per-monitor aware, so without the context
++     * switch below they return VIRT rects and this intersection mixes two spaces.
++     *
++     * MEASURED on the dev box (3840x2160 output at scale 1.7, 32px top panel), both queries in the
++     * same call: DEFAULT ctx gives rcWork=(0,32)-(2262,1272) (virt), PER_MONITOR_AWARE gives
++     * rcWork=(0,54)-(3840,2160) (raw). Against a raw window rect of (-7,48)-(3847,2167) the virt
++     * answer yields 2262x1224 -- garbage that then trips the "smaller than required" fallback
++     * below and anchors the geometry at the surface's top-left, i.e. exactly the 4px class of
++     * error this whole area is about. The raw answer yields 3840x2106, the configured size.
++     *
++     * At scale 1 raw == virt, so this changes NOTHING on a 96-dpi desktop -- including the build
++     * tester's 1920x1080 box, where the 11.10-77 geometry fix was reasoned out. It is only
++     * fractional-scale desktops that were wrong, and they were wrong before 77 as well.
++     *
++     * Gated with the window-rect half of the fix (NEUTRON_MAXKEEP_FIX=0) so one switch restores
++     * the whole pre-fix arithmetic for an A/B. */
+     mi.cbSize = sizeof(mi);
+-    if (!(hmonitor = NtUserMonitorFromRect(&surface->window.rect, 0)) ||
+-        !NtUserGetMonitorInfo(hmonitor, (MONITORINFO *)&mi))
++    if (neutron_maxkeep_fix())
++    {
++        UINT context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
++        hmonitor = NtUserMonitorFromRect(&surface->window.rect, 0);
++        if (hmonitor && !NtUserGetMonitorInfo(hmonitor, (MONITORINFO *)&mi)) hmonitor = NULL;
++        NtUserSetThreadDpiAwarenessContext(context);
++        if (!hmonitor)
++        {
++            SetRectEmpty(rect);
++            return;
++        }
++    }
++    else if (!(hmonitor = NtUserMonitorFromRect(&surface->window.rect, 0)) ||
++             !NtUserGetMonitorInfo(hmonitor, (MONITORINFO *)&mi))
+     {
+         SetRectEmpty(rect);
+         return;
+@@ -1268,10 +1301,41 @@
+          * the right-edge gap the tester measured. */
+         if (fix && content) OffsetRect(&rect, -content->left, -content->top);
+ 
+-        wayland_surface_coords_from_window(surface, rect.left, rect.top,
+-                                           (int *)&rect.left, (int *)&rect.top);
+-        wayland_surface_coords_from_window(surface, rect.right, rect.bottom,
+-                                           (int *)&rect.right, (int *)&rect.bottom);
++        /* NEUTRON maxkeep fix #4 (2026-09-08): round the window->surface conversion OUTWARD.
++         *
++         * This rect is a CONTAINMENT rect -- the part of the window that must be visible -- so
++         * rounding it to nearest can make it come out a pixel SHORT of the configured size at a
++         * fractional scale, and short is not a small error here: the block just below then throws
++         * the rect away and falls back to SetRect(0, 0, current.width, current.height), which
++         * anchors the geometry at the surface's TOP-LEFT. For a maximized window whose surface
++         * starts at the frame-inflated origin that puts the frame back on screen and shifts the
++         * content by the frame width -- the very defect this patch exists to remove.
++         *
++         * MEASURED here, dev box at scale 1.7 with the window-rect fix in place: the visible
++         * subregion is (7,6)-(3847,2112) window px; to nearest that is 2259x1238 surface px, one
++         * short of the 2259x1239 configure, so the fallback fired and the geometry came out
++         * (0,0)-(2259,1239). Rounding outward gives (4,3)-(2263,1243) -> clamped (4,3)-(2263,1242)
++         * = exactly 2259x1239, inside the 2267x1246 surface, anchored on the work area.
++         *
++         * At scale 1.0 the division is exact, so floor/ceil == round and this changes NOTHING --
++         * including on the build tester's 1920x1080 box. Gated with the rest of the fix. */
++        if (neutron_maxkeep_fix())
++        {
++            double s = surface->window.scale;
++            RECT win_local = rect;
++            if (s <= 0.0) s = 1.0;
++            rect.left   = (LONG)floor(win_local.left   / s);
++            rect.top    = (LONG)floor(win_local.top    / s);
++            rect.right  = (LONG)ceil (win_local.right  / s);
++            rect.bottom = (LONG)ceil (win_local.bottom / s);
++        }
++        else
++        {
++            wayland_surface_coords_from_window(surface, rect.left, rect.top,
++                                               (int *)&rect.left, (int *)&rect.top);
++            wayland_surface_coords_from_window(surface, rect.right, rect.bottom,
++                                               (int *)&rect.right, (int *)&rect.bottom);
++        }
+ 
+         /* If the window rect in the monitor is smaller than required,
+          * fall back to an appropriately sized rect at the top-left. */
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -472,6 +472,69 @@
+     return on;
+ }
+ 
++/**********************************************************************
++ *          neutron_maxkeep_fix
++ *
++ * Kill switch for the 2026-09-08 maximized WINDOW-RECT fix in
++ * wayland_configure_window(). NEUTRON_MAXKEEP_FIX=0 restores the pre-fix
++ * behaviour exactly -- the Win32 window rect is forced to the compositor's
++ * configure size -- so the A/B costs no rebuild. Deliberately named to match
++ * NEUTRON_MAXGEOM_FIX (wayland_surface.c), which gates the xdg-geometry half
++ * of the same story; the two are independent and can be flipped separately.
++ */
++BOOL neutron_maxkeep_fix(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_MAXKEEP_FIX", TRUE);
++    return on;
++}
++
++/**********************************************************************
++ *          neutron_window_work_area_part
++ *
++ * The part of `surface`'s Win32 window rect that lies inside its monitor's
++ * WORK AREA, in window (Win32) pixels. Returns FALSE if there is no monitor or
++ * the intersection is empty.
++ *
++ * Deliberately the same arithmetic as wayland_surface_get_rect_in_monitor()
++ * (wayland_surface.c) with use_work_area=TRUE, because that is the function
++ * that actually decides the xdg window geometry: this predicate is a
++ * PREDICTION of what the geometry pass will do with the rect we are about to
++ * leave alone, so it has to be computed in the same space, from the same rect
++ * (surface->window.rect), against the same rcWork.
++ */
++static BOOL neutron_window_work_area_part(struct wayland_surface *surface, RECT *out)
++{
++    HMONITOR hmon;
++    MONITORINFO mi;
++    UINT context;
++    BOOL ret = FALSE;
++
++    /* ⚠️ COORDINATE SPACE. surface->window.rect is the RAW (physical-pixel) window rect -- the
++     * driver is handed raw rects by win32u and hands raw rects back (NtUserSetRawWindowPos maps
++     * raw->virt on the way in). NtUserMonitorFromRect and NtUserGetMonitorInfo, however, answer in
++     * get_thread_dpi(), and the driver thread is NOT per-monitor aware by default, so they return
++     * VIRT rects. Intersecting the two silently mixes spaces.
++     *
++     * MEASURED on the dev box (3840x2160 output at scale 1.7, 32px KDE panel), same call, same
++     * instant, printed from this function:
++     *   DEFAULT ctx  rcMonitor=(0,0)-(2262,1272)  rcWork=(0,32)-(2262,1272)   <- virt
++     *   PERMON  ctx  rcMonitor=(0,0)-(3840,2160)  rcWork=(0,54)-(3840,2160)   <- raw
++     * with the window rect at (-7,48)-(3847,2167) raw. The virt intersection gives 2262x1224,
++     * which is nonsense; the raw one gives 3840x2106, which is EXACTLY the configure. At scale 1
++     * raw == virt and the two are indistinguishable, which is why this never mattered on the
++     * tester's 1920x1080 box and why it has to be got right before any of it can be reproduced
++     * here. */
++    context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
++    mi.cbSize = sizeof(mi);
++    if ((hmon = NtUserMonitorFromRect(&surface->window.rect, 0)) &&
++        NtUserGetMonitorInfo(hmon, &mi))
++        ret = intersect_rect(out, &mi.rcWork, &surface->window.rect);
++    NtUserSetThreadDpiAwarenessContext(context);
++
++    return ret;
++}
++
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *toplevel_surface,
+                                                     struct wayland_surface *owner_surface,
+@@ -1220,6 +1283,7 @@
+     BOOL needs_exit_size_move = FALSE;
+     BOOL restoring_from_minimize = FALSE;
+     BOOL reposition_max = FALSE;
++    BOOL maxkeep = FALSE;
+     struct wayland_win_data *data;
+     RECT rect, cur_window_rect;
+ 
+@@ -1338,6 +1402,76 @@
+         window_height += offset_y;
+     }
+ 
++    /* NEUTRON maxkeep (2026-09-08): for a MAXIMIZED configure, do NOT force the Win32 window rect
++     * down to the compositor's configure size when win32u's own maximized rect is ALREADY correct.
++     *
++     * Windows maximizes by INFLATING the work area by the frame, so a maximized window's frame
++     * hangs off-screen and its CLIENT lands exactly on the work area. Measured on a build tester's
++     * 1920x1080 @ scale 1 with a 32px top panel (rcWork = (0,32)-(1920,1080)): win32u's
++     * get_min_max_info produces ptMaxSize 1928x1056 / ptMaxPosition -4,28 -- window
++     * (-4,28)-(1924,1084), which is right. Photoshop 2026 answers WM_NCCALCSIZE itself and insets
++     * on that Windows assumption, so its client came out on the work area.
++     *
++     * The code below then did SetRect(&rect, 0, 0, window_width, window_height) from the
++     * compositor's configure (1920x1048) and DISCARDED that rect: the window became
++     * (-4,28)-(1916,1076) while Photoshop kept client (0,31)-(1920,1079) -- a client not even
++     * contained in its own window. On screen the content started at (4,35) instead of (0,32), with
++     * a 4px non-client strip down the LEFT and 3 rows across the TOP, and the client CUT on the
++     * right and bottom: the asymmetric (+4,+3) signature, re-measured twice from the tester's
++     * screenshots (see OPEN-ISSUES.md 2026-09-08 "CORRECTION"). The SSD add-back just above does
++     * not help, because it is gated on SERVER_SIDE decorations and Adobe runs CSD.
++     *
++     * A LARGER surface than the configure is exactly what the 11.10-77 geometry work is for: the
++     * xdg window geometry is the sub-rect the compositor pins to the maximized area, and
++     * wayland_surface_reconfigure_geometry() already computes (window rect n rcWork) clamped to the
++     * configure size -- (4,4)-(1924,1052) inside a 1928x1056 surface for the rect above, i.e.
++     * exactly the configured 1920x1048, landing on the work area.
++     *
++     * So keep the window rect whenever it already satisfies the maximize contract: the part of it
++     * inside the WORK AREA is exactly the configured size. This is an EXACT-equality test rather
++     * than "big enough" on purpose:
++     *   - it fires only where win32u and the compositor already agree on the maximized area, which
++     *     is the Photoshop case and the only case this bug is about;
++     *   - it does NOT fire for a window that is merely oversized while maximized. Premiere's
++     *     self-maximized overhang window (WIN 3850x2116 against a 3840x2111 monitor, 2256px
++     *     configure) keeps the old forced resize, so the frame-spill crop and the 11.10-49
++     *     crop/maximize livelock are reached by exactly the same path as before.
++     * Also required: win32u must agree the window is maximized (surface->window.state), which
++     * keeps this off the compositor-initiated snap path below (reposition_max), where WS_MAXIMIZE
++     * is not set yet and the stale floating rect must not be preserved.
++     *
++     * Kill switch: NEUTRON_MAXKEEP_FIX=0 restores the forced resize exactly. */
++    if ((state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++        !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
++        window_width > 0 && window_height > 0)
++    {
++        RECT work;
++        BOOL win32_max = !!(surface->window.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED);
++        BOOL have_work = neutron_window_work_area_part(surface, &work);
++        BOOL fits = have_work &&
++                    work.right - work.left == window_width &&
++                    work.bottom - work.top == window_height;
++
++        if (neutron_maxkeep_fix() && win32_max && fits)
++        {
++            flags |= SWP_NOSIZE;
++            maxkeep = TRUE;
++        }
++
++        /* Report at the OUTCOME, and report the no-op case too: "we did nothing, and here is the
++         * number that made us do nothing" is the line that matters when a fix appears to change
++         * nothing. A diagnostic printed before the decision is a guess. */
++        if (neutron_wl_diag())
++            ERR("neutron-maxkeep: hwnd=%p win=%s workpart=%s(%dx%d) cfg=%dx%d win32max=%d gate=%d"
++                " -> %s\n", hwnd, wine_dbgstr_rect(&surface->window.rect),
++                have_work ? wine_dbgstr_rect(&work) : "(none)",
++                have_work ? (int)(work.right - work.left) : 0,
++                have_work ? (int)(work.bottom - work.top) : 0,
++                window_width, window_height, win32_max, neutron_maxkeep_fix(),
++                maxkeep ? "KEEPING the Win32 maximized rect (SWP_NOSIZE)"
++                        : "resizing to the configure (pre-fix behaviour)");
++    }
++
+     /* Detect a restore from an application-initiated minimize: the last
+      * requested config placed the window at the offscreen sentinel position
+      * with WS_MINIMIZE, and the compositor is now sending a configure. Ack
+@@ -1423,9 +1557,9 @@
+         flags |= SWP_NOSENDCHANGING;
+     }
+ 
+-    ERR("neutron-cfg: configure_window hwnd=%p SetRawWindowPos rect=(%ld,%ld,%ld,%ld) flags=%#x %s\n",
++    ERR("neutron-cfg: configure_window hwnd=%p SetRawWindowPos rect=(%ld,%ld,%ld,%ld) flags=%#x %s%s\n",
+         hwnd, (long)rect.left, (long)rect.top, (long)rect.right, (long)rect.bottom, flags,
+-        (flags & SWP_NOSIZE) ? "NOSIZE" : "RESIZE");
++        (flags & SWP_NOSIZE) ? "NOSIZE" : "RESIZE", maxkeep ? " (maxkeep)" : "");
+ 
+     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
+ }

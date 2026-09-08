@@ -1,0 +1,254 @@
+winewayland: put a maximized window's xdg geometry in surface-local coords, anchored to the work area.
+
+NEUTRON 2026-09-08. Symptom (build tester, 11.10-75, 1920x1080 @ scale 1, KDE panel
+32px at top): maximized Photoshop 2026 sits ~4px off, content overlapping the panel
+and an ~8px gap down the right edge. 100% reproducible, 417/417 configures.
+
+wayland_surface_reconfigure_geometry()'s subregion branch derived the geometry rect
+from the FULL window rect intersected with the FULL monitor. Both halves are wrong on
+a desktop with a reserved strut:
+
+1. rcMonitor vs rcWork. A maximized xdg surface's geometry is the rect the compositor
+   pins to the MAXIMIZED AREA. Win32 insets a maximized window rect by the frame so
+   the CLIENT lands on the work-area origin -- measured (-4,28)-(1924,1084) against a
+   work area of (0,32)-(1920,1080). Intersected with rcMonitor the top edge (28) is
+   still inside the monitor, so the geometry top came out 0 instead of 4 and the whole
+   window is pinned 4px low. Invisible without a panel, where rcWork == rcMonitor --
+   which is why this survived this long.
+
+2. window-local vs surface-local. When the frame-spill crop is active,
+   wayland_surface_attach_shm() sets the wp_viewport SOURCE to the in-monitor
+   subregion, so surface-local (0,0) is NOT the window rect origin any more.
+   Re-deriving the rect from the window rect applies the same left inset a SECOND
+   time. Measured, all inside ONE wayland_surface_reconfigure() call (the crop is
+   computed before the maximized config is acked, the geometry after it):
+
+     neutron-overhang: full=1928x1056 clipped=1920x1052      crop origin (4,0)
+     reconfigure_geometry geometry=(4,0)-(1924,1048)         right 1924 > surface 1920
+     reconfigure_size     size=1920x1052
+     xdg_toplevel_handle_configure 1916x1048                 <- 1924 - 4 - 4
+
+   xdg-shell clamps the effective geometry to the surface bounds, so the compositor
+   silently cut the overrun and re-offered a 1916-wide maximized size. That re-offer
+   is the narrow window and the right-edge gap.
+
+The crop rect is now plumbed from wayland_surface_reconfigure() through
+wayland_surface_reconfigure_xdg() to the geometry code. It cannot be re-derived
+there: the maximized config is acked in between, after which
+wayland_surface_get_frame_spill_rect() returns FALSE.
+
+With both corrections the cropped and uncropped passes converge on the same screen
+placement -- geometry (0,4)-(1920,1052) on a 1920x1052 cropped surface, and
+(4,4)-(1924,1052) on the full 1928x1056 surface, both putting the window rect origin
+at (-4,28) and the client at the work-area origin (0,32). The geometry SIZE is
+unchanged in every case (still exactly current.width x current.height), so nothing
+that wayland_surface_config_is_compatible() or neutron_crop_would_break_maximized()
+depend on moves.
+
+Also asserts the invariant in place: geometry that runs outside the surface is slid
+back into range (size preserved) and reported at ERR. It is silent otherwise -- the
+compositor just clamps and re-configures smaller -- which is exactly how this bug hid.
+
+Kill switch: NEUTRON_MAXGEOM_FIX=0 restores the pre-fix arithmetic exactly, for an
+A/B without a rebuild. Diagnostics under the existing NEUTRON_WL_DIAG=1.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1045,9 +1045,17 @@
+  *
+  * Gets the largest rectangle within a surface's window (in window coordinates)
+  * that is visible in a monitor.
++ *
++ * NEUTRON maxgeom fix (2026-09-08): `use_work_area` picks rcWork instead of
++ * rcMonitor. A MAXIMIZED xdg surface's window geometry is the rect the
++ * compositor pins to the MAXIMIZED AREA -- i.e. the work area, not the whole
++ * monitor -- so on a desktop with a reserved strut (a KDE panel) the two are
++ * different rects and intersecting with the monitor anchors the geometry in the
++ * wrong place. See the call site for the measured numbers. FULLSCREEN keeps
++ * rcMonitor, which is what it is pinned to.
+  */
+ static void wayland_surface_get_rect_in_monitor(struct wayland_surface *surface,
+-                                                RECT *rect)
++                                                RECT *rect, BOOL use_work_area)
+ {
+     HMONITOR hmonitor;
+     MONITORINFO mi;
+@@ -1060,7 +1068,8 @@
+         return;
+     }
+ 
+-    intersect_rect(rect, &mi.rcMonitor, &surface->window.rect);
++    intersect_rect(rect, use_work_area ? &mi.rcWork : &mi.rcMonitor,
++                   &surface->window.rect);
+     OffsetRect(rect, -surface->window.rect.left, -surface->window.rect.top);
+ }
+ 
+@@ -1184,12 +1193,32 @@
+ }
+ 
+ /**********************************************************************
++ *          neutron_maxgeom_fix
++ *
++ * Kill switch for the 2026-09-08 maximized-geometry fix in
++ * wayland_surface_reconfigure_geometry(). NEUTRON_MAXGEOM_FIX=0 restores the
++ * pre-fix arithmetic exactly, for an A/B without a rebuild.
++ */
++static BOOL neutron_maxgeom_fix(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_MAXGEOM_FIX", TRUE);
++    return on;
++}
++
++/**********************************************************************
+  *          wayland_surface_reconfigure_geometry
+  *
+  * Sets the xdg_surface geometry
++ *
++ * `content` is the frame-spill crop that wayland_surface_reconfigure() applied
++ * to THIS pass (window-local coords), or NULL when the surface carries the whole
++ * window. It is what makes surface-local != window-local, and the geometry must
++ * be in SURFACE-local coords -- see the fix note below.
+  */
+ static void wayland_surface_reconfigure_geometry(struct wayland_surface *surface,
+-                                                 int width, int height)
++                                                 int width, int height,
++                                                 const RECT *content)
+ {
+     RECT rect;
+ 
+@@ -1199,7 +1228,45 @@
+                                    WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)) &&
+         (width > surface->current.width || height > surface->current.height))
+     {
+-        wayland_surface_get_rect_in_monitor(surface, &rect);
++        BOOL fix = neutron_maxgeom_fix();
++        BOOL maximized = !!(surface->current.state &
++                            WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED);
++
++        /* NEUTRON maxgeom fix #1 (2026-09-08): anchor a MAXIMIZED window's
++         * geometry to the WORK AREA, not the whole monitor.
++         *
++         * Measured, PS 2026 on 1920x1080 with a 32px top panel (11.10-75):
++         * Win32 maximized window rect = (-4,28)-(1924,1084) -- correct: Win32
++         * insets a maximized window rect by the frame so the CLIENT lands on the
++         * work-area origin (0,32). The compositor pins the geometry rect to the
++         * maximized area, so the geometry must be the window's intersection with
++         * the WORK area, in window-local coords: (4,4)-(1924,1052), i.e. exactly
++         * the 1920x1048 the compositor configured. Against rcMonitor the top
++         * edge (28) is still inside the monitor, so the intersection's top comes
++         * out 0 and the whole window is pinned 4px low. Invisible with no panel,
++         * because there rcWork == rcMonitor -- which is why this never showed up
++         * on a strut-less desktop. */
++        wayland_surface_get_rect_in_monitor(surface, &rect, fix && maximized);
++
++        /* NEUTRON maxgeom fix #2 (2026-09-08): the geometry is SURFACE-local.
++         *
++         * When the frame-spill crop is active the surface no longer starts at
++         * the window rect's origin: wayland_surface_attach_shm() sets the
++         * wp_viewport SOURCE to `content`, so surface-local (0,0) IS window-local
++         * `content->left,top`. Re-deriving the rect from the full window rect
++         * therefore applies the same inset a SECOND time. Measured on the same
++         * launch, in ONE wayland_surface_reconfigure() call (the crop is computed
++         * before the maximized config is acked, the geometry after it):
++         *
++         *   neutron-overhang: full=1928x1056 clipped=1920x1052   crop origin (4,0)
++         *   reconfigure_geometry geometry=(4,0)-(1924,1048)      right 1924 > 1920
++         *   xdg_toplevel_handle_configure 1916x1048              <- 1924-4-4
++         *
++         * xdg-shell says the effective geometry is CLAMPED to the surface
++         * bounds, so the compositor silently cut 4px off the right and re-offered
++         * a 1916-wide maximized size. That re-offer is the 4px-narrow window and
++         * the right-edge gap the tester measured. */
++        if (fix && content) OffsetRect(&rect, -content->left, -content->top);
+ 
+         wayland_surface_coords_from_window(surface, rect.left, rect.top,
+                                            (int *)&rect.left, (int *)&rect.top);
+@@ -1219,6 +1286,38 @@
+             rect.right = min(rect.right, rect.left + surface->current.width);
+             rect.bottom = min(rect.bottom, rect.top + surface->current.height);
+         }
++
++        /* NEUTRON maxgeom fix #3 (2026-09-08): the invariant, asserted here
++         * rather than in a harness -- the geometry must lie INSIDE the surface.
++         * Violating it is silent: the compositor clamps, then re-configures a
++         * smaller maximized size, and the only visible result is a window a few
++         * px short. Slide back into range first (that keeps the configured size,
++         * which config_is_compatible() depends on), clamp only if it still does
++         * not fit. With #1 and #2 in place this should never fire; if the ERR
++         * below ever appears, the surface/window mapping is wrong somewhere
++         * else and THAT is the bug to chase. */
++        if (fix && width > 0 && height > 0 &&
++            (rect.left < 0 || rect.top < 0 ||
++             rect.right > width || rect.bottom > height))
++        {
++            RECT before = rect;
++            if (rect.right > width)   OffsetRect(&rect, width - rect.right, 0);
++            if (rect.bottom > height) OffsetRect(&rect, 0, height - rect.bottom);
++            if (rect.left < 0) { rect.left = 0; rect.right = min(rect.right, width); }
++            if (rect.top < 0)  { rect.top = 0; rect.bottom = min(rect.bottom, height); }
++            rect.right = min(rect.right, width);
++            rect.bottom = min(rect.bottom, height);
++            ERR("neutron-maxgeom: hwnd=%p geometry %s ran outside the %dx%d surface;"
++                " corrected to %s\n", surface->hwnd, wine_dbgstr_rect(&before),
++                width, height, wine_dbgstr_rect(&rect));
++        }
++
++        if (neutron_wl_surf_diag())
++            ERR("neutron-maxgeom: hwnd=%p surface=%dx%d current=%dx%d,%#x crop=%s"
++                " geometry=%s\n", surface->hwnd, width, height,
++                surface->current.width, surface->current.height, surface->current.state,
++                content ? wine_dbgstr_rect(content) : "(none)", wine_dbgstr_rect(&rect));
++
+         TRACE("Window is too large for Wayland state, using subregion\n");
+     }
+     else
+@@ -1375,7 +1474,8 @@
+  * state.
+  */
+ static BOOL wayland_surface_reconfigure_xdg(struct wayland_surface *surface,
+-                                            int width, int height)
++                                            int width, int height,
++                                            const RECT *content)
+ {
+     struct wayland_window_config *window = &surface->window;
+ 
+@@ -1415,7 +1515,7 @@
+         return FALSE;
+     }
+ 
+-    wayland_surface_reconfigure_geometry(surface, width, height);
++    wayland_surface_reconfigure_geometry(surface, width, height, content);
+ 
+     return TRUE;
+ }
+@@ -1474,6 +1574,12 @@
+     struct wayland_window_config *window = &surface->window;
+     int win_width, win_height, width, height;
+     RECT spill;
++    /* NEUTRON maxgeom fix: non-NULL only while the frame-spill crop is actually
++     * applied to this pass, so wayland_surface_reconfigure_geometry() knows where
++     * surface-local (0,0) sits in window coords. It cannot re-derive this: the
++     * maximized config is acked in between, after which
++     * wayland_surface_get_frame_spill_rect() returns FALSE. */
++    const RECT *content = NULL;
+ 
+     win_width = surface->window.rect.right - surface->window.rect.left;
+     win_height = surface->window.rect.bottom - surface->window.rect.top;
+@@ -1490,6 +1596,7 @@
+     {
+         win_width = spill.right - spill.left;
+         win_height = spill.bottom - spill.top;
++        content = &spill;
+ 
+         if (neutron_wl_surf_diag())
+             ERR("neutron-overhang: hwnd=%p full=%dx%d clipped=%dx%d viewport-dest=%dx%d\n",
+@@ -1517,7 +1624,7 @@
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+     case WAYLAND_SURFACE_ROLE_POPUP:
+         if (!surface->xdg_surface) break; /* surface role has been cleared */
+-        if (!wayland_surface_reconfigure_xdg(surface, width, height)) return FALSE;
++        if (!wayland_surface_reconfigure_xdg(surface, width, height, content)) return FALSE;
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         if (!surface->wl_subsurface) break; /* surface role has been cleared */
