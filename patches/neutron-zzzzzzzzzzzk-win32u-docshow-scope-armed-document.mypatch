@@ -1,0 +1,133 @@
+# neutron-win32u-docshow-scope-armed-document
+#
+# PS 2026 canvas dead at the third document -- OUR OWN force-show walk was the cause.
+#
+# Path B ("force-show docks") reveals the deferred-visible OWL dock hierarchy after a document is
+# created. Its class filter matches "OWL.Document" by SUBSTRING and it walks from GA_ROOT, so it
+# revealed EVERY hidden document window in the frame -- including ones Photoshop had deliberately
+# hidden, because that is how PS implements tabs (exactly one document window visible at a time).
+#
+# By the third document there is a hidden one to find. From photoshop-20260909-145009.log:
+#
+#   12662  OWL document 0x311f8 created            <- doc 1
+#   17613  OWL document 0xa0fee created            <- doc 2; walk reveals 0xa0fee only
+#   18464  doc 1 hidden (tester switched tabs)
+#   25764  OWL document 0x514ca created            <- doc 3
+#   25769  force-show -> revealed 2 window(s)      <- 0x514ca AND 0x311f8
+#   25771  force-show -> revealed 1 window(s)      <- 0x311f8 again, PS re-hid it
+#   25773  force-show -> revealed 1 window(s)      <- 0x311f8 again; our last write wins
+#
+# Doc 1's window ends WS_VISIBLE and stacked over the canvas region, so a canvas click resolves to
+# IT rather than the active document. AdobeOwl's wndproc throws .?AVException@Owl@@ on the
+# WM_MOUSEACTIVATE and its catch funclet swallows it, so the app stays healthy and the click simply
+# evaporates. Every reported property follows: canvas-only (menus/panels/tabs are elsewhere), the
+# third document every time, blank-vs-file irrelevant, and clicking doc 1's tab recovers it -- that
+# is PS showing the window legitimately (cmd=4), reconciling the state our cmd=8 forced.
+#
+# Reproduced on 11.10-80 with the heap corruption completely silent in the same session (guard 0,
+# winedbg 0), so it is provably independent of the winhttp/GrowthSDK defect closed in 11.10-80.
+#
+# Fix: scope the walk to the document window whose creation ARMED it. Any other OWL.Document* is
+# skipped, subtree and all, exactly as WelcomeScreen and PSFloat already are. Docks, tab panes,
+# palettes and grippers are untouched -- they are ancestors of the documents, not descendants, so
+# nothing the walk exists for is lost.
+#
+# KILL SWITCH: NEUTRON_DOCSHOW_SCOPE=0 restores the pre-patch blanket walk exactly. Before this
+# there was NO env gate reaching the walk, so the defect could not be A/B'd on a shipped build.
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5149,6 +5149,67 @@
+ {
+     return neutron_ascii_has( c, "WelcomeScreen" ) || neutron_ascii_has( c, "PSFloat" );
+ }
++/* === NEUTRON: SCOPE THE WALK TO THE DOCUMENT IT WAS ARMED ON. ===============================
++ *
++ * THE BUG THIS FIXES (build tester, 2026-09-09, reproduced 4+ times, root-caused in
++ * photoshop-20260909-145009.log): with three documents open, the canvas stopped responding to
++ * clicks. Menus, panels and tabs kept working; clicking document 1's tab restored it.
++ *
++ * It was ours. neutron_want_show() matches "OWL.Document" by SUBSTRING and the walk runs from
++ * GA_ROOT, so it reveals EVERY hidden document window in the frame -- not just the one whose
++ * creation armed it. Photoshop keeps exactly one document window visible and hides the rest
++ * (that is how tabs work). By the third document there is a hidden one to find:
++ *
++ *   12662  OWL document 0x311f8 created            <- doc 1
++ *   17613  OWL document 0xa0fee created            <- doc 2, walk reveals 0xa0fee only (doc 1
++ *                                                     still visible, nothing to "rescue")
++ *   18464  doc 1 hidden as the tester switched tabs
++ *   25764  OWL document 0x514ca created            <- doc 3
++ *   25769  force-show -> revealed 2 window(s)      <- 0x514ca AND 0x311f8
++ *   25771  force-show -> revealed 1 window(s)      <- 0x311f8 again, PS re-hid it
++ *   25773  force-show -> revealed 1 window(s)      <- 0x311f8 again; our last write wins
++ *
++ * Doc 1's window is then WS_VISIBLE and stacked over the canvas region, so a canvas click
++ * resolves (via window_from_point) to IT, not the active document. AdobeOwl's wndproc throws
++ * .?AVException@Owl@@ on the WM_MOUSEACTIVATE and its catch funclet swallows it -- which is why
++ * the app stays healthy and the click merely evaporates. Every reported property follows:
++ * canvas-only, third document, blank-vs-file irrelevant, and clicking doc 1's tab recovers it
++ * (that is PS showing the window legitimately, reconciling the state we forced).
++ *
++ * THE FIX: the walk exists to reveal the dock hierarchy of the document that was JUST CREATED,
++ * whose WS_VISIBLE winewayland leaves deferred. Any OTHER document window's visibility is
++ * Photoshop's business -- it hid it on purpose. Skip those, subtree and all, exactly as we
++ * already skip WelcomeScreen and PSFloat. Docks, tab panes, palettes and grippers are unchanged;
++ * they are ancestors of the documents, not descendants, so nothing the walk is FOR is lost.
++ *
++ * KILL SWITCH: NEUTRON_DOCSHOW_SCOPE=0 restores the pre-patch blanket walk exactly, so the
++ * 0-vs-N A/B can be run on one shipped build in a single session -- the tester can reproduce
++ * this on demand at the third document. */
++static BOOL neutron_docshow_scope(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_DOCSHOW_SCOPE" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_DOCSHOW_SCOPE = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++/* The document window whose creation armed the current force-show budget. Written in
++ * neutron_on_window_created, read by the walk. A plain volatile pointer: it is written on the
++ * one thread that creates OWL windows and only ever compared for identity. */
++static HWND volatile neutron_dockshow_hwnd;
++
++/* TRUE for a document window that is not the one we were armed on -- PS owns its visibility. */
++static BOOL neutron_foreign_document( HWND hwnd, const char *c )
++{
++    if (!neutron_ascii_has( c, "OWL.Document" )) return FALSE;
++    return hwnd != neutron_dockshow_hwnd;
++}
++
+ static int neutron_force_show_docks( HWND parent, int depth )
+ {
+     HWND *list;
+@@ -5160,6 +5221,15 @@
+     {
+         neutron_class_ascii( list[i], cb );
+         if (neutron_skip_subtree( cb )) continue;                 /* leave home/float as PS put it */
++        if (neutron_docshow_scope() && neutron_foreign_document( list[i], cb ))
++        {
++            /* Log ONLY the ones we would have wrongly revealed, so the line count stays at the
++               bug's own rate and the A/B against NEUTRON_DOCSHOW_SCOPE=0 is readable in the log. */
++            if (!(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
++                ERR( "neutron: force-show skipping foreign document %p (armed on %p) -- PS hid it on purpose\n",
++                     list[i], neutron_dockshow_hwnd );
++            continue;
++        }
+         if (neutron_want_show( cb ) && !(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
+         {
+             RECT rc = {0, 0, 0, 0};
+@@ -5390,6 +5460,9 @@
+     if (neutron_class_is( hwnd, neutron_document_class ) || neutron_class_is( hwnd, neutron_docwindow_class ))
+     {
+         ERR( "neutron: OWL document %p created -> welcome dismiss + dock force-show armed\n", hwnd );
++        /* NEUTRON: scope the walk to THIS document (see neutron_docshow_scope). Set before the
++           budget so the walk can never run against a stale target. */
++        neutron_dockshow_hwnd = hwnd;
+         InterlockedExchange( &neutron_dismiss_pending, 1 );
+         InterlockedExchange( &neutron_shell_emit_pending, 1 );
+         /* NEUTRON avenue-3: arm the geometry trace for the doc-create relayout window. Bounded line
