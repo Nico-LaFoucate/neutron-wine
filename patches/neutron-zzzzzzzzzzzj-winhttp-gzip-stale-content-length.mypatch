@@ -1,0 +1,160 @@
+winhttp: don't leave a stale Content-Length behind when decompressing.
+
+winhttp stores response headers twice -- a parsed array (what WinHttpQueryHeaders
+answers attribute queries from) and a flat text blob (what WINHTTP_QUERY_RAW_HEADERS
+and _RAW_HEADERS_CRLF return verbatim). When WINHTTP_OPTION_DECOMPRESSION is on and
+the response is gzip/deflate, init_gzip_stream() deletes Content-Length because the
+number describes the COMPRESSED body while WinHttpReadData() now yields the
+DECOMPRESSED one. Upstream's remove_header() only edits the parsed array, and only
+its first match. Two ways out of that survive, both measured on stock 11.10-79 with
+a localhost harness serving 403 compressed / 8193 decompressed bytes:
+
+  1. RAW_HEADERS_CRLF still contains "Content-Length: 403" while the attribute query
+     already says HEADER_NOT_FOUND and ReadData delivers 8193 -- the same header of
+     the same response reported two different ways at the same instant.
+  2. If the response carries Content-Length TWICE (a proxy re-adding it, say), the
+     second copy survives remove_header() entirely and the plain attribute query
+     returns 403 against an 8193-byte body:
+       VERDICT UNSAFE reported=403 actual=8193 overrun=7790
+
+A caller sizing a buffer from either one under-allocates by the compression ratio.
+On a build tester's machine AdobeGrowthSDK.dll did exactly that -- 1512 allocated,
+8193 copied, a 6681-byte overrun into a following FREE block whose base_offset was
+overwritten with 0x3039, the ASCII "90" out of the JSON being copied
+("...cpuThreshold":90,"__stage__growth.contentC...). RtlAllocateHeap later derived a
+subheap pointer from that field and hung the process into a node.exe crash loop. The
+sequence was captured by the 11.10-79 heap guard.
+
+Remove Content-Length from the raw blob as well, and drop every copy from the parsed
+array rather than just the first. request->content_length -- the INTERNAL read-loop
+bound, which upstream already parks at ~0ull here -- is untouched, as is
+Content-Encoding in both stores.
+
+Gate NEUTRON_WINHTTP_GZIP_HEADERS: 0 restores the pre-patch behaviour exactly,
+1 (default) applies the fix.
+
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -2731,6 +2731,107 @@
+     return ERROR_WINHTTP_LOGIN_FAILURE;
+ }
+ 
++/* =============================================================================================
++ * NEUTRON: winhttp decompression leaves a stale Content-Length in the RAW header blob.
++ *
++ * WHAT IS WRONG.  winhttp keeps the response headers TWICE: a parsed array (request->headers[],
++ * what WinHttpQueryHeaders() answers attribute queries from) and a flat text blob
++ * (request->raw_headers, what WINHTTP_QUERY_RAW_HEADERS / _RAW_HEADERS_CRLF hand back verbatim).
++ * read_reply() builds both.  When WINHTTP_OPTION_DECOMPRESSION is on and the response carries
++ * Content-Encoding: gzip/deflate, init_gzip_stream() installs a decompressing data_stream and
++ * -- correctly -- deletes Content-Length, because the number describes the COMPRESSED body while
++ * WinHttpReadData() now yields the DECOMPRESSED one.  But remove_header() -> delete_header()
++ * only edits the parsed ARRAY.  Nothing touches raw_headers.  So the two query paths disagree
++ * about the same header of the same response at the same instant:
++ *
++ *     WinHttpQueryHeaders( WINHTTP_QUERY_CONTENT_LENGTH )   -> ERROR_WINHTTP_HEADER_NOT_FOUND
++ *     WinHttpQueryHeaders( WINHTTP_QUERY_RAW_HEADERS_CRLF ) -> "... Content-Length: 403 ..."
++ *     WinHttpReadData()                                     -> 8193 bytes
++ *
++ * (Those three lines are literal output of the localhost harness on unpatched 11.10-79.)
++ *
++ * WHY IT MATTERS.  A caller that sizes a buffer by scanning the raw blob -- an ordinary thing to
++ * do, and the only way to read a header winhttp has no attribute constant for -- allocates the
++ * compressed size and then copies in the decompressed body.  On a build tester's machine Adobe's
++ * AdobeGrowthSDK.dll did exactly that: 1512 bytes allocated, 8193 written, a 6681-byte heap
++ * overrun that walked into a following FREE block and overwrote its base_offset with 0x3039 --
++ * the ASCII "90" out of the JSON text  "...cpuThreshold":90,"__stage__growth.contentC...  that
++ * was being copied.  RtlAllocateHeap later derived a subheap pointer from that field and hung
++ * the process; the node.exe helper respawned into a crash loop.  The whole sequence was captured
++ * by the 11.10-79 heap guard (NEUTRON_HEAP_BASE_GUARD), which is how the writer was identified.
++ *
++ * WHAT THIS DOES, AND WHAT IT DELIBERATELY DOES NOT.
++ *  - It removes Content-Length from raw_headers as well, so the blob agrees with the array.
++ *    That is the whole fix: make the two reports of one header consistent.
++ *  - It also removes any DUPLICATE Content-Length from the parsed array.  Upstream's
++ *    remove_header() drops only index 0, so a second copy of a header we have just decided is
++ *    a lie would survive and be reported as truth.
++ *  - It does NOT touch request->content_length.  That is the INTERNAL read-loop bound, and
++ *    upstream already parks it at ~0ull here so end_of_data_stream()/the min() clamps defer to
++ *    the gzip stream's own end-of-data.  Reported metadata and the read loop are separate
++ *    concerns and only the reported side is changed.
++ *  - It does NOT touch Content-Encoding, in either store.  Leaving it is upstream's deliberate
++ *    choice, it cannot cause an under-allocation, and stripping it would change what every
++ *    caller sees about how a response was transferred -- winhttp is on Adobe's licensing/IMS
++ *    sign-in path, so the narrower change is the right one.  A stale Content-Encoding at worst
++ *    makes a caller try to inflate an already-inflated body and fail loudly; a stale
++ *    Content-Length makes it corrupt the heap silently.
++ *  - It allocates nothing and can fail nothing: the removal is an in-place memmove that only
++ *    ever SHRINKS a NUL-terminated buffer that is already owned by the request.
++ *
++ * KILL SWITCH.  NEUTRON_WINHTTP_GZIP_HEADERS=0 restores the pre-patch behaviour exactly, stale
++ * blob included.  1 (default) applies the fix.  Named to match NEUTRON_MAXKEEP_FIX /
++ * NEUTRON_HEAP_BASE_GUARD.
++ * ============================================================================================= */
++
++static BOOL neutron_winhttp_gzip_headers_fix(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        WCHAR buf[8];
++        DWORD len = GetEnvironmentVariableW( L"NEUTRON_WINHTTP_GZIP_HEADERS", buf, ARRAY_SIZE(buf) );
++        enabled = (len && len < ARRAY_SIZE(buf) && buf[0] == '0') ? 0 : 1;
++        /* One-shot at ERR so a capture can tell "gate off" from "patch absent". */
++        ERR( "neutron-winhttp: gate NEUTRON_WINHTTP_GZIP_HEADERS resolved to %d\n", enabled );
++    }
++    return enabled == 1;
++}
++
++/* Delete every "<field>: ..." line from the raw header blob.  The blob is a NUL-terminated
++ * WCHAR string of CRLF-separated lines whose first line is the status line (never a header,
++ * so it is skipped) and which ends with an empty line.  Removal is a memmove of the tail over
++ * the matched line, so the buffer only shrinks and stays NUL-terminated throughout. */
++static void neutron_raw_headers_remove( struct request *request, const WCHAR *field )
++{
++    SIZE_T fieldlen = wcslen( field );
++    WCHAR *p = request->raw_headers, *eol;
++
++    if (!p) return;
++    if (!(p = wcsstr( p, L"\r\n" ))) return;   /* skip the status line */
++    p += 2;
++
++    while (*p && (eol = wcsstr( p, L"\r\n" )) && eol != p)
++    {
++        WCHAR *sep = p;
++
++        if (!wcsnicmp( p, field, fieldlen ))
++        {
++            sep = p + fieldlen;
++            while (*sep == ' ' || *sep == '\t') sep++;
++        }
++        if (sep != p && *sep == ':')
++        {
++            WCHAR *rest = eol + 2;
++            TRACE( "neutron: dropping stale %s from the raw headers\n", debugstr_w(field) );
++            memmove( p, rest, (wcslen( rest ) + 1) * sizeof(WCHAR) );
++            continue;                          /* re-examine at the same position */
++        }
++        p = eol + 2;
++    }
++}
++
+ static DWORD init_gzip_stream( struct request *request, BOOL is_gzip )
+ {
+     struct gzip_stream *gzip_stream;
+@@ -2760,7 +2861,13 @@
+     gzip_stream->parent = request->data_stream;
+     request->data_stream = &gzip_stream->data_stream;
+ 
+-    remove_header( request, L"Content-Length", FALSE );
++    if (neutron_winhttp_gzip_headers_fix())
++    {
++        while (get_header_index( request, L"Content-Length", 0, FALSE ) != -1)
++            remove_header( request, L"Content-Length", FALSE );
++        neutron_raw_headers_remove( request, L"Content-Length" );
++    }
++    else remove_header( request, L"Content-Length", FALSE );
+     request->content_length = ~0ull;
+     return ERROR_SUCCESS;
+ }
