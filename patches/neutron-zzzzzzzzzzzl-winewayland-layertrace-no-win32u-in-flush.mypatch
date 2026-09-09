@@ -1,0 +1,104 @@
+# neutron-winewayland-layertrace-no-win32u-in-flush
+#
+# ⛔ OUR OWN DIAGNOSTIC HARD-FROZE PHOTOSHOP. NEUTRON_LAYER_TRACE=1 could deadlock the process.
+#
+# The layer trace opened with NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) so it could compare win32u's
+# WS_EX_LAYERED against wws->layered. That one call sits inside the driver's surface-flush callback,
+# which win32u invokes WITH surface->mutex held -- so it takes
+#
+#     surface->mutex  ->  user_lock
+#
+# while every shipping path in win32u takes them the other way round:
+#
+#     user_lock -> surface->mutex     (apply_window_pos -> update_surface_region -> get_win_ptr
+#                                      [user_lock] -> window_surface_set_shape [surface->mutex])
+#
+# A textbook ABBA inversion. Measured on the build tester's box on 11.10-81 and symbolised from the
+# freeze capture against the matching unstripped tree:
+#
+#   thread 814247 (wayland event thread)
+#     wl_display_dispatch_queue_pending -> ffi_call -> xdg_surface_handle_configure
+#       -> NtUserCallHwndParam -> window_surface_flush+0x617   [takes surface->mutex]
+#         -> wayland_window_surface_flush+0xfa1
+#           -> NtUserCallHwndParam(GetWindowLongW) -> get_window_long_size
+#             -> get_user_handle_ptr -> user_lock              BLOCKED
+#
+#   thread 814245 (main)
+#     NtUserUpdateLayeredWindow+0x201 -> apply_window_pos+0x1260  [holds user_lock]
+#       -> window_surface_set_shape+0x1f -> window_surface_lock   BLOCKED
+#
+# Our own build's code pins it exactly: at flush+0xf9c the driver loads GWL_EXSTYLE (-20) and dispatch
+# code 10 (NtUserCallHwndParam_GetWindowLongW), and the return address 0x292d1 is the frame in the
+# capture. 137 threads then parked and 36 piled onto ntdll's loader_section behind the pair; the
+# session logged 177 loader_section waits where no other session in 30+ logs exceeded 4.
+#
+# It is the only NtUser* call in the whole flush body, so with the trace off the inversion does not
+# exist. That is why this had never been seen before the traces were armed on 2026-09-09.
+#
+# Fix: gate the trace on wws->layered alone. That is already win32u's own answer -- it is passed
+# into WAYLAND_CreateWindowSurface as a parameter -- so the extra read bought nothing that was not
+# on hand, and cost a hard hang of the app it was meant to diagnose.
+#
+# RULE: a diagnostic that calls back into win32u from inside a driver callback can invert a lock
+# order the shipping path never does, so the trace changes the very behaviour it observes. If a
+# trace needs a value it does not already hold, cache it where the shipping code computed it.
+
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -630,13 +630,42 @@
+             }
+         }
+         else alpha_bits = shape_bits ? 0xff000000 : 0;
+-        {   /* NEUTRON layer-trace (NEUTRON_LAYER_TRACE=1) */
++        {   /* NEUTRON layer-trace (NEUTRON_LAYER_TRACE=1)
++             *
++             * ⛔ NEVER CALL WIN32U FROM IN HERE. THIS TRACE DEADLOCKED PHOTOSHOP (2026-09-09).
++             *
++             * This block used to open with NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) so it could
++             * compare win32u's WS_EX_LAYERED against wws->layered. That single call is an
++             * ABBA lock-order inversion, and it wedged the whole process:
++             *
++             *   win32u's window_surface_flush() holds surface->mutex across the driver flush
++             *   callback, so NtUserGetWindowLongW here took   surface->mutex -> user_lock.
++             *   Everywhere else in win32u the order is the other way:  apply_window_pos ->
++             *   update_surface_region -> get_win_ptr (takes user_lock) -> window_surface_set_shape
++             *   (takes surface->mutex), i.e.                 user_lock -> surface->mutex.
++             *
++             * Measured on the build tester's box, 11.10-81, symbolised from the freeze capture:
++             *   thread A (wayland event thread)  wl_display_dispatch_queue_pending -> ffi_call ->
++             *     xdg_surface_handle_configure -> window_surface_flush [holds surface->mutex] ->
++             *     wayland_window_surface_flush+0xfa1 -> NtUserCallHwndParam(GetWindowLongW) ->
++             *     get_window_long_size -> get_user_handle_ptr -> user_lock   BLOCKED
++             *   thread B (main)  NtUserUpdateLayeredWindow -> apply_window_pos [holds user_lock]
++             *     -> window_surface_set_shape -> window_surface_lock          BLOCKED
++             * 137 threads then parked and 36 piled onto ntdll's loader_section behind them.
++             *
++             * wws->layered is already win32u's own answer -- WAYLAND_CreateWindowSurface receives
++             * it as a parameter -- so the extra read bought nothing that was not on hand, and cost
++             * a hard hang of the app we were trying to diagnose. Gate on wws->layered alone.
++             *
++             * The rule this produced: a diagnostic that calls back into win32u from inside a
++             * driver callback can invert a lock order the shipping path never does, so the trace
++             * changes the very behaviour it is meant to observe. If a trace needs a value it does
++             * not already hold, cache it where the shipping code already computed it. */
+             static int lt = -1;
+             if (lt < 0) { const char *e = getenv("NEUTRON_LAYER_TRACE"); lt = (e && e[0]=='1') ? 1 : 0; }
+             if (lt)
+             {
+-                DWORD ex = NtUserGetWindowLongW(window_surface->hwnd, GWL_EXSTYLE);
+-                if ((ex & WS_EX_LAYERED) || wws->layered)
++                if (wws->layered)
+                 {
+                     /* Pixel-class histogram of the flushed area: all-zero / invalid (a=0,rgb!=0) /
+                      * opaque / semi-transparent. Pins what the app+GDI actually produced. */
+@@ -656,8 +685,8 @@
+                             else n_semi++;
+                         }
+                     }
+-                    ERR("neutron-layer: hwnd=%p ex=%08x wws_layered=%d fmt=%s surf.alpha_bits=%08x alpha_mask=%08x color_key=%08x -> applied=%08x sanitize=%d shape=%d px[zero=%u inval=%u opq=%u semi=%u]\n",
+-                        window_surface->hwnd, (unsigned)ex, wws->layered,
++                    ERR("neutron-layer: hwnd=%p wws_layered=%d fmt=%s surf.alpha_bits=%08x alpha_mask=%08x color_key=%08x -> applied=%08x sanitize=%d shape=%d px[zero=%u inval=%u opq=%u semi=%u]\n",
++                        window_surface->hwnd, wws->layered,
+                         (buffer_format==WL_SHM_FORMAT_ARGB8888)?"ARGB":"XRGB",
+                         window_surface->alpha_bits, window_surface->alpha_mask,
+                         (unsigned)window_surface->color_key, alpha_bits, sanitize, !!shape_bits,
