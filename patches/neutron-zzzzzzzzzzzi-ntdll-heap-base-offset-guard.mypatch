@@ -1,0 +1,287 @@
+neutron: ntdll/heap — refuse to dereference a subheap derived from a corrupt base_offset
+
+PS 2026 froze intermittently with ~167 threads piled up behind the process heap lock.
+find_free_block() derives a candidate block's owning subheap from the 16-bit base_offset
+field at block+4 and dereferences it with no check at all. In eight captured faults that
+field had been overwritten with printable ASCII (0x3039 six times, plus 0x3a22 and 0x2d36),
+the derived pointer was up to 809 MB below the block and unmapped, and the read of
+subheap->block_size faulted at ntdll+0x54356 *while holding heap->cs*. Photoshop's vectored
+handler never completed the unwind, the lock was never released, and every other thread
+wedged behind heap -> fls -> loader.
+
+The corruption is external: block_set_base() derives base_offset from two runtime addresses
+only, every write site in heap.c was audited, and the largest value any of them can produce
+for that heap is 0xFD. This patch does NOT fix the corruption. It turns a whole-session
+deadlock into one log line and a skipped block, and it dumps the block header as hex and
+ASCII so the writer can be identified.
+
+- struct heap gains neutron_max_base_offset, the largest base_offset a block of this heap
+  can legitimately hold, maintained by neutron_note_region() from create_subheap() and
+  RtlCreateHeap(). It lands in existing padding: offsetof(struct heap, subheap) stays 0xac0
+  and sizeof(struct heap) is unchanged.
+- find_free_block() calls neutron_block_base_valid() before block_get_subheap(); a block
+  that fails is skipped (never unlinked -- list_remove() would write through pointers inside
+  the header we just proved corrupt).
+- The failure path runs find_subheap() to report the block's TRUE region, hence the value
+  base_offset should have held.
+- Gate NEUTRON_HEAP_BASE_GUARD: 0 restores pre-patch behaviour exactly, 1 (default) bound
+  check, 2 strict (also confirms the derived region via find_subheap on every derivation).
+
+--- a/dlls/ntdll/heap.c
++++ b/dlls/ntdll/heap.c
+@@ -469,6 +469,14 @@
+     SIZE_T           neutron_cache_size[NEUTRON_LARGE_CACHE_COUNT];
+     SIZE_T           neutron_cache_bytes;
+     unsigned int     neutron_cache_next;   /* round-robin eviction cursor */
++    /* NEUTRON base_offset guard (see neutron_block_base_valid below): the largest
++     * base_offset any block in THIS heap can legitimately hold, i.e.
++     * (largest region ever created for it - 1) / REGION_ALIGN. Maintained by
++     * neutron_note_region(). It occupies padding the 16-byte-aligned SUBHEAP already
++     * forced after neutron_cache_next, so sizeof(struct heap) and
++     * offsetof(struct heap, subheap) (0xac0 on x86_64) are UNCHANGED -- verify with the
++     * objdump recipe in HEAP-INVESTIGATION.md 1a. */
++    unsigned int     neutron_max_base_offset;
+     SUBHEAP          subheap;
+ };
+ 
+@@ -592,6 +600,21 @@
+     subheap->data_size = commit_end - (char *)(subheap + 1);
+ }
+ 
++/* NEUTRON: record that `heap` now owns a region of `region_size` bytes, so the guard in
++ * neutron_block_base_valid() knows the largest base_offset a block of this heap can
++ * legitimately carry. Called from create_subheap() and RtlCreateHeap(), the only two places
++ * a region a block can live in is made (large blocks get base_offset 0 by construction and
++ * never reach find_free_block). Monotonic: regions are never shrunk, only decommitted. */
++static inline void neutron_note_region( struct heap *heap, SIZE_T region_size )
++{
++    unsigned int off;
++
++    if (!region_size) return;
++    off = (unsigned int)((region_size - 1) / REGION_ALIGN);
++    if (off > FIELD_MAX( struct block, base_offset )) off = FIELD_MAX( struct block, base_offset );
++    if (off > heap->neutron_max_base_offset) heap->neutron_max_base_offset = off;
++}
++
+ static inline void *first_block( const SUBHEAP *subheap )
+ {
+     return (void *)&subheap->block;
+@@ -1440,6 +1463,7 @@
+ 
+     subheap->user_value = heap;
+     subheap_set_bounds( subheap, (char *)subheap + commit_size, (char *)subheap + total_size );
++    neutron_note_region( heap, subheap_size( subheap ) );
+     block_size = (SIZE_T)ROUND_ADDR( subheap_size( subheap ) - subheap_overhead( subheap ), BLOCK_ALIGN - 1 );
+     block_init_free( first_block( subheap ), flags, subheap, block_size );
+ 
+@@ -1449,6 +1473,188 @@
+ }
+ 
+ 
++/* =========================================================================================
++ * NEUTRON: base_offset sanity guard  (2026-09-08)
++ *
++ * WHY THIS EXISTS.  Photoshop 2026 froze intermittently with ~167 threads piled up behind
++ * the process heap lock.  Eight faults were captured and every one has the same shape:
++ *
++ *   find_free_block() picks a free block and derives its owning subheap from the 16-bit
++ *   base_offset field at block+4 --
++ *       region_base = ROUND_ADDR( block, REGION_ALIGN - 1 ) - base_offset * REGION_ALIGN
++ *   -- then dereferences that pointer with NO check of any kind.  In all eight faults
++ *   base_offset had been overwritten with printable ASCII: 0x3039 ("90") six times, plus
++ *   0x3a22 and 0x2d36.  The derived pointer was up to 809 MB below the block, unmapped, and
++ *   the read of subheap->block_size faulted at ntdll+0x54356 WHILE HOLDING heap->cs.
++ *   Photoshop's vectored exception handler never completed the unwind, the lock was never
++ *   released, and every other thread wedged behind heap -> fls -> loader.  That is the hang.
++ *
++ *   The corruption is NOT ours and NOT ntdll's: block_set_base() derives the field from two
++ *   runtime addresses only, every write site in this file was audited, and the largest value
++ *   any of them can produce for that heap is 0xFD.  So this guard does not fix the
++ *   corruption.  It converts a whole-session deadlock into one log line and a skipped block,
++ *   and it prints the evidence needed to identify the writer.  See
++ *   ~/neutron-handoffs/HEAP-INVESTIGATION.md.
++ *
++ * WHY A BOUND IS UNAMBIGUOUS.  base_offset counts 64 KB units from a block down to the base
++ * of the region it lives in, so it is bounded by the size of the largest region this heap
++ * owns.  heap->neutron_max_base_offset tracks exactly that (neutron_note_region()), which
++ * makes a false positive impossible by construction -- a legitimate block can never exceed
++ * its own region.  For Photoshop's process heap the ceiling is 0xFD
++ * (HEAP_MAX_GROW_SIZE = 0xfd0000 / REGION_ALIGN); the observed 0x3039 is 123x that.
++ *
++ * WHY NOT MORE, ON THE HOT PATH.  Proving the derived pointer really is the block's subheap
++ * needs find_subheap(), an O(number of regions) list walk with three dereferences per node,
++ * and this is the allocation path of the very app we are trying to keep responsive (a heap
++ * with 1 GB in flight has ~64 regions).  Paying that on every allocation to catch a
++ * one-in-millions event is the wrong trade, so the walk runs only where it is free:
++ *   (a) on the failure path, where it also tells us the TRUE base_offset -- a number nobody
++ *       has ever had, and the second half of the "who wrote this" question; and
++ *   (b) under NEUTRON_HEAP_BASE_GUARD=2, opt-in, for hunting a corruption too small for the
++ *       bound to see.
++ *
++ * WHY NOT __TRY/__EXCEPT AROUND THE DEREFERENCE.  It would not help.  The pile-up is caused
++ * by exception DISPATCH (RtlDispatchException runs the app's vectored handler) happening
++ * while heap->cs is held; a guarded read still dispatches.  The fault has to be avoided, not
++ * caught.
++ *
++ * WHY SKIP RATHER THAN UNLINK A BAD BLOCK.  Skipping writes nothing: the entry stays linked
++ * exactly as it was and the walk continues through the same `next` pointer it already used
++ * to get here, so free-list integrity is untouched (this is the same `continue` the loop
++ * already does for undersized blocks and for FREE_LINK heads).  list_remove() by contrast
++ * writes through entry->entry.next/prev -- pointers that live at block+8..+24, inside the
++ * very header we have just proven to be corrupt.  If the store that hit base_offset also hit
++ * those links, unlinking becomes a second wild write and can destroy the free list for the
++ * whole process.  The cost of skipping is that the block is never reused (1-2 blocks per
++ * session, observed) and is re-examined by later walks (bounded by the report rate limit).
++ *
++ * KILL SWITCH.  NEUTRON_HEAP_BASE_GUARD=0 restores the pre-patch behaviour exactly, fault
++ * included.  =1 (default) bound check.  =2 strict.  Named to match NEUTRON_MAXKEEP_FIX /
++ * NEUTRON_MAXGEOM_FIX.
++ * ========================================================================================= */
++
++#define NEUTRON_BASE_GUARD_MAX_REPORTS 8
++
++static int neutron_heap_base_guard(void)
++{
++    static int level = -1;
++    static int resolving;
++    static const WCHAR nameW[] = {'N','E','U','T','R','O','N','_','H','E','A','P','_',
++                                  'B','A','S','E','_','G','U','A','R','D',0};
++    UNICODE_STRING name, value;
++    WCHAR buf[8];
++    TEB *teb = NtCurrentTeb();
++
++    if (level >= 0) return level;
++    /* Default ON, and deliberately NOT cached until the environment really exists, so an
++     * early call cannot latch the wrong answer for the life of the process -- the exact trap
++     * NEUTRON_HEAP_LARGE_CACHE hit when it was keyed off TRACE_ON. `resolving` is a
++     * re-entrancy stop in case the query itself ever allocates. */
++    if (!teb || !teb->Peb || !teb->Peb->ProcessParameters || resolving) return 1;
++
++    resolving = 1;
++    name.Buffer = (WCHAR *)nameW;
++    name.Length = sizeof(nameW) - sizeof(WCHAR);
++    name.MaximumLength = sizeof(nameW);
++    value.Buffer = buf;
++    value.Length = 0;
++    value.MaximumLength = sizeof(buf);
++    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) || !value.Length) level = 1;
++    else if (buf[0] == '0') level = 0;
++    else if (buf[0] == '2') level = 2;
++    else level = 1;
++    resolving = 0;
++    /* One-shot, at ERR so it survives default logging: "guard absent" and "guard disabled"
++     * must never look identical in a capture. */
++    ERR( "neutron-heap-guard: gate NEUTRON_HEAP_BASE_GUARD resolved to %d\n", level );
++    return level;
++}
++
++static void neutron_report_bad_base( const struct heap *heap, const struct block *block,
++                                     const void *derived, SIZE_T req_size, const char *why )
++{
++    static const char hexdig[] = "0123456789abcdef";
++    static LONG reports;
++    const unsigned char *dump = (const unsigned char *)block - 32;
++    const SUBHEAP *real;
++    char line[3 * 16 + 1], asc[17];
++    unsigned int i, j, n;
++
++    n = (unsigned int)InterlockedIncrement( &reports );
++    if (n > NEUTRON_BASE_GUARD_MAX_REPORTS)
++    {
++        if (!(n % 1024))
++            ERR( "neutron-heap-guard: %u corrupt blocks skipped in this process so far\n", n );
++        return;
++    }
++
++    ERR( "neutron-heap-guard: %s: heap %p block %p base_offset %#x -> subheap %p "
++         "(block flags %#x type %#x size %#x, request %#Ix)\n", why, heap, block,
++         (unsigned int)block->base_offset, derived, block_get_flags( block ),
++         block_get_type( block ), block_get_size( block ), req_size );
++
++    /* Free on this path, and it answers the question the register dumps could not: where the
++     * block actually lives, hence what base_offset SHOULD have been. */
++    real = find_subheap( heap, block, FALSE );
++    if (real)
++        ERR( "neutron-heap-guard:   real region %p, so base_offset should be %#x\n",
++             subheap_base( real ),
++             (unsigned int)(((char *)ROUND_ADDR( block, REGION_ALIGN - 1 )
++                             - (char *)subheap_base( real )) / REGION_ALIGN) );
++    else
++        ERR( "neutron-heap-guard:   block is in NO region of this heap -- its free-list link may be corrupt too\n" );
++
++    /* Dump the header and its neighbourhood as hex AND ASCII. All 16 corrupt bytes observed
++     * on 2026-09-08 were printable (0x22..0x3a), so the surrounding text is the single best
++     * chance of naming the writer, and this is the only place we are guaranteed to be looking
++     * at a corrupted block at the moment of detection.
++     * Range is [block-32, block+32) and cannot fault: at least sizeof(SUBHEAP)-worth of
++     * mapped header (0x38 bytes) precedes any first_block(), and the caller has just walked
++     * this block's 32-byte `struct entry`, so both halves are proven mapped. */
++    for (i = 0; i < 64; i += 16)
++    {
++        for (j = 0; j < 16; j++)
++        {
++            unsigned char c = dump[i + j];
++            line[j * 3]     = hexdig[c >> 4];
++            line[j * 3 + 1] = hexdig[c & 0xf];
++            line[j * 3 + 2] = ' ';
++            asc[j] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++        }
++        line[48] = 0;
++        asc[16] = 0;
++        ERR( "neutron-heap-guard:   %p  %s |%s|%s\n", dump + i, line, asc,
++             i == 32 ? "  <-- block header, base_offset = bytes 4-5" : "" );
++    }
++}
++
++/* TRUE if it is safe to derive and dereference this block's subheap. */
++static BOOL neutron_block_base_valid( const struct heap *heap, const struct block *block, SIZE_T req_size )
++{
++    unsigned int off = block->base_offset;
++    const char *derived = (const char *)ROUND_ADDR( block, REGION_ALIGN - 1 ) - (SIZE_T)off * REGION_ALIGN;
++    int level = neutron_heap_base_guard();
++
++    if (!level) return TRUE;    /* kill switch: pre-patch behaviour, fault included */
++
++    if (off > heap->neutron_max_base_offset)
++    {
++        neutron_report_bad_base( heap, block, derived, req_size, "base_offset out of range for this heap" );
++        return FALSE;
++    }
++    if (level >= 2)
++    {
++        const SUBHEAP *real = find_subheap( heap, block, FALSE );
++        if (!real || (const void *)subheap_base( real ) != (const void *)derived)
++        {
++            neutron_report_bad_base( heap, block, derived, req_size,
++                                     "derived region is not the block's region (strict mode)" );
++            return FALSE;
++        }
++    }
++    return TRUE;
++}
++
+ static struct block *find_free_block( struct heap *heap, ULONG flags, SIZE_T block_size )
+ {
+     struct list *ptr = &find_free_list( heap, block_size, FALSE )->entry;
+@@ -1466,6 +1672,9 @@
+         if (block_get_flags( block ) == BLOCK_FLAG_FREE_LINK) continue;
+         if (block_get_size( block ) >= block_size)
+         {
++            /* NEUTRON: never dereference a subheap derived from a corrupt base_offset --
++             * that fault, taken under heap->cs, is the PS 2026 freeze. Skip the block. */
++            if (!neutron_block_base_valid( heap, block, block_size )) continue;
+             if (!subheap_commit( heap, block_get_subheap( heap, block ), block, block_size )) return NULL;
+             list_remove( &entry->entry );
+             return block;
+@@ -1904,6 +2113,11 @@
+     subheap = &heap->subheap;
+     subheap->user_value = heap;
+     subheap_set_bounds( subheap, (char *)heap + commit_size, (char *)heap + total_size );
++    /* NEUTRON: seed the base_offset ceiling. Assigned unconditionally because RtlCreateHeap
++     * with a caller-supplied `addr` never zeroes the struct, and a garbage ceiling would
++     * either disable the guard or -- far worse -- make it reject valid blocks. */
++    heap->neutron_max_base_offset = 0;
++    neutron_note_region( heap, subheap_size( subheap ) );
+     block_size = (SIZE_T)ROUND_ADDR( subheap_size( subheap ) - subheap_overhead( subheap ), BLOCK_ALIGN - 1 );
+     block_init_free( first_block( subheap ), flags, subheap, block_size );
+ 
