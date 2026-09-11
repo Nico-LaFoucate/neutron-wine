@@ -96,6 +96,34 @@ done
 #
 # LC_COLLATE only affects sort/glob order, so this cannot change what gets compiled.
 export LC_COLLATE=C
+
+# --- toolbar artwork ------------------------------------------------------------------------
+# Wine's comctl32 history/view toolbar strips are glossy Tango bitmaps — the bright green arrows
+# in the file dialog every Adobe app raises. We replace them with flat glyphs, in two palettes
+# (light glyphs for dark chrome, dark for light); comctl32 picks by COLOR_BTNFACE luminance.
+#
+# ⛔ WHY THIS IS A BUILD STEP AND NOT PART OF THE PATCH. Two independent reasons:
+#   1. wine-tkg applies userpatches with `patch -Np1`, which CANNOT apply binary diffs, and the
+#      artwork that actually ships is .bmp.
+#   2. Wine only regenerates .bmp from .svg in MAINTAINER MODE, which additionally requires an
+#      in-tree build (`srcdir = .`). Ours is out-of-tree, so that path is closed —
+#      RSVG/CONVERT/ICOTOOL are all empty in our generated Makefile. Verified, not assumed.
+# So the generator writes both the .svg (our source) and the .bmp (what the resource compiler
+# eats) straight into the tree, and the .mypatch carries only the C/rc/h that reference them.
+_ART="$REPO/build/art/gen_toolbar_icons.py"
+_ART_DEST="$WORK/wine-tkg-git/wine-tkg-git/src/wine-git/dlls/comctl32"
+if [ -f "$_ART" ] && [ -d "$_ART_DEST" ]; then
+    for _t in rsvg-convert magick; do
+        command -v "$_t" >/dev/null || { echo "build.sh: need $_t to generate toolbar artwork" >&2; exit 6; }
+    done
+    echo "generating comctl32 toolbar artwork"
+    python3 "$_ART" "$_ART_DEST" >/dev/null || { echo "build.sh: toolbar artwork generation FAILED" >&2; exit 6; }
+elif [ -f "$_ART" ]; then
+    # First bootstrap: the source tree does not exist yet, so there is nothing to write into.
+    # The stock artwork gets compiled this once; the next build replaces it.
+    echo "build.sh: NOTE - no source tree yet, skipping toolbar artwork (stock icons this build)" >&2
+fi
+
 cd "$TKGDIR"
 ./non-makepkg-build.sh
 

@@ -1,0 +1,135 @@
+# neutron-zzzzzzzzzzzm-comctl32-flat-toolbar-strips
+#
+# Replace Wine's glossy Tango history/view toolbar strips with flat glyphs, in TWO palettes, and
+# pick between them by the luminance of COLOR_BTNFACE.
+#
+# WHY. The bright green gradient arrows in the nav toolbar are the most dated thing in the Common
+# Item Dialog every Adobe app raises on File > Import. They are not comdlg32's: itemdlg.c asks
+# comctl32 for the STANDARD strips (IDB_HIST_LARGE_COLOR frames 0/1, IDB_VIEW_LARGE_COLOR frame 8
+# = VIEW_PARENTFOLDER), so fixing them fixes every Wine toolbar rather than one dialog.
+#
+# TWO PALETTES, NOT ONE COMPROMISE. These strips are shared, and Wine draws them on COLOR_BTNFACE
+# -- 43,43,43 under the Neutron theme, Windows-default light elsewhere. A single mid grey is
+# mediocre on both grounds. So there are two sets, and NEUTRON_chrome_is_dark() reads the actual
+# colour (Rec. 601 luma, threshold at mid) rather than assuming. Re-evaluated per TB_ADDBITMAP so
+# a theme change is picked up by toolbars created afterwards.
+#
+#   IDB_{VIEW,HIST}_{SMALL,LARGE}           light glyphs #C3CAD3  -> dark chrome  (what we ship)
+#   IDB_{VIEW,HIST}_{SMALL,LARGE}_ONLIGHT   dark glyphs  #414A55  -> light chrome (new, 126/127/132/133)
+#
+# ⛔ THE ARTWORK IS NOT IN THIS PATCH, AND CANNOT BE. Two independent reasons, both verified:
+#   1. wine-tkg applies userpatches with `patch -Np1`, which cannot apply binary diffs. The files
+#      that ship are .bmp.
+#   2. Wine regenerates .bmp from .svg only in MAINTAINER MODE, which also demands an in-tree
+#      build (srcdir = .). Ours is out-of-tree, so RSVG/CONVERT/ICOTOOL are empty in the generated
+#      Makefile -- checked, not assumed.
+# The bitmaps are produced by build/art/gen_toolbar_icons.py, which build.sh runs before the wine
+# build. It writes the .svg (source) and the .bmp (what wrc eats) into dlls/comctl32/ directly.
+#
+# The generated BMPs match the stock files byte-for-byte in STRUCTURE: BITMAPV4HEADER (108),
+# 32bpp, BI_BITFIELDS, explicit BGRA masks, bottom-up, pixel data at offset 122 -- and the same
+# total file sizes. ImageMagick's own BMP writer emits a BITMAPV5HEADER (124), so the generator
+# writes the header itself rather than trusting it.
+#
+# ⛔ Glyphs must survive 16px. The first draft drew sort-by-name as the letters A and Z; at 16px
+# they were mush. Anything with interior detail under ~3px is cut, not shrunk.
+#
+# Verified: comctl32.dll builds clean, and `wrestool -l` shows all ten bitmap resources with the
+# four new ids present at exactly (file size - 14) bytes each, which is the DIB without its file
+# header.
+
+--- a/dlls/comctl32/comctl32.h
++++ b/dlls/comctl32/comctl32.h
+@@ -78,6 +78,16 @@
+ #define IDB_HIST_SMALL      130
+ #define IDB_HIST_LARGE      131
+ 
++/* NEUTRON: a second set of the history/view strips, drawn with DARK glyphs for LIGHT chrome.
++ * The ids above now carry LIGHT glyphs, which is what the Neutron theme's dark COLOR_BTNFACE
++ * needs; these are their counterparts. TOOLBAR_AddBitmap picks between them by the luminance of
++ * COLOR_BTNFACE, because these strips are shared by every Wine toolbar and a single mid grey is
++ * poor on both grounds. Ids sit next to their partners deliberately. */
++#define IDB_VIEW_SMALL_ONLIGHT  126
++#define IDB_VIEW_LARGE_ONLIGHT  127
++#define IDB_HIST_SMALL_ONLIGHT  132
++#define IDB_HIST_LARGE_ONLIGHT  133
++
+ #define IDM_TODAY                      4163
+ #define IDM_GOTODAY                    4164
+ 
+--- a/dlls/comctl32/comctl32.rc
++++ b/dlls/comctl32/comctl32.rc
+@@ -132,6 +132,19 @@
+ /* @makedep: idb_hist_large.bmp */
+ IDB_HIST_LARGE BITMAP idb_hist_large.bmp
+ 
++/* NEUTRON: the on-light counterparts (dark glyphs). See comctl32.h. */
++/* @makedep: idb_view_small_onlight.bmp */
++IDB_VIEW_SMALL_ONLIGHT BITMAP idb_view_small_onlight.bmp
++
++/* @makedep: idb_view_large_onlight.bmp */
++IDB_VIEW_LARGE_ONLIGHT BITMAP idb_view_large_onlight.bmp
++
++/* @makedep: idb_hist_small_onlight.bmp */
++IDB_HIST_SMALL_ONLIGHT BITMAP idb_hist_small_onlight.bmp
++
++/* @makedep: idb_hist_large_onlight.bmp */
++IDB_HIST_LARGE_ONLIGHT BITMAP idb_hist_large_onlight.bmp
++
+ /* @makedep: idb_cmdlink.bmp */
+ IDB_CMDLINK BITMAP idb_cmdlink.bmp
+ 
+--- a/dlls/comctl32/toolbar.c
++++ b/dlls/comctl32/toolbar.c
+@@ -2860,6 +2860,24 @@
+  * TOOLBAR_AddBitmap:  Add the bitmaps to the default image list.
+  *
+  */
++/* NEUTRON: pick the history/view strip that suits the chrome it will be drawn on.
++ *
++ * Wine's stock strips are glossy Tango artwork with bright green arrows — the most dated thing in
++ * the file dialog Adobe apps raise. They are replaced with flat glyphs, but these strips are SHARED
++ * by every Wine toolbar and are drawn on COLOR_BTNFACE, which is dark under the Neutron theme and
++ * light under Windows' defaults. One mid-grey set is mediocre on both, so there are two, and the
++ * choice is made from the actual colour rather than assumed.
++ *
++ * Rec. 601 luma, threshold at mid. COLOR_BTNFACE is a flat colour (no gradient), so a single
++ * sample is the whole answer. Re-evaluated per TB_ADDBITMAP rather than cached: a theme change
++ * rewrites the palette, and toolbars created afterwards should follow it.
++ */
++static BOOL NEUTRON_chrome_is_dark(void)
++{
++    COLORREF c = GetSysColor(COLOR_BTNFACE);
++    return (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000 < 128;
++}
++
+ static LRESULT
+ TOOLBAR_AddBitmap (TOOLBAR_INFO *infoPtr, INT count, const TBADDBITMAP *lpAddBmp)
+ {
+@@ -2889,20 +2907,22 @@
+             case IDB_VIEW_SMALL_COLOR:
+             case 6:
+ 	        info.nButtons = 12;
+-	        info.nID = IDB_VIEW_SMALL;
++	        /* NEUTRON: light glyphs on dark chrome, dark glyphs on light. See
++	         * NEUTRON_chrome_is_dark(). */
++	        info.nID = NEUTRON_chrome_is_dark() ? IDB_VIEW_SMALL : IDB_VIEW_SMALL_ONLIGHT;
+ 	        break;
+             case IDB_VIEW_LARGE_COLOR:
+             case 7:
+ 	        info.nButtons = 12;
+-	        info.nID = IDB_VIEW_LARGE;
++	        info.nID = NEUTRON_chrome_is_dark() ? IDB_VIEW_LARGE : IDB_VIEW_LARGE_ONLIGHT;
+ 	        break;
+             case IDB_HIST_SMALL_COLOR:
+ 	        info.nButtons = 5;
+-	        info.nID = IDB_HIST_SMALL;
++	        info.nID = NEUTRON_chrome_is_dark() ? IDB_HIST_SMALL : IDB_HIST_SMALL_ONLIGHT;
+ 	        break;
+             case IDB_HIST_LARGE_COLOR:
+ 	        info.nButtons = 5;
+-	        info.nID = IDB_HIST_LARGE;
++	        info.nID = NEUTRON_chrome_is_dark() ? IDB_HIST_LARGE : IDB_HIST_LARGE_ONLIGHT;
+ 	        break;
+ 	    default:
+                 WARN("unknown bitmap id, %Id\n", lpAddBmp->nID);
