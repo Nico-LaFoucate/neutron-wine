@@ -99,29 +99,42 @@ export LC_COLLATE=C
 
 # --- toolbar artwork ------------------------------------------------------------------------
 # Wine's comctl32 history/view toolbar strips are glossy Tango bitmaps — the bright green arrows
-# in the file dialog every Adobe app raises. We replace them with flat glyphs, in two palettes
-# (light glyphs for dark chrome, dark for light); comctl32 picks by COLOR_BTNFACE luminance.
+# in the file dialog every Adobe app raises. We replace them with flat glyphs in two palettes;
+# comctl32 picks by COLOR_BTNFACE luminance.
 #
 # ⛔ WHY THIS IS A BUILD STEP AND NOT PART OF THE PATCH. Two independent reasons:
 #   1. wine-tkg applies userpatches with `patch -Np1`, which CANNOT apply binary diffs, and the
-#      artwork that actually ships is .bmp.
-#   2. Wine only regenerates .bmp from .svg in MAINTAINER MODE, which additionally requires an
-#      in-tree build (`srcdir = .`). Ours is out-of-tree, so that path is closed —
-#      RSVG/CONVERT/ICOTOOL are all empty in our generated Makefile. Verified, not assumed.
-# So the generator writes both the .svg (our source) and the .bmp (what the resource compiler
-# eats) straight into the tree, and the .mypatch carries only the C/rc/h that reference them.
+#      artwork that ships is .bmp.
+#   2. Wine regenerates .bmp from .svg only in MAINTAINER MODE, which also requires an in-tree
+#      build (`srcdir = .`). We build TWO architectures from one source, so only one could ever
+#      be in-tree — that door is shut regardless. Verified, not assumed.
+#
+# 🚨 AND WHY IT IS INJECTED INTO non-makepkg-build.sh RATHER THAN RUN FROM HERE. The first
+# version ran the generator before `./non-makepkg-build.sh` and the 11.10-83 build FAILED:
+# `_prepare` re-creates the wine-git tree and re-applies the patch set, which deletes untracked
+# files — so the artwork was wiped after being written, comctl32.rc then referenced
+# `idb_view_small_onlight.bmp: No such file or directory`, and configure died with "could not
+# create Makefile". The artwork must land AFTER _prepare and BEFORE ./configure.
+#
+# Same injection technique build.sh already uses for the tmpfs flag above: patch the wine-tkg
+# script, then VERIFY the edit took rather than trusting sed.
 _ART="$REPO/build/art/gen_toolbar_icons.py"
-_ART_DEST="$WORK/wine-tkg-git/wine-tkg-git/src/wine-git/dlls/comctl32"
-if [ -f "$_ART" ] && [ -d "$_ART_DEST" ]; then
-    for _t in rsvg-convert magick; do
+if [ -f "$_ART" ]; then
+    for _t in rsvg-convert magick python3; do
         command -v "$_t" >/dev/null || { echo "build.sh: need $_t to generate toolbar artwork" >&2; exit 6; }
     done
-    echo "generating comctl32 toolbar artwork"
-    python3 "$_ART" "$_ART_DEST" >/dev/null || { echo "build.sh: toolbar artwork generation FAILED" >&2; exit 6; }
-elif [ -f "$_ART" ]; then
-    # First bootstrap: the source tree does not exist yet, so there is nothing to write into.
-    # The stock artwork gets compiled this once; the next build replaces it.
-    echo "build.sh: NOTE - no source tree yet, skipping toolbar artwork (stock icons this build)" >&2
+    _HOOK="      python3 \"$_ART\" \"\$_where/src/wine-git/dlls/comctl32\" || exit 6"
+    if ! grep -qF "gen_toolbar_icons.py" "$TKGDIR/non-makepkg-build.sh"; then
+        # insert immediately after the `_prepare` call, inside the same if-branch
+        awk -v hook="$_HOOK" '
+            { print }
+            /^      _prepare$/ && !done { print hook; done=1 }
+        ' "$TKGDIR/non-makepkg-build.sh" > "$TKGDIR/non-makepkg-build.sh.new" \
+            && mv "$TKGDIR/non-makepkg-build.sh.new" "$TKGDIR/non-makepkg-build.sh"
+    fi
+    grep -qF "gen_toolbar_icons.py" "$TKGDIR/non-makepkg-build.sh" \
+        || { echo "build.sh: FAILED to inject the toolbar-artwork step into non-makepkg-build.sh" >&2; exit 6; }
+    echo "toolbar artwork step injected (runs after _prepare)"
 fi
 
 cd "$TKGDIR"
