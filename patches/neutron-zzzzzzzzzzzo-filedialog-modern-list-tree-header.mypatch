@@ -1,0 +1,470 @@
+# neutron-zzzzzzzzzzzo-filedialog-modern-list-tree-header
+#
+# Make the file dialog's list, tree and header look like something from this decade. Six changes,
+# all paint/metrics, none of which alters what the dialog RETURNS to the application.
+#
+# Specced by a Fable 5.1 agent against the source; every claim below was re-verified here.
+#
+# 1. FULL-ROW SELECTION -- and the fix is two lines in shell32, not comctl32.
+#    explorerframe's ebrowser.c ALREADY ORs FWF_FULLROWSELECT into the folder settings before
+#    CreateViewWindow, and listview implements full-row select correctly in its classic path. But
+#    shlview.c never translated the shell flag into LVS_EX_FULLROWSELECT -- grep for LVS_EX_ in
+#    that file returns ZERO hits. So the selection was a text-width blob purely because nobody
+#    forwarded the request. LVS_EX_DOUBLEBUFFER goes with it, because change 5 invalidates a row
+#    with erase on every mouse move. The tree gets NSTCS_FULLROWSELECT for the same reason
+#    (nstc.c maps it to TVS_FULLROWSELECT; TVS_HASLINES is unset, which is what
+#    TREEVIEW_IsFullRowSelect requires).
+#    ⚠️ Deliberate behaviour change: clicking the blank area right of a filename now selects that
+#    row, exactly as on Windows.
+#    ⛔ NOT done by forcing full-row painting inside listview: hit-testing, LVIR_SELECTBOUNDS and
+#    LISTVIEW_GetItemBox would still be text-width, so clicking blank space would paint a
+#    selection that did not exist.
+#
+# 2. HEADER: a label, not a pushbutton. HEADER_DrawItemFrame drew DrawEdge(EDGE_RAISED) per column
+#    and HEADER_DrawRestBackground drew another raised edge across the dead area past the last
+#    column -- a row of 3D buttons above the file list, the most Win95 thing in the browser area.
+#    Both become a 1px hairline in COLOR_3DSHADOW plus an inset column divider. Label colour is
+#    blended 65% toward the face so it sits back from the filenames; hovering brings it to full
+#    strength instead of turning it COLOR_HIGHLIGHT (the "web view" look, which fought the
+#    selection colour). VERT_BORDER 4 -> 10 for a ~23px header.
+#    Hot-track was gated on HDS_BUTTONS && HDS_HOTTRACK, and LISTVIEW_CreateHeader does not set
+#    HDS_HOTTRACK -- so a file list's headers could never hover at all. Gate is now HDS_BUTTONS.
+#
+# 3. ROW HEIGHT. listview rows were ntmHeight+1 -- 17px with 16px shell icons. New ROW_PADDING 6
+#    applies to REPORT/LIST/SMALLICON only; HEIGHT_PADDING is left alone because it also sizes
+#    icon-view labels and is reported through LVM_GETITEMSPACING. Small icons were pinned to
+#    Box.top while the label is DT_VCENTER, so they are now centred in the taller row. The tree
+#    gets a matching TVHEIGHT_ROW_PAD so the two panes share a rhythm. Apps that set their own
+#    heights (nMeasureItemHeight, TVM_SETITEMHEIGHT) still win -- both override afterwards.
+#
+# 4. TREE HOVER is a row fill instead of underlined highlight-coloured text. Also stabilises item
+#    widths while the mouse moves, because TREEVIEW_ComputeTextWidth calls FontForItem too.
+#
+# 5. LIST HOVER, which did not exist. nHotItem was only ever set by an explicit LVM_SETHOTITEM;
+#    LISTVIEW_MouseMove's hot block is gated on LISTVIEW_IsHotTracking() (TRACKSELECT/ONECLICK/
+#    TWOCLICK), none of which a file list sets, and there was no WM_MOUSELEAVE case at all.
+#    Tracking is now done for PAINTING only -- no LVN_HOTTRACK is sent, so LISTVIEW_SetCursor does
+#    not switch to the hand cursor and MouseHover's hover-selects behaviour stays off.
+#    customdraw_fill already set CDIS_HOT from nHotItem; nothing consumed it. prepaint_setup now
+#    does.
+#
+# 6. FOCUS RECTANGLE only when the focused item is NOT selected. With a full-row highlight the
+#    marching-ants box inside it is the last Win9x tell; keyboard focus on an unselected row still
+#    needs the cue and keeps it.
+#
+# ⭐ THE HOVER COLOUR IS DERIVED, NOT HARDCODED. New COMCTL32_HoverColor() blends COLOR_WINDOW 22%
+# toward COLOR_HIGHLIGHT from the LIVE comctl32_color table, so it is a quiet blue-grey on the
+# Neutron dark theme (43,43,43 + 48,150,250) and a pale blue on Windows' light defaults. Shared by
+# listview, treeview and header so the three cannot drift, and uncached so a theme change moves it.
+#
+# ⚠️ ALL OF THIS IS THE CLASSIC DRAWING PATH. We set ThemeActive=0 in every prefix, so
+# GetWindowTheme() returns NULL and every `if (theme)` branch in these three controls is dead code
+# for us. Verified per control rather than assumed.
+#
+# Compiles clean for comctl32, comctl32_v6 and shell32.
+
+--- a/dlls/comctl32/comctl32.h
++++ b/dlls/comctl32/comctl32.h
+@@ -209,6 +209,11 @@
+ void COMCTL32_GetFontMetrics(HFONT hFont, TEXTMETRICW *ptm);
+ BOOL COMCTL32_IsReflectedMessage(UINT uMsg);
+ BOOL COMCTL32_IsThemed(HWND hwnd);
++
++/* NEUTRON: the row-hover tint, derived from the live system colours so it is correct on a dark
++ * prefix theme AND on Windows' light defaults. Shared by listview, treeview and header so the
++ * three do not drift. */
++COLORREF COMCTL32_HoverColor(void);
+ LRESULT COMCTL32_NCPaint(HWND hwnd, WPARAM wp, LPARAM lp, const WCHAR *theme_class);
+ LRESULT COMCTL32_SetVersion(INT *current_version, INT new_version);
+ LRESULT COMCTL32_ThemeChanged(HWND hwnd, const WCHAR *theme_class, BOOL invalidate, BOOL erase);
+--- a/dlls/comctl32/commctrl.c
++++ b/dlls/comctl32/commctrl.c
+@@ -2605,6 +2605,27 @@
+     return DoNotify(&notify, code, hdr);
+ }
+ 
++/***********************************************************************
++ * COMCTL32_HoverColor (internal)
++ *
++ * NEUTRON: the fill used behind a hovered list/tree row, and behind a hovered header item.
++ *
++ * Blended from the LIVE system colours rather than hardcoded, because these controls are drawn on
++ * COLOR_WINDOW, which the Neutron prefix theme sets to 43,43,43 while Windows' defaults leave it
++ * white. A fixed tint is wrong on one of the two. 22% toward COLOR_HIGHLIGHT gives a quiet
++ * blue-grey on the dark theme (~44,67,89 against a 48,150,250 highlight) and a pale blue on light.
++ *
++ * Deliberately NOT cached: comctl32_color is refreshed on WM_SYSCOLORCHANGE, and a theme switch
++ * must move the hover with it.
++ */
++COLORREF COMCTL32_HoverColor(void)
++{
++    COLORREF base = comctl32_color.clrWindow, hi = comctl32_color.clrHighlight;
++    return RGB((GetRValue(base) * 78 + GetRValue(hi) * 22) / 100,
++               (GetGValue(base) * 78 + GetGValue(hi) * 22) / 100,
++               (GetBValue(base) * 78 + GetBValue(hi) * 22) / 100);
++}
++
+ /**************************************************************************
+  * SendNotifyEx [COMCTL32.342]
+  *
+--- a/dlls/comctl32/header.c
++++ b/dlls/comctl32/header.c
+@@ -90,7 +90,10 @@
+ } HEADER_INFO;
+ 
+ 
+-#define VERT_BORDER     4
++/* NEUTRON: was 4. The header is nHeight = text height + VERT_BORDER (see HEADER_Layout and
++ * HEADER_SetFont); 4px of total padding is 1995-tight above a file list. 10 gives ~23px at 96dpi.
++ * The sort arrow derives from nHeight - VERT_BORDER, so it is unaffected. */
++#define VERT_BORDER     10
+ #define DIVIDER_WIDTH  10
+ #define HOT_DIVIDER_WIDTH 2
+ #define MAX_HEADER_TEXT_LEN 260
+@@ -299,7 +302,9 @@
+     }
+ #endif
+ 
+-    hbr = CreateSolidBrush(GetBkColor(hdc));
++    /* NEUTRON: hovering a column tints it with the shared row-hover colour instead of doing
++     * nothing, so the header responds the way the list below it does. */
++    hbr = CreateSolidBrush(hottrack ? COMCTL32_HoverColor() : GetBkColor(hdc));
+     FillRect(hdc, r, hbr);
+     DeleteObject(hbr);
+ }
+@@ -307,19 +312,37 @@
+ static void
+ HEADER_DrawItemFrame(HEADER_INFO *infoPtr, HDC hdc, RECT *r, const HEADER_ITEM *item)
+ {
++    HBRUSH hbr;
++    RECT edge;
++
+     if (COMCTL32_IsThemed(infoPtr->hwndSelf)) return;
+ 
+-    if (!(infoPtr->dwStyle & HDS_FLAT))
+-    {
+-        if (infoPtr->dwStyle & HDS_BUTTONS) {
+-            if (item->bDown)
+-                DrawEdge (hdc, r, BDR_RAISEDOUTER, BF_RECT | BF_FLAT | BF_ADJUST);
+-            else
+-                DrawEdge (hdc, r, EDGE_RAISED, BF_RECT | BF_SOFT | BF_ADJUST);
+-        }
+-        else
+-            DrawEdge (hdc, r, EDGE_ETCHED, BF_BOTTOM | BF_RIGHT | BF_ADJUST);
+-    }
++    /* NEUTRON: quiet 1px rules instead of a raised 3D button.
++     *
++     * Every column header used to be DrawEdge(EDGE_RAISED), which is the single most Win95 thing
++     * inside the file dialog's browser area — a row of pushbuttons above the file list. A column
++     * header is a label, so it is drawn as one: a hairline under the whole header and a short
++     * divider between columns, both in COLOR_3DSHADOW so they read as a rule on the dark prefix
++     * theme (30,30,30 on 43,43,43) and on Windows' light defaults alike.
++     *
++     * bDown deliberately no longer changes the frame; the pressed state stays visible as the
++     * existing 1px text offset in HEADER_DrawItem. */
++    hbr = CreateSolidBrush(comctl32_color.clr3dShadow);
++
++    edge = *r;
++    edge.top = edge.bottom - 1;
++    FillRect(hdc, &edge, hbr);           /* the rule under the header */
++
++    edge = *r;
++    edge.left = edge.right - 1;
++    edge.top += 4;
++    edge.bottom -= 5;
++    if (edge.bottom > edge.top)
++        FillRect(hdc, &edge, hbr);       /* the column divider, inset top and bottom */
++
++    DeleteObject(hbr);
++
++    r->bottom -= 1;                      /* keep the label centred above the rule */
+ }
+ 
+ /* Create a region for the sort arrow with its bounding rect's top-left
+@@ -413,7 +436,21 @@
+ 	return phdi->rect.right;
+ 
+     /* Set the colors before sending NM_CUSTOMDRAW so that it can change them */
+-    SetTextColor(hdc, (bHotTrack && !COMCTL32_IsThemed(infoPtr->hwndSelf)) ? comctl32_color.clrHighlight : comctl32_color.clrBtnText);
++    /* NEUTRON: a column header is a label, not a link. Normal state is the button text blended
++     * 65% toward the face so it sits back from the file names below it; hovering brings it to
++     * full strength. Previously the hot state turned the text COLOR_HIGHLIGHT, which is the
++     * Win95 "web view" look and fights the selection colour. */
++    if (COMCTL32_IsThemed(infoPtr->hwndSelf))
++        SetTextColor(hdc, comctl32_color.clrBtnText);
++    else if (bHotTrack)
++        SetTextColor(hdc, comctl32_color.clrBtnText);
++    else
++    {
++        COLORREF fg = comctl32_color.clrBtnText, bg = comctl32_color.clr3dFace;
++        SetTextColor(hdc, RGB((GetRValue(fg) * 65 + GetRValue(bg) * 35) / 100,
++                              (GetGValue(fg) * 65 + GetGValue(bg) * 35) / 100,
++                              (GetBValue(fg) * 65 + GetBValue(bg) * 35) / 100));
++    }
+     SetBkColor(hdc, comctl32_color.clr3dFace);
+ 
+     if (lCDFlags & CDRF_NOTIFYITEMDRAW && !(phdi->fmt & HDF_OWNERDRAW))
+@@ -642,10 +679,19 @@
+         return;
+     }
+ 
+-    if (infoPtr->dwStyle & HDS_BUTTONS)
+-        DrawEdge(hdc, rect, EDGE_RAISED, BF_TOP | BF_LEFT | BF_BOTTOM | BF_SOFT | BF_MIDDLE);
+-    else
+-        DrawEdge(hdc, rect, EDGE_ETCHED, BF_BOTTOM | BF_MIDDLE);
++    /* NEUTRON: the area past the last column is not a button either. Flat fill plus the same
++     * hairline, so the dead block on the right of the file dialog's header stops reading as a
++     * raised control with nothing in it. */
++    {
++        RECT edge = *rect;
++        HBRUSH hbr;
++
++        FillRect(hdc, rect, GetSysColorBrush(COLOR_3DFACE));
++        hbr = CreateSolidBrush(comctl32_color.clr3dShadow);
++        edge.top = edge.bottom - 1;
++        FillRect(hdc, &edge, hbr);
++        DeleteObject(hbr);
++    }
+ }
+ 
+ static void
+@@ -1899,8 +1945,11 @@
+     INT   nItem, nWidth;
+     HDC   hdc;
+     /* With theming, hottracking is always enabled */
++    /* NEUTRON: was gated on HDS_BUTTONS && HDS_HOTTRACK. The listview creates its header WITHOUT
++     * HDS_HOTTRACK (LISTVIEW_CreateHeader), so a file list's column headers could never hover.
++     * Requiring HDS_BUTTONS alone is enough to keep headers that are not buttons inert. */
+     BOOL  hotTrackEnabled =
+-        ((infoPtr->dwStyle & HDS_BUTTONS) && (infoPtr->dwStyle & HDS_HOTTRACK))
++        (infoPtr->dwStyle & HDS_BUTTONS)
+         || COMCTL32_IsThemed (infoPtr->hwndSelf);
+     INT oldHotItem = infoPtr->iHotItem;
+ 
+--- a/dlls/comctl32/listview.c
++++ b/dlls/comctl32/listview.c
+@@ -347,6 +347,12 @@
+ 
+ /* padding for items in list, report and small icon display modes */
+ #define HEIGHT_PADDING 1
++/* NEUTRON: extra breathing room for REPORT/LIST/SMALLICON rows only (see
++ * LISTVIEW_CalculateItemHeight). HEIGHT_PADDING itself is left alone because it also sizes icon
++ * view labels and is reported through LVM_GETITEMSPACING. With 16px shell icons a row was 17px;
++ * this makes it ~23px, which is what stops a file list reading as 1995. An owner-draw app that
++ * sets nMeasureItemHeight still wins -- that override is applied after this. */
++#define ROW_PADDING 6
+ 
+ /* offset of items in report display mode */
+ #define REPORT_MARGINX 2
+@@ -1108,6 +1114,12 @@
+                 textcolor = comctl32_color.clrBtnText;
+             }
+         }
++        /* NEUTRON: hovered-but-unselected rows get the shared tint. customdraw_fill already sets
++         * CDIS_HOT from nHotItem; nothing consumed it for painting before. Under
++         * LVS_EX_FULLROWSELECT the subitems inherit the DC colours set for item 0, so the tint
++         * spans the row; without it, it covers the label, which is still correct. */
++        else if (cd->nmcd.uItemState & CDIS_HOT)
++            backcolor = COMCTL32_HoverColor();
+     }
+ 
+     if (backcolor == CLR_DEFAULT)
+@@ -1734,6 +1746,14 @@
+ /* used to handle collapse main item column case */
+ static inline BOOL LISTVIEW_DrawFocusRect(const LISTVIEW_INFO *infoPtr, HDC hdc)
+ {
++    /* NEUTRON: skip the dotted rectangle when the focused item is also selected -- with
++     * LVS_EX_FULLROWSELECT the highlight already marks the row, and the marching ants inside it
++     * are the last Win9x tell. Focus on an UNSELECTED item still draws, because nothing else
++     * would show where the keyboard is. */
++    if (infoPtr->nFocusedItem >= 0
++        && (LISTVIEW_GetItemState(infoPtr, infoPtr->nFocusedItem, LVIS_SELECTED) & LVIS_SELECTED))
++        return FALSE;
++
+     return (infoPtr->rcFocus.left < infoPtr->rcFocus.right) ?
+             DrawFocusRect(hdc, &infoPtr->rcFocus) : FALSE;
+ }
+@@ -2430,7 +2450,9 @@
+ 		Icon.left += infoPtr->iconSize.cx * lpLVItem->iIndent + REPORT_MARGINX;
+ 	    }
+ 
+-	    Icon.top    = Box.top;
++	    /* NEUTRON: centre the icon in the row rather than pinning it to the top. The label is
++	     * already DT_VCENTER, so with the taller rows above an icon left at Box.top floats. */
++	    Icon.top    = Box.top + max(0, (infoPtr->nItemHeight - infoPtr->iconSize.cy) / 2);
+ 	    Icon.right  = Icon.left;
+ 	    if (infoPtr->himlSmall &&
+                 (!lpColumnInfo || lpLVItem->iSubItem == 0 ||
+@@ -3028,7 +3050,7 @@
+ 	    nItemHeight = max(nItemHeight, infoPtr->iconStateSize.cy);
+ 	if (infoPtr->himlSmall)
+ 	    nItemHeight = max(nItemHeight, infoPtr->iconSize.cy);
+-	nItemHeight += HEIGHT_PADDING;
++	nItemHeight += HEIGHT_PADDING + ROW_PADDING;
+     if (infoPtr->nMeasureItemHeight > 0)
+         nItemHeight = infoPtr->nMeasureItemHeight;
+     }
+@@ -4194,6 +4216,34 @@
+         notify_listview(infoPtr, LVN_HOTTRACK, &nmlv);
+     }
+ 
++    /* NEUTRON: track the hovered row for PAINTING, independently of LISTVIEW_IsHotTracking().
++     *
++     * A file list is created without LVS_EX_TRACKSELECT/ONECLICK/TWOCLICK, so the block above
++     * never runs and nHotItem was only ever set by an explicit LVM_SETHOTITEM -- i.e. rows had no
++     * hover state at all. This sets nHotItem for drawing only: no LVN_HOTTRACK is sent, so
++     * LISTVIEW_SetCursor does not switch to the hand cursor and LISTVIEW_MouseHover's
++     * hover-selects-the-item behaviour stays off. Purely visual. */
++    {
++        TRACKMOUSEEVENT tme;
++        LVHITTESTINFO hot;
++
++        hot.pt = pt;
++        LISTVIEW_HitTest(infoPtr, &hot, TRUE, TRUE);
++
++        if (hot.iItem != infoPtr->nHotItem)
++        {
++            LISTVIEW_InvalidateItem(infoPtr, infoPtr->nHotItem);
++            infoPtr->nHotItem = hot.iItem;
++            LISTVIEW_InvalidateItem(infoPtr, infoPtr->nHotItem);
++        }
++
++        /* so the tint is cleared when the pointer leaves the control entirely */
++        tme.cbSize = sizeof(tme);
++        tme.dwFlags = TME_LEAVE;
++        tme.hwndTrack = infoPtr->hwndSelf;
++        _TrackMouseEvent(&tme);
++    }
++
+     return 0;
+ }
+ 
+@@ -11863,6 +11913,17 @@
+   case WM_LBUTTONUP:
+     return LISTVIEW_LButtonUp(infoPtr, (WORD)wParam, (SHORT)LOWORD(lParam), (SHORT)HIWORD(lParam));
+ 
++  case WM_MOUSELEAVE:
++    /* NEUTRON: drop the hover tint when the pointer leaves the list. Requested via TME_LEAVE in
++     * LISTVIEW_MouseMove; without this the last hovered row stays tinted. */
++    if (infoPtr->nHotItem != -1)
++    {
++        INT old_hot = infoPtr->nHotItem;
++        infoPtr->nHotItem = -1;
++        LISTVIEW_InvalidateItem(infoPtr, old_hot);
++    }
++    return 0;
++
+   case WM_MOUSEMOVE:
+     return LISTVIEW_MouseMove (infoPtr, (WORD)wParam, (SHORT)LOWORD(lParam), (SHORT)HIWORD(lParam));
+ 
+--- a/dlls/comctl32/treeview.c
++++ b/dlls/comctl32/treeview.c
+@@ -312,8 +312,10 @@
+ static inline HFONT
+ TREEVIEW_FontForItem(const TREEVIEW_INFO *infoPtr, const TREEVIEW_ITEM *item)
+ {
+-    if ((infoPtr->dwStyle & TVS_TRACKSELECT) && (item == infoPtr->hotItem))
+-        return item->state & TVIS_BOLD ? infoPtr->hBoldUnderlineFont : infoPtr->hUnderlineFont;
++    /* NEUTRON: no underline on hover. Underlined + highlight-coloured text is the Win95 "web
++     * view" look and it fights the selection colour; the hover is a row fill instead, set in
++     * TREEVIEW_DrawItem. The font no longer changes, so item widths stay stable while moving the
++     * mouse -- TREEVIEW_ComputeTextWidth calls this too. */
+     if (item->state & TVIS_BOLD)
+         return infoPtr->hBoldFont;
+     return infoPtr->hFont;
+@@ -1731,6 +1733,7 @@
+ 
+ #define TVHEIGHT_MIN         16
+ #define TVHEIGHT_FONT_ADJUST 3 /* 2 for focus border + 1 for margin some apps assume */
++#define TVHEIGHT_ROW_PAD     6 /* NEUTRON: see TREEVIEW_NaturalHeight */
+ 
+ /* Compute the natural height for items. */
+ static UINT
+@@ -1756,6 +1759,11 @@
+     if (height < infoPtr->normalImageHeight)
+         height = infoPtr->normalImageHeight;
+ 
++    /* NEUTRON: match the breathing room given to listview rows, so the folder tree and the file
++     * list beside it have the same rhythm. TVM_SETITEMHEIGHT still overrides this for apps that
++     * size their own rows. */
++    height += TVHEIGHT_ROW_PAD;
++
+     /* Round down, unless we support odd ("non even") heights. */
+     if (!(infoPtr->dwStyle & TVS_NONEVENHEIGHT))
+         height &= ~1;
+@@ -2557,11 +2565,14 @@
+     }
+     else
+     {
+-	nmcdhdr.clrTextBk = GETBKCOLOR(infoPtr->clrBk);
++	/* NEUTRON: hovering tints the ROW instead of recolouring the text. With TVS_FULLROWSELECT
++	 * (which explorerframe now asks for) the FillRect below covers the whole row, and the icon
++	 * backdrop and ETO_OPAQUE text both take clrTextBk, so the tint is continuous. */
+ 	if ((infoPtr->dwStyle & TVS_TRACKSELECT) && (item == infoPtr->hotItem))
+-	    nmcdhdr.clrText = comctl32_color.clrHighlight;
++	    nmcdhdr.clrTextBk = COMCTL32_HoverColor();
+ 	else
+-	    nmcdhdr.clrText = GETTXTCOLOR(infoPtr->clrText);
++	    nmcdhdr.clrTextBk = GETBKCOLOR(infoPtr->clrBk);
++	nmcdhdr.clrText = GETTXTCOLOR(infoPtr->clrText);
+     }
+ 
+     hOldFont = SelectObject(hdc, TREEVIEW_FontForItem(infoPtr, item));
+@@ -2695,8 +2706,12 @@
+ 			NULL);
+ 	    SetTextAlign(hdc, align);
+ 
+-	    /* Draw focus box around the selected item */
+-	    if ((item == infoPtr->selectedItem) && inFocus)
++	    /* NEUTRON: no marching-ants box INSIDE the selection fill -- with a full-row highlight
++	     * it is the last Win9x tell, and the fill already says which row is current. Keyboard
++	     * focus resting on an item that is NOT selected still needs the cue, so that case keeps
++	     * it. */
++	    if ((item == infoPtr->selectedItem) && inFocus
++	        && !(item->state & TVIS_SELECTED))
+ 	    {
+ 		DrawFocusRect(hdc,&rcText);
+ 	    }
+--- a/dlls/shell32/ebrowser.c
++++ b/dlls/shell32/ebrowser.c
+@@ -563,7 +563,11 @@
+ 
+     if(SUCCEEDED(hr))
+     {
+-        style = NSTCS_HASEXPANDOS | NSTCS_ROOTHASEXPANDO | NSTCS_SHOWSELECTIONALWAYS;
++        /* NEUTRON: NSTCS_FULLROWSELECT maps to TVS_FULLROWSELECT in nstc.c, so the folder tree
++         * highlights the whole row the way the file list now does. TVS_HASLINES is not set here,
++         * which is what TREEVIEW_IsFullRowSelect() requires for it to take effect. */
++        style = NSTCS_FULLROWSELECT | NSTCS_HASEXPANDOS | NSTCS_ROOTHASEXPANDO |
++                NSTCS_SHOWSELECTIONALWAYS;
+         hr = INameSpaceTreeControl2_Initialize(pnstc2, GetParent(hwnd), NULL, style);
+         if(SUCCEEDED(hr))
+         {
+--- a/dlls/shell32/shlview.c
++++ b/dlls/shell32/shlview.c
+@@ -382,6 +382,25 @@
+ 	if(!This->hWndList)
+ 	  return FALSE;
+ 
++        /* NEUTRON: forward FWF_FULLROWSELECT, which was being dropped on the floor.
++         *
++         * ebrowser.c already ORs FWF_FULLROWSELECT into fs.fFlags before CreateViewWindow, and
++         * the listview implements full-row select correctly in its classic path — but nothing
++         * here ever translated the shell flag into LVS_EX_FULLROWSELECT, so the file dialog's
++         * selection was a text-width blob rather than a row. That is the single most 1995-looking
++         * thing about it, and it was a missing translation rather than missing support.
++         *
++         * LVS_EX_DOUBLEBUFFER comes along because the hover state added in comctl32 invalidates a
++         * row with erase on every mouse move, and the list has no back buffer otherwise.
++         *
++         * ⚠️ Behaviour, deliberately: clicking the blank area to the right of a name now selects
++         * that row. That is what Windows does. Selection STATE and everything the dialog reads
++         * back are untouched — this changes which rectangle is painted and hit-tested. */
++        if (This->FolderSettings.fFlags & FWF_FULLROWSELECT)
++            SendMessageW(This->hWndList, LVM_SETEXTENDEDLISTVIEWSTYLE,
++                         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
++                         LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
++
+         This->ListViewSortInfo.bIsAscending = TRUE;
+         This->ListViewSortInfo.nHeaderID = -1;
+         This->ListViewSortInfo.nLastHeaderID = -1;

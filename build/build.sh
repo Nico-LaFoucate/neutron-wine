@@ -118,23 +118,29 @@ export LC_COLLATE=C
 #
 # Same injection technique build.sh already uses for the tmpfs flag above: patch the wine-tkg
 # script, then VERIFY the edit took rather than trusting sed.
-_ART="$REPO/build/art/gen_toolbar_icons.py"
-if [ -f "$_ART" ]; then
-    for _t in rsvg-convert magick python3; do
-        command -v "$_t" >/dev/null || { echo "build.sh: need $_t to generate toolbar artwork" >&2; exit 6; }
+_ART_TB="$REPO/build/art/gen_toolbar_icons.py"
+_ART_SH="$REPO/build/art/gen_shell_icons.py"
+if [ -f "$_ART_TB" ] || [ -f "$_ART_SH" ]; then
+    for _t in rsvg-convert magick icotool python3; do
+        command -v "$_t" >/dev/null || { echo "build.sh: need $_t to generate artwork" >&2; exit 6; }
     done
-    _HOOK="      python3 \"$_ART\" \"\$_where/src/wine-git/dlls/comctl32\" || exit 6"
-    if ! grep -qF "gen_toolbar_icons.py" "$TKGDIR/non-makepkg-build.sh"; then
-        # insert immediately after the `_prepare` call, inside the same if-branch
-        awk -v hook="$_HOOK" '
-            { print }
-            /^      _prepare$/ && !done { print hook; done=1 }
-        ' "$TKGDIR/non-makepkg-build.sh" > "$TKGDIR/non-makepkg-build.sh.new" \
-            && mv "$TKGDIR/non-makepkg-build.sh.new" "$TKGDIR/non-makepkg-build.sh"
-    fi
+    # Strip any previously injected hook first, so this is idempotent and a changed hook actually
+    # replaces the old one instead of running alongside it.
+    sed -i '/gen_toolbar_icons\.py\|gen_shell_icons\.py/d' "$TKGDIR/non-makepkg-build.sh"
+    _HOOK="      python3 \"$_ART_TB\" \"\$_where/src/wine-git/dlls/comctl32\" || exit 6
+      python3 \"$_ART_SH\" \"\$_where/src/wine-git/dlls/shell32/resources\" || exit 6"
+    awk -v hook="$_HOOK" '
+        { print }
+        /^      _prepare$/ && !done { print hook; done=1 }
+    ' "$TKGDIR/non-makepkg-build.sh" > "$TKGDIR/non-makepkg-build.sh.new" \
+        && cat "$TKGDIR/non-makepkg-build.sh.new" > "$TKGDIR/non-makepkg-build.sh" \
+        && rm -f "$TKGDIR/non-makepkg-build.sh.new"
+    [ -x "$TKGDIR/non-makepkg-build.sh" ] \
+        || { echo "build.sh: non-makepkg-build.sh lost its executable bit during injection" >&2; exit 6; }
     grep -qF "gen_toolbar_icons.py" "$TKGDIR/non-makepkg-build.sh" \
-        || { echo "build.sh: FAILED to inject the toolbar-artwork step into non-makepkg-build.sh" >&2; exit 6; }
-    echo "toolbar artwork step injected (runs after _prepare)"
+        && grep -qF "gen_shell_icons.py" "$TKGDIR/non-makepkg-build.sh" \
+        || { echo "build.sh: FAILED to inject the artwork steps into non-makepkg-build.sh" >&2; exit 6; }
+    echo "artwork steps injected (toolbar + shell icons, run after _prepare)"
 fi
 
 cd "$TKGDIR"
