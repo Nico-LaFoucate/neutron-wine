@@ -98,7 +98,15 @@ cmd_snapshot() {
         rel="${rel#./}"
         # Accept an absolute path inside the base tree and normalise it.
         case "$rel" in "$BASE"/*) rel="${rel#"$BASE"/}" ;; esac
-        [ -f "$BASE/$rel" ] || die "not in the base tree: $rel"
+        if [ ! -f "$BASE/$rel" ]; then
+            # NEW FILE: nothing to copy. Record it so emit diffs it against /dev/null, which
+            # `patch -Np1` applies as a file creation (hunk @@ -0,0 +1,N @@).
+            mkdir -p "$SNAP/new/$(dirname "$rel")"
+            : > "$SNAP/new/$rel"
+            echo "  + $rel (NEW FILE - will be diffed against /dev/null)"
+            echo "$rel" >> "$SNAP/manifest"
+            continue
+        fi
         if [ -f "$SNAP/files/$rel" ]; then
             echo "  = $rel (already snapshotted, keeping the ORIGINAL pristine copy)"
             continue
@@ -125,10 +133,19 @@ require_snapshot() {
   now:      $BASE"
 }
 
+# A file snapshotted while absent from the base tree is a NEW file: its pristine copy is /dev/null.
+is_new() { [ -e "$SNAP/new/$1" ]; }
+snap_path() { if is_new "$1"; then echo /dev/null; else echo "$SNAP/files/$1"; fi; }
+
 cmd_status() {
     check_base; require_snapshot
     local rel changed=0
     while read -r rel; do
+        if is_new "$rel"; then
+            if [ -f "$BASE/$rel" ]; then echo "  A $rel (new file)"; changed=1
+            else echo "  = $rel (new file, not created yet)"; fi
+            continue
+        fi
         if cmp -s "$SNAP/files/$rel" "$BASE/$rel"; then
             echo "  = $rel (unchanged)"
         else
@@ -143,6 +160,7 @@ cmd_reset() {
     check_base; require_snapshot
     local rel
     while read -r rel; do
+        if is_new "$rel"; then rm -f "$BASE/$rel"; echo "  removed $rel (new file)"; continue; fi
         cp -p "$SNAP/files/$rel" "$BASE/$rel"
         echo "  restored $rel"
     done < "$SNAP/manifest"
@@ -180,17 +198,19 @@ cmd_emit() {
         echo >> "$tmp"
     fi
 
-    local rel n=0 files=0
+    local rel n=0 files=0 src
     while read -r rel; do
-        cmp -s "$SNAP/files/$rel" "$BASE/$rel" && continue
+        src="$(snap_path "$rel")"
+        if is_new "$rel"; then [ -f "$BASE/$rel" ] || continue
+        else cmp -s "$src" "$BASE/$rel" && continue; fi
         # Never hand-edit diff output: let diff write the labels itself.
         diff -u --label "a/$rel" --label "b/$rel" \
-             "$SNAP/files/$rel" "$BASE/$rel" >> "$tmp" || true
+             "$src" "$BASE/$rel" >> "$tmp" || true
         # NB: diff exits 1 when the files differ, which is the normal case here. With
         # `set -o pipefail` that status propagates out of the command substitution and, under
         # `set -e`, kills the script mid-loop with no message. Swallow it explicitly.
         local hunks
-        hunks="$( { diff -u "$SNAP/files/$rel" "$BASE/$rel" || true; } | command grep -c '^@@' )" || hunks=0
+        hunks="$( { diff -u "$src" "$BASE/$rel" || true; } | command grep -c '^@@' )" || hunks=0
         n=$(( n + hunks ))
         files=$(( files + 1 ))
     done < "$SNAP/manifest"
@@ -201,6 +221,7 @@ cmd_emit() {
     local vdir; vdir="$(mktemp -d)"
     while read -r rel; do
         mkdir -p "$vdir/$(dirname "$rel")"
+        is_new "$rel" && continue      # created by the patch itself
         cp "$SNAP/files/$rel" "$vdir/$rel"
     done < "$SNAP/manifest"
     if ! patch -p1 -d "$vdir" --dry-run < "$tmp" > "$vdir/.dryrun" 2>&1; then
@@ -216,6 +237,7 @@ cmd_emit() {
     # And that applying it really reproduces the edited files byte-for-byte.
     patch -p1 -d "$vdir" --silent < "$tmp"
     while read -r rel; do
+        if is_new "$rel" && [ ! -f "$BASE/$rel" ]; then continue; fi
         cmp -s "$vdir/$rel" "$BASE/$rel" || { rm -rf "$vdir"; rm -f "$tmp"; \
             die "applied patch does not reproduce $rel — refusing to write"; }
     done < "$SNAP/manifest"

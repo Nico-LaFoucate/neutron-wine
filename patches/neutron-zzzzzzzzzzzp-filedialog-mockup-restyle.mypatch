@@ -1,0 +1,2200 @@
+# neutron-zzzzzzzzzzzp-filedialog-mockup-restyle
+#
+# Make Wine's Common Item Dialog (dlls/comdlg32/itemdlg.c -- the popup Premiere raises on
+# Import, and every IFileOpenDialog/IFileSaveDialog) LOOK LIKE THE APPROVED MOCKUP
+# (~/.cache/neutron-mock/itemdlg.html, ROADMAP.md item 1), not one more increment on it.
+#
+# Three rounds of small, individually-correct comctl32 changes had shipped and the operator's
+# verdict on 11.10-84 was "It literally hardly looks any different." This patch works the whole
+# gap list at once -- the frame, the breadcrumb, the panels, the fields, the accent button --
+# and was iterated against the mockup by sampling pixels, not by eye.
+#
+# WHAT IT DRAWS (values are the mockup's, verbatim, in include/wine/neutronui.h):
+#   frame     #232323 ground; nav band with round #333 hover fills and a 1px #313131 rule;
+#             breadcrumb "Z: > Footage > A-Roll" (#9aa0a6 / current #dcdcdc), built from the
+#             folder's filesystem ancestors on OnNavigationComplete; 7px margins all round
+#   panels    tree and list each a #1e1e1e rounded (r4) panel with a 1px #303030 border,
+#             separated by a 7px gap; "PLACES" caps label above the tree; children inset so
+#             the corners show; the splitter lives in the gap
+#   tree      stroked chevrons (#8a8a8a / open #c8c8c8) in a fixed slot; grey #2f2f2f rounded
+#             selection with white text; #cfcfcf text; the empty Favorites root is not listed
+#   header    uppercase, 1px-tracked #7f7f7f labels on the panel fill, one #2c2c2c rule, no
+#             dividers, no bevel; columns Name / Size / Type / Modified (Attributes is no
+#             longer on by default -- it is not in Explorer's default Details view either);
+#             the name column takes the slack so there is no dead column past the last one
+#   list      rounded (r3) full-row selection #3096fa inset 4px from the panel edge, white text
+#             with #d8e9fd detail columns; unselected detail columns #a3a3a3; hover #292929;
+#             icons drawn masked so the rounded fill shows through
+#   fields    filename edit and filter combo as #171717 rounded (r4) boxes with a 1px #3a3a3a
+#             border (lighter when focused); "Files of type:" label shown; the combo is
+#             CBS_OWNERDRAWFIXED and draws its own text and chevron glyph
+#   buttons   #323232 fill / #3f3f3f border / r4; Open is the accent #3096fa with white
+#             medium-weight text; bottom right, Open then Cancel; no mnemonic underline
+#
+# HOW, AND WHY THIS WAY:
+#   * A fixed palette in our own code (neutronui.h), not GetSysColor and not the visual style.
+#     Two theming systems live in every prefix (the classic palette, which the Neutron theme
+#     drives, and the Aero .msstyles wine.inf turns on, which comctl32 v6 controls paint from);
+#     deriving these surfaces from either made the look depend on prefix state, and darkening
+#     the global button palette breaks the Adobe apps' own labels (Lightroom's About box).
+#   * The push buttons become BS_OWNERDRAW so comctl32's DIRECT paint path (paint_button() on
+#     press/focus/enable, which never goes through WM_PAINT) lands in our WM_DRAWITEM too --
+#     a paint-only subclass would flash the classic bevel on every press. A small subclass
+#     answers WM_GETDLGCODE / BM_SETSTYLE exactly as a push button would, because
+#     DEFDLG_SetDefButton rewrites the default button's style on every focus move and would
+#     otherwise clobber BS_OWNERDRAW. Verified: WM_GETDLGCODE on Open = DLGC_BUTTON |
+#     DLGC_DEFPUSHBUTTON; Enter in the filename box still drives the default button.
+#   * The filter combo's arrow and text field are also repainted directly (CBRepaintButton,
+#     CBPaintText); the subclass overdraws immediately after the messages that trigger them.
+#   * comctl32's listview / treeview / header changes are OPT-IN through private style bits
+#     (LVS_EX_NEUTRON_SHELL, TVS_EX_NEUTRON_SHELL, HDS_NEUTRON_SHELL) that shell32 and
+#     explorerframe set on the file view's controls; no other application's controls change.
+#     Wine's treeview never stored extended styles at all -- TVM_SETEXTENDEDSTYLE now does.
+#   * Layout is real layout (update_layout rewritten), not padding tricks: the mockup's
+#     label column, full-width fields and bottom-right buttons.
+#
+# THE HARD CONSTRAINT -- nothing may change what the dialog RETURNS -- was tested, not assumed:
+# a driver posted Enter with a folder name (navigated: breadcrumb gained the segment), switched
+# the filter through CBN_SELCHANGE, typed a file name and pressed Enter; the harness printed
+#   RESULT path=[Z:\usr\share\licenses\7zip\License.txt] filetypeindex=3
+# i.e. the exact file typed and the exact filter chosen.
+#
+# Measured on the throwaway prefix (Neutron theme, ThemeActive=0, 96 dpi, KDE 1.7x capture):
+#   ground #232323, panels #1e1e1e / border #2f, header text #7f7f7f, selection #3096fa,
+#   detail text #a3a3a3, fields #171717, Cancel #323232, Open #3096fa, crumbs #9aa0a6/#dcdcdc.
+#
+# Companion (NOT in this patch): bin/neutron's DEFAULT_THEME_COLORS gains "Scrollbar"="30 30 30"
+# so the classic scrollbar track in the list is dark; Wine's scrollbar is drawn by win32u from
+# that palette key and it had never been set.
+#
+# Files: include/wine/neutronui.h (new), dlls/comdlg32/{itemdlg.c,comdlg32.rc},
+#        dlls/comctl32/{listview.c,treeview.c,header.c} (also built as comctl32_v6),
+#        dlls/shell32/{ebrowser.c,shlview.c,shfldr_fs.c,shfldr_desktop.c,shfldr_mycomp.c,
+#        shell32.rc,shresdef.h}, dlls/explorerframe/nstc.c
+
+--- a/dlls/comctl32/header.c
++++ b/dlls/comctl32/header.c
+@@ -39,6 +39,7 @@
+ #include "commctrl.h"
+ #include "comctl32.h"
+ #include "wine/debug.h"
++#include "wine/neutronui.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(header);
+ 
+@@ -303,8 +304,12 @@
+ #endif
+ 
+     /* NEUTRON: hovering a column tints it with the shared row-hover colour instead of doing
+-     * nothing, so the header responds the way the list below it does. */
+-    hbr = CreateSolidBrush(hottrack ? COMCTL32_HoverColor() : GetBkColor(hdc));
++     * nothing, so the header responds the way the list below it does. The shell look keeps
++     * the panel fill and shows hover through the label colour instead. */
++    if (infoPtr->dwStyle & HDS_NEUTRON_SHELL)
++        hbr = CreateSolidBrush(NEUTRON_PANEL_FILL);
++    else
++        hbr = CreateSolidBrush(hottrack ? COMCTL32_HoverColor() : GetBkColor(hdc));
+     FillRect(hdc, r, hbr);
+     DeleteObject(hbr);
+ }
+@@ -327,6 +332,14 @@
+      *
+      * bDown deliberately no longer changes the frame; the pressed state stays visible as the
+      * existing 1px text offset in HEADER_DrawItem. */
++    /* NEUTRON shell look: one rule under the header in the mockup's colour, no dividers */
++    if (infoPtr->dwStyle & HDS_NEUTRON_SHELL)
++    {
++        neutron_hrule(hdc, r->left, r->right, r->bottom - 1, NEUTRON_HEADER_RULE);
++        r->bottom -= 1;
++        return;
++    }
++
+     hbr = CreateSolidBrush(comctl32_color.clr3dShadow);
+ 
+     edge = *r;
+@@ -401,6 +414,18 @@
+     }
+ #endif
+ 
++    /* NEUTRON: the shell look measures the same caps, letter-spaced label it draws */
++    if (GetWindowLongW(hwnd, GWL_STYLE) & HDS_NEUTRON_SHELL)
++    {
++        WCHAR buf[MAX_HEADER_TEXT_LEN];
++        int old_extra = SetTextCharacterExtra(hdc, 1);   /* one device px, see ebrowser.c */
++        lstrcpynW(buf, item->pszText, ARRAY_SIZE(buf));
++        CharUpperBuffW(buf, lstrlenW(buf));
++        DrawTextW(hdc, buf, -1, rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_CALCRECT);
++        SetTextCharacterExtra(hdc, old_extra);
++        return;
++    }
++
+     DrawTextW(hdc, item->pszText, -1, rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_CALCRECT);
+ }
+ 
+@@ -418,6 +443,13 @@
+     }
+ #endif
+ 
++    if (GetWindowLongW(hwnd, GWL_STYLE) & HDS_NEUTRON_SHELL)
++    {
++        neutron_draw_caps(hdc, item->pszText, rect, DT_LEFT | DT_END_ELLIPSIS | DT_VCENTER | DT_SINGLELINE,
++                          1);
++        return;
++    }
++
+     DrawTextW(hdc, item->pszText, -1, rect, DT_LEFT | DT_END_ELLIPSIS | DT_VCENTER | DT_SINGLELINE);
+ }
+ 
+@@ -440,7 +472,13 @@
+      * 65% toward the face so it sits back from the file names below it; hovering brings it to
+      * full strength. Previously the hot state turned the text COLOR_HIGHLIGHT, which is the
+      * Win95 "web view" look and fights the selection colour. */
+-    if (COMCTL32_IsThemed(infoPtr->hwndSelf))
++    if (infoPtr->dwStyle & HDS_NEUTRON_SHELL)
++    {
++        /* the shell look: fixed palette, hover brightens the label */
++        SetTextColor(hdc, bHotTrack ? NEUTRON_HEADER_HOT : NEUTRON_HEADER_TEXT);
++        SetBkColor(hdc, NEUTRON_PANEL_FILL);
++    }
++    else if (COMCTL32_IsThemed(infoPtr->hwndSelf))
+         SetTextColor(hdc, comctl32_color.clrBtnText);
+     else if (bHotTrack)
+         SetTextColor(hdc, comctl32_color.clrBtnText);
+@@ -451,7 +489,8 @@
+                               (GetGValue(fg) * 65 + GetGValue(bg) * 35) / 100,
+                               (GetBValue(fg) * 65 + GetBValue(bg) * 35) / 100));
+     }
+-    SetBkColor(hdc, comctl32_color.clr3dFace);
++    if (!(infoPtr->dwStyle & HDS_NEUTRON_SHELL))
++        SetBkColor(hdc, comctl32_color.clr3dFace);
+ 
+     if (lCDFlags & CDRF_NOTIFYITEMDRAW && !(phdi->fmt & HDF_OWNERDRAW))
+     {
+@@ -686,6 +725,15 @@
+         RECT edge = *rect;
+         HBRUSH hbr;
+ 
++        if (infoPtr->dwStyle & HDS_NEUTRON_SHELL)
++        {
++            hbr = CreateSolidBrush(NEUTRON_PANEL_FILL);
++            FillRect(hdc, rect, hbr);
++            DeleteObject(hbr);
++            neutron_hrule(hdc, rect->left, rect->right, rect->bottom - 1, NEUTRON_HEADER_RULE);
++            return;
++        }
++
+         FillRect(hdc, rect, GetSysColorBrush(COLOR_3DFACE));
+         hbr = CreateSolidBrush(comctl32_color.clr3dShadow);
+         edge.top = edge.bottom - 1;
+@@ -719,8 +767,17 @@
+ 
+     /* draw Background */
+     if (infoPtr->uNumItem == 0 && !COMCTL32_IsThemed(infoPtr->hwndSelf)) {
+-        hbrBk = GetSysColorBrush(COLOR_3DFACE);
+-        FillRect(hdc, &rect, hbrBk);
++        if (infoPtr->dwStyle & HDS_NEUTRON_SHELL)
++        {
++            hbrBk = CreateSolidBrush(NEUTRON_PANEL_FILL);
++            FillRect(hdc, &rect, hbrBk);
++            DeleteObject(hbrBk);
++        }
++        else
++        {
++            hbrBk = GetSysColorBrush(COLOR_3DFACE);
++            FillRect(hdc, &rect, hbrBk);
++        }
+     }
+ 
+     x = rect.left;
+--- a/dlls/comctl32/listview.c
++++ b/dlls/comctl32/listview.c
+@@ -141,6 +141,7 @@
+ #include "shlwapi.h"
+ 
+ #include "wine/debug.h"
++#include "wine/neutronui.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(listview);
+ 
+@@ -1101,25 +1102,28 @@
+     /* apparently, for selected items, we have to override the returned values */
+     if (!SubItem)
+     {
++        BOOL neutron = (infoPtr->dwLvExStyle & LVS_EX_NEUTRON_SHELL) != 0;
++
+         if (cd->nmcd.uItemState & CDIS_SELECTED)
+         {
+             if (infoPtr->bFocus)
+             {
+-                backcolor = comctl32_color.clrHighlight;
+-                textcolor = comctl32_color.clrHighlightText;
++                backcolor = neutron ? NEUTRON_LIST_SELECTED : comctl32_color.clrHighlight;
++                textcolor = neutron ? NEUTRON_LIST_SELTEXT : comctl32_color.clrHighlightText;
+             }
+             else if (infoPtr->dwStyle & LVS_SHOWSELALWAYS)
+             {
+-                backcolor = comctl32_color.clr3dFace;
+-                textcolor = comctl32_color.clrBtnText;
++                backcolor = neutron ? NEUTRON_TREE_SELECTED : comctl32_color.clr3dFace;
++                textcolor = neutron ? NEUTRON_LIST_TEXT : comctl32_color.clrBtnText;
+             }
+         }
+         /* NEUTRON: hovered-but-unselected rows get the shared tint. customdraw_fill already sets
+          * CDIS_HOT from nHotItem; nothing consumed it for painting before. Under
+          * LVS_EX_FULLROWSELECT the subitems inherit the DC colours set for item 0, so the tint
+-         * spans the row; without it, it covers the label, which is still correct. */
++         * spans the row; without it, it covers the label, which is still correct. The shell
++         * look uses its fixed hover colour, which is tuned for the panel fill. */
+         else if (cd->nmcd.uItemState & CDIS_HOT)
+-            backcolor = COMCTL32_HoverColor();
++            backcolor = neutron ? NEUTRON_LIST_HOVER : COMCTL32_HoverColor();
+     }
+ 
+     if (backcolor == CLR_DEFAULT)
+@@ -1780,6 +1784,14 @@
+         return;
+ 
+     LISTVIEW_GetItemBox(infoPtr, nItem, &rcBox);
++    if (infoPtr->dwLvExStyle & LVS_EX_NEUTRON_SHELL)
++    {
++        /* NEUTRON: the rounded row fill spans the client width, not just the columns */
++        RECT client;
++        GetClientRect(infoPtr->hwndSelf, &client);
++        rcBox.left = min(rcBox.left, client.left);
++        rcBox.right = max(rcBox.right, client.right);
++    }
+     LISTVIEW_InvalidateRect(infoPtr, &rcBox);
+ }
+ 
+@@ -4724,7 +4736,30 @@
+     else
+         background = &rcSelect;
+ 
+-    if (nmlvcd->clrTextBk != CLR_NONE)
++    /* NEUTRON shell look (details + full-row select): a selected or hovered row is one
++     * rounded fill inset from the list's edges, painted once with the first subitem; the
++     * per-cell opaque fills are skipped so the corners stay rounded, and the text is drawn
++     * transparent below. Rows that are neither keep the background the erase gave them. */
++    if ((infoPtr->dwLvExStyle & LVS_EX_NEUTRON_SHELL) && infoPtr->uView == LV_VIEW_DETAILS &&
++        (infoPtr->dwLvExStyle & LVS_EX_FULLROWSELECT))
++    {
++        if (item->iSubItem == 0 &&
++            ((item->state & LVIS_SELECTED) || (nmlvcd->nmcd.uItemState & CDIS_HOT)))
++        {
++            RECT row;
++            int dpi = neutron_window_dpi(infoPtr->hwndSelf);
++            int inset = neutron_scale(NEUTRON_ROW_INSET, dpi);
++
++            GetClientRect(infoPtr->hwndSelf, &row);
++            row.left += inset;
++            row.right -= inset;
++            row.top = rcBox.top;
++            row.bottom = rcBox.bottom;
++            neutron_round_rect(nmlvcd->nmcd.hdc, &row, GetBkColor(nmlvcd->nmcd.hdc), CLR_NONE,
++                               neutron_scale(NEUTRON_ROW_RADIUS, dpi));
++        }
++    }
++    else if (nmlvcd->clrTextBk != CLR_NONE)
+         ExtTextOutW(nmlvcd->nmcd.hdc, background->left, background->top, ETO_OPAQUE, background, NULL, 0, NULL);
+ 
+     if (item->state & LVIS_FOCUSED)
+@@ -4782,7 +4817,9 @@
+             style = ILD_NORMAL;
+ 
+         ImageList_DrawEx(himl, item->iImage, nmlvcd->nmcd.hdc, rcIcon.left, rcIcon.top,
+-                         rcIcon.right - rcIcon.left, rcIcon.bottom - rcIcon.top, infoPtr->clrBk,
++                         rcIcon.right - rcIcon.left, rcIcon.bottom - rcIcon.top,
++                         /* NEUTRON: masked over the rounded row fill, not on a square of clrBk */
++                         (infoPtr->dwLvExStyle & LVS_EX_NEUTRON_SHELL) ? CLR_NONE : infoPtr->clrBk,
+                          item->state & LVIS_CUT ? RGB(255, 255, 255) : CLR_DEFAULT,
+                          style | (item->state & LVIS_OVERLAYMASK));
+     }
+@@ -4814,6 +4851,20 @@
+     if (infoPtr->uView == LV_VIEW_DETAILS && infoPtr->dwLvExStyle & LVS_EX_GRIDLINES)
+         rcLabel.bottom--;
+ 
++    if (infoPtr->dwLvExStyle & LVS_EX_NEUTRON_SHELL)
++    {
++        /* NEUTRON: transparent text over the row fill; the detail columns sit back from the
++         * name, and take the selection's lighter tint when the row is selected */
++        int old_mode = SetBkMode(nmlvcd->nmcd.hdc, TRANSPARENT);
++        if (item->iSubItem && infoPtr->uView == LV_VIEW_DETAILS)
++            SetTextColor(nmlvcd->nmcd.hdc,
++                         (item->state & LVIS_SELECTED) && infoPtr->bFocus ? NEUTRON_LIST_SELDIM
++                                                                            : NEUTRON_LIST_DIM);
++        DrawTextW(nmlvcd->nmcd.hdc, item->pszText, -1, &rcLabel, format);
++        SetBkMode(nmlvcd->nmcd.hdc, old_mode);
++        return;
++    }
++
+     DrawTextW(nmlvcd->nmcd.hdc, item->pszText, -1, &rcLabel, format);
+ }
+ 
+--- a/dlls/comctl32/treeview.c
++++ b/dlls/comctl32/treeview.c
+@@ -55,6 +55,7 @@
+ #include "commctrl.h"
+ #include "comctl32.h"
+ #include "wine/debug.h"
++#include "wine/neutronui.h"
+ #include "wine/exception.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(treeview);
+@@ -65,6 +66,7 @@
+   HWND          hwnd;
+   HWND          hwndNotify;     /* Owner window to send notifications to */
+   DWORD         dwStyle;
++  DWORD         dwExStyle;      /* NEUTRON: TVM_SETEXTENDEDSTYLE, kept for TVS_EX_NEUTRON_SHELL */
+   HTREEITEM     root;
+   UINT          uInternalStatus;
+   INT           Timer;
+@@ -2403,6 +2405,17 @@
+     width = item->stateOffset - item->linesOffset;
+     rectsize = min(height, width) / 4;
+ 
++    /* NEUTRON shell look: a stroked chevron in a fixed slot -- "›" collapsed, "⌄" open --
++     * in the mockup's glyph colours, brighter when open. */
++    if (infoPtr->dwExStyle & TVS_EX_NEUTRON_SHELL)
++    {
++        int dpi = neutron_window_dpi(infoPtr->hwnd);
++        BOOL open = (item->state & TVIS_EXPANDED) && !(item->state & TVIS_EXPANDPARTIAL);
++        neutron_chevron(hdc, centerx, centery, max(rectsize * 2 / 3, 3), neutron_scale(1, dpi),
++                        open, open ? NEUTRON_CHEVRON_OPEN : NEUTRON_CHEVRON);
++        return;
++    }
++
+     /* NEUTRON: a filled triangle instead of the Win95 boxed +/-.
+      *
+      * ⭐ WHY THIS PATH IS EVEN REACHED. Above, comctl32 v6 asks GetWindowTheme() and, when a
+@@ -2538,6 +2551,7 @@
+     COLORREF oldTextColor, oldTextBkColor;
+     int centery;
+     BOOL inFocus = (GetFocus() == infoPtr->hwnd);
++    BOOL neutron = (infoPtr->dwExStyle & TVS_EX_NEUTRON_SHELL) != 0;
+     NMTVCUSTOMDRAW nmcdhdr;
+ 
+     TREEVIEW_UpdateDispInfo(infoPtr, item, CALLBACK_MASK_ALL);
+@@ -2552,7 +2566,13 @@
+ 	((item->state & TVIS_SELECTED) && (!infoPtr->focusedItem || item == infoPtr->focusedItem) &&
+ 	 (inFocus || (infoPtr->dwStyle & TVS_SHOWSELALWAYS))))
+     {
+-	if ((item->state & TVIS_DROPHILITED) || inFocus)
++	if (neutron)
++	{
++	    /* the shell look: one quiet grey selection whether or not the tree has focus */
++	    nmcdhdr.clrTextBk = NEUTRON_TREE_SELECTED;
++	    nmcdhdr.clrText   = NEUTRON_TREE_SELTEXT;
++	}
++	else if ((item->state & TVIS_DROPHILITED) || inFocus)
+ 	{
+ 	    nmcdhdr.clrTextBk = comctl32_color.clrHighlight;
+ 	    nmcdhdr.clrText   = comctl32_color.clrHighlightText;
+@@ -2569,7 +2589,7 @@
+ 	 * (which explorerframe now asks for) the FillRect below covers the whole row, and the icon
+ 	 * backdrop and ETO_OPAQUE text both take clrTextBk, so the tint is continuous. */
+ 	if ((infoPtr->dwStyle & TVS_TRACKSELECT) && (item == infoPtr->hotItem))
+-	    nmcdhdr.clrTextBk = COMCTL32_HoverColor();
++	    nmcdhdr.clrTextBk = neutron ? NEUTRON_TREE_HOVER : COMCTL32_HoverColor();
+ 	else
+ 	    nmcdhdr.clrTextBk = GETBKCOLOR(infoPtr->clrBk);
+ 	nmcdhdr.clrText = GETTXTCOLOR(infoPtr->clrText);
+@@ -2605,9 +2625,22 @@
+ 
+     if (TREEVIEW_IsFullRowSelect(infoPtr))
+     {
+-        HBRUSH brush = CreateSolidBrush(nmcdhdr.clrTextBk);
+-        FillRect(hdc, &item->rect, brush);
+-        DeleteObject(brush);
++        if (neutron && nmcdhdr.clrTextBk != GETBKCOLOR(infoPtr->clrBk))
++        {
++            /* NEUTRON shell look: the row fill is a rounded rectangle inset from the edges */
++            int dpi = neutron_window_dpi(infoPtr->hwnd);
++            RECT row = item->rect;
++            row.left += neutron_scale(NEUTRON_ROW_INSET, dpi);
++            row.right -= neutron_scale(NEUTRON_ROW_INSET, dpi);
++            neutron_round_rect(hdc, &row, nmcdhdr.clrTextBk, CLR_NONE,
++                               neutron_scale(NEUTRON_ROW_RADIUS, dpi));
++        }
++        else
++        {
++            HBRUSH brush = CreateSolidBrush(nmcdhdr.clrTextBk);
++            FillRect(hdc, &item->rect, brush);
++            DeleteObject(brush);
++        }
+     }
+ 
+     TREEVIEW_DrawItemLines(infoPtr, hdc, item);
+@@ -2690,6 +2723,13 @@
+ 	    rcText.bottom = item->rect.bottom;
+ 	    rcText.left = item->textOffset;
+ 	    rcText.right = rcText.left + item->textWidth + 4;
++	    if (neutron)
++	    {
++	        /* NEUTRON: keep the opaque text box inside the rounded row fill */
++	        int dpi = neutron_window_dpi(infoPtr->hwnd);
++	        rcText.right = min(rcText.right, item->rect.right -
++	                           neutron_scale(NEUTRON_ROW_INSET + NEUTRON_ROW_RADIUS, dpi));
++	    }
+ 
+             TRACE("drawing text %s at (%s)\n",
+                   debugstr_w(item->pszText), wine_dbgstr_rect(&rcText));
+@@ -5822,6 +5862,16 @@
+     case TVM_SETINDENT:
+ 	return TREEVIEW_SetIndent(infoPtr, (UINT)wParam);
+ 
++    case TVM_SETEXTENDEDSTYLE:
++        /* NEUTRON: Wine never stored these. wParam is the mask, lParam the styles. Only
++         * TVS_EX_NEUTRON_SHELL is acted on; the rest is kept so TVM_GETEXTENDEDSTYLE answers. */
++        infoPtr->dwExStyle = (infoPtr->dwExStyle & ~(DWORD)wParam) | ((DWORD)lParam & (DWORD)wParam);
++        TREEVIEW_Invalidate(infoPtr, NULL);
++        return 0;
++
++    case TVM_GETEXTENDEDSTYLE:
++        return infoPtr->dwExStyle;
++
+     case TVM_SETINSERTMARK:
+ 	return TREEVIEW_SetInsertMark(infoPtr, (BOOL)wParam, (HTREEITEM)lParam);
+ 
+--- a/dlls/comdlg32/comdlg32.rc
++++ b/dlls/comdlg32/comdlg32.rc
+@@ -517,8 +517,10 @@
+     EDITTEXT        IDC_FILENAME, 226, 240, 100, 12,  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | ES_AUTOHSCROLL
+ 
+     LTEXT           "Files of type:", IDC_FILETYPESTATIC, 160, 256, 60, 9, SS_RIGHT | WS_CLIPSIBLINGS
++    /* NEUTRON: CBS_OWNERDRAWFIXED so itemdlg.c paints the field and its items (see
++     * neutron_draw_combo_item); CBS_HASSTRINGS keeps CB_GETLBTEXT and the filter logic as is */
+     COMBOBOX        IDC_FILETYPE, 226, 256, 100, 60,  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+-                    WS_CLIPSIBLINGS | CBS_HASSTRINGS | CBS_DROPDOWNLIST
++                    WS_CLIPSIBLINGS | CBS_HASSTRINGS | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED
+ 
+     DEFPUSHBUTTON   "&Open",  IDOK,     350, 240, 32, 14, WS_GROUP | WS_CLIPSIBLINGS
+ 
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -34,6 +34,7 @@
+ 
+ #include "wine/debug.h"
+ #include "wine/list.h"
++#include "wine/neutronui.h"
+ 
+ #define IDC_NAV_TOOLBAR      200
+ #define IDC_NAVBACK          201
+@@ -147,6 +148,15 @@
+     GUID client_guid;
+ 
+     HANDLE user_actctx;
++
++    /* NEUTRON restyle state -- paint and layout only, see neutron_init_frame() */
++    HBRUSH hbr_ground, hbr_field;
++    HFONT hfont_accent;         /* heavier label for the default (accent) button */
++    RECT rc_navband;            /* toolbar + breadcrumb band, dialog client coords */
++    RECT rc_crumbs;             /* where the breadcrumb is painted */
++    RECT rc_filename_frame;     /* the painted field around the borderless filename edit */
++    LPWSTR *crumbs;             /* breadcrumb segments, root first */
++    UINT crumb_count;
+ } FileDialogImpl;
+ 
+ /**************************************************************************
+@@ -1754,17 +1764,579 @@
+     return show;
+ }
+ 
++
++/**************************************************************************
++ * NEUTRON restyle of the dialog frame.
++ *
++ * The approved mockup (docs: ROADMAP.md item 1) is a flat dark dialog: a #232323 ground, a
++ * nav band with round hover fills and a breadcrumb, rounded panels for the browser, fields
++ * drawn as rounded #171717 boxes, and an accent-blue Open button. Wine's template gives us
++ * user32/comctl32 v6 controls with 3D bevels that follow whichever of the prefix's TWO theming
++ * systems happens to win (classic palette vs. the Aero visual style wine.inf turns on), so
++ * the frame paints itself from the fixed palette in include/wine/neutronui.h instead.
++ *
++ * THE ONE HARD CONSTRAINT: nothing here may change what the dialog RETURNS. Every control
++ * keeps its identity, window text, message semantics and notification codes; the changes
++ * are owner-draw, custom-draw, WM_CTLCOLOR* and geometry. The push buttons become
++ * BS_OWNERDRAW (so comctl32's direct paint_button() path also lands in our WM_DRAWITEM
++ * instead of flashing a classic bevel), and a subclass answers WM_GETDLGCODE/BM_SETSTYLE the
++ * way a push button would so the dialog manager's default-button logic (Enter, focus moves)
++ * is byte-for-byte what it was.
++ */
++
++static int neutron_text_height(FileDialogImpl *This)
++{
++    HFONT font = (HFONT)SendMessageW(This->dlg_hwnd, WM_GETFONT, 0, 0);
++    TEXTMETRICW tm = { 0 };
++    HDC hdc = GetDC(This->dlg_hwnd);
++    HFONT old = font ? SelectObject(hdc, font) : NULL;
++
++    GetTextMetricsW(hdc, &tm);
++    if (old) SelectObject(hdc, old);
++    ReleaseDC(This->dlg_hwnd, hdc);
++    return tm.tmHeight ? tm.tmHeight : neutron_scale(13, This->dpi_y);
++}
++
++/* width of a push button for its current text: text + padding, never narrower than 60 */
++static int neutron_button_width(FileDialogImpl *This, HWND button, HFONT font)
++{
++    WCHAR text[256];
++    SIZE sz = { 0 };
++    HDC hdc;
++    HFONT old;
++
++    if (!button) return 0;
++    if (!font) font = (HFONT)SendMessageW(button, WM_GETFONT, 0, 0);
++    GetWindowTextW(button, text, ARRAY_SIZE(text));
++    hdc = GetDC(button);
++    old = font ? SelectObject(hdc, font) : NULL;
++    GetTextExtentPoint32W(hdc, text, lstrlenW(text), &sz);
++    if (old) SelectObject(hdc, old);
++    ReleaseDC(button, hdc);
++    return max(sz.cx + 2 * neutron_scale(12, This->dpi_x), neutron_scale(60, This->dpi_x));
++}
++
++/* width of a label's text in the dialog font, plus a little air */
++static int neutron_label_width(FileDialogImpl *This, int id)
++{
++    HWND hwnd = GetDlgItem(This->dlg_hwnd, id);
++    HFONT font = (HFONT)SendMessageW(This->dlg_hwnd, WM_GETFONT, 0, 0), old = NULL;
++    WCHAR text[256];
++    SIZE sz = { 0 };
++    HDC hdc;
++
++    if (!hwnd) return 0;
++    GetWindowTextW(hwnd, text, ARRAY_SIZE(text));
++    hdc = GetDC(This->dlg_hwnd);
++    if (font) old = SelectObject(hdc, font);
++    GetTextExtentPoint32W(hdc, text, lstrlenW(text), &sz);
++    if (old) SelectObject(hdc, old);
++    ReleaseDC(This->dlg_hwnd, hdc);
++    return sz.cx + neutron_scale(4, This->dpi_x);
++}
++
++static void neutron_free_crumbs(FileDialogImpl *This)
++{
++    UINT i;
++    for (i = 0; i < This->crumb_count; i++) CoTaskMemFree(This->crumbs[i]);
++    free(This->crumbs);
++    This->crumbs = NULL;
++    This->crumb_count = 0;
++}
++
++/* Rebuild the breadcrumb from psi_folder: the folder and its filesystem ancestors, stopping
++ * at the first virtual parent (My Computer, the namespace root), so a path reads
++ * "Z: > Footage > A-Roll" rather than "Desktop > My Computer > Z: > Footage > A-Roll". */
++static void neutron_update_crumbs(FileDialogImpl *This)
++{
++    IShellItem *item, *parent, *grandparent;
++    LPWSTR names[64];
++    UINT count = 0, i;
++
++    neutron_free_crumbs(This);
++    if (!This->psi_folder) return;
++
++    item = This->psi_folder;
++    IShellItem_AddRef(item);
++    while (item && count < ARRAY_SIZE(names))
++    {
++        SFGAOF attrs = 0;
++        LPWSTR name = NULL;
++
++        if (FAILED(IShellItem_GetDisplayName(item, SIGDN_NORMALDISPLAY, &name)) || !name)
++            break;
++        /* a drive with no label is named "(Z:)"; the breadcrumb shows it as "Z:" */
++        {
++            int len = lstrlenW(name);
++            if (len >= 4 && name[len - 1] == ')' && name[len - 2] == ':' && name[len - 4] == '(')
++            {
++                name[len - 1] = 0;
++                memmove(name, name + len - 3, 3 * sizeof(WCHAR));
++            }
++        }
++        names[count++] = name;
++
++        if (FAILED(IShellItem_GetParent(item, &parent))) parent = NULL;
++        IShellItem_Release(item);
++        item = parent;
++        if (!item) break;
++
++        /* stop at a virtual parent, and do not list the namespace root itself */
++        if (FAILED(IShellItem_GetAttributes(item, SFGAO_FILESYSTEM, &attrs)) ||
++            !(attrs & SFGAO_FILESYSTEM) ||
++            FAILED(IShellItem_GetParent(item, &grandparent)))
++        {
++            IShellItem_Release(item);
++            item = NULL;
++            break;
++        }
++        IShellItem_Release(grandparent);
++    }
++    if (item) IShellItem_Release(item);
++
++    if (!count) return;
++    if (!(This->crumbs = malloc(count * sizeof(*This->crumbs))))
++    {
++        for (i = 0; i < count; i++) CoTaskMemFree(names[i]);
++        return;
++    }
++    for (i = 0; i < count; i++) This->crumbs[i] = names[count - 1 - i];
++    This->crumb_count = count;
++    TRACE("neutron: %u crumbs, current %s\n", count, debugstr_w(This->crumbs[count - 1]));
++}
++
++static void neutron_paint_crumbs(FileDialogImpl *This, HDC hdc)
++{
++    static const WCHAR sepW[] = L" \x203a ";      /* " > " */
++    static const WCHAR ellW[] = L"\x2026";        /* "..." */
++    HFONT font = (HFONT)SendMessageW(This->dlg_hwnd, WM_GETFONT, 0, 0), old_font = NULL;
++    int widths[64], total = 0, avail, x, y, old_mode;
++    SIZE sz, sep_sz, ell_sz;
++    UINT i, first = 0, last;
++
++    TRACE("neutron: painting %u crumbs in %s\n", This->crumb_count, wine_dbgstr_rect(&This->rc_crumbs));
++    if (!This->crumb_count) return;
++    last = This->crumb_count - 1;
++
++    if (font) old_font = SelectObject(hdc, font);
++    old_mode = SetBkMode(hdc, TRANSPARENT);
++    GetTextExtentPoint32W(hdc, sepW, 3, &sep_sz);
++    GetTextExtentPoint32W(hdc, ellW, 1, &ell_sz);
++
++    for (i = 0; i <= last; i++)
++    {
++        GetTextExtentPoint32W(hdc, This->crumbs[i], lstrlenW(This->crumbs[i]), &sz);
++        widths[i] = sz.cx;
++        total += sz.cx + (i ? sep_sz.cx : 0);
++    }
++
++    /* too long: drop leading segments behind an ellipsis, keep the current folder */
++    avail = This->rc_crumbs.right - This->rc_crumbs.left;
++    while (first < last && total + ell_sz.cx + sep_sz.cx > avail)
++    {
++        total -= widths[first] + sep_sz.cx;
++        first++;
++    }
++
++    x = This->rc_crumbs.left;
++    y = (This->rc_crumbs.top + This->rc_crumbs.bottom - sep_sz.cy) / 2;
++    SetTextColor(hdc, NEUTRON_CRUMB_DIM);
++    if (first)
++    {
++        TextOutW(hdc, x, y, ellW, 1);
++        x += ell_sz.cx;
++        TextOutW(hdc, x, y, sepW, 3);
++        x += sep_sz.cx;
++    }
++    for (i = first; i <= last; i++)
++    {
++        SetTextColor(hdc, i == last ? NEUTRON_CRUMB_CURRENT : NEUTRON_CRUMB_DIM);
++        TextOutW(hdc, x, y, This->crumbs[i], lstrlenW(This->crumbs[i]));
++        x += widths[i];
++        if (i < last)
++        {
++            SetTextColor(hdc, NEUTRON_CRUMB_DIM);
++            TextOutW(hdc, x, y, sepW, 3);
++            x += sep_sz.cx;
++        }
++    }
++
++    SetBkMode(hdc, old_mode);
++    if (old_font) SelectObject(hdc, old_font);
++}
++
++static void neutron_draw_button(FileDialogImpl *This, const DRAWITEMSTRUCT *dis)
++{
++    BOOL accent = dis->CtlID == IDOK;
++    BOOL hot = GetPropW(dis->hwndItem, L"neutron_hot") != NULL;
++    BOOL pressed = (dis->itemState & ODS_SELECTED) != 0;
++    COLORREF fill, border, text;
++    WCHAR label[256];
++    RECT rc = dis->rcItem;
++    UINT flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
++    HFONT old_font = NULL;
++
++    if (accent)
++    {
++        fill = pressed ? NEUTRON_ACCENT_PRESSED : hot ? NEUTRON_ACCENT_HOT : NEUTRON_ACCENT;
++        border = (dis->itemState & ODS_FOCUS) ? RGB(0x9c, 0xcc, 0xff) : fill;
++        text = NEUTRON_ACCENT_TEXT;
++    }
++    else
++    {
++        fill = pressed ? NEUTRON_BTN_PRESSED : hot ? NEUTRON_BTN_HOT : NEUTRON_BTN_FILL;
++        border = (dis->itemState & ODS_FOCUS) ? NEUTRON_FIELD_FOCUS : NEUTRON_BTN_BORDER;
++        text = NEUTRON_BTN_TEXT;
++    }
++    if (dis->itemState & ODS_DISABLED) text = NEUTRON_SECTION_TEXT;
++
++    /* the button erased itself with WM_CTLCOLORBTN (our ground brush), so the pixels outside
++     * the rounded corners are already the dialog ground */
++    neutron_round_rect(dis->hDC, &rc, fill, border, neutron_scale(NEUTRON_BTN_RADIUS, This->dpi_x));
++
++    if (accent && This->hfont_accent) old_font = SelectObject(dis->hDC, This->hfont_accent);
++    /* no mnemonic underline (the mockup shows none; Alt+letter still works): drop the '&'
++     * from the local copy rather than trusting DT_HIDEPREFIX */
++    {
++        WCHAR raw[256];
++        unsigned int i, j = 0;
++        GetWindowTextW(dis->hwndItem, raw, ARRAY_SIZE(raw));
++        for (i = 0; raw[i] && j < ARRAY_SIZE(label) - 1; i++)
++        {
++            if (raw[i] == '&' && raw[i + 1] != '&') continue;
++            if (raw[i] == '&') i++;
++            label[j++] = raw[i];
++        }
++        label[j] = 0;
++    }
++    SetBkMode(dis->hDC, TRANSPARENT);
++    SetTextColor(dis->hDC, text);
++    DrawTextW(dis->hDC, label, -1, &rc, flags);
++    if (old_font) SelectObject(dis->hDC, old_font);
++}
++
++/* text of the filter combo's current selection, for both paint paths */
++static void neutron_combo_text(HWND combo, int index, WCHAR *buf, int len)
++{
++    buf[0] = 0;
++    if (index == CB_ERR) return;
++    if (SendMessageW(combo, CB_GETLBTEXTLEN, index, 0) >= len) return;
++    SendMessageW(combo, CB_GETLBTEXT, index, (LPARAM)buf);
++}
++
++/* the field portion and the dropdown items of the (CBS_OWNERDRAWFIXED) filter combo */
++static void neutron_draw_combo_item(FileDialogImpl *This, const DRAWITEMSTRUCT *dis)
++{
++    BOOL field = (dis->itemState & ODS_COMBOBOXEDIT) != 0;
++    RECT rc = dis->rcItem;
++    WCHAR text[256];
++    HBRUSH brush;
++
++    brush = CreateSolidBrush(!field && (dis->itemState & ODS_SELECTED) ? NEUTRON_BTN_HOT
++                                                                      : NEUTRON_FIELD_FILL);
++    FillRect(dis->hDC, &rc, brush);
++    DeleteObject(brush);
++
++    neutron_combo_text(dis->hwndItem, dis->itemID == (UINT)-1 ? CB_ERR : (int)dis->itemID,
++                       text, ARRAY_SIZE(text));
++    if (field)
++    {
++        /* same geometry as the subclass's WM_PAINT so the two never disagree by a pixel */
++        GetClientRect(dis->hwndItem, &rc);
++        rc.right -= neutron_scale(28, This->dpi_x);
++    }
++    rc.left += neutron_scale(8, This->dpi_x);
++    SetBkMode(dis->hDC, TRANSPARENT);
++    SetTextColor(dis->hDC, field ? NEUTRON_FIELD_DIMTEXT : NEUTRON_FIELD_TEXT);
++    DrawTextW(dis->hDC, text, -1, &rc,
++              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
++}
++
++/* Push buttons are BS_OWNERDRAW so every paint path (WM_PAINT and comctl32's direct
++ * paint_button() on state changes) reaches WM_DRAWITEM. This subclass keeps the dialog
++ * manager's view of them identical to a push button's. */
++static LRESULT CALLBACK neutron_button_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    WNDPROC oldproc = (WNDPROC)GetPropW(hwnd, L"neutron_oldproc");
++
++    switch (msg)
++    {
++    case WM_GETDLGCODE:
++        return DLGC_BUTTON | (GetPropW(hwnd, L"neutron_def") ? DLGC_DEFPUSHBUTTON
++                                                              : DLGC_UNDEFPUSHBUTTON);
++    case BM_SETSTYLE:
++        /* DEFDLG_SetDefButton marks the default button by rewriting its style. Remember the
++         * request and stay owner-drawn, or the classic bevel comes back on the next focus
++         * move. */
++        if ((wparam & BS_TYPEMASK) == BS_DEFPUSHBUTTON || (wparam & BS_TYPEMASK) == BS_PUSHBUTTON)
++        {
++            SetPropW(hwnd, L"neutron_def",
++                     (HANDLE)(ULONG_PTR)((wparam & BS_TYPEMASK) == BS_DEFPUSHBUTTON));
++            if (LOWORD(lparam)) InvalidateRect(hwnd, NULL, FALSE);
++            return 0;
++        }
++        break;
++    case WM_LBUTTONDBLCLK:
++        /* an owner-drawn button reports BN_DOUBLECLICKED; a push button presses again */
++        return CallWindowProcW(oldproc, hwnd, WM_LBUTTONDOWN, wparam, lparam);
++    case WM_MOUSEMOVE:
++        if (!GetPropW(hwnd, L"neutron_hot"))
++        {
++            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
++            SetPropW(hwnd, L"neutron_hot", (HANDLE)1);
++            TrackMouseEvent(&tme);
++            InvalidateRect(hwnd, NULL, FALSE);
++        }
++        break;
++    case WM_MOUSELEAVE:
++        RemovePropW(hwnd, L"neutron_hot");
++        InvalidateRect(hwnd, NULL, FALSE);
++        break;
++    case WM_NCDESTROY:
++        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)oldproc);
++        RemovePropW(hwnd, L"neutron_oldproc");
++        RemovePropW(hwnd, L"neutron_def");
++        RemovePropW(hwnd, L"neutron_hot");
++        RemovePropW(hwnd, L"itemdlg_This");
++        break;
++    }
++    return CallWindowProcW(oldproc, hwnd, msg, wparam, lparam);
++}
++
++/* The filter combo: frame, text and glyph are ours. comctl32's combo also repaints its
++ * arrow button and text field directly (CBRepaintButton / CBPaintText), so the messages that
++ * trigger those are followed by an immediate overdraw. */
++static LRESULT CALLBACK neutron_combo_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    WNDPROC oldproc = (WNDPROC)GetPropW(hwnd, L"neutron_oldproc");
++    FileDialogImpl *This = GetPropW(hwnd, L"itemdlg_This");
++    LRESULT ret;
++
++    switch (msg)
++    {
++    case WM_PAINT:
++    {
++        PAINTSTRUCT ps;
++        HDC hdc = BeginPaint(hwnd, &ps);
++        HFONT font = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0), old_font = NULL;
++        WCHAR text[256];
++        RECT rc, rc_text;
++        int dpi = This ? This->dpi_x : neutron_window_dpi(hwnd);
++
++        GetClientRect(hwnd, &rc);
++        neutron_round_rect(hdc, &rc, NEUTRON_FIELD_FILL,
++                           GetFocus() == hwnd ? NEUTRON_FIELD_FOCUS : NEUTRON_FIELD_BORDER,
++                           neutron_scale(NEUTRON_FIELD_RADIUS, dpi));
++
++        neutron_combo_text(hwnd, SendMessageW(hwnd, CB_GETCURSEL, 0, 0), text, ARRAY_SIZE(text));
++        rc_text = rc;
++        rc_text.left += neutron_scale(8, dpi);
++        rc_text.right -= neutron_scale(28, dpi);
++        if (font) old_font = SelectObject(hdc, font);
++        SetBkMode(hdc, TRANSPARENT);
++        SetTextColor(hdc, NEUTRON_FIELD_DIMTEXT);
++        DrawTextW(hdc, text, -1, &rc_text,
++                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
++        if (old_font) SelectObject(hdc, old_font);
++
++        neutron_chevron(hdc, rc.right - neutron_scale(14, dpi), (rc.top + rc.bottom) / 2,
++                        neutron_scale(3, dpi), neutron_scale(1, dpi), TRUE, NEUTRON_FIELD_GLYPH);
++        EndPaint(hwnd, &ps);
++        return 0;
++    }
++    case WM_ERASEBKGND:
++        return 1;
++    case WM_NCDESTROY:
++        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)oldproc);
++        RemovePropW(hwnd, L"neutron_oldproc");
++        RemovePropW(hwnd, L"itemdlg_This");
++        break;
++    case WM_LBUTTONDOWN:
++    case WM_LBUTTONUP:
++    case WM_LBUTTONDBLCLK:
++    case WM_KEYDOWN:
++    case WM_SYSKEYDOWN:
++    case WM_CHAR:
++    case WM_MOUSEWHEEL:
++    case WM_SETFOCUS:
++    case WM_KILLFOCUS:
++    case WM_CAPTURECHANGED:
++    case WM_COMMAND:
++    case CB_SETCURSEL:
++    case CB_SHOWDROPDOWN:
++        ret = CallWindowProcW(oldproc, hwnd, msg, wparam, lparam);
++        if (IsWindow(hwnd))
++            RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
++        return ret;
++    }
++    return CallWindowProcW(oldproc, hwnd, msg, wparam, lparam);
++}
++
++static void neutron_ownerdraw_button(FileDialogImpl *This, int id, BOOL is_default)
++{
++    HWND hwnd = GetDlgItem(This->dlg_hwnd, id);
++    LONG style;
++
++    if (!hwnd) return;
++    style = GetWindowLongW(hwnd, GWL_STYLE);
++    SetWindowLongW(hwnd, GWL_STYLE, (style & ~BS_TYPEMASK) | BS_OWNERDRAW);
++    SetPropW(hwnd, L"neutron_def", (HANDLE)(ULONG_PTR)is_default);
++    SetPropW(hwnd, L"itemdlg_This", This);
++    SetPropW(hwnd, L"neutron_oldproc",
++             (HANDLE)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)neutron_button_proc));
++}
++
++/* called once from WM_INITDIALOG, after the template's controls exist */
++static void neutron_init_frame(FileDialogImpl *This)
++{
++    HWND hwnd;
++    HFONT font;
++    LOGFONTW lf;
++    int text_h = neutron_text_height(This);
++
++    This->hbr_ground = CreateSolidBrush(NEUTRON_DLG_GROUND);
++    This->hbr_field = CreateSolidBrush(NEUTRON_FIELD_FILL);
++
++    font = (HFONT)SendMessageW(This->dlg_hwnd, WM_GETFONT, 0, 0);
++    if (font && GetObjectW(font, sizeof(lf), &lf))
++    {
++        lf.lfWeight = FW_MEDIUM;   /* the mockup's 500; a synthesized bold reads as a smudge */
++        This->hfont_accent = CreateFontIndirectW(&lf);
++    }
++
++    /* the filename edit loses its sunken frame; the dialog paints a rounded field around it */
++    if ((hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILENAME)))
++    {
++        SetWindowLongW(hwnd, GWL_STYLE, GetWindowLongW(hwnd, GWL_STYLE) & ~WS_BORDER);
++        SetWindowLongW(hwnd, GWL_EXSTYLE,
++                       GetWindowLongW(hwnd, GWL_EXSTYLE) & ~(WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
++        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
++                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
++    }
++
++    neutron_ownerdraw_button(This, IDOK, TRUE);
++    neutron_ownerdraw_button(This, IDCANCEL, FALSE);
++
++    if ((hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILETYPE)))
++    {
++        /* CBS_OWNERDRAWFIXED (template): the field height is ours to set */
++        SendMessageW(hwnd, CB_SETITEMHEIGHT, (WPARAM)-1, text_h + 2 * neutron_scale(3, This->dpi_y));
++        SendMessageW(hwnd, CB_SETITEMHEIGHT, 0, text_h + 2 * neutron_scale(4, This->dpi_y));
++        SetPropW(hwnd, L"itemdlg_This", This);
++        SetPropW(hwnd, L"neutron_oldproc",
++                 (HANDLE)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)neutron_combo_proc));
++    }
++}
++
++static void neutron_destroy_frame(FileDialogImpl *This)
++{
++    neutron_free_crumbs(This);
++    if (This->hbr_ground) DeleteObject(This->hbr_ground);
++    if (This->hbr_field) DeleteObject(This->hbr_field);
++    if (This->hfont_accent) DeleteObject(This->hfont_accent);
++    This->hbr_ground = This->hbr_field = NULL;
++    This->hfont_accent = NULL;
++}
++
++static LRESULT on_wm_erasebkgnd(FileDialogImpl *This, HDC hdc)
++{
++    RECT rc;
++
++    /* also reached from the (TBSTYLE_TRANSPARENT) toolbar with a shifted origin, so fill
++     * the clip box rather than our client rect */
++    GetClipBox(hdc, &rc);
++    FillRect(hdc, &rc, This->hbr_ground);
++    SetWindowLongPtrW(This->dlg_hwnd, DWLP_MSGRESULT, 1);
++    return TRUE;
++}
++
++static LRESULT on_wm_paint(FileDialogImpl *This)
++{
++    PAINTSTRUCT ps;
++    HDC hdc = BeginPaint(This->dlg_hwnd, &ps);
++    RECT rc;
++
++    GetClientRect(This->dlg_hwnd, &rc);
++    neutron_hrule(hdc, 0, rc.right, This->rc_navband.bottom - 1, NEUTRON_NAV_RULE);
++    neutron_paint_crumbs(This, hdc);
++
++    if (!IsRectEmpty(&This->rc_filename_frame))
++    {
++        HWND edit = GetDlgItem(This->dlg_hwnd, IDC_FILENAME);
++        neutron_round_rect(hdc, &This->rc_filename_frame, NEUTRON_FIELD_FILL,
++                           (edit && GetFocus() == edit) ? NEUTRON_FIELD_FOCUS : NEUTRON_FIELD_BORDER,
++                           neutron_scale(NEUTRON_FIELD_RADIUS, This->dpi_x));
++    }
++
++    EndPaint(This->dlg_hwnd, &ps);
++    return TRUE;
++}
++
++static LRESULT on_wm_drawitem(FileDialogImpl *This, const DRAWITEMSTRUCT *dis)
++{
++    if (dis->CtlType == ODT_BUTTON && (dis->CtlID == IDOK || dis->CtlID == IDCANCEL))
++        neutron_draw_button(This, dis);
++    else if (dis->CtlType == ODT_COMBOBOX && dis->CtlID == IDC_FILETYPE)
++        neutron_draw_combo_item(This, dis);
++    else
++        return FALSE;
++
++    SetWindowLongPtrW(This->dlg_hwnd, DWLP_MSGRESULT, TRUE);
++    return TRUE;
++}
++
++/* nav toolbar: round hover/pressed fill, no edges, no offset */
++static LRESULT on_wm_notify(FileDialogImpl *This, LPARAM lparam)
++{
++    const NMHDR *hdr = (const NMHDR *)lparam;
++    NMTBCUSTOMDRAW *cd = (NMTBCUSTOMDRAW *)lparam;
++    LRESULT ret = CDRF_DODEFAULT;
++
++    if (hdr->idFrom != IDC_NAV_TOOLBAR || hdr->code != NM_CUSTOMDRAW)
++        return FALSE;
++
++    switch (cd->nmcd.dwDrawStage)
++    {
++    case CDDS_PREPAINT:
++        ret = CDRF_NOTIFYITEMDRAW;
++        break;
++    case CDDS_ITEMPREPAINT:
++        if (cd->nmcd.uItemState & (CDIS_HOT | CDIS_SELECTED | CDIS_CHECKED))
++        {
++            RECT rc = cd->nmcd.rc;
++            neutron_round_rect(cd->nmcd.hdc, &rc,
++                               (cd->nmcd.uItemState & CDIS_SELECTED) ? NEUTRON_NAV_PRESSED
++                                                                     : NEUTRON_NAV_HOT,
++                               CLR_NONE, neutron_scale(4, This->dpi_x));
++        }
++        ret = CDRF_DODEFAULT | TBCDRF_NOEDGES | TBCDRF_NOBACKGROUND | TBCDRF_NOOFFSET |
++              TBCDRF_NOMARK | TBCDRF_NOETCHEDEFFECT;
++        break;
++    }
++    SetWindowLongPtrW(This->dlg_hwnd, DWLP_MSGRESULT, ret);
++    return TRUE;
++}
++
+ static void update_layout(FileDialogImpl *This)
+ {
+     HDWP hdwp;
+     HWND hwnd;
+     RECT dialog_rc;
+     RECT cancel_rc, dropdown_rc, open_rc;
+-    RECT filetype_rc, filename_rc, filenamelabel_rc;
++    RECT filetype_rc, filetypelabel_rc, filename_rc, filenamelabel_rc, frame_rc;
+     RECT toolbar_rc, ebrowser_rc, customctrls_rc;
+-    static const UINT vspacing = 4, hspacing = 4;
+     static const UINT min_width = 320, min_height = 200;
+-    BOOL show_dropdown;
++    /* NEUTRON: the mockup's geometry -- a 7px margin all round, panels separated by the
++     * same, a label column for the field rows, fields to the right edge, buttons bottom
++     * right. All 96-dpi values scaled by the dialog's dpi. */
++    const int margin = neutron_scale(7, This->dpi_x);
++    const int vgap = neutron_scale(6, This->dpi_y);
++    const int hgap = neutron_scale(8, This->dpi_x);
++    const int nav_h = neutron_scale(38, This->dpi_y);
++    const int field_pad = neutron_scale(8, This->dpi_x);
++    int label_w = neutron_scale(64, This->dpi_x);
++    int text_h, edit_h, field_h, btn_h, row_bottom, cctrl_h;
++    BOOL show_dropdown, show_filetype = This->filterspec_count > 0;
+ 
+     if (!GetClientRect(This->dlg_hwnd, &dialog_rc))
+     {
+@@ -1778,142 +2350,136 @@
+         return;
+     }
+ 
++    text_h = neutron_text_height(This);
++    /* the label column fits the wider of the two labels (apps can rename "File name:") */
++    label_w = max(label_w, neutron_label_width(This, IDC_FILENAMESTATIC));
++    if(show_filetype) label_w = max(label_w, neutron_label_width(This, IDC_FILETYPESTATIC));
++    edit_h = text_h + neutron_scale(2, This->dpi_y);        /* the borderless edit window */
++    field_h = text_h + 2 * neutron_scale(4, This->dpi_y);   /* the painted field around it */
++    btn_h = field_h;
++
+     /****
+      * Calculate the size of the dialog and all the parts.
+      */
+ 
+-    /* Cancel button */
++    /* Cancel button, bottom right */
++    row_bottom = dialog_rc.bottom - margin;
+     hwnd = GetDlgItem(This->dlg_hwnd, IDCANCEL);
+-    if(hwnd)
+-    {
+-        int cancel_width, cancel_height;
+-        GetWindowRect(hwnd, &cancel_rc);
+-        cancel_width = cancel_rc.right - cancel_rc.left;
+-        cancel_height = cancel_rc.bottom - cancel_rc.top;
+-
+-        cancel_rc.left = dialog_rc.right - cancel_width - hspacing;
+-        cancel_rc.top = dialog_rc.bottom - cancel_height - vspacing;
+-        cancel_rc.right = cancel_rc.left + cancel_width;
+-        cancel_rc.bottom = cancel_rc.top + cancel_height;
+-    }
++    cancel_rc.right = dialog_rc.right - margin;
++    cancel_rc.left = cancel_rc.right - neutron_button_width(This, hwnd, NULL);
++    cancel_rc.bottom = row_bottom;
++    cancel_rc.top = row_bottom - btn_h;
+ 
+     /* Open/Save dropdown */
+     show_dropdown = update_open_dropdown(This);
+ 
+     if(show_dropdown)
+     {
+-        int dropdown_width, dropdown_height;
++        int dropdown_width;
+         hwnd = GetDlgItem(This->dlg_hwnd, psh1);
+ 
+         GetWindowRect(hwnd, &dropdown_rc);
+         dropdown_width = dropdown_rc.right - dropdown_rc.left;
+-        dropdown_height = dropdown_rc.bottom - dropdown_rc.top;
+ 
+-        dropdown_rc.left = cancel_rc.left - dropdown_width - hspacing;
++        dropdown_rc.right = cancel_rc.left - hgap;
++        dropdown_rc.left = dropdown_rc.right - dropdown_width;
+         dropdown_rc.top = cancel_rc.top;
+-        dropdown_rc.right = dropdown_rc.left + dropdown_width;
+-        dropdown_rc.bottom = dropdown_rc.top + dropdown_height;
++        dropdown_rc.bottom = cancel_rc.bottom;
+     }
+     else
+     {
+-        dropdown_rc.left = dropdown_rc.right = cancel_rc.left - hspacing;
++        dropdown_rc.left = dropdown_rc.right = cancel_rc.left - hgap;
+         dropdown_rc.top = cancel_rc.top;
+         dropdown_rc.bottom = cancel_rc.bottom;
+     }
+ 
+     /* Open/Save button */
+     hwnd = GetDlgItem(This->dlg_hwnd, IDOK);
+-    if(hwnd)
+-    {
+-        int open_width, open_height;
+-        GetWindowRect(hwnd, &open_rc);
+-        open_width = open_rc.right - open_rc.left;
+-        open_height = open_rc.bottom - open_rc.top;
+-
+-        open_rc.left = dropdown_rc.left - open_width;
+-        open_rc.top = dropdown_rc.top;
+-        open_rc.right = open_rc.left + open_width;
+-        open_rc.bottom = open_rc.top + open_height;
+-    }
+-
+-    /* The filetype combobox. */
+-    hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILETYPE);
+-    if(hwnd)
+-    {
+-        int filetype_width, filetype_height;
+-        GetWindowRect(hwnd, &filetype_rc);
+-
+-        filetype_width = filetype_rc.right - filetype_rc.left;
+-        filetype_height = filetype_rc.bottom - filetype_rc.top;
++    open_rc.right = dropdown_rc.left;
++    open_rc.left = open_rc.right - neutron_button_width(This, hwnd, This->hfont_accent);
++    open_rc.top = dropdown_rc.top;
++    open_rc.bottom = dropdown_rc.bottom;
++
++    /* The filetype combobox and its label: a full-width field row above the buttons. */
++    if(show_filetype)
++    {
++        filetype_rc.bottom = cancel_rc.top - vgap;
++        filetype_rc.top = filetype_rc.bottom - field_h;
++        filetype_rc.left = margin + label_w + hgap;
++        filetype_rc.right = dialog_rc.right - margin;
++
++        filetypelabel_rc.left = margin;
++        filetypelabel_rc.right = margin + label_w;
++        filetypelabel_rc.top = filetype_rc.top + (field_h - text_h) / 2;
++        filetypelabel_rc.bottom = filetypelabel_rc.top + text_h;
+ 
+-        filetype_rc.right = cancel_rc.right;
+-
+-        filetype_rc.left = filetype_rc.right - filetype_width;
+-        filetype_rc.top = cancel_rc.top - filetype_height - vspacing;
+-        filetype_rc.bottom = filetype_rc.top + filetype_height;
+-
+-        if(!This->filterspec_count)
+-            filetype_rc.left = filetype_rc.right;
+-    }
+-
+-    /* Filename label. */
+-    hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILENAMESTATIC);
+-    if(hwnd)
+-    {
+-        int filetypelabel_width, filetypelabel_height;
+-        GetWindowRect(hwnd, &filenamelabel_rc);
+-
+-        filetypelabel_width = filenamelabel_rc.right - filenamelabel_rc.left;
+-        filetypelabel_height = filenamelabel_rc.bottom - filenamelabel_rc.top;
+-
+-        filenamelabel_rc.left = 160; /* FIXME */
+-        filenamelabel_rc.top = filetype_rc.top;
+-        filenamelabel_rc.right = filenamelabel_rc.left + filetypelabel_width;
+-        filenamelabel_rc.bottom = filenamelabel_rc.top + filetypelabel_height;
++        row_bottom = filetype_rc.top - vgap;
+     }
+-
+-    /* Filename edit box. */
+-    hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILENAME);
+-    if(hwnd)
++    else
+     {
+-        int filename_width, filename_height;
+-        GetWindowRect(hwnd, &filename_rc);
+-
+-        filename_width = filetype_rc.left - filenamelabel_rc.right - hspacing*2;
+-        filename_height = filename_rc.bottom - filename_rc.top;
++        SetRectEmpty(&filetype_rc);
++        SetRectEmpty(&filetypelabel_rc);
++        row_bottom = cancel_rc.top - vgap;
++    }
++
++    /* Filename field: the painted frame, the edit centred inside it, the label to its left. */
++    frame_rc.left = margin + label_w + hgap;
++    frame_rc.right = dialog_rc.right - margin;
++    frame_rc.bottom = row_bottom;
++    frame_rc.top = row_bottom - field_h;
++    This->rc_filename_frame = frame_rc;
++
++    filename_rc.left = frame_rc.left + field_pad;
++    filename_rc.right = frame_rc.right - field_pad;
++    filename_rc.top = frame_rc.top + (field_h - edit_h) / 2;
++    filename_rc.bottom = filename_rc.top + edit_h;
++
++    filenamelabel_rc.left = margin;
++    filenamelabel_rc.right = margin + label_w;
++    filenamelabel_rc.top = frame_rc.top + (field_h - text_h) / 2;
++    filenamelabel_rc.bottom = filenamelabel_rc.top + text_h;
+ 
+-        filename_rc.left = filenamelabel_rc.right + hspacing;
+-        filename_rc.top = filetype_rc.top;
+-        filename_rc.right = filename_rc.left + filename_width;
+-        filename_rc.bottom = filename_rc.top + filename_height;
+-    }
++    /* The custom controls */
++    customctrls_rc.left = margin;
++    customctrls_rc.right = dialog_rc.right - margin;
++    customctrls_rc.bottom = frame_rc.top - vgap;
++    cctrl_h = ctrl_container_resize(This, customctrls_rc.right - customctrls_rc.left);
++    customctrls_rc.top = customctrls_rc.bottom - cctrl_h;
+ 
++    /* The nav band: toolbar at the left, breadcrumb beside it, rule underneath. */
++    SetRect(&This->rc_navband, 0, 0, dialog_rc.right, nav_h);
+     hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAV_TOOLBAR);
+     if(hwnd)
+     {
+-        GetWindowRect(hwnd, &toolbar_rc);
+-        MapWindowPoints(NULL, This->dlg_hwnd, (POINT*)&toolbar_rc, 2);
++        /* TB_AUTOSIZE stretches the toolbar to the parent's width; size it to its buttons so
++         * it neither covers the breadcrumb nor inverts the breadcrumb rect */
++        RECT last = { 0 };
++        int count = SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0), tb_w, tb_h;
++        if(count > 0) SendMessageW(hwnd, TB_GETITEMRECT, count - 1, (LPARAM)&last);
++        tb_w = last.right + neutron_scale(2, This->dpi_x);
++        tb_h = last.bottom + neutron_scale(2, This->dpi_y);
++        toolbar_rc.left = margin - neutron_scale(2, This->dpi_x);
++        toolbar_rc.top = (nav_h - tb_h) / 2;
++        toolbar_rc.right = toolbar_rc.left + tb_w;
++        toolbar_rc.bottom = toolbar_rc.top + tb_h;
+     }
+-
+-    /* The custom controls */
+-    customctrls_rc.left = dialog_rc.left + hspacing;
+-    customctrls_rc.right = dialog_rc.right - hspacing;
+-    customctrls_rc.bottom = filename_rc.top - vspacing;
+-    customctrls_rc.top = customctrls_rc.bottom -
+-        ctrl_container_resize(This, customctrls_rc.right - customctrls_rc.left);
++    else
++        SetRect(&toolbar_rc, margin, 0, margin, nav_h);
++    SetRect(&This->rc_crumbs, toolbar_rc.right + neutron_scale(10, This->dpi_x), 0,
++            dialog_rc.right - margin, nav_h - 1);
+ 
+     /* The ExplorerBrowser control. */
+-    ebrowser_rc.left = dialog_rc.left + hspacing;
+-    ebrowser_rc.top = toolbar_rc.bottom + vspacing;
+-    ebrowser_rc.right = dialog_rc.right - hspacing;
+-    ebrowser_rc.bottom = customctrls_rc.top - vspacing;
++    ebrowser_rc.left = margin;
++    ebrowser_rc.top = nav_h + margin;
++    ebrowser_rc.right = dialog_rc.right - margin;
++    ebrowser_rc.bottom = (cctrl_h ? customctrls_rc.top - vgap : frame_rc.top) - margin;
+ 
+     /****
+      * Move everything to the right place.
+      */
+ 
+     /* FIXME: The Save Dialog uses a slightly different layout. */
+-    hdwp = BeginDeferWindowPos(7);
++    hdwp = BeginDeferWindowPos(11);
+ 
+     if(hdwp && This->peb)
+         IExplorerBrowser_SetRect(This->peb, &hdwp, ebrowser_rc);
+@@ -1925,9 +2491,17 @@
+                        SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     /* The default controls */
+-    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILETYPE)) )
+-        DeferWindowPos(hdwp, hwnd, NULL, filetype_rc.left, filetype_rc.top, 0, 0,
+-                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILETYPE)) && show_filetype)
++        DeferWindowPos(hdwp, hwnd, NULL, filetype_rc.left, filetype_rc.top,
++                       filetype_rc.right - filetype_rc.left,
++                       field_h + neutron_scale(160, This->dpi_y), /* the rest is the dropped list */
++                       SWP_NOZORDER | SWP_NOACTIVATE);
++
++    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILETYPESTATIC)) && show_filetype)
++        DeferWindowPos(hdwp, hwnd, NULL, filetypelabel_rc.left, filetypelabel_rc.top,
++                       filetypelabel_rc.right - filetypelabel_rc.left,
++                       filetypelabel_rc.bottom - filetypelabel_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILENAME)) )
+         DeferWindowPos(hdwp, hwnd, NULL, filename_rc.left, filename_rc.top,
+@@ -1935,26 +2509,39 @@
+                        SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_FILENAMESTATIC)) )
+-        DeferWindowPos(hdwp, hwnd, NULL, filenamelabel_rc.left, filenamelabel_rc.top, 0, 0,
+-                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++        DeferWindowPos(hdwp, hwnd, NULL, filenamelabel_rc.left, filenamelabel_rc.top,
++                       filenamelabel_rc.right - filenamelabel_rc.left,
++                       filenamelabel_rc.bottom - filenamelabel_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDOK)) )
+-        DeferWindowPos(hdwp, hwnd, NULL, open_rc.left, open_rc.top, 0, 0,
+-                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++        DeferWindowPos(hdwp, hwnd, NULL, open_rc.left, open_rc.top,
++                       open_rc.right - open_rc.left, open_rc.bottom - open_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp && This->hmenu_opendropdown && (hwnd = GetDlgItem(This->dlg_hwnd, psh1)))
+-        DeferWindowPos(hdwp, hwnd, NULL, dropdown_rc.left, dropdown_rc.top, 0, 0,
+-                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++        DeferWindowPos(hdwp, hwnd, NULL, dropdown_rc.left, dropdown_rc.top,
++                       dropdown_rc.right - dropdown_rc.left, dropdown_rc.bottom - dropdown_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDCANCEL)) )
+-        DeferWindowPos(hdwp, hwnd, NULL, cancel_rc.left, cancel_rc.top, 0, 0,
+-                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++        DeferWindowPos(hdwp, hwnd, NULL, cancel_rc.left, cancel_rc.top,
++                       cancel_rc.right - cancel_rc.left, cancel_rc.bottom - cancel_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
++
++    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAV_TOOLBAR)) )
++        DeferWindowPos(hdwp, hwnd, NULL, toolbar_rc.left, toolbar_rc.top,
++                       toolbar_rc.right - toolbar_rc.left, toolbar_rc.bottom - toolbar_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp)
+         EndDeferWindowPos(hdwp);
+     else
+         ERR("Failed to position dialog controls.\n");
+ 
++    /* the rule, breadcrumb and field frame are painted by the dialog itself */
++    InvalidateRect(This->dlg_hwnd, NULL, TRUE);
++
+     return;
+ }
+ 
+@@ -2022,7 +2609,11 @@
+     int height;
+     int navUpImgIndex;
+ 
+-    htoolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL, TBSTYLE_FLAT | WS_CHILD | WS_VISIBLE,
++    /* NEUTRON: TBSTYLE_TRANSPARENT so the band erases with the dialog ground; the buttons
++     * themselves are custom-drawn from on_wm_notify(). */
++    htoolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL,
++                               TBSTYLE_FLAT | TBSTYLE_TRANSPARENT | CCS_NODIVIDER | CCS_NORESIZE |
++                               WS_CHILD | WS_VISIBLE,
+                                0, 0, 0, 0,
+                                hwnd, (HMENU)IDC_NAV_TOOLBAR, NULL, NULL);
+ 
+@@ -2055,8 +2646,10 @@
+     button[2].iString = 0;
+ 
+     SendMessageW(htoolbar, TB_ADDBUTTONSW, 3, (LPARAM)button);
+-    height = MulDiv(24, This->dpi_y, USER_DEFAULT_SCREEN_DPI);
+-    SendMessageW(htoolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(height, height));
++    /* NEUTRON: the mockup's nav buttons are wider than tall (2.6em x 2em) */
++    height = MulDiv(26, This->dpi_y, USER_DEFAULT_SCREEN_DPI);
++    SendMessageW(htoolbar, TB_SETBUTTONSIZE, 0,
++                 MAKELPARAM(MulDiv(30, This->dpi_x, USER_DEFAULT_SCREEN_DPI), height));
+     SendMessageW(htoolbar, TB_AUTOSIZE, 0, 0);
+ }
+ 
+@@ -2124,11 +2717,14 @@
+     SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LPARAM)This);
+     This->dlg_hwnd = hwnd;
+ 
++    neutron_init_frame(This);
++
+     hitem = GetDlgItem(This->dlg_hwnd, pshHelp);
+     if(hitem) ShowWindow(hitem, SW_HIDE);
+ 
++    /* NEUTRON: the "Files of type:" label is shown with its combo, as in the mockup */
+     hitem = GetDlgItem(This->dlg_hwnd, IDC_FILETYPESTATIC);
+-    if(hitem) ShowWindow(hitem, SW_HIDE);
++    if(hitem && !This->filterspec_count) ShowWindow(hitem, SW_HIDE);
+ 
+     /* Fill filetypes combobox, or hide it. */
+     hitem = GetDlgItem(This->dlg_hwnd, IDC_FILETYPE);
+@@ -2247,6 +2843,8 @@
+     DeleteObject(This->hfont_opendropdown);
+     This->hfont_opendropdown = NULL;
+ 
++    neutron_destroy_frame(This);
++
+     return TRUE;
+ }
+ 
+@@ -2370,6 +2968,11 @@
+     case IDC_NAVFORWARD:      return on_browse_forward(This);
+     case IDC_FILETYPE:        return on_command_filetype(This, wparam, lparam);
+     case IDC_NAVUP:           return on_browse_up(This);
++    case IDC_FILENAME:
++        /* NEUTRON: the painted field frame shows focus */
++        if(HIWORD(wparam) == EN_SETFOCUS || HIWORD(wparam) == EN_KILLFOCUS)
++            InvalidateRect(This->dlg_hwnd, &This->rc_filename_frame, TRUE);
++        return FALSE;
+     default:                  TRACE("Unknown command.\n");
+     }
+     return FALSE;
+@@ -2388,6 +2991,30 @@
+     case WM_DESTROY:          return on_wm_destroy(This);
+     }
+ 
++    /* NEUTRON: the frame paints itself (see neutron_init_frame) */
++    if(!This || !This->hbr_ground)
++        return FALSE;
++
++    switch(umessage)
++    {
++    case WM_ERASEBKGND:       return on_wm_erasebkgnd(This, (HDC)wparam);
++    case WM_PAINT:            return on_wm_paint(This);
++    case WM_DRAWITEM:         return on_wm_drawitem(This, (const DRAWITEMSTRUCT *)lparam);
++    case WM_NOTIFY:           return on_wm_notify(This, lparam);
++    case WM_CTLCOLORDLG:
++    case WM_CTLCOLORBTN:
++        return (INT_PTR)This->hbr_ground;
++    case WM_CTLCOLORSTATIC:
++        SetTextColor((HDC)wparam, NEUTRON_LABEL_TEXT);
++        SetBkColor((HDC)wparam, NEUTRON_DLG_GROUND);
++        return (INT_PTR)This->hbr_ground;
++    case WM_CTLCOLOREDIT:
++    case WM_CTLCOLORLISTBOX:
++        SetTextColor((HDC)wparam, NEUTRON_FIELD_TEXT);
++        SetBkColor((HDC)wparam, NEUTRON_FIELD_FILL);
++        return (INT_PTR)This->hbr_field;
++    }
++
+     return FALSE;
+ }
+ 
+@@ -3563,6 +4190,10 @@
+         This->psi_folder = NULL;
+     }
+ 
++    /* NEUTRON: the breadcrumb follows the folder */
++    neutron_update_crumbs(This);
++    if(This->dlg_hwnd) InvalidateRect(This->dlg_hwnd, &This->rc_navband, TRUE);
++
+     events_OnFolderChange(This);
+ 
+     return S_OK;
+--- a/dlls/explorerframe/nstc.c
++++ b/dlls/explorerframe/nstc.c
+@@ -31,6 +31,7 @@
+ 
+ #include "wine/list.h"
+ #include "wine/debug.h"
++#include "wine/neutronui.h"
+ 
+ #include "explorerframe_main.h"
+ 
+@@ -489,7 +490,12 @@
+     if(This->style & NSTCS_DIMMEDCHECKBOXES)
+         treeview_ex_style |= TVS_EX_DIMMEDCHECKBOXES;
+ 
++    /* NEUTRON: chevrons, grey selection, rounded rows, panel colours -- see neutronui.h */
++    treeview_ex_style |= TVS_EX_NEUTRON_SHELL;
++
+     SendMessageW(This->hwnd_tv, TVM_SETEXTENDEDSTYLE, treeview_ex_style, 0xffff);
++    SendMessageW(This->hwnd_tv, TVM_SETBKCOLOR, 0, NEUTRON_PANEL_FILL);
++    SendMessageW(This->hwnd_tv, TVM_SETTEXTCOLOR, 0, NEUTRON_TREE_TEXT);
+ 
+     if(Shell_GetImageLists(NULL, &ShellSmallIconList))
+     {
+--- a/dlls/shell32/ebrowser.c
++++ b/dlls/shell32/ebrowser.c
+@@ -27,6 +27,8 @@
+ 
+ #include "wine/list.h"
+ #include "wine/debug.h"
++#include "wine/neutronui.h"
++#include "shresdef.h"
+ #include "debughlp.h"
+ 
+ #include "shell32_main.h"
+@@ -36,7 +38,7 @@
+ 
+ #define SPLITTER_WIDTH 2
+ #define NP_MIN_WIDTH 60
+-#define NP_DEFAULT_WIDTH 150
++#define NP_DEFAULT_WIDTH 170   /* NEUTRON: was 150; the mockup's tree pane is ~26% of the dialog */
+ #define SV_MIN_WIDTH 150
+ 
+ typedef struct _event_client {
+@@ -83,6 +85,7 @@
+     int travellog_count;
+ 
+     int dpix;
++    HFONT hfont_section;        /* NEUTRON: the "PLACES" label above the tree */
+ 
+     IShellView *psv;
+     RECT sv_rc;
+@@ -270,11 +273,31 @@
+ /**************************************************************************
+  * Helper functions
+  */
++/*
++ * NEUTRON: the two panes are drawn as rounded panels (fill #1e1e1e, 1px #303030 border,
++ * radius 4) separated by a gap, with the child windows inset so the rounded corners show.
++ * navpane.rc and sv_rc are the PANEL rectangles; panel_inner() gives the child's.
++ */
++#define NEUTRON_PANE_GAP    7   /* logical px between the two panels */
++#define NEUTRON_PANE_INSET  4   /* child inset from the panel edge; >= the corner radius */
++#define NEUTRON_SECTION_H   22  /* room for the section label above the tree */
++
++static void panel_inner(const ExplorerBrowserImpl *This, const RECT *panel, RECT *inner, BOOL section)
++{
++    int inset = neutron_scale(NEUTRON_PANE_INSET, This->dpix);
++    *inner = *panel;
++    InflateRect(inner, -inset, -inset);
++    if (section) inner->top += neutron_scale(NEUTRON_SECTION_H, This->dpix) - inset;
++    if (inner->right < inner->left) inner->right = inner->left;
++    if (inner->bottom < inner->top) inner->bottom = inner->top;
++}
++
+ static void update_layout(ExplorerBrowserImpl *This)
+ {
+     RECT rc;
+     INT navpane_width_actual;
+     INT shellview_width_actual;
++    INT gap = neutron_scale(NEUTRON_PANE_GAP, This->dpix);
+     int np_min_width = MulDiv(NP_MIN_WIDTH, This->dpix, USER_DEFAULT_SCREEN_DPI);
+     int sv_min_width = MulDiv(SV_MIN_WIDTH, This->dpix, USER_DEFAULT_SCREEN_DPI);
+     TRACE("%p (navpane: %d, EBO_SHOWFRAMES: %d)\n",
+@@ -287,7 +310,7 @@
+     else
+         navpane_width_actual = 0;
+ 
+-    shellview_width_actual = rc.right - navpane_width_actual;
++    shellview_width_actual = rc.right - navpane_width_actual - (navpane_width_actual ? gap : 0);
+     if(shellview_width_actual < sv_min_width && navpane_width_actual)
+     {
+         INT missing_width = sv_min_width - shellview_width_actual;
+@@ -300,7 +323,7 @@
+         else
+         {
+             /* Hide the navpane */
+-            shellview_width_actual += navpane_width_actual;
++            shellview_width_actual += navpane_width_actual + gap;
+             navpane_width_actual = 0;
+         }
+     }
+@@ -320,22 +343,25 @@
+     else
+         ZeroMemory(&This->navpane.rc, sizeof(RECT));
+ 
+-    SetRect(&This->sv_rc, navpane_width_actual, 0, navpane_width_actual + shellview_width_actual,
+-            rc.bottom);
++    SetRect(&This->sv_rc, rc.right - shellview_width_actual, 0, rc.right, rc.bottom);
+ }
+ 
+ static void size_panes(ExplorerBrowserImpl *This)
+ {
+     int splitter_width = MulDiv(SPLITTER_WIDTH, This->dpix, USER_DEFAULT_SCREEN_DPI);
++    int gap = This->sv_rc.left - This->navpane.rc.right;
++    RECT inner;
++
++    /* NEUTRON: the splitter lives in the gap between the panels */
+     MoveWindow(This->navpane.hwnd_splitter,
+-               This->navpane.rc.right - splitter_width, This->navpane.rc.top,
++               This->navpane.rc.right + max(0, (gap - splitter_width) / 2), This->navpane.rc.top,
+                splitter_width, This->navpane.rc.bottom - This->navpane.rc.top,
+                TRUE);
+ 
+-    MoveWindow(This->hwnd_sv,
+-               This->sv_rc.left, This->sv_rc.top,
+-               This->sv_rc.right - This->sv_rc.left, This->sv_rc.bottom - This->sv_rc.top,
+-               TRUE);
++    panel_inner(This, &This->sv_rc, &inner, FALSE);
++    MoveWindow(This->hwnd_sv, inner.left, inner.top,
++               inner.right - inner.left, inner.bottom - inner.top, TRUE);
++    InvalidateRect(This->hwnd_main, NULL, TRUE);
+ }
+ 
+ static HRESULT create_new_shellview(ExplorerBrowserImpl *This, IShellItem *psi)
+@@ -345,6 +371,7 @@
+     IShellView *psv;
+     HWND hwnd_new;
+     HRESULT hr;
++    RECT inner;
+ 
+     TRACE("%p, %p\n", This, psi);
+ 
+@@ -361,7 +388,8 @@
+             }
+ 
+             This->fs.fFlags |= FWF_USESEARCHFOLDER | FWF_FULLROWSELECT | FWF_NOCLIENTEDGE;
+-            hr = IShellView_CreateViewWindow(psv, This->psv, &This->fs, psb, &This->sv_rc, &hwnd_new);
++            panel_inner(This, &This->sv_rc, &inner, FALSE);   /* NEUTRON: inside the panel */
++            hr = IShellView_CreateViewWindow(psv, This->psv, &This->fs, psb, &inner, &hwnd_new);
+             if(SUCCEEDED(hr))
+             {
+                 /* Replace the old shellview */
+@@ -607,7 +635,31 @@
+                 hr = SHCreateShellItem(NULL, NULL, pidl, &psi);
+                 if(SUCCEEDED(hr))
+                 {
+-                    hr = INameSpaceTreeControl2_AppendRoot(pnstc2, psi, SHCONTF_NONFOLDERS, NSTCRS_VISIBLE, NULL);
++                    /* NEUTRON: an empty Favorites root is a dead row at the top of the
++                     * tree; only list it when there is something under it. */
++                    IShellFolder *psf_fav;
++                    BOOL has_items = TRUE;
++
++                    /* (BHID_EnumItems is not implemented by Wine's shell item; go through
++                     * the folder's own enumerator) */
++                    if(SUCCEEDED(IShellItem_BindToHandler(psi, NULL, &BHID_SFObject,
++                                                          &IID_IShellFolder, (void**)&psf_fav)))
++                    {
++                        IEnumIDList *penum;
++                        has_items = FALSE;
++                        if(IShellFolder_EnumObjects(psf_fav, NULL, SHCONTF_FOLDERS | SHCONTF_NONFOLDERS,
++                                                    &penum) == S_OK && penum)
++                        {
++                            LPITEMIDLIST first;
++                            ULONG fetched = 0;
++                            has_items = IEnumIDList_Next(penum, 1, &first, &fetched) == S_OK && fetched;
++                            if(has_items) ILFree(first);
++                            IEnumIDList_Release(penum);
++                        }
++                        IShellFolder_Release(psf_fav);
++                    }
++                    if(has_items)
++                        hr = INameSpaceTreeControl2_AppendRoot(pnstc2, psi, SHCONTF_NONFOLDERS, NSTCRS_VISIBLE, NULL);
+                     IShellItem_Release(psi);
+                 }
+                 ILFree(pidl);
+@@ -644,16 +696,18 @@
+ {
+     UINT height, width;
+     int splitter_width = MulDiv(SPLITTER_WIDTH, This->dpix, USER_DEFAULT_SCREEN_DPI);
++    RECT inner;
+ 
+     TRACE("%p\n", This);
+ 
+-    width = This->navpane.rc.right - This->navpane.rc.left - splitter_width;
+-    height = This->navpane.rc.bottom - This->navpane.rc.top;
++    /* NEUTRON: the tree sits inside its panel, under the section label; the splitter is no
++     * longer part of the pane rectangle */
++    (void)splitter_width;
++    panel_inner(This, &This->navpane.rc, &inner, TRUE);
++    width = inner.right - inner.left;
++    height = inner.bottom - inner.top;
+ 
+-    MoveWindow(This->navpane.hwnd_nstc,
+-               This->navpane.rc.left, This->navpane.rc.top,
+-               width, height,
+-               TRUE);
++    MoveWindow(This->navpane.hwnd_nstc, inner.left, inner.top, width, height, TRUE);
+ 
+     return FALSE;
+ }
+@@ -678,6 +732,16 @@
+     case WM_LBUTTONDOWN:      return navpane_splitter_beginresize(This, hWnd, lParam);
+     case WM_MOUSEMOVE:        return navpane_splitter_resizing(This, hWnd, lParam);
+     case WM_LBUTTONUP:        return navpane_splitter_endresize(This, hWnd, lParam);
++    case WM_ERASEBKGND:
++    {
++        /* NEUTRON: the splitter is a strip of the dialog ground, not a COLOR_3DFACE bar */
++        HBRUSH brush = CreateSolidBrush(NEUTRON_DLG_GROUND);
++        RECT rc;
++        GetClientRect(hWnd, &rc);
++        FillRect((HDC)wParam, &rc, brush);
++        DeleteObject(brush);
++        return 1;
++    }
+     default:
+         return DefWindowProcW(hWnd, uMessage, wParam, lParam);
+     }
+@@ -737,6 +801,74 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON: the browser's own surface is the dialog ground with two rounded panels on it */
++static LRESULT main_on_wm_erasebkgnd(ExplorerBrowserImpl *This, HDC hdc)
++{
++    HBRUSH brush = CreateSolidBrush(NEUTRON_DLG_GROUND);
++    RECT rc;
++
++    GetClientRect(This->hwnd_main, &rc);
++    FillRect(hdc, &rc, brush);
++    DeleteObject(brush);
++    return 1;
++}
++
++static HFONT neutron_section_font(ExplorerBrowserImpl *This)
++{
++    HFONT base;
++    LOGFONTW lf;
++
++    if(This->hfont_section) return This->hfont_section;
++
++    base = (HFONT)SendMessageW(GetParent(This->hwnd_main), WM_GETFONT, 0, 0);
++    if(!base) base = GetStockObject(DEFAULT_GUI_FONT);
++    if(!GetObjectW(base, sizeof(lf), &lf)) return NULL;
++
++    /* the mockup's .tsec is smaller caps, but the dialog font's embedded bitmap sizes turn a
++     * shrunk Tahoma into "PL ACES"; the full-size face with 1px tracking reads as the header
++     * does */
++    lf.lfWeight = FW_MEDIUM;
++    This->hfont_section = CreateFontIndirectW(&lf);
++    return This->hfont_section;
++}
++
++static LRESULT main_on_wm_paint(ExplorerBrowserImpl *This)
++{
++    PAINTSTRUCT ps;
++    HDC hdc = BeginPaint(This->hwnd_main, &ps);
++    int radius = neutron_scale(NEUTRON_PANEL_RADIUS, This->dpix);
++
++    if(!IsRectEmpty(&This->navpane.rc))
++    {
++        WCHAR label[64];
++        HFONT font, old_font = NULL;
++        RECT rc = This->navpane.rc;
++
++        neutron_round_rect(hdc, &rc, NEUTRON_PANEL_FILL, NEUTRON_PANEL_BORDER, radius);
++
++        if(LoadStringW(shell32_hInstance, IDS_NEUTRON_PLACES, label, ARRAY_SIZE(label)) &&
++           (font = neutron_section_font(This)))
++        {
++            int pad = neutron_scale(NEUTRON_PANE_INSET + 6, This->dpix);
++            rc.left += pad;
++            rc.right -= pad;
++            rc.top += neutron_scale(NEUTRON_PANE_INSET, This->dpix);
++            rc.bottom = This->navpane.rc.top + neutron_scale(NEUTRON_SECTION_H, This->dpix);
++            old_font = SelectObject(hdc, font);
++            SetTextColor(hdc, NEUTRON_SECTION_TEXT);
++            neutron_draw_caps(hdc, label, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
++                              1 /* one device px: scaled tracking reads as word gaps */);
++            SelectObject(hdc, old_font);
++        }
++    }
++
++    if(!IsRectEmpty(&This->sv_rc))
++        neutron_round_rect(hdc, &This->sv_rc, NEUTRON_PANEL_FILL, NEUTRON_PANEL_BORDER, radius);
++
++    EndPaint(This->hwnd_main, &ps);
++    return 0;
++}
++
+ static LRESULT main_on_cwm_getishellbrowser(ExplorerBrowserImpl *This)
+ {
+     return (LRESULT)&This->IShellBrowser_iface;
+@@ -750,6 +882,8 @@
+     {
+     case WM_CREATE:           return main_on_wm_create(hWnd, (CREATESTRUCTW*)lParam);
+     case WM_SIZE:             return main_on_wm_size(This);
++    case WM_ERASEBKGND:       return main_on_wm_erasebkgnd(This, (HDC)wParam);
++    case WM_PAINT:            return main_on_wm_paint(This);
+     case CWM_GETISHELLBROWSER: return main_on_cwm_getishellbrowser(This);
+     default:                  return DefWindowProcW(hWnd, uMessage, wParam, lParam);
+     }
+@@ -915,6 +1049,8 @@
+     ILFree(This->current_pidl);
+     This->current_pidl = NULL;
+ 
++    if(This->hfont_section) DeleteObject(This->hfont_section);   /* NEUTRON */
++    This->hfont_section = NULL;
+     DestroyWindow(This->hwnd_main);
+     This->destroyed = TRUE;
+ 
+--- a/dlls/shell32/shell32.rc
++++ b/dlls/shell32/shell32.rc
+@@ -130,7 +130,7 @@
+ STRINGTABLE
+ {
+         /* columns in the shellview */
+-	IDS_SHV_COLUMN1		"File"
++	IDS_SHV_COLUMN1		"Name" /* NEUTRON: was "File"; Explorer calls it Name */
+ 	IDS_SHV_COLUMN2		"Size"
+ 	IDS_SHV_COLUMN3		"Type"
+ 	IDS_SHV_COLUMN4		"Modified"
+@@ -141,6 +141,9 @@
+ 	IDS_SHV_COLUMN9		"Comments"
+ 	IDS_SHV_COLUMN_DELFROM	"Original location"
+ 	IDS_SHV_COLUMN_DELDATE	"Date deleted"
++
++	/* NEUTRON: section label above the folder tree */
++	IDS_NEUTRON_PLACES	"Places"
+ 	IDS_SHV_COL_DOCS	"Documents"
+ 	IDS_SHV_COL_STATUS	"Status"
+ 	IDS_SHV_COL_LOCATION	"Location"
+--- a/dlls/shell32/shfldr_desktop.c
++++ b/dlls/shell32/shfldr_desktop.c
+@@ -82,11 +82,12 @@
+ 
+ static const shvheader desktop_header[] =
+ {
+-    { &FMTID_Storage, PID_STG_NAME, IDS_SHV_COLUMN1, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 15 },
++    /* NEUTRON: same treatment as shfldr_fs.c -- text columns left, Attributes off by default */
++    { &FMTID_Storage, PID_STG_NAME, IDS_SHV_COLUMN1, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_LEFT,  15 },
+     { &FMTID_Storage, PID_STG_SIZE, IDS_SHV_COLUMN2, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 10 },
+-    { &FMTID_Storage, PID_STG_STORAGETYPE, IDS_SHV_COLUMN3, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 10 },
+-    { &FMTID_Storage, PID_STG_WRITETIME, IDS_SHV_COLUMN4, SHCOLSTATE_TYPE_DATE | SHCOLSTATE_ONBYDEFAULT, LVCFMT_RIGHT, 12 },
+-    { &FMTID_Storage, PID_STG_ATTRIBUTES, IDS_SHV_COLUMN5, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 5  },
++    { &FMTID_Storage, PID_STG_STORAGETYPE, IDS_SHV_COLUMN3, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_LEFT,  10 },
++    { &FMTID_Storage, PID_STG_WRITETIME, IDS_SHV_COLUMN4, SHCOLSTATE_TYPE_DATE | SHCOLSTATE_ONBYDEFAULT, LVCFMT_LEFT,  12 },
++    { &FMTID_Storage, PID_STG_ATTRIBUTES, IDS_SHV_COLUMN5, SHCOLSTATE_TYPE_STR,                           LVCFMT_LEFT,  5  },
+ };
+ 
+ /**************************************************************************
+--- a/dlls/shell32/shfldr_fs.c
++++ b/dlls/shell32/shfldr_fs.c
+@@ -174,11 +174,15 @@
+ 
+ static const shvheader GenericSFHeader[] =
+ {
+-    { &FMTID_Storage, PID_STG_NAME,        IDS_SHV_COLUMN1, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 15 },
++    /* NEUTRON: Name, Type and Modified read left-to-right like Explorer's; only Size is a
++     * number. Attributes is not on by default (it is not in Explorer's default Details view
++     * either) -- shlview.c gives such columns no width, so the file list shows the four the
++     * mockup does and the name column takes the slack. */
++    { &FMTID_Storage, PID_STG_NAME,        IDS_SHV_COLUMN1, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_LEFT,  15 },
+     { &FMTID_Storage, PID_STG_SIZE,        IDS_SHV_COLUMN2, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 10 },
+-    { &FMTID_Storage, PID_STG_STORAGETYPE, IDS_SHV_COLUMN3, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 10 },
+-    { &FMTID_Storage, PID_STG_WRITETIME,   IDS_SHV_COLUMN4, SHCOLSTATE_TYPE_DATE | SHCOLSTATE_ONBYDEFAULT, LVCFMT_RIGHT, 12 },
+-    { &FMTID_Storage, PID_STG_ATTRIBUTES,  IDS_SHV_COLUMN5, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_RIGHT, 5  },
++    { &FMTID_Storage, PID_STG_STORAGETYPE, IDS_SHV_COLUMN3, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT,  LVCFMT_LEFT,  10 },
++    { &FMTID_Storage, PID_STG_WRITETIME,   IDS_SHV_COLUMN4, SHCOLSTATE_TYPE_DATE | SHCOLSTATE_ONBYDEFAULT, LVCFMT_LEFT,  12 },
++    { &FMTID_Storage, PID_STG_ATTRIBUTES,  IDS_SHV_COLUMN5, SHCOLSTATE_TYPE_STR,                           LVCFMT_LEFT,  5  },
+ };
+ 
+ #define GENERICSHELLVIEWCOLUMNS 5
+--- a/dlls/shell32/shfldr_mycomp.c
++++ b/dlls/shell32/shfldr_mycomp.c
+@@ -75,8 +75,9 @@
+ 
+ static const shvheader mycomputer_header[] =
+ {
+-    { &FMTID_Storage, PID_STG_NAME, IDS_SHV_COLUMN1, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT, LVCFMT_RIGHT, 15 },
+-    { &FMTID_Storage, PID_STG_STORAGETYPE, IDS_SHV_COLUMN3, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT, LVCFMT_RIGHT, 10 },
++    /* NEUTRON: text columns read left-to-right, as in shfldr_fs.c */
++    { &FMTID_Storage, PID_STG_NAME, IDS_SHV_COLUMN1, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT, LVCFMT_LEFT, 15 },
++    { &FMTID_Storage, PID_STG_STORAGETYPE, IDS_SHV_COLUMN3, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT, LVCFMT_LEFT, 10 },
+     { NULL, 0, IDS_SHV_COLUMN6, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT, LVCFMT_RIGHT, 10 },
+     { NULL, 0, IDS_SHV_COLUMN7, SHCOLSTATE_TYPE_STR | SHCOLSTATE_ONBYDEFAULT, LVCFMT_RIGHT, 10 },
+ };
+--- a/dlls/shell32/shlview.c
++++ b/dlls/shell32/shlview.c
+@@ -56,6 +56,7 @@
+ #include "shobjidl.h"
+ #include "shresdef.h"
+ #include "wine/debug.h"
++#include "wine/neutronui.h"
+ 
+ #include "docobj.h"
+ #include "pidl.h"
+@@ -401,6 +402,18 @@
+                          LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
+                          LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+ 
++        /* NEUTRON: the shell look -- rounded inset rows, dim detail columns, panel colours.
++         * Opt-in through a private extended style so no other listview is affected; the
++         * desktop keeps its transparent treatment below. */
++        if (!(This->FolderSettings.fFlags & FWF_DESKTOP))
++        {
++            SendMessageW(This->hWndList, LVM_SETEXTENDEDLISTVIEWSTYLE,
++                         LVS_EX_NEUTRON_SHELL, LVS_EX_NEUTRON_SHELL);
++            SendMessageW(This->hWndList, LVM_SETBKCOLOR, 0, NEUTRON_PANEL_FILL);
++            SendMessageW(This->hWndList, LVM_SETTEXTBKCOLOR, 0, NEUTRON_PANEL_FILL);
++            SendMessageW(This->hWndList, LVM_SETTEXTCOLOR, 0, NEUTRON_LIST_TEXT);
++        }
++
+         This->ListViewSortInfo.bIsAscending = TRUE;
+         This->ListViewSortInfo.nHeaderID = -1;
+         This->ListViewSortInfo.nLastHeaderID = -1;
+@@ -424,6 +437,35 @@
+ }
+ 
+ /**********************************************************
++* ShellView_FitNameColumn()
++*
++* NEUTRON: in details view the name column takes whatever width the other columns leave, so
++* the list has no dead area past the last column and no horizontal scrollbar for the
++* default set. Width only; nothing about the items changes.
++*/
++static int GetDeviceCaps_dpi(HWND hwnd)
++{
++    return neutron_window_dpi(hwnd);
++}
++
++static void ShellView_FitNameColumn(IShellViewImpl *This)
++{
++    RECT rc;
++    int i, used = 0, width, min_width;
++
++    if (!This->hWndList || This->columns < 2) return;
++    if ((GetWindowLongW(This->hWndList, GWL_STYLE) & LVS_TYPEMASK) != LVS_REPORT) return;
++
++    GetClientRect(This->hWndList, &rc);
++    for (i = 1; i < This->columns; i++)
++        used += (int)SendMessageW(This->hWndList, LVM_GETCOLUMNWIDTH, i, 0);
++    min_width = MulDiv(120, GetDeviceCaps_dpi(This->hWndList), USER_DEFAULT_SCREEN_DPI);
++    width = max(rc.right - rc.left - used, min_width);
++    if (width != (int)SendMessageW(This->hWndList, LVM_GETCOLUMNWIDTH, 0, 0))
++        SendMessageW(This->hWndList, LVM_SETCOLUMNWIDTH, 0, width);
++}
++
++/**********************************************************
+ * ShellView_InitList()
+ *
+ * - adds all needed columns to the shellview
+@@ -469,6 +511,8 @@
+ 
+     for (This->columns = 0;; This->columns++)
+     {
++        SHCOLSTATEF state = SHCOLSTATE_ONBYDEFAULT;
++
+         if (This->pSF2Parent)
+             hr = IShellFolder2_GetDetailsOf(This->pSF2Parent, NULL, This->columns, &sd);
+         else
+@@ -477,11 +521,26 @@
+ 
+         lvColumn.fmt = sd.fmt;
+         lvColumn.cx = MulDiv(sd.cxChar, tm.tmAveCharWidth * 3, 2); /* chars->pixel */
++        /* NEUTRON: a column the folder does not show by default (Attributes) keeps its
++         * index -- the subitem texts are fetched by column index -- but gets no width, so
++         * it neither takes space nor leaves a dead header past the last real column. */
++        if (This->pSF2Parent &&
++            SUCCEEDED(IShellFolder2_GetDefaultColumnState(This->pSF2Parent, This->columns, &state)) &&
++            !(state & SHCOLSTATE_ONBYDEFAULT))
++            lvColumn.cx = 0;
+         StrRetToBufW(&sd.str, NULL, nameW, ARRAY_SIZE(nameW));
+         SendMessageW(This->hWndList, LVM_INSERTCOLUMNW, This->columns, (LPARAM)&lvColumn);
+     }
+ 
+     if (details) IShellDetails_Release(details);
++
++    /* NEUTRON: the column header draws as quiet caps labels on the panel fill */
++    {
++        HWND header = (HWND)SendMessageW(This->hWndList, LVM_GETHEADER, 0, 0);
++        if (header)
++            SetWindowLongW(header, GWL_STYLE, GetWindowLongW(header, GWL_STYLE) | HDS_NEUTRON_SHELL);
++    }
++    ShellView_FitNameColumn(This);
+ }
+ 
+ /* LVM_SORTITEMS callback used when initially inserting items */
+@@ -1123,6 +1182,7 @@
+ 	if(This->hWndList)
+ 	{
+ 	  MoveWindow(This->hWndList, 0, 0, wWidth, wHeight, TRUE);
++	  ShellView_FitNameColumn(This);   /* NEUTRON */
+ 	}
+ 
+ 	return S_OK;
+--- a/dlls/shell32/shresdef.h
++++ b/dlls/shell32/shresdef.h
+@@ -156,6 +156,9 @@
+ /* Note: this string is referenced from the registry*/
+ #define IDS_RECYCLEBIN_FOLDER_NAME   8964
+ 
++/* NEUTRON: section label above the folder tree in the ExplorerBrowser pane */
++#define IDS_NEUTRON_PLACES           4200
++
+ /* Properties dialog */
+ #define IDD_FILE_PROPERTIES        8
+ #define IDD_FOLDER_PROPERTIES      9
+--- a/include/wine/neutronui.h
++++ b/include/wine/neutronui.h
+@@ -0,0 +1,196 @@
++/*
++ * NEUTRON: the fixed palette and shared drawing helpers for the surfaces Neutron restyles
++ * (the Common Item Dialog frame in comdlg32, the ExplorerBrowser panels in shell32, the
++ * namespace tree in explorerframe, and the opt-in "shell" looks in comctl32's listview,
++ * treeview and header).
++ *
++ * WHY A FIXED PALETTE AND NOT GetSysColor. Two independent theming systems exist in every
++ * prefix: the classic Control Panel\Colors palette (which the Neutron theme drives) and the
++ * visual style (which upstream wine.inf turns on and which paints comctl32 v6 controls from
++ * Aero's own light colour table). Deriving these surfaces from either one made the dialog's
++ * look depend on prefix state, and a restyle that darkens the global button palette makes the
++ * Adobe apps' own labels unreadable (Lightroom's About box went black on black -- see
++ * neutron-zzzzzzzzzq-frame-border-palette). So these surfaces paint from THIS table, in our
++ * own code, and look the same straight after `neutron prefix provision` regardless of theme.
++ *
++ * The values are the approved mockup's (itemdlg.html, .dlg CSS block), verbatim. Keep them
++ * in one place: the hover colour drifting between three controls is exactly the failure
++ * COMCTL32_HoverColor() was written to stop.
++ *
++ * Everything here is header-only so comdlg32, shell32, explorerframe and comctl32 (both
++ * versions) share it without a new import.
++ */
++
++#ifndef __WINE_NEUTRONUI_H
++#define __WINE_NEUTRONUI_H
++
++#include "windef.h"
++#include "wingdi.h"
++#include "winuser.h"
++#include "commctrl.h"   /* CLR_NONE */
++
++/* dialog frame */
++#define NEUTRON_DLG_GROUND      RGB(0x23, 0x23, 0x23)   /* dialog client background        */
++#define NEUTRON_NAV_RULE        RGB(0x31, 0x31, 0x31)   /* 1px rule under the nav band     */
++#define NEUTRON_NAV_HOT         RGB(0x33, 0x33, 0x33)   /* nav button hover/pressed fill   */
++#define NEUTRON_NAV_PRESSED     RGB(0x3b, 0x3b, 0x3b)
++#define NEUTRON_CRUMB_DIM       RGB(0x9a, 0xa0, 0xa6)   /* breadcrumb ancestors + separators */
++#define NEUTRON_CRUMB_CURRENT   RGB(0xdc, 0xdc, 0xdc)   /* breadcrumb current folder       */
++#define NEUTRON_LABEL_TEXT      RGB(0xb4, 0xb4, 0xb4)   /* "File name:" style labels       */
++
++/* panels (tree and list) */
++#define NEUTRON_PANEL_FILL      RGB(0x1e, 0x1e, 0x1e)
++#define NEUTRON_PANEL_BORDER    RGB(0x30, 0x30, 0x30)
++#define NEUTRON_PANEL_RADIUS    4                       /* logical px                       */
++#define NEUTRON_SECTION_TEXT    RGB(0x7b, 0x7b, 0x7b)   /* "PLACES" style section labels   */
++
++/* tree rows */
++#define NEUTRON_TREE_TEXT       RGB(0xcf, 0xcf, 0xcf)
++#define NEUTRON_TREE_SELECTED   RGB(0x2f, 0x2f, 0x2f)
++#define NEUTRON_TREE_SELTEXT    RGB(0xff, 0xff, 0xff)
++#define NEUTRON_TREE_HOVER      RGB(0x27, 0x27, 0x27)
++#define NEUTRON_CHEVRON         RGB(0x8a, 0x8a, 0x8a)
++#define NEUTRON_CHEVRON_OPEN    RGB(0xc8, 0xc8, 0xc8)
++
++/* column header */
++#define NEUTRON_HEADER_TEXT     RGB(0x7f, 0x7f, 0x7f)
++#define NEUTRON_HEADER_HOT      RGB(0xa8, 0xa8, 0xa8)
++#define NEUTRON_HEADER_RULE     RGB(0x2c, 0x2c, 0x2c)
++
++/* list rows */
++#define NEUTRON_LIST_TEXT       RGB(0xdc, 0xdc, 0xdc)
++#define NEUTRON_LIST_DIM        RGB(0xa3, 0xa3, 0xa3)   /* Size / Type / Modified columns  */
++#define NEUTRON_LIST_SELECTED   RGB(0x30, 0x96, 0xfa)
++#define NEUTRON_LIST_SELTEXT    RGB(0xff, 0xff, 0xff)
++#define NEUTRON_LIST_SELDIM     RGB(0xd8, 0xe9, 0xfd)
++#define NEUTRON_LIST_HOVER      RGB(0x29, 0x29, 0x29)
++#define NEUTRON_ROW_RADIUS      3                       /* logical px                       */
++#define NEUTRON_ROW_INSET       4                       /* logical px, from the panel edge  */
++
++/* fields (filename edit, filter combo) */
++#define NEUTRON_FIELD_FILL      RGB(0x17, 0x17, 0x17)
++#define NEUTRON_FIELD_BORDER    RGB(0x3a, 0x3a, 0x3a)
++#define NEUTRON_FIELD_FOCUS     RGB(0x5a, 0x5a, 0x5a)
++#define NEUTRON_FIELD_TEXT      RGB(0xe6, 0xe6, 0xe6)
++#define NEUTRON_FIELD_DIMTEXT   RGB(0xcf, 0xcf, 0xcf)
++#define NEUTRON_FIELD_GLYPH     RGB(0xb9, 0xbe, 0xc4)
++#define NEUTRON_FIELD_RADIUS    4
++
++/* buttons */
++#define NEUTRON_BTN_FILL        RGB(0x32, 0x32, 0x32)
++#define NEUTRON_BTN_HOT         RGB(0x3a, 0x3a, 0x3a)
++#define NEUTRON_BTN_PRESSED     RGB(0x2a, 0x2a, 0x2a)
++#define NEUTRON_BTN_BORDER      RGB(0x3f, 0x3f, 0x3f)
++#define NEUTRON_BTN_TEXT        RGB(0xe4, 0xe4, 0xe4)
++#define NEUTRON_ACCENT          RGB(0x30, 0x96, 0xfa)
++#define NEUTRON_ACCENT_HOT      RGB(0x4a, 0xa4, 0xfb)
++#define NEUTRON_ACCENT_PRESSED  RGB(0x25, 0x82, 0xe0)
++#define NEUTRON_ACCENT_TEXT     RGB(0xff, 0xff, 0xff)
++#define NEUTRON_BTN_RADIUS      4
++
++/* scale a 96-dpi logical size to the given dpi */
++static inline int neutron_scale(int px, int dpi)
++{
++    return MulDiv(px, dpi ? dpi : USER_DEFAULT_SCREEN_DPI, USER_DEFAULT_SCREEN_DPI);
++}
++
++/* DPI of the device a window is on, as the dialog code computes it */
++static inline int neutron_window_dpi(HWND hwnd)
++{
++    HDC hdc = GetDC(hwnd);
++    int dpi = hdc ? GetDeviceCaps(hdc, LOGPIXELSX) : USER_DEFAULT_SCREEN_DPI;
++    if (hdc) ReleaseDC(hwnd, hdc);
++    return dpi ? dpi : USER_DEFAULT_SCREEN_DPI;
++}
++
++/*
++ * Fill a rounded rectangle, optionally with a 1px border. `radius` and the border are in
++ * DEVICE pixels -- callers scale with neutron_scale() first. GDI's RoundRect draws the pen
++ * inside the rectangle and excludes the right/bottom edge, exactly like FillRect.
++ */
++static inline void neutron_round_rect(HDC hdc, const RECT *rc, COLORREF fill, COLORREF border,
++                                      int radius)
++{
++    HBRUSH brush = CreateSolidBrush(fill), old_brush;
++    HPEN pen = CreatePen(PS_SOLID, 1, border == CLR_NONE ? fill : border), old_pen;
++
++    old_brush = SelectObject(hdc, brush);
++    old_pen = SelectObject(hdc, pen);
++    if (radius > 0)
++        RoundRect(hdc, rc->left, rc->top, rc->right, rc->bottom, radius * 2, radius * 2);
++    else
++        Rectangle(hdc, rc->left, rc->top, rc->right, rc->bottom);
++    SelectObject(hdc, old_pen);
++    SelectObject(hdc, old_brush);
++    DeleteObject(pen);
++    DeleteObject(brush);
++}
++
++/* a 1px horizontal rule across [left, right) at row y */
++static inline void neutron_hrule(HDC hdc, int left, int right, int y, COLORREF color)
++{
++    RECT rc = { left, y, right, y + 1 };
++    HBRUSH brush = CreateSolidBrush(color);
++    FillRect(hdc, &rc, brush);
++    DeleteObject(brush);
++}
++
++/*
++ * A stroked chevron: `open` points down, otherwise right. `size` is the half-extent in
++ * device pixels, `width` the stroke width.
++ */
++static inline void neutron_chevron(HDC hdc, int cx, int cy, int size, int width, BOOL open,
++                                   COLORREF color)
++{
++    HPEN pen = CreatePen(PS_SOLID, width, color), old_pen = SelectObject(hdc, pen);
++    POINT pt[3];
++
++    if (open)
++    {
++        pt[0].x = cx - size; pt[0].y = cy - size / 2;
++        pt[1].x = cx;        pt[1].y = cy + size / 2;
++        pt[2].x = cx + size; pt[2].y = cy - size / 2;
++    }
++    else
++    {
++        pt[0].x = cx - size / 2; pt[0].y = cy - size;
++        pt[1].x = cx + size / 2; pt[1].y = cy;
++        pt[2].x = cx - size / 2; pt[2].y = cy + size;
++    }
++    Polyline(hdc, pt, 3);
++    SelectObject(hdc, old_pen);
++    DeleteObject(pen);
++}
++
++/*
++ * Uppercase, letter-spaced label -- the "PLACES" / "NAME" treatment. Draws with the DC's
++ * current font and text colour, transparent background. `spacing` is the extra tracking in
++ * device pixels. The text is uppercased into a local copy; the source is never modified.
++ */
++static inline void neutron_draw_caps(HDC hdc, const WCHAR *text, RECT *rc, UINT dt_flags,
++                                     int spacing)
++{
++    WCHAR buf[128];
++    int old_extra, old_mode;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(buf) - 1 && text[i]; i++) buf[i] = text[i];
++    buf[i] = 0;
++    CharUpperBuffW(buf, i);
++
++    old_extra = SetTextCharacterExtra(hdc, spacing);
++    old_mode = SetBkMode(hdc, TRANSPARENT);
++    DrawTextW(hdc, buf, -1, rc, dt_flags);
++    SetBkMode(hdc, old_mode);
++    SetTextCharacterExtra(hdc, old_extra);
++}
++
++/*
++ * Private style bits by which shell32/explorerframe opt a control into the Neutron shell
++ * look. Chosen from ranges Windows leaves undefined so nothing else can set them by accident.
++ */
++#define LVS_EX_NEUTRON_SHELL    0x20000000  /* listview: rounded inset rows, dim subitems */
++#define TVS_EX_NEUTRON_SHELL    0x00001000  /* treeview: chevrons, grey selection, rounded rows */
++#define HDS_NEUTRON_SHELL       0x00008000  /* header: caps label, palette colours, no dividers */
++
++#endif /* __WINE_NEUTRONUI_H */
