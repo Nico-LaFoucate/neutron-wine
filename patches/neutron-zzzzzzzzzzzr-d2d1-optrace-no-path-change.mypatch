@@ -1,0 +1,157 @@
+# neutron-zzzzzzzzzzzr-d2d1-optrace-no-path-change
+#
+# 🚨 A DIAGNOSTIC THAT CHANGED THE PATH IT MEASURED.
+#
+# NEUTRON_D2D_OPTRACE=1 arms a pixel census on Premiere's wide-short strip surfaces -- the time
+# ruler and its in/out highlight. The census ran inside the per-row copy loop, reading the
+# DESTINATION buffer, so `diag` had to be ANDed into the read-through guard to force the ordinary
+# copy path:
+#
+#     if (!paint && !diag && neutron_wic_readthrough() && render_target->pool_factory)
+#
+# The consequence is that arming the trace pushed EXACTLY the surfaces under study onto the slow
+# per-row memcpy path. Every measurement taken with OPTRACE on was measuring the fallback, not the
+# shipping path -- and the operator had been editing all day with it set. Recorded in
+# PERFORMANCE.md 2026-08-21 as "fix this before the next perf session"; never fixed until now, and
+# the next perf session is the timeline-zoom work.
+#
+# The fix is the one that entry already named: run the census from the MAPPED SOURCE pointer
+# instead. `neutron_timebar_census()` takes a base pointer, a row pitch and the dimensions, and is
+# called from both paths -- once from `mapped_texture.pData` in the read-through branch before the
+# hand-off, once from `src` in the copy path. Same pass over the same pixels, same output line,
+# and `diag` no longer appears in the guard.
+#
+# `paint` (NEUTRON_D2D_WICPAINT) deliberately still forces the copy path: it WRITES magenta over
+# the surface, so it cannot run on a buffer about to be handed to the bitmap. That one is a
+# destructive test and is expected to change behaviour.
+#
+# ⭐ The general rule this is the second instance of: a probe must not alter what it observes.
+# See also the NEUTRON_LAYER_TRACE deadlock (11.10-82), where a trace called win32u from inside
+# the driver's surface-flush callback and inverted a lock.
+
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -553,6 +553,45 @@
+     return cached;
+ }
+ 
++/* NEUTRON TIMEBAR CENSUS, from a mapped SOURCE pointer.
++ *
++ * 🚨 Split out 2026-09-13 to fix a diagnostic that changed the path it measured.
++ * The census used to run inside the copy loop, reading the DESTINATION buffer --
++ * so `diag` had to be ANDed into the read-through guard below to force the copy
++ * path, and arming NEUTRON_D2D_OPTRACE=1 pushed exactly the wide-short strip
++ * surfaces under study onto the slow per-row memcpy path. Every perf number taken
++ * with OPTRACE on was therefore measuring the fallback, and the operator had been
++ * editing all day with it set. Reading the mapped source instead costs the same
++ * pass over the pixels and leaves the fast path intact.
++ *
++ * Caller gates on bpp == 4, which is what the 32bpp pixel test assumes. */
++static void neutron_timebar_census(const BYTE *src, unsigned int pitch,
++        unsigned int width, unsigned int height)
++{
++    unsigned int nz_alpha = 0, nz_rgb = 0, i;
++    static LONG census_n;
++
++    for (i = 0; i < height; ++i)
++    {
++        const unsigned int *p = (const unsigned int *)(src + (size_t)i * pitch);
++        unsigned int n = width;
++
++        while (n--)
++        {
++            unsigned int px = *p++;
++
++            if (px & 0xff000000)
++                ++nz_alpha;
++            if (px & 0x00ffffff)
++                ++nz_rgb;
++        }
++    }
++
++    if (InterlockedIncrement(&census_n) <= 3000)
++        ERR("neutron-timebar: CENSUS %ux%u nz_alpha=%u nz_rgb=%u of %u px\n",
++                width, height, nz_alpha, nz_rgb, width * height);
++}
++
+ static HRESULT d2d_wic_render_target_present(IUnknown *outer_unknown)
+ {
+     struct d2d_wic_render_target *render_target = impl_from_IUnknown(outer_unknown);
+@@ -566,7 +605,6 @@
+     unsigned int i;
+     HRESULT hr;
+     BOOL paint, diag;
+-    unsigned int nz_alpha = 0, nz_rgb = 0;
+ 
+     /* Only the strip-shaped surfaces, and only where the pixel layout is the 32bpp
+      * one the fill and the pixel census below assume. */
+@@ -639,7 +677,8 @@
+      * before the handoff so a failure leaves us on the ordinary path with nothing to
+      * unwind. */
+     /* The paint test and the pixel census both work in the ordinary copy path below. */
+-    if (!paint && !diag && neutron_wic_readthrough() && render_target->pool_factory)
++    /* `diag` is deliberately NOT tested here any more -- see neutron_timebar_census(). */
++    if (!paint && neutron_wic_readthrough() && render_target->pool_factory)
+     {
+         struct d2d_factory *factory =
+                 unsafe_impl_from_ID2D1Factory((ID2D1Factory *)render_target->pool_factory);
+@@ -670,6 +709,10 @@
+              * That wasted a full copy on every fallback, on top of the copy the fallback
+              * already does, and made the fix cost more than it saved the moment the cap
+              * was reached. */
++            if (diag)
++                neutron_timebar_census(mapped_texture.pData, mapped_texture.RowPitch,
++                        render_target->width, render_target->height);
++
+             d2d_wic_render_target_detach(render_target);
+ 
+             if (replacement)
+@@ -722,6 +765,10 @@
+ 
+     src = mapped_texture.pData;
+ 
++    if (diag)
++        neutron_timebar_census(src, mapped_texture.RowPitch,
++                render_target->width, render_target->height);
++
+     for (i = 0; i < render_target->height; ++i)
+     {
+         memcpy(dst, src, render_target->bpp * render_target->width);
+@@ -736,21 +783,6 @@
+          *                            fill or the brush colour is being lost
+          *   both > 0              -- content is present and correct here, so it is lost
+          *                            after this point. */
+-        if (diag)
+-        {
+-            const unsigned int *p = (const unsigned int *)dst;
+-            unsigned int n = render_target->width;
+-
+-            while (n--)
+-            {
+-                unsigned int px = *p++;
+-
+-                if (px & 0xff000000)
+-                    ++nz_alpha;
+-                if (px & 0x00ffffff)
+-                    ++nz_rgb;
+-            }
+-        }
+ 
+         if (paint)
+         {
+@@ -764,15 +796,6 @@
+         dst += dst_pitch;
+     }
+ 
+-    if (diag)
+-    {
+-        static LONG census_n;
+-
+-        if (InterlockedIncrement(&census_n) <= 3000)
+-            ERR("neutron-timebar: CENSUS %ux%u nz_alpha=%u nz_rgb=%u of %u px\n",
+-                    render_target->width, render_target->height, nz_alpha, nz_rgb,
+-                    render_target->width * render_target->height);
+-    }
+ 
+     ID3D10Texture2D_Unmap(render_target->readback_texture, 0);
+     IWICBitmapLock_Release(bitmap_lock);

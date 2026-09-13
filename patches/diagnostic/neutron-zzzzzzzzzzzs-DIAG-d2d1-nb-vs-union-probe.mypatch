@@ -1,0 +1,152 @@
+neutron-zzzzzzzzzzzs-DIAG-d2d1-nb-vs-union-probe
+
+DIAGNOSTIC ONLY (patches/diagnostic). Prints, never gates. Ships in no release.
+
+THE QUESTION. The DC-direct present already reports `blitCoverage` = union_px / client_px per
+window every 200 presents. In the 2026-08-21 timeline capture the 3640x604 timeline container
+sat at 40-97% per 200-present window, which killed the "copy only the dirty region" lever for
+the pre-draw hook (PERFORMANCE.md 2026-09-13). But that union is nb UNION nc, and nc is a
+clip SUPERSET: glyph runs, geometries and Clear fold the current clip -- or the WHOLE target
+when nothing is pushed -- into it (neutron_dr_add_clip). If the high coverage is nc inflating
+the union, the real dirty area is smaller and tightening the union would pay on BOTH copies
+(pre-draw hook + present readback, together ~20% of wall time). One session answers it.
+
+WHAT IT ADDS, on the same DC-DIRECT line:
+    nbCoverage=N%   nb_px / client_px -- the EXACT-rect half alone, same +2 fringe, same clamp,
+                    same denominator as blitCoverage
+    unionFrames=N   presents that accumulated into union_px
+    nbFrames=N      of those, presents where nb contributed
+    ncFrames=N      presents where nc contributed at all
+    ncFull=N        presents where nc ALONE covered >= 95% of the client -- the signature of an
+                    unclipped glyph/geometry/Clear inflating the union
+
+READING IT: nbCoverage ~= blitCoverage => the 40-97% is genuinely dirty and the enquiry is
+closed. nbCoverage much smaller (and ncFull high) => we over-report our own dirty rects.
+
+⛔ A PROBE MUST NOT CHANGE THE PATH IT OBSERVES (OPTRACE disabled the fast path it measured;
+LAYER_TRACE inverted a lock from inside the flush callback). This one: reads context fields
+that neutron_dr_get_union() already reads from the same caller on the same thread; takes no
+lock; performs no D3D or win32u call; adds no branch that touches uv, u, the blit or drawing;
+its only output is five extra fields on a log line that already prints at that cadence.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -93,6 +93,8 @@
+  * union (device pixels) as a RECT, for clipping the DC-direct blit-back. Defined in
+  * device.c. */
+ void neutron_dr_get_union(ID2D1RenderTarget *rt, RECT *out, BOOL *valid);
++/* NEUTRON DIAG nb-vs-union: the two halves of that union separately (device.c). */
++void neutron_dr_get_union_parts(ID2D1RenderTarget *rt, RECT *nb, BOOL *nb_valid, RECT *nc, BOOL *nc_valid);
+ 
+ /* NEUTRON op-trace: per-frame op/clear stats for the DC-direct present diagnostic. */
+ void neutron_dr_get_frame_stats(ID2D1RenderTarget *rt, unsigned *ops, unsigned *clears, RECT *clear_rect);
+@@ -896,6 +898,15 @@
+      * what makes a stale bitmap stomp the window's GDI-drawn content. */
+     unsigned long long union_px;
+     unsigned long long client_px;
++    /* NEUTRON DIAG nb-vs-union (2026-09-13, patches/diagnostic): is the union above inflated by
++     * the nc clip-superset fallback (glyph runs / geometries / Clear with no clip pushed fold
++     * the WHOLE target into nc)? nb_px counts the EXACT-rect half of the same union alone,
++     * with the same +2 fringe and clamp as u; nc_frames = frames where nc contributed at all;
++     * nc_full_frames = frames where nc alone covered >= 95% of the client. union_frames =
++     * frames that accumulated into union_px. Accumulate-only: nothing reads these except the
++     * DC-DIRECT report line. */
++    unsigned long long nb_px;
++    unsigned int union_frames, nb_frames, nc_frames, nc_full_frames;
+     /* NEUTRON PERF: cumulative stage timings (QPC ticks) + worst case, per container. */
+     LONGLONG perf_wdc, perf_readback, perf_blit, perf_total;
+     /* NEUTRON PERF: the OTHER half of a frame -- how long the app's own drawing takes
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1492,6 +1492,23 @@
+     else *valid = FALSE;
+ }
+ 
++/* NEUTRON DIAG nb-vs-union (2026-09-13): the two halves of the union above, separately, so the
++ * DC-DIRECT report can say how much of union_px the exact-rect half (nb) accounts for. Reads the
++ * same fields neutron_dr_get_union() reads, from the same caller, on the same thread, under no
++ * additional lock. It does not write context state and changes nothing about what is drawn or
++ * blitted -- a probe must not alter what it observes (see the OPTRACE and LAYER_TRACE incidents). */
++void neutron_dr_get_union_parts(ID2D1RenderTarget *rt, RECT *nb, BOOL *nb_valid, RECT *nc, BOOL *nc_valid)
++{
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext((ID2D1DeviceContext6 *)rt);
++
++    if ((*nb_valid = !!context->nb_valid))
++        SetRect(nb, (LONG)context->nb_l, (LONG)context->nb_t,
++                (LONG)(context->nb_r + 0.999f), (LONG)(context->nb_b + 0.999f));
++    if ((*nc_valid = !!context->nc_valid))
++        SetRect(nc, (LONG)context->nc_l, (LONG)context->nc_t,
++                (LONG)(context->nc_r + 0.999f), (LONG)(context->nc_b + 0.999f));
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_inner_QueryInterface(IUnknown *iface, REFIID iid, void **out)
+ {
+     NEUTRON_API_TIME();
+--- a/dlls/d2d1/hwnd_render_target.c
++++ b/dlls/d2d1/hwnd_render_target.c
+@@ -391,12 +391,18 @@
+         if (!(++render_target->pres_n % 200))
+         {
+             unsigned int ms = (unsigned int)(GetTickCount() - render_target->pres_tick0);
+-            ERR("neutron-dr: DC-DIRECT hwnd=%p presents=%u in %ums (%u/s) blitCoverage=%u%% avgMB/s=%u\n",
++            /* NEUTRON DIAG nb-vs-union: nbCoverage beside blitCoverage, same denominator. */
++            ERR("neutron-dr: DC-DIRECT hwnd=%p presents=%u in %ums (%u/s) blitCoverage=%u%% avgMB/s=%u"
++                " | nbCoverage=%u%% unionFrames=%u nbFrames=%u ncFrames=%u ncFull=%u\n",
+                     render_target->hwnd, render_target->pres_n, ms,
+                     ms ? render_target->pres_n * 1000 / ms : 0,
+                     render_target->client_px
+                         ? (unsigned int)(render_target->union_px * 100 / render_target->client_px) : 0,
+-                    ms ? (unsigned int)(render_target->union_px * 4 / 1024 / 1024 * 1000 / ms) : 0);
++                    ms ? (unsigned int)(render_target->union_px * 4 / 1024 / 1024 * 1000 / ms) : 0,
++                    render_target->client_px
++                        ? (unsigned int)(render_target->nb_px * 100 / render_target->client_px) : 0,
++                    render_target->union_frames, render_target->nb_frames,
++                    render_target->nc_frames, render_target->nc_full_frames);
+         }
+ 
+         if (neutron_perf())
+@@ -475,9 +481,44 @@
+         }
+         if (uv)
+         {
++            /* NEUTRON DIAG nb-vs-union: the exact-rect half of the same union, clamped the same
++             * way, accumulated beside it. Reads only; uv and u are not touched. */
++            RECT nb, nc;
++            BOOL nbv = FALSE, ncv = FALSE;
++            int fw = render_target->dst_rect.right - render_target->dst_rect.left;
++            int fh = render_target->dst_rect.bottom - render_target->dst_rect.top;
++
+             render_target->union_px += (unsigned long long)(u.right - u.left) * (u.bottom - u.top);
+             render_target->client_px += (unsigned long long)(render_target->dst_rect.right - render_target->dst_rect.left)
+                     * (render_target->dst_rect.bottom - render_target->dst_rect.top);
++            render_target->union_frames++;
++
++            neutron_dr_get_union_parts(render_target->dxgi_target, &nb, &nbv, &nc, &ncv);
++            if (nbv)
++            {
++                nb.left -= 2; nb.top -= 2; nb.right += 2; nb.bottom += 2;   /* same AA fringe as u */
++                if (nb.left < 0) nb.left = 0;
++                if (nb.top < 0) nb.top = 0;
++                if (nb.right > fw) nb.right = fw;
++                if (nb.bottom > fh) nb.bottom = fh;
++                if (nb.right > nb.left && nb.bottom > nb.top)
++                {
++                    render_target->nb_px += (unsigned long long)(nb.right - nb.left) * (nb.bottom - nb.top);
++                    render_target->nb_frames++;
++                }
++            }
++            if (ncv)
++            {
++                if (nc.left < 0) nc.left = 0;
++                if (nc.top < 0) nc.top = 0;
++                if (nc.right > fw) nc.right = fw;
++                if (nc.bottom > fh) nc.bottom = fh;
++                render_target->nc_frames++;
++                if (nc.right > nc.left && nc.bottom > nc.top
++                        && (unsigned long long)(nc.right - nc.left) * (nc.bottom - nc.top) * 100
++                           >= (unsigned long long)fw * fh * 95)
++                    render_target->nc_full_frames++;
++            }
+         }
+         /* NEUTRON: a frame that drew NOTHING has nothing to composite -- blitting back the
+          * pixels we captured at BeginDraw can only restore stale content over whatever else
