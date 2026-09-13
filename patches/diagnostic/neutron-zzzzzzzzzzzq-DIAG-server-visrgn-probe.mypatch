@@ -1,0 +1,116 @@
+server: DIAGNOSTIC (NEUTRON_VISRGN_PROBE=1, default OFF) -- time get_visible_region() in set_window_pos().
+
+old_vis_rgn is consumed only by expose_window() (gated on !SWP_NOREDRAW) and as win_rgn in the
+frame/client-changed block, which sits after the SWP_NOREDRAW goto. For every NOREDRAW call on a
+visible window the region is therefore computed and freed unused. Lightroom Classic's startup
+issues ~31k rect-unchanged SetWindowPos calls, ~2/3 of them with NOREDRAW (flag 0x381f). This probe
+answers one question: how much wall time that wasted work costs across an LrC startup. Counts
+set_window_pos calls, splits by not-visible (region skipped) / NOREDRAW (computed, unused) /
+redraw (used), flags rect-unchanged, and times the get_visible_region() call. Reports cumulatively
+every 5 s of activity on wineserver's stderr as `neutron-visrgn:`. Inert unless the env var is set.
+Lives in patches/diagnostic/ (INCLUDE_DIAGNOSTIC=1 builds only).
+
+--- a/server/window.c
++++ b/server/window.c
+@@ -1933,6 +1933,84 @@
+ 
+ 
+ /* set the window and client rectangles, updating the update region if necessary */
++/* NEUTRON diagnostic (NEUTRON_VISRGN_PROBE, default OFF): what does the old_vis_rgn computation
++ * at the top of set_window_pos() cost across an app startup?
++ *
++ * old_vis_rgn is consumed only by expose_window() (gated on !SWP_NOREDRAW) and reused as win_rgn
++ * in the frame/client-changed block, which sits after the SWP_NOREDRAW goto. So for every NOREDRAW
++ * call on a visible window the region is computed -- a walk of the parent chain intersecting
++ * sibling rects, with allocations -- and then freed unused. Lightroom's startup issues ~31k
++ * rect-unchanged SetWindowPos calls, ~2/3 carrying NOREDRAW. This counts the calls, splits them by
++ * not-visible / NOREDRAW / redraw and by rect-unchanged, and times get_visible_region() itself.
++ *
++ * Output: NEUTRON_VISRGN_PROBE=1 -> stderr; any other non-empty value -> that path, opened for
++ * append (independent of whatever fd the server inherited). Prints an "armed" banner on the first
++ * call, a cumulative report every 5 s of activity, and a FINAL report at server exit. */
++static FILE *neutron_visrgn_out;
++static int neutron_visrgn_probe(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char *e = getenv( "NEUTRON_VISRGN_PROBE" );
++        v = 0;
++        if (e && e[0] && strcmp( e, "0" ))
++        {
++            neutron_visrgn_out = strcmp( e, "1" ) ? fopen( e, "a" ) : stderr;
++            if (neutron_visrgn_out) v = 1;
++        }
++    }
++    return v;
++}
++static unsigned long long neutron_visrgn_ns(void)
++{
++    struct timespec ts;
++    clock_gettime( CLOCK_MONOTONIC, &ts );
++    return (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++}
++static unsigned long long nv_calls, nv_skipped, nv_t_first, nv_t_report;
++static unsigned long long nv_nr_calls, nv_nr_ns, nv_nr_noop_calls, nv_nr_noop_ns, nv_rd_calls, nv_rd_ns;
++static void neutron_visrgn_report( const char *tag, unsigned long long now )
++{
++    fprintf( neutron_visrgn_out, "neutron-visrgn: %s t=%llus pid=%ld set_window_pos calls=%llu | region skipped (not visible)=%llu | "
++             "NOREDRAW region computed+unused: calls=%llu total=%llums (avg %lluus) of which rect-unchanged "
++             "calls=%llu total=%llums | redraw (region used): calls=%llu total=%llums\n",
++             tag, (now - nv_t_first) / 1000000000ull, (long)getpid(), nv_calls, nv_skipped,
++             nv_nr_calls, nv_nr_ns / 1000000, nv_nr_calls ? (nv_nr_ns / 1000) / nv_nr_calls : 0,
++             nv_nr_noop_calls, nv_nr_noop_ns / 1000000, nv_rd_calls, nv_rd_ns / 1000000 );
++    fflush( neutron_visrgn_out );
++}
++static void neutron_visrgn_atexit(void)
++{
++    if (neutron_visrgn_out && nv_calls) neutron_visrgn_report( "FINAL", neutron_visrgn_ns() );
++}
++static void neutron_visrgn_account( unsigned int swp_flags, int visible, int noop, unsigned long long t_enter )
++{
++    unsigned long long now = neutron_visrgn_ns(), dt = now - t_enter;
++
++    if (!nv_calls)
++    {
++        nv_t_first = nv_t_report = now;
++        atexit( neutron_visrgn_atexit );
++        fprintf( neutron_visrgn_out, "neutron-visrgn: armed pid=%ld\n", (long)getpid() );
++        fflush( neutron_visrgn_out );
++    }
++    nv_calls++;
++    if (!visible) nv_skipped++;
++    else if (swp_flags & SWP_NOREDRAW)
++    {
++        nv_nr_calls++; nv_nr_ns += dt;
++        if (noop) { nv_nr_noop_calls++; nv_nr_noop_ns += dt; }
++    }
++    else { nv_rd_calls++; nv_rd_ns += dt; }
++
++    if (now - nv_t_report >= 5000000000ull)
++    {
++        neutron_visrgn_report( "cumulative", now );
++        nv_t_report = now;
++    }
++}
++
+ static void set_window_pos( struct window *win, struct window *previous,
+                             unsigned int swp_flags, const struct rectangle *window_rect,
+                             const struct rectangle *client_rect, const struct rectangle *visible_rect,
+@@ -1946,10 +2024,16 @@
+     int client_changed, frame_changed;
+     int visible = (win->style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW);
+     int zorder_changed = 0;
++    unsigned long long neutron_t_enter = 0;  /* NEUTRON visrgn probe */
+ 
+     if (win->parent && !is_visible( win->parent )) visible = 0;
+ 
++    if (neutron_visrgn_probe()) neutron_t_enter = neutron_visrgn_ns();
+     if (visible && !(old_vis_rgn = get_visible_region( win, DCX_WINDOW ))) return;
++    if (neutron_t_enter)
++        neutron_visrgn_account( swp_flags, visible,
++                                !memcmp( &old_window_rect, window_rect, sizeof(old_window_rect) ),
++                                neutron_t_enter );
+ 
+     /* set the new window info before invalidating anything */
+ 
