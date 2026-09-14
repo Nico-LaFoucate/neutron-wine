@@ -1,0 +1,134 @@
+win32u: Apply TA_RIGHT/TA_CENTER text alignment in device space in NtGdiExtTextOutW.
+
+The reference point x,y stays in logical units until the final lp_to_dp,
+but the extent vector used for horizontal alignment is already converted
+to device units.  Under any non-identity DC transform the subtraction
+"x -= width.x" therefore mixes spaces and the alignment offset is scaled
+a second time by the final mapping: a TA_RIGHT string on a DC scaled by s
+is drawn s times its own width too far left, and TA_CENTER half that.
+The opaque background box had the same mixing (logical y/ascent, device
+width) and was intersected with an already-device clip rect.
+
+Move the reference point to device space after the (logical) vertical
+alignment and before the horizontal one, and build the opaque box in
+device space.  Identity transforms are unaffected.
+
+Photoshop owner-draws its menus on a DC carrying a 163/96 world transform
+and right-aligns every accelerator with SetTextAlign(TA_RIGHT) at a fixed
+logical x; each accelerator landed 1.7x its width left of that edge and
+the longest labels ran under it (OPEN-ISSUES.md, menu label/accelerator
+overlap).  Reproduced and verified on preserved-fixes/harnesses/menuprobe.c
+modes odxfr/odmapr at LogPixels=163.
+
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -5799,6 +5799,7 @@
+     DC * dc = get_dc_ptr( hdc );
+     PHYSDEV physdev;
+     INT breakRem;
++    INT text_top, text_bottom;
+     static int quietfixme = 0;
+ 
+     if (!dc) return FALSE;
+@@ -5971,6 +5972,46 @@
+         width = desired[1];
+     }
+ 
++    /* Vertical alignment first: x, y and the text metrics are all still in
++     * logical units here. */
++    switch( align & (TA_TOP | TA_BOTTOM | TA_BASELINE) )
++    {
++    case TA_TOP:
++        y += tm.tmAscent * cosEsc;
++        x += tm.tmAscent * sinEsc;
++        break;
++
++    case TA_BOTTOM:
++        y -= tm.tmDescent * cosEsc;
++        x -= tm.tmDescent * sinEsc;
++        break;
++
++    case TA_BASELINE:
++        break;
++    }
++
++    /* The extent vector 'width' is already in device units, so move the
++     * reference point (and the opaque box's vertical extent) to device space
++     * BEFORE applying the horizontal alignment.  Subtracting a device width
++     * from a logical x and mapping the result afterwards scales the alignment
++     * offset a second time under any non-identity DC transform: a TA_RIGHT
++     * string on a DC scaled by s lands s times its own width too far left.
++     * (Introduced by wine-staging's win32u-NtGdiExtTextOutW-rotation, which
++     * moved the logical->device conversion to the last step.) */
++    {
++        POINT box[2];
++        box[0].x = x; box[0].y = y - tm.tmAscent;
++        box[1].x = x; box[1].y = y + tm.tmDescent;
++        lp_to_dp(dc, box, 2);
++        text_top = box[0].y;
++        text_bottom = box[1].y;
++    }
++    pt.x = x;
++    pt.y = y;
++    lp_to_dp(dc, &pt, 1);
++    x = pt.x;
++    y = pt.y;
++
+     switch( align & (TA_LEFT | TA_RIGHT | TA_CENTER) )
+     {
+     case TA_LEFT:
+@@ -6001,50 +6042,28 @@
+         break;
+     }
+ 
+-    switch( align & (TA_TOP | TA_BOTTOM | TA_BASELINE) )
+-    {
+-    case TA_TOP:
+-        y += tm.tmAscent * cosEsc;
+-        x += tm.tmAscent * sinEsc;
+-        break;
+-
+-    case TA_BOTTOM:
+-        y -= tm.tmDescent * cosEsc;
+-        x -= tm.tmDescent * sinEsc;
+-        break;
+-
+-    case TA_BASELINE:
+-        break;
+-    }
+-
+     if (dc->attr->background_mode != TRANSPARENT)
+     {
+         if(!((flags & ETO_CLIPPED) && (flags & ETO_OPAQUE)))
+         {
+             if(!(flags & ETO_OPAQUE) || !lprect ||
+                x < rc.left || x + width.x >= rc.right ||
+-               y - tm.tmAscent < rc.top || y + tm.tmDescent >= rc.bottom)
++               text_top < rc.top || text_bottom >= rc.bottom)
+             {
+                 RECT text_box;
+                 text_box.left = x;
+                 text_box.right = x + width.x;
+-                text_box.top = y - tm.tmAscent;
+-                text_box.bottom = y + tm.tmDescent;
++                text_box.top = text_top;
++                text_box.bottom = text_bottom;
++                order_rect( &text_box );
+ 
+                 if (flags & ETO_CLIPPED) intersect_rect( &text_box, &text_box, &rc );
+-                lp_to_dp(dc, (POINT *)&text_box, 2);
+                 if (!IsRectEmpty( &text_box ))
+                     physdev->funcs->pExtTextOut( physdev, 0, 0, ETO_OPAQUE, &text_box, NULL, 0, NULL );
+             }
+         }
+     }
+ 
+-    pt.x = x;
+-    pt.y = y;
+-    lp_to_dp(dc, &pt, 1);
+-    x = pt.x;
+-    y = pt.y;
+-
+     ret = physdev->funcs->pExtTextOut( physdev, x, y, (flags & ~ETO_OPAQUE), &rc,
+                                        str, count, (INT*)deltas );
+ 
