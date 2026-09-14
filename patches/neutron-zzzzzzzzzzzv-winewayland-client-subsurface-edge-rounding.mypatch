@@ -1,0 +1,118 @@
+winewayland: place a client subsurface on the edges of its window rect, rounded outward
+
+Premiere Pro's Program Monitor showed a thin black L along the left and bottom of the video
+view -- static, immune to repaints and to resizing the panel, sitting between the GL child's
+own pillarbox grey and the panel's grey border. It is not drawn by anyone: it is a strip of
+the toplevel surface that nothing paints, exposed because two paths derive the child's
+on-screen rect from the same window rect and disagree by one pixel.
+
+  (a) What the parent stops painting. WS_CLIPCHILDREN / DCX_CLIPCHILDREN are resolved in the
+      server: clip_children() (server/window.c) subtracts each visible child's visible_rect,
+      in raw device pixels, exactly. Everything the parent draws through that DC -- here the
+      Direct2D DC-direct blit-back -- leaves the child's rect untouched.
+
+  (b) What the child covers. wayland_surface_reconfigure_client() converted the ORIGIN and the
+      EXTENT of the child's client rect to logical coordinates separately, each with
+      round(v / scale), then wl_subsurface_set_position + wp_viewport_set_destination. At a
+      fractional scale the logical grid is coarser than the device grid, so round-trip
+      recovers the rect only when both the origin and the far edge happen to sit within half
+      a device pixel of the logical grid.
+
+Measured on the dev box (3840x2160 @ scale 1.7, neutron-wine 11.10-87, log
+premiere-20260914-144822.log): video view hwnd 0x101d8, client == window == visible rect,
+2128x854 device px, on toplevel 0x10122. The driver logged
+    reconfigure_client subsurface=991,122+1252x502
+i.e. round(2128/1.7)=1252, round(854/1.7)=502 -- the extent is right. Placing 991,122 back on
+the device grid gives left 1685, top 207, right 3813, bottom 1061. The log prints only the
+rounded output, which admits an origin of cx in {1684,1685}, cy in {207,208}; of those four,
+only cx=1684, cy=208 yields a child that starts one pixel right of the exclusion (1685 vs
+1684) and ends one pixel above it (1061 vs 1062), with the top and right edges overlapping
+by one and invisible. That is the operator's L, uniquely, so the specific case is fixed by the
+observation rather than read from the log.
+
+Rounding each EDGE to nearest does not fix it: 1684/1.7 = 990.6 rounds to 991 and lands on
+1685 again. A device coordinate that is not within half a pixel of a multiple of the scale
+cannot be hit by an integer logical position at all, so the child cannot be made to cover
+exactly the exclusion in general. What it can always do is cover no less: round the near
+edges DOWN and the far edges UP. For the four candidate origins above this gives, per edge,
+an overlap of 0-2 device px over painted parent content and never a gap. The overlap hides at
+most two rows/columns of the parent right beside the child; the gap was a black line.
+
+The buffer is unchanged; only the viewport destination grows by up to two logical px per
+axis, which the compositor already resamples (1252*1.7 = 2128.4 was never 1:1 either).
+wayland_client_surface_create()'s initial destination (the 2026-08-31 fix for the oversized
+first present) still uses the nearest-rounded extent: it has no position to work from and is
+replaced by reconfigure_client on attach a few ms later; the defect it fixed was an ABSENT
+destination, and a 1-2 px difference for one frame is not that defect. The frame offset is
+folded into the origin before conversion, as before, so both edges carry it once.
+
+Scope: client subsurfaces only (the path that covers a parent exclusion). Owned-window
+subsurfaces, toplevel sizing, the frame-spill crop and the maximized-configure path are
+untouched. Kill switch NEUTRON_CLIENT_EDGE_ROUND=0 restores the previous arithmetic for A/B
+without a rebuild; NEUTRON_WL_DIAG=1 reports both results at the outcome.
+
+wayland_surface_reconfigure_client() is upstream Wine code and upstream behaves the same
+way; Windows shows no seam because the child's swapchain covers exactly the rect the parent
+excludes. Third upstream-worthy divergence found on this project, alongside the
+NtGdiExtTextOutW alignment and the SB_CTL painted guard.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1441,9 +1441,54 @@
+     client_width = client_rect->right - client_rect->left;
+     client_height = client_rect->bottom - client_rect->top;
+ 
+-    wayland_surface_coords_from_window(surface, client_x, client_y, &x, &y);
+-    wayland_surface_coords_from_window(surface, client_width, client_height,
+-                                       &width, &height);
++    /* NEUTRON: convert the rect's EDGES, rounded outward, not its origin and extent.
++     *
++     * The parent stops painting exactly the child's rect: WS_CLIPCHILDREN / DCX_CLIPCHILDREN
++     * subtract the child's visible_rect in device pixels (server/window.c clip_children).
++     * Converting the origin and the extent separately with round(v / scale) placed the
++     * subsurface up to one device pixel inside that rect on any edge, and the strip in
++     * between is painted by nobody. Measured on Premiere's Program Monitor at scale 1.7:
++     * client 2128x854 at a 1684,208 origin became subsurface 991,122+1252x502, which sits
++     * at device 1685..3813 x 207..1061 -- a one-pixel black L along the left and bottom.
++     *
++     * A device coordinate that is not within half a pixel of a multiple of the scale cannot
++     * be hit by an integer logical position at all, so exact coverage is not available in
++     * general. Covering NO LESS always is: floor the near edges, ceil the far edges. The
++     * child then overlaps at most two device rows/columns of painted parent content beside
++     * it, and never leaves a gap. Kill switch NEUTRON_CLIENT_EDGE_ROUND=0 restores the old
++     * arithmetic for an A/B without a rebuild. */
++    {
++        static int edge_round = -1;
++        int old_x, old_y, old_w, old_h;
++
++        if (edge_round < 0) edge_round = neutron_gate("NEUTRON_CLIENT_EDGE_ROUND", TRUE);
++
++        wayland_surface_coords_from_window(surface, client_x, client_y, &old_x, &old_y);
++        wayland_surface_coords_from_window(surface, client_width, client_height,
++                                           &old_w, &old_h);
++        if (edge_round)
++        {
++            double scale = surface->window.scale;
++            int x2 = (int)ceil((client_x + client_width) / scale);
++            int y2 = (int)ceil((client_y + client_height) / scale);
++
++            x = (int)floor(client_x / scale);
++            y = (int)floor(client_y / scale);
++            width = x2 - x;
++            height = y2 - y;
++        }
++        else
++        {
++            x = old_x; y = old_y; width = old_w; height = old_h;
++        }
++
++        if (neutron_wl_surf_diag() && (x != old_x || y != old_y || width != old_w || height != old_h))
++            ERR("neutron-clientedge: hwnd=%p client=(%d,%d)-(%d,%d) win px scale=%.4f -> "
++                "subsurface %d,%d+%dx%d (origin/extent rounding gave %d,%d+%dx%d)\n",
++                surface->hwnd, client_x, client_y, client_x + client_width,
++                client_y + client_height, surface->window.scale,
++                x, y, width, height, old_x, old_y, old_w, old_h);
++    }
+ 
+     TRACE("hwnd=%p subsurface=%d,%d+%dx%d\n", surface->hwnd, x, y, width, height);
+ 
