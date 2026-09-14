@@ -1,0 +1,143 @@
+win32u: Don't paint the hovered state of a scroll bar control the application painted itself.
+
+Commit 78ac7ae24d9 ("user32: Draw standard scroll bars in hovered state
+only when they were previously painted by DefWinProc()") stopped the
+WM_NCMOUSEMOVE hover repaint from drawing over a non-client area the
+application paints in WM_NCPAINT, tracking that with scroll_info.painted.
+The same repaint runs for SB_CTL on WM_MOUSEMOVE / WM_MOUSELEAVE, but that
+path was left without the guard: handle_scroll_event() draws the control
+into a cache DC, outside any WM_PAINT, whenever the scroll bar window
+procedure sees the mouse move.  An application that subclasses a SCROLLBAR
+control and owns its WM_PAINT (the usual way to skin one) has its content
+replaced by the classic/themed drawing on every hover, and nothing tells
+it to repaint.  When no visual style is active there is not even a hover
+state to show: USER_ScrollBarDraw ignores hit_test unless the mouse is
+captured, so the repaint reproduces the resting look over the
+application's pixels.
+
+Complete the guard for controls the way it already works for standard
+bars: NtUserBeginPaint marks a scroll bar control as not painted by the
+default procedure, scroll_bar_window_proc's WM_PAINT (via draw_scroll_bar)
+marks it painted again, and the SCROLL_NOWHERE hover repaint requires the
+flag for every bar kind.  A control whose WM_PAINT reaches the default
+handler keeps its hover behaviour unchanged.
+
+Photoshop subclasses real SCROLLBAR controls (its own window procedure
+paints them) and forwards WM_MOUSEMOVE when not
+dragging; its dark scroll bars flashed to the Win32 palette on every hover
+(OPEN-ISSUES.md, "Scroll-bar colour flash").  Reproduced with no Adobe
+code by preserved-fixes/harnesses/sbhover2.c: a subclassed control lost
+its pixels on a single WM_MOUSEMOVE with no WM_PAINT delivered.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -2046,6 +2046,11 @@
+ 
+     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
+ 
++    /* A scroll bar control's WM_PAINT is being handled by whoever owns its window procedure.
++     * Mark it as not painted by the default procedure; scroll_bar_window_proc() marks it painted
++     * again if its own WM_PAINT handler gets to draw. Mirrors the WM_NCPAINT handling above. */
++    if (is_scroll_bar_control( hwnd )) set_standard_scroll_painted( hwnd, SB_CTL, FALSE );
++
+     TRACE( "hdc = %p box = (%s), fErase = %d\n", hdc, wine_dbgstr_rect(&rect), erase );
+ 
+     /* NEUTRON PM-TRAILS DIAG (NEUTRON_PAINT_TRACE=1): dump the FULL update region the
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -159,7 +159,7 @@
+     INT   maxVal;   /* Maximum scroll-bar value */
+     INT   page;     /* Page size of scroll bar (Win32) */
+     UINT  flags;    /* EnableScrollBar flags */
+-    BOOL  painted;  /* Whether the scroll bar is painted by DefWinProc() */
++    BOOL  painted;  /* Whether the scroll bar was last painted by the default window procedure */
+ };
+ 
+ struct scroll_bar_win_data
+--- a/dlls/win32u/scroll.c
++++ b/dlls/win32u/scroll.c
+@@ -135,6 +135,19 @@
+     user_unlock();
+ }
+ 
++/* Is this window a scroll bar control, i.e. does it carry SB_CTL scroll info? */
++BOOL is_scroll_bar_control( HWND hwnd )
++{
++    BOOL ret = FALSE;
++    WND *win = get_win_ptr( hwnd );
++
++    if (!win || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return FALSE;
++    if (win->cbWndExtra >= sizeof(struct scroll_bar_win_data))
++        ret = ((struct scroll_bar_win_data *)win->wExtra)->magic == SCROLLBAR_MAGIC;
++    release_win_ptr( win );
++    return ret;
++}
++
+ static BOOL show_scroll_bar( HWND hwnd, int bar, BOOL show_horz, BOOL show_vert )
+ {
+     ULONG old_style, set_bits = 0, clear_bits = 0;
+@@ -360,12 +373,9 @@
+     params.interior = draw_interior;
+     KeUserModeCallback( NtUserDrawScrollBar, &params, sizeof(params), &ret_ptr, &ret_len );
+ 
+-    if (bar == SB_HORZ || bar == SB_VERT)
+-    {
+-        NtGdiGetAppClipBox( hdc, &clip_box );
+-        if (intersect_rect( &intersect, &params.rect, &clip_box ))
+-            set_standard_scroll_painted( hwnd, bar, TRUE );
+-    }
++    NtGdiGetAppClipBox( hdc, &clip_box );
++    if (intersect_rect( &intersect, &params.rect, &clip_box ))
++        set_standard_scroll_painted( hwnd, bar, TRUE );
+ }
+ 
+ void draw_nc_scrollbar( HWND hwnd, HDC hdc, BOOL draw_horizontal, BOOL draw_vertical )
+@@ -447,7 +457,7 @@
+     struct scroll_info *info;
+     BOOL ret;
+ 
+-    if (bar != SB_HORZ && bar != SB_VERT) return FALSE;
++    if (bar != SB_HORZ && bar != SB_VERT && bar != SB_CTL) return FALSE;
+     if (!(info = get_scroll_info_ptr( hwnd, bar, FALSE ))) return FALSE;
+     ret = info->painted;
+     release_scroll_info_ptr( info );
+@@ -689,13 +699,14 @@
+     switch (g_tracking_info.hit_test)
+     {
+     case SCROLL_NOWHERE:  /* No tracking in progress */
+-        /* For standard scroll bars, hovered state gets painted only when the scroll bar was
+-         * previously painted by DefWinProc(). If an application handles WM_NCPAINT by itself, then
+-         * the scrollbar shouldn't be repainted here to avoid overwriting the application painted
++        /* Hovered state gets painted only when the scroll bar was previously painted by the
++         * default window procedure. If an application paints the scroll bar by itself (WM_NCPAINT
++         * for standard scroll bars, WM_PAINT for a subclassed scroll bar control), then the
++         * scrollbar shouldn't be repainted here to avoid overwriting the application painted
+          * content */
+-        if (msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE ||
+-            ((msg == WM_NCMOUSEMOVE || msg == WM_NCMOUSELEAVE) &&
+-             is_standard_scroll_painted( hwnd, bar )))
++        if ((msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE ||
++             ((msg == WM_NCMOUSEMOVE || msg == WM_NCMOUSELEAVE) && bar != SB_CTL)) &&
++            is_standard_scroll_painted( hwnd, bar ))
+             draw_scroll_bar( hwnd, hdc, bar, hittest, &g_tracking_info, TRUE, TRUE );
+         break;
+ 
+@@ -1437,7 +1448,7 @@
+ {
+     struct scroll_info *info;
+ 
+-    if (bar != SB_HORZ && bar != SB_VERT)
++    if (bar != SB_HORZ && bar != SB_VERT && bar != SB_CTL)
+         return;
+ 
+     if ((info = get_scroll_info_ptr( hwnd, bar, FALSE )))
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -152,6 +152,7 @@
+ extern LRESULT scroll_bar_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
+                                        BOOL ansi );
+ extern void set_standard_scroll_painted( HWND hwnd, int bar, BOOL painted );
++extern BOOL is_scroll_bar_control( HWND hwnd );
+ extern void track_scroll_bar( HWND hwnd, int scrollbar, POINT pt );
+ 
+ /* sysparams.c */
