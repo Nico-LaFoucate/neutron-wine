@@ -1,0 +1,278 @@
+winewayland: show the last resolved cursor when the current handle cannot be resolved
+
+Premiere Pro: click another window, click back on File, move down into the dropdown -- the
+cursor vanishes the instant it crosses into the first item and stays gone while the menu is
+open. Operator: "it doesn't disappear with time, it disappears with position".
+
+Captured 2026-09-14 (premiere-20260914-160333.log, WINEDEBUG=+cursor,+waylanddrv, 11.10-88).
+A freshly spawned helper process (its own Wayland client; the CEF window family) called
+NtUserSetCursor(0x302b4) once, on a thread input it shares with Premiere's UI thread, so the
+wineserver's current cursor for Premiere's windows became a handle that Premiere's process
+cannot read -- win32u keeps cursor pixels per process:
+
+    0644:trace:cursor:NtUserSetCursor 0x302b4
+    13a0:trace:cursor:process_wine_setcursor hwnd 0x20128, window 0x20128, hcursor 0x302b4
+    13a0:warn:cursor:get_icon_ptr icon handle 0x302b4 from other process
+    13a0:err:waylanddrv:wayland_pointer_update_cursor_buffer Failed to get icon info for cursor=0x302b4
+    ...
+    13a4:trace:waylanddrv:pointer_handle_enter hwnd=0x302e6            <- the File dropdown
+    13a0:trace:cursor:process_wine_setcursor hwnd 0x302e6, window 0x302e6, hcursor 0x302b4
+    13a0:err:waylanddrv:wayland_pointer_update_cursor_buffer Failed to get icon info for cursor=0x302b4
+
+wayland_pointer_update_cursor_buffer() answers a failed get_icon_info() with clear_cursor, and
+wayland_set_cursor() then sends wl_pointer.set_cursor(NULL): the cursor is hidden. On the
+main window nobody sees that, because the next WM_SETCURSOR replaces the handle with a live
+one. A menu dropdown is a fresh surface: pointer_handle_enter() hides the cursor for it by
+design and waits for the follow-up WM_WINE_SETCURSOR, the follow-up carried the same foreign
+handle, and win32u sends no WM_SETCURSOR while a menu holds capture (process_mouse_message
+returns before it when hwndCapture is set), so nothing ever replaced it. The popup 0x302e6 was
+held from line 13428 to 14571 with the handle re-set and re-failing at every entry.
+
+On Windows a cursor handle is usable from any process and the displayed image outlives the
+handle (user32 tests: DestroyCursor on the active cursor leaves it current while GetIconInfo
+fails); winex11 leaves the previous X cursor in place when create_cursor() fails. Hiding is
+the wrong end of the failure.
+
+Fix: remember the last cursor that resolved -- bitmap plus unscaled hotspot, or cursor-shape
+enum -- at the outcome of a successful resolve, and when a non-NULL handle fails to resolve,
+show that instead of nothing; with nothing retained, show the default arrow via the shape
+protocol. A NULL handle (explicit hide, or a fresh surface awaiting its follow-up) and a fully
+transparent cursor still hide: those are resolved outcomes, not failures. Covers every
+unresolvable handle (foreign, destroyed), not only this one.
+
+Not fixed by the existing cross-process cursor sync: that block keys on the WINDOW under the
+pointer being foreign, and here the window is ours while the HANDLE is foreign; its data source
+(a shape published by the owning process's driver in WAYLAND_SetCursor) is never written in this
+path either, because the WM_WINE_SETCURSOR goes to the window's process, not the handle's.
+
+Disproven on the way: a destroyed-handle use-after-free (single-process harness: the menu's own
+WM_SETCURSOR sets a fresh arrow, cursor stays), a serial/xdg_popup mismatch (the popup's enter
+serial is used and accepted; the same path is healthy in premiere-20260914-144822.log), pointer
+clip/lock/relative mode (zero events in every session), and an owner-drawn/CEF dropdown (it is
+a stock #32768 promoted to xdg_popup).
+
+Kill switch NEUTRON_CURSOR_KEEP=0 restores the upstream hide for A/B without a rebuild;
+NEUTRON_WL_DIAG=1 prints one neutron-cursorkeep line per substitution, at the outcome. Compiled
+on both arches. Not a workaround for Adobe: Windows tolerates the foreign handle because cursors
+are global there; Wine's per-process cursor pixels are the upstream gap.
+
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -666,10 +666,82 @@
+     return TRUE;
+ }
+ 
+-static void wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
++/* NEUTRON: keep the last cursor that DID resolve when the current handle cannot be turned into pixels.
++ *
++ * The compositor shows whatever wl_pointer.set_cursor last named, per surface entry. The driver
++ * re-resolves the CURRENT Win32 cursor HANDLE into a bitmap at every entry and at every cursor-window
++ * change, and when get_icon_info() fails it falls through to set_cursor(NULL): the cursor is hidden.
++ * That is the wrong end of the failure. Windows keeps displaying the last cursor image whatever
++ * happens to the handle afterwards (user32 tests: DestroyCursor on the active cursor leaves it
++ * current while GetIconInfo fails), and winex11 simply leaves the previous X cursor in place.
++ *
++ * MEASURED 2026-09-14, Premiere Pro, log premiere-20260914-160333.log, WINEDEBUG=+cursor,+waylanddrv:
++ * a helper process (own Wayland client, CEF family) called NtUserSetCursor(0x302b4) on a thread input
++ * shared with Premiere's UI thread. win32u keeps cursor pixels per process, so Premiere's driver got
++ *     warn:cursor:get_icon_ptr icon handle 0x302b4 from other process
++ *     err:waylanddrv:wayland_pointer_update_cursor_buffer Failed to get icon info for cursor=0x302b4
++ * On the main window that is invisible: the next WM_SETCURSOR replaces the handle. Under a menu the
++ * popup is a FRESH surface -- pointer_handle_enter() issues set_cursor(NULL) by design and waits for
++ * the follow-up WM_WINE_SETCURSOR -- and the follow-up carried the same foreign handle, so nothing
++ * was ever attached and the cursor stayed hidden for the life of the menu. win32u sends no
++ * WM_SETCURSOR while a menu holds capture, so the app never got the chance to set a live one.
++ * Operator: "it doesn't disappear with time, it disappears with position".
++ *
++ * Fix: remember the last cursor that resolved (bitmap with its unscaled hotspot, or cursor-shape
++ * enum) at the OUTCOME of a successful resolve, and when a non-NULL handle fails to resolve, show
++ * that instead of nothing; with nothing retained, show the default arrow via the shape protocol.
++ * A NULL handle (an explicit hide, or a fresh surface awaiting its follow-up) still hides, and a
++ * fully transparent cursor still hides -- both are resolved outcomes, not failures. Covers every
++ * unresolvable handle (foreign, destroyed), not just this one.
++ *
++ * Kill switch NEUTRON_CURSOR_KEEP=0 restores the upstream hide; NEUTRON_WL_DIAG=1 reports each
++ * substitution at the outcome. All state below is guarded by process_wayland.pointer.mutex. */
++static struct
++{
++    HCURSOR hcursor;                             /* handle the retained cursor was built from (diag) */
++    struct wayland_shm_buffer *shm_buffer;       /* own ref; the last resolved bitmap, if any */
++    int hotspot_x, hotspot_y;                    /* in buffer pixels, unscaled */
++    enum wp_cursor_shape_device_v1_shape shape;  /* nonzero if the last resolved cursor was a shape */
++} neutron_cursor_last;
++
++static BOOL neutron_cursor_keep_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) v = neutron_gate("NEUTRON_CURSOR_KEEP", TRUE);
++    return v;
++}
++
++static BOOL neutron_pointer_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_WL_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static void neutron_cursor_remember_buffer(HCURSOR hcursor, struct wayland_shm_buffer *buf, int hx, int hy)
++{
++    if (neutron_cursor_last.shm_buffer) wayland_shm_buffer_unref(neutron_cursor_last.shm_buffer);
++    wayland_shm_buffer_ref(buf);
++    neutron_cursor_last.shm_buffer = buf;
++    neutron_cursor_last.hotspot_x = hx;
++    neutron_cursor_last.hotspot_y = hy;
++    neutron_cursor_last.shape = 0;
++    neutron_cursor_last.hcursor = hcursor;
++}
++
++static void neutron_cursor_remember_shape(HCURSOR hcursor, enum wp_cursor_shape_device_v1_shape shape)
++{
++    neutron_cursor_last.shape = shape;
++    neutron_cursor_last.hcursor = hcursor;
++}
++
++/* NEUTRON: returns FALSE only when a non-NULL handle could not be resolved (get_icon_info or buffer
++ * creation failed). A NULL handle and a fully transparent cursor are resolved hides: TRUE. */
++static BOOL wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+ {
+     struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
+     ICONINFOEXW info = {0};
++    BOOL resolved = TRUE;
+ 
+     if (!hcursor) goto clear_cursor;
+ 
+@@ -683,6 +755,7 @@
+     if (!get_icon_info(hcursor, &info))
+     {
+         ERR("Failed to get icon info for cursor=%p\n", hcursor);
++        resolved = FALSE;
+         goto clear_cursor;
+     }
+ 
+@@ -707,6 +780,7 @@
+     if (!cursor->shm_buffer)
+     {
+         ERR("Failed to create shm_buffer for cursor=%p\n", hcursor);
++        resolved = FALSE;
+         goto clear_cursor;
+     }
+ 
+@@ -721,10 +795,13 @@
+         cursor->hotspot_y = cursor->shm_buffer->height / 2;
+     }
+ 
++    /* NEUTRON: this handle resolved -- record it at the outcome, before the hotspot is scaled. */
++    neutron_cursor_remember_buffer(hcursor, cursor->shm_buffer, cursor->hotspot_x, cursor->hotspot_y);
++
+     cursor->hotspot_x = round(cursor->hotspot_x / scale);
+     cursor->hotspot_y = round(cursor->hotspot_y / scale);
+ 
+-    return;
++    return TRUE;
+ 
+ clear_cursor:
+     if (cursor->shm_buffer)
+@@ -732,6 +809,7 @@
+         wayland_shm_buffer_unref(cursor->shm_buffer);
+         cursor->shm_buffer = NULL;
+     }
++    return resolved;
+ }
+ 
+ static void wayland_pointer_clear_cursor_surface(void)
+@@ -930,6 +1008,7 @@
+ 
+     wp_cursor_shape_device_v1_set_shape(pointer->wp_cursor_shape_device_v1,
+                                         pointer->enter_serial, shape);
++    neutron_cursor_remember_shape(hcursor, shape);
+ 
+     return TRUE;
+ }
+@@ -977,6 +1056,57 @@
+     }
+ }
+ 
++/* NEUTRON: called with pointer->mutex held, for a non-NULL handle that did not resolve. Applies the
++ * last resolved cursor (or the default arrow shape) and returns TRUE; FALSE means the caller keeps
++ * the upstream behaviour (hide). See neutron_cursor_last above. */
++static BOOL neutron_cursor_keep_last(HWND hwnd, HCURSOR hcursor, double scale)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    struct wayland_cursor *cursor = &pointer->cursor;
++    const char *what;
++
++    if (!neutron_cursor_keep_enabled()) return FALSE;
++
++    if (neutron_cursor_last.shape || !neutron_cursor_last.shm_buffer)
++    {
++        enum wp_cursor_shape_device_v1_shape shape = neutron_cursor_last.shape ?
++            neutron_cursor_last.shape : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
++
++        if (!process_wayland.wp_cursor_shape_manager_v1) return FALSE;
++        if (!pointer->wp_cursor_shape_device_v1)
++            pointer->wp_cursor_shape_device_v1 =
++                wp_cursor_shape_manager_v1_get_pointer(
++                    process_wayland.wp_cursor_shape_manager_v1, pointer->wl_pointer);
++        if (!pointer->wp_cursor_shape_device_v1) return FALSE;
++        wayland_pointer_clear_cursor_surface();
++        wp_cursor_shape_device_v1_set_shape(pointer->wp_cursor_shape_device_v1,
++                                            pointer->enter_serial, shape);
++        what = neutron_cursor_last.shape ? "last shape" : "default shape (nothing retained)";
++    }
++    else
++    {
++        if (cursor->shm_buffer) wayland_shm_buffer_unref(cursor->shm_buffer);
++        wayland_shm_buffer_ref(neutron_cursor_last.shm_buffer);
++        cursor->shm_buffer = neutron_cursor_last.shm_buffer;
++        cursor->hotspot_x = round(neutron_cursor_last.hotspot_x / scale);
++        cursor->hotspot_y = round(neutron_cursor_last.hotspot_y / scale);
++        wayland_pointer_update_cursor_surface(scale);
++        if (!cursor->shm_buffer) return FALSE;
++        wl_pointer_set_cursor(pointer->wl_pointer,
++                              pointer->enter_serial,
++                              cursor->wl_surface,
++                              cursor->hotspot_x,
++                              cursor->hotspot_y);
++        wayland_pointer_clear_cursor_shape();
++        what = "last bitmap";
++    }
++
++    if (neutron_pointer_diag())
++        ERR("neutron-cursorkeep: hwnd=%p hcursor=%p unresolvable -> kept %s (built from hcursor=%p)\n",
++            hwnd, hcursor, what, neutron_cursor_last.hcursor);
++    return TRUE;
++}
++
+ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+ {
+     struct wayland_pointer *pointer = &process_wayland.pointer;
+@@ -1018,14 +1148,20 @@
+         }
+         else
+         {
+-            if (use_hcursor) wayland_pointer_update_cursor_buffer(hcursor, scale);
+-            wayland_pointer_update_cursor_surface(scale);
+-            wl_pointer_set_cursor(pointer->wl_pointer,
+-                                  pointer->enter_serial,
+-                                  pointer->cursor.wl_surface,
+-                                  pointer->cursor.hotspot_x,
+-                                  pointer->cursor.hotspot_y);
+-            wayland_pointer_clear_cursor_shape();
++            BOOL resolved = TRUE;
++
++            if (use_hcursor) resolved = wayland_pointer_update_cursor_buffer(hcursor, scale);
++            /* NEUTRON: an unresolvable handle shows the last resolved cursor, not nothing. */
++            if (resolved || !hcursor || !neutron_cursor_keep_last(hwnd, hcursor, scale))
++            {
++                wayland_pointer_update_cursor_surface(scale);
++                wl_pointer_set_cursor(pointer->wl_pointer,
++                                      pointer->enter_serial,
++                                      pointer->cursor.wl_surface,
++                                      pointer->cursor.hotspot_x,
++                                      pointer->cursor.hotspot_y);
++                wayland_pointer_clear_cursor_shape();
++            }
+         }
+         wl_display_flush(process_wayland.wl_display);
+         reapply_clip = TRUE;
