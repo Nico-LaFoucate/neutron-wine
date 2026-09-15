@@ -1,0 +1,162 @@
+win32u: SetActiveWindow() on a WS_DISABLED window activates its last active popup, not the window
+
+Premiere Pro, New Project dialog: click away to another app via the dock, click back, and the
+dialog "grabs focus then loses focus". Every other cycle. Operator's narrowing: foregrounding
+another app from the dock "primes it to throw out the focus it just received".
+
+Captured 2026-09-15 (premiere-20260915-134050.log, WINEDEBUG=+win,+waylanddrv, 11.10-89).
+Dialog 0x1a026a is a #32770 owned by the main frame 0x40194; the frame is WS_DISABLED for the
+dialog's whole life (NtUserEnableWindow(0x40194,0) at 67275, re-enabled at 103774 after the
+dialog closed at 104057). After every CLEAN return, Premiere's PlugPlug (CEP host) runs a
+create/destroy cycle and then "restores" activation to the frame:
+
+    13c8 WIN_CreateWindowEx L"PLUGPLUG_UI_NATIVE_WINDOW_CLASS_NAME" ... parent=0x40194   (0x802ce, hidden 1x1)
+    13c8 WIN_CreateWindowEx L"06e2f54a-..." style=82000000 0x0                          (0x70294, CEP host popup)
+    0298 NtUserSetFocus 0x202e8 -> set_active_window hwnd 0x70294                        (CEPHtmlEngine child)
+    13c8 user_destroy_window (0x70294)
+    13c8 activate_other_window win = 0x1a026a fg = 0x70294                              <- correct: dialog again
+    13c8 user_destroy_window (0x802ce)
+    13c8 NtUserSetActiveWindow 0x40194                                                   <- the mover
+    13c8 set_active_window hwnd 0x40194, previous 0x1a026a, mouse 0, focus 1
+
+No activate_other_window line precedes that NtUserSetActiveWindow; it is the application's own
+SetActiveWindow(main frame). Wine accepts it, the disabled frame becomes the active and
+foreground window behind its modal dialog, and the driver then reads fg=0x40194 at the next
+leave ("SKIP (not the foreground window)") and at the next return ("SKIP -- foreground 0x40194
+is already ours"): the dialog's focus is never re-established. Cycles 1/3/5 clean, 2/4 broken,
+matching the log exactly (82751, 92910, 101746). activate_other_window() and its three guarded
+callers are upstream-identical and behave correctly here; they were the prior suspect.
+
+Windows: "A window must be enabled before it can be activated" (EnableWindow, Remarks). Wine
+already applies that rule to its own automatic re-activation (can_activate_window rejects
+WS_DISABLED) and to NtUserSetFocus (WS_DISABLED on the top-level -> fail), but
+NtUserSetActiveWindow activated any top-level handle. Upstream-unmodified in our tree.
+
+Fix: in NtUserSetActiveWindow, a WS_DISABLED top-level target is redirected to its last active
+popup (GetLastActivePopup; the server's make_window_active keeps it for every owner) when that
+popup is visible, top-level, not minimized and enabled; when it is already active nothing
+happens and it is returned as "previous"; when there is no activatable popup the call is
+refused (returns 0, activation left alone). Enabled targets, child targets and all internal
+set_active_window() callers (set_foreground_window, SetFocus, SetWindowPos activation,
+activate_other_window) are untouched. In the log's case the redirect target is the dialog,
+already active: the call becomes a no-op and fg stays on the dialog.
+
+Kill switch NEUTRON_SETACTIVE_DISABLED=0 restores the upstream behaviour without a rebuild;
+NEUTRON_WL_DIAG=1 prints one neutron-setactive-disabled line per redirect/refusal, at the
+outcome. Compiled on both arches. Not a workaround for Adobe: PlugPlug's call is legal on
+Windows because Windows never lets it activate the disabled frame.
+
+Aside (untouched): set_active_window() returns an uninitialised `ret` when hwnd is already
+active (goto done before ret is assigned; gcc -Wmaybe-uninitialized at input.c:2102). Upstream
+too.
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2102,12 +2102,64 @@
+     return ret;
+ }
+ 
++/* NEUTRON: SetActiveWindow() on a WS_DISABLED top-level window.
++ *
++ * Windows: "A window must be enabled before it can be activated" (EnableWindow, Remarks). Wine
++ * encodes the same rule for its own automatic re-activation (can_activate_window in window.c
++ * rejects WS_DISABLED) and for SetFocus (the WS_DISABLED check above), but NtUserSetActiveWindow
++ * took any top-level handle and made it active. That is how the owner of a modal dialog -- disabled
++ * by the dialog for exactly this reason -- became the active and foreground window while its
++ * dialog was still up: Premiere's PlugPlug (CEP host) tears down a temporary owned window and then
++ * calls SetActiveWindow(main frame) to "restore" activation; the main frame is WS_DISABLED behind
++ * the New Project dialog. From then on the driver saw the frame as foreground, so the next
++ * keyboard-focus leave and return were classified as in-app focus changes and the dialog lost the
++ * focus it had just been given (premiere-20260915-134050.log, +win,+waylanddrv).
++ *
++ * Fix: a WS_DISABLED target activates its last active popup instead (what Windows does when a
++ * disabled owner is asked to take activation), or is refused when there is no activatable popup.
++ * Enabled windows, child windows and the internal set_active_window() callers are untouched.
++ *
++ * Kill switch NEUTRON_SETACTIVE_DISABLED=0 restores the upstream behaviour without a rebuild;
++ * NEUTRON_WL_DIAG=1 reports each redirect or refusal, at the outcome. */
++static BOOL neutron_setactive_disabled_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SETACTIVE_DISABLED" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_SETACTIVE_DISABLED = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++static BOOL neutron_wl_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_WL_DIAG" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++/* same test as can_activate_window() in window.c: visible, top-level, not minimized, enabled */
++static BOOL neutron_activatable( HWND hwnd )
++{
++    DWORD style;
++
++    if (!hwnd || !is_window( hwnd )) return FALSE;
++    style = get_window_long( hwnd, GWL_STYLE );
++    if (!(style & WS_VISIBLE)) return FALSE;
++    if ((style & (WS_POPUP|WS_CHILD)) == WS_CHILD) return FALSE;
++    if (style & WS_MINIMIZE) return FALSE;
++    return !(style & WS_DISABLED);
++}
++
+ /**********************************************************************
+  *           NtUserSetActiveWindow    (win32u.@)
+  */
+ HWND WINAPI NtUserSetActiveWindow( HWND hwnd )
+ {
+-    HWND prev;
++    HWND prev, neutron_disabled = 0;
+ 
+     TRACE( "%p\n", hwnd );
+ 
+@@ -2125,9 +2177,40 @@
+         style = get_window_long( hwnd, GWL_STYLE );
+         if ((style & (WS_POPUP|WS_CHILD)) == WS_CHILD)
+             return get_active_window();  /* Windows doesn't seem to return an error here */
++
++        if ((style & WS_DISABLED) && neutron_setactive_disabled_on())
++        {
++            HWND popup = NtUserGetLastActivePopup( hwnd ), active = get_active_window();
++
++            if (popup == hwnd || !neutron_activatable( popup ))
++            {
++                if (neutron_wl_diag())
++                    ERR( "neutron-setactive-disabled: hwnd=%p is WS_DISABLED and its last active popup %p cannot take activation -> REFUSED, active stays %p\n",
++                         hwnd, popup, active );
++                return 0;
++            }
++            if (popup == active)
++            {
++                if (neutron_wl_diag())
++                    ERR( "neutron-setactive-disabled: hwnd=%p is WS_DISABLED -> its last active popup %p is already active, left alone\n",
++                         hwnd, popup );
++                return active;
++            }
++            neutron_disabled = hwnd;
++            hwnd = popup;
++        }
+     }
+ 
+-    if (!set_active_window( hwnd, &prev, FALSE, TRUE, 0 )) return 0;
++    if (!set_active_window( hwnd, &prev, FALSE, TRUE, 0 ))
++    {
++        if (neutron_disabled && neutron_wl_diag())
++            ERR( "neutron-setactive-disabled: hwnd=%p is WS_DISABLED -> activating its last active popup %p FAILED\n",
++                 neutron_disabled, hwnd );
++        return 0;
++    }
++    if (neutron_disabled && neutron_wl_diag())
++        ERR( "neutron-setactive-disabled: hwnd=%p is WS_DISABLED -> activated its last active popup %p instead (previous %p)\n",
++             neutron_disabled, hwnd, prev );
+     return prev;
+ }
+ 
