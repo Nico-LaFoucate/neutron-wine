@@ -1,0 +1,132 @@
+win32u: SetFocus() on another thread's top-level moves the foreground with the activation
+
+Premiere Pro: click away to another app, click back, and about a second later the app gains
+focus, loses it, and regains it. Independent of the file dialog (reproduces on the home screen
+with no dialog present) and of which app you click away to. Operator: "this is a legitimate
+focus, unfocus, refocus process when clicking back on the app."
+
+Captured 2026-09-16 (premiere-20260916-185237.log, WINEDEBUG=+win,+waylanddrv, 11.10-90, no
+dialog). Every cycle, a freshly spawned CEF process (wayland_process_init on its first thread)
+creates a WS_CHILD|WS_VISIBLE "CefBrowserWindow" inside a zero-sized CEF host top-level owned by
+Premiere's main thread, and runs CEF's focus sequence on the child:
+
+    0a10 set_foreground_window hwnd 0x2017a, mouse 0, internal 0 -> ret 0     <- denied, correctly
+    0a10 NtUserSetFocus 0x2017a prev 0x1015c
+    0a10 set_active_window hwnd 0x30146, previous 0x10156, mouse 0, focus 0   <- active moves alone
+    0178 set_foreground_window hwnd 0x30146, previous 0x30146 -> ret 1        <- foreground, LATE
+    0178 set_foreground_window hwnd 0x10156, previous 0x30146 -> ret 1        <- and unwinds again
+
+0x2017a is a child, so the WS_CHILD walk above resolves hwndTop to the host 0x30146, which
+belongs to thread 0178, not to the caller 0a10. Four foreground transitions per cycle where
+Windows has two, and in between Wine sits in a state Windows never enters: an active window that
+is not the foreground window. That desynchronised pair, not any repaint, is what the operator
+sees as gain/lose/regain.
+
+Windows (HANDOFF-61, Win11 26200, measured with a control program owning all the windows --
+rc-scripts/ncact_child.py T6, a second process parenting a WS_CHILD|WS_VISIBLE into a hidden
+0x86000000 popup and running SetWindowPos/SetForegroundWindow/SetFocus, exactly CEF's sequence):
+
+    [child proc] SetForegroundWindow(child) -> 0 err=0        <- Windows denies it too
+    [child proc] SetFocus(child) -> prev=1838536
+    STATE T6   fg=B active=B focus=B | ACTIVECAPTION: A=0 B=1
+
+So the denial is not the difference -- Windows denies the same call -- and neither is the steal:
+Windows performs it. The difference is that on Windows SetFocus moves the foreground, the active
+window and the focus together, in one transition, even though the caller's own
+SetForegroundWindow was just refused. Wine reaches set_foreground_window() from NtUserSetFocus
+only when there is no active window at all:
+
+    if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
+    if (hwndTop != active)
+        if (!set_active_window( hwndTop, NULL, FALSE, FALSE, 0 )) return 0;
+
+Here active is 0x10156, so the short circuit skips the foreground move and only the active window
+changes; the owning thread's own SetForegroundWindow then catches up as a separate transition and
+has to be unwound the same way.
+
+Fix: in NtUserSetFocus, when the resolved top-level is not already active, belongs to a different
+thread than the caller, and is not already the foreground window, move the foreground to it
+(internal, as Windows does after refusing the application's explicit call) instead of moving the
+active window alone. set_foreground_window() performs the activation itself, so the pair stays in
+step and the cycle is one transition each way. The same-thread case -- a thread activating its own
+top-level, the common path for every application -- is untouched, as is the active == 0 branch and
+every other set_active_window() caller.
+
+Kill switch NEUTRON_SETFOCUS_FOREGROUND=0 restores the upstream behaviour without a rebuild;
+NEUTRON_WL_DIAG=1 prints one neutron-setfocus-fg line per move, at the outcome.
+
+Supersedes an earlier attempt of the same file (hidden cross-thread targets took no activation at
+all), which the Windows measurement above refuted: the activation is correct, only its pairing
+with the foreground was wrong.
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2217,6 +2217,51 @@
+ /*****************************************************************
+  *           NtUserSetFocus  (win32u.@)
+  */
++
++/* NEUTRON: SetFocus() on a top-level owned by another thread.
++ *
++ * Windows moves the foreground window, the active window and the focus together here, in one
++ * transition, even when the caller's own SetForegroundWindow() was refused a moment earlier
++ * (measured on Win11 26200 with a control program owning every window: a second process parents
++ * a WS_CHILD|WS_VISIBLE into a hidden 0x86000000 popup and runs CEF's
++ * SetWindowPos/SetForegroundWindow/SetFocus sequence; SetForegroundWindow returns 0 and SetFocus
++ * then leaves fg == active == focus == that popup -- HANDOFF-61 T6).
++ *
++ * Wine could only reach set_foreground_window() from here when no window was active at all, so
++ * with an active window present it moved the active window alone and left the foreground behind.
++ * The owning thread's own SetForegroundWindow then arrived as a second transition and was unwound
++ * as a third and fourth, and in between the active window was not the foreground window -- a
++ * state Windows does not enter. Premiere's CEF hosts do this on every click-back, one per spawned
++ * CEF process, and the application sees activate/deactivate/activate.
++ *
++ * Only the divergent branch is touched: the target must be a top-level owned by a different
++ * thread that is neither already active nor already the foreground window. A thread activating
++ * its own top-level -- the common path -- keeps the upstream behaviour.
++ *
++ * Kill switch NEUTRON_SETFOCUS_FOREGROUND=0 restores the upstream behaviour without a rebuild;
++ * NEUTRON_WL_DIAG=1 reports each move, at the outcome. */
++static BOOL neutron_setfocus_foreground_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SETFOCUS_FOREGROUND" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_SETFOCUS_FOREGROUND = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++static BOOL neutron_setfocus_moves_foreground( HWND top, HWND active )
++{
++    if (!top || !active) return FALSE;              /* the active == 0 branch already foregrounds */
++    if (!neutron_setfocus_foreground_on()) return FALSE;
++    if (get_window_thread( top, NULL ) == GetCurrentThreadId()) return FALSE;
++    if (top == NtUserGetForegroundWindow()) return FALSE;   /* nothing to move */
++    return TRUE;
++}
++
+ HWND WINAPI NtUserSetFocus( HWND hwnd )
+ {
+     HWND hwndTop = hwnd, active;
+@@ -2257,7 +2302,15 @@
+         if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
+         if (hwndTop != active)
+         {
+-            if (!set_active_window( hwndTop, NULL, FALSE, FALSE, 0 )) return 0;
++            if (neutron_setfocus_moves_foreground( hwndTop, active ))
++            {
++                /* set_foreground_window() activates hwndTop itself, keeping the pair in step */
++                if (!set_foreground_window( hwndTop, FALSE, TRUE )) return 0;
++                if (neutron_wl_diag())
++                    ERR( "neutron-setfocus-fg: hwnd=%p top=%p (thread %04x, not ours) -> moved the foreground with the activation, was active %p\n",
++                         hwnd, hwndTop, (unsigned int)get_window_thread( hwndTop, NULL ), active );
++            }
++            else if (!set_active_window( hwndTop, NULL, FALSE, FALSE, 0 )) return 0;
+             if (!is_window( hwnd )) return 0;  /* Abort if window destroyed */
+ 
+             /* Do not change focus if the window is no longer active */
