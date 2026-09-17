@@ -1,0 +1,222 @@
+win32u: SetParent() no longer makes a HIDDEN window the foreground window (closes the second door of the Premiere click-back focus loss)
+
+Premiere Pro: click away to another app, click back, and ~0.6 s later the app loses focus and
+regains it ~0.65 s after that. Operator: "a legitimate focus, unfocus, refocus process when
+clicking back on the app." Every cycle, unchanged across 11.10-90, 91 (on/off), 92 (on/off),
+NEUTRON_KBD_FOREGROUND=0. Ranked #6 in RELEASE-CANDIDATE.md.
+
+WHAT IT IS (all MEASURED unless marked)
+
+Nothing above Wine moves the focus. KWin's own record (windowActivated/windowAdded/windowRemoved
+script, 2026-09-17 14:57 local, premiere-20260917-145724.log) shows ONE activation on the
+click-back (14:57:45.618, the file dialog) and then nothing until the operator dismissed the two
+dialogs (50.109 / 51.045, 0.9 s apart, file dialog then New Project -- the same Esc/Cancel pair
+the 143447 run shows at 4377.5-4378.8, where the "hands-off deactivation" at 4363.78 coincides to
+the second with his 18:35 "The fix doesn't work" message, i.e. his click over to Claude). Inside
+Wine, keyboard focus never left either: no neutron-wlkillfg between the click-back and the
+dismissals.
+
+What moves is Wine's ACTIVE/FOREGROUND window, inside the process, on every click-back:
+
+    5719.447  kbdfg 0x30142 FOREGROUNDING          <- click back onto the file dialog (#32770)
+    5719.472  PLUGPLUG_UI_NATIVE_WINDOW created, owner = frame, hidden
+    5719.477  GUID host 0x101a4 created: WS_POPUP, 0x0, no owner, never shown
+    5719.676  CEPHtmlEngine process starts (wayland_process_init)
+    5720.081  NtUserSetFocus(Chrome child) -> host active, "was active 0x30142"   <- door 1
+    5720.726  host torn down, SetActiveWindow(frame) refused (WS_DISABLED, 11.10-90 fix)
+
+Door 1 is CEF's stock SetFocus() into the hidden host (11.10-92 refuses it). Door 2, found in the
++win capture of 11.10-90 (premiere-20260916-185237.log, Premiere's main thread, every cycle):
+
+    NtUserSetParent (0x30146 0x20144)          <- PlugPlug reparents the host under its UI window
+    show_window hwnd=0x30146, cmd=0, was_visible 0
+    calc_winpos hwnd 0x30146 ... flags 00001801 style 86000000
+    WAYLAND_WindowPosChanged hwnd 0x30146 ... flags 0000092d      <- no SWP_NOACTIVATE
+    set_foreground_window hwnd 0x30146, mouse 0, internal 0 -> ret 1, previous 0x30146
+
+NtUserSetParent repositions with set_window_pos( SWP_NOSIZE ); set_window_pos() reads the missing
+SWP_NOACTIVATE as "activate" and, the host being WS_POPUP rather than WS_CHILD, calls
+set_foreground_window() on a 0x0 window nobody can see. On 90/91 it was a no-op because door 1
+had already activated the host (19852). On 92, with door 1 shut, it became the steal -- INFERRED
+from the 90 trace (the 92 logs are err-only); it is the only activation call left in the cycle
+and it lacks SWP_NOACTIVATE by construction. That is why the 92 guard "changed nothing" and why
+its "refutation" was wrong: it tested one door with the other open.
+
+Windows performs door 1 (HANDOFF-61 T6, and 13/13 real click-backs) but 4x earlier and half as
+long: host active at +152 ms for 240-320 ms, i.e. over before the user's next action. Under Wine
+the CEF process spawn puts the steal at +630 ms and the teardown at +1280 ms, inside the window
+where the user is already interacting, and the window that shows it is Wine's own comdlg32
+#32770 (no Adobe WM_NCACTIVATE shield: nc_paint 0x10272 0 inside each steal,
+premiere-20260915-134050.log). Every operator-confirmed capture ran with a #32770 as the
+foreground window. Whether Windows' shell dialog dims for its 300 ms is NOT measured.
+
+THE FIX (this patch, two hunks)
+
+1. dlls/win32u/window.c NtUserSetParent: when the window was hidden on entry and is not a
+   WS_CHILD, the reposition carries SWP_NOACTIVATE. Windows' own sequence for this step
+   (dlls/user32/tests/msg.c WmSetParentSeq_2) marks every activation message optional even for a
+   popup that was visible and active before the call, so Wine's unconditional activation of a
+   never-shown popup here is at best unverified Windows behaviour. Visible windows keep the
+   upstream path (the SW_SHOW that follows activates them as before).
+2. dlls/win32u/input.c: NEUTRON_SETFOCUS_HIDDEN_SIBLING defaults to 1 again. Both doors must be
+   shut for the cycle to stop; with either open the host takes the activation through the other.
+
+With both shut the host never becomes active, so its destruction triggers no
+activate_other_window, and PlugPlug's SetActiveWindow(frame) at teardown is handled by the
+11.10-90 rule (dialog up: frame WS_DISABLED, left alone) or is the same in-thread frame
+activation Windows shows 15 ms after the host returns (HANDOFF-61 run 4 #5).
+
+WHY THE OTHER SIX APPS CANNOT REGRESS -- what the guard excludes
+  - every window that was visible when SetParent() was called (upstream path, unchanged);
+  - every WS_CHILD (Photoshop's OWL document/dock reparenting, MDI children): WM_CHILDACTIVATE
+    is not touched -- the flag is only added on the set_foreground_window() branch;
+  - a hidden window that is already the active window (the activation was a no-op);
+  - a hidden top-level the app reparents and then shows: ShowWindow()/SWP_SHOWWINDOW activates it
+    exactly as before -- only the reparent itself stops activating.
+  Photoshop, After Effects, Illustrator, Animate, Lightroom Classic and Media Encoder reach this
+  branch only through the same PlugPlug/CEF host pattern (a hidden 0x0 popup reparented under a
+  hidden PlugPlug window), where the suppressed activation is by construction one of a window
+  with no WS_VISIBLE.
+
+HONEST LIMITS
+  - Door 2 being the 92-era steal is INFERRED from the 90 trace, not seen in a 92 +win log.
+  - That both doors shut removes what the operator sees is the prediction; the A/B below is the
+    test. Windows really does activate the host through door 1; the SetFocus rule is a Neutron
+    rule that reproduces Windows' visible outcome, as its own header says.
+
+A/B ON ONE PREFIX (~/.premiere2025), same gesture (New Project > Browse, click away, click back,
+hands off), one variable per pair, NEUTRON_WL_DIAG=1 WINEDEBUG=+timestamp:
+    A  (both doors shut, defaults)           expect: no unfocus/refocus; log shows
+       neutron-setfocus-hidden ... REFUSED and neutron-setparent-hidden ... WITHOUT activation
+    B  NEUTRON_SETPARENT_NOACTIVATE=0        expect: cycle back (door 2 open); no setparent line
+    C  NEUTRON_SETFOCUS_HIDDEN_SIBLING=0     expect: cycle back (door 1 open); neutron-setfocus-fg
+Kill switches: NEUTRON_SETPARENT_NOACTIVATE=0 and NEUTRON_SETFOCUS_HIDDEN_SIBLING=0. Diagnostics
+under NEUTRON_WL_DIAG=1, printed after the outcome: neutron-setparent-hidden (with the active
+window measured before and after the reposition) and neutron-setfocus-hidden.
+Compiled clean on both arches (dlls/win32u/window.o, input.o).
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2311,7 +2311,9 @@
+     if (on < 0)
+     {
+         const char *e = getenv( "NEUTRON_SETFOCUS_HIDDEN_SIBLING" );
+-        on = e ? (e[0] != '0') : 0;   /* NEUTRON: OFF by default -- refuted 2026-09-17, see header */
++        on = e ? (e[0] != '0') : 1;   /* NEUTRON: ON again 2026-09-17 -- the "refutation" tested this door
++                                       * with the second one (NtUserSetParent's reposition activating the
++                                       * same hidden host, dlls/win32u/window.c) still open */
+         ERR( "neutron-gateresolved: NEUTRON_SETFOCUS_HIDDEN_SIBLING = %d (%s)\n", on, e ? "environment" : "default" );
+     }
+     return on;
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -594,6 +594,84 @@
+    all doc-open paths (File>New/Open/recovery), both PS versions. Defined near neutron_on_window_created. */
+ static void neutron_predecision_on_reparent( HWND child, HWND parent );
+ 
++/* NEUTRON: SetParent() must not make a HIDDEN window the foreground window.
++ *
++ * NtUserSetParent() hides the window, relinks it, and then repositions it with
++ * set_window_pos( SWP_NOSIZE ) "to make hwnd the top window in the z-order and send the
++ * expected WM_WINDOWPOSCHANGING/CHANGED". set_window_pos() treats the missing SWP_NOACTIVATE as
++ * an order to activate: a WS_CHILD gets WM_CHILDACTIVATE, anything else goes through
++ * set_foreground_window(). For a window that was already hidden when SetParent() was called that
++ * hands the foreground, the activation and the focus to a window nobody can see.
++ *
++ * MEASURED (premiere-20260916-185237.log, WINEDEBUG=+win,+waylanddrv, 11.10-90, one line per
++ * click-back cycle, Premiere's main thread 0178):
++ *
++ *   NtUserSetParent (0x30146 0x20144)               <- PlugPlug reparents its 0x0, WS_POPUP,
++ *   show_window hwnd=0x30146, cmd=0, was_visible 0     never-shown CEP host under its UI window
++ *   calc_winpos hwnd 0x30146 ... flags 00001801 style 86000000
++ *   WAYLAND_WindowPosChanged hwnd 0x30146 ... flags 0000092d      <- no SWP_NOACTIVATE
++ *   set_foreground_window hwnd 0x30146, mouse 0, internal 0 -> ret 1, previous 0x30146
++ *
++ * On 11.10-90/91 that call was a no-op only because the CEF process's SetFocus() had activated
++ * the same host a moment earlier (19852: set_active_window hwnd 0x30146, previous 0x10156). On
++ * 11.10-92, with that SetFocus refused (NEUTRON_SETFOCUS_HIDDEN_SIBLING), this became the call
++ * that took the activation away from the file dialog the operator was looking at -- which is why
++ * the 92 guard "changed nothing": it closed one of two doors. The host is torn down ~0.65 s later
++ * and activation returns; the operator sees focus leave and come back ~1 s after clicking into
++ * the app (premiere-20260917-143447.log: SetFocus REFUSED at +0.60 s, host teardown at +1.25 s).
++ *
++ * Windows' own SetParent() sequence (dlls/user32/tests/msg.c WmSetParentSeq_2, measured on
++ * Windows) repositions with exactly SWP_NOSIZE too and marks every activation message in that
++ * step optional, i.e. Windows does not reliably activate there even for a popup that was visible
++ * and active before the call; nothing in that test covers a never-shown popup. Wine's
++ * set_window_pos() activates unconditionally. This keeps the upstream reposition for windows that
++ * were visible (the SW_SHOW that follows re-activates them as Windows does) and adds
++ * SWP_NOACTIVATE only when the window was hidden on entry and is not a WS_CHILD (children keep
++ * their WM_CHILDACTIVATE).
++ *
++ * What is excluded, so the other apps cannot regress: every visible window (was_visible); every
++ * WS_CHILD (Photoshop's OWL document/dock reparenting, MDI-style children -- WM_CHILDACTIVATE is
++ * untouched); a hidden window that is already the active window (the call was a no-op anyway).
++ * A hidden top-level that an application reparents and then shows still activates through
++ * ShowWindow()/SetWindowPos(SWP_SHOWWINDOW) exactly as before.
++ *
++ * Kill switch NEUTRON_SETPARENT_NOACTIVATE=0 restores the upstream behaviour without a rebuild;
++ * NEUTRON_WL_DIAG=1 prints one neutron-setparent-hidden line per suppressed activation, AFTER the
++ * reposition, with the active window it measured before and after. */
++static BOOL neutron_setparent_noactivate_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SETPARENT_NOACTIVATE" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_SETPARENT_NOACTIVATE = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++static BOOL neutron_setparent_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_WL_DIAG" ); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++/* TRUE when the reposition inside NtUserSetParent must carry SWP_NOACTIVATE */
++static BOOL neutron_setparent_hidden_noactivate( HWND hwnd, BOOL was_visible )
++{
++    DWORD style;
++
++    if (was_visible) return FALSE;                          /* upstream path */
++    if (!neutron_setparent_noactivate_on()) return FALSE;
++    style = get_window_long( hwnd, GWL_STYLE );
++    if (style & WS_VISIBLE) return FALSE;                    /* shown meanwhile: upstream path */
++    if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD) return FALSE;   /* WM_CHILDACTIVATE, untouched */
++    if (hwnd == get_active_window()) return FALSE;          /* activation would be a no-op */
++    return TRUE;
++}
++
+ /*****************************************************************
+  *           NtUserSetParent (win32u.@)
+  */
+@@ -717,8 +795,22 @@
+     winpos.cy = 0;
+     winpos.flags = SWP_NOSIZE;
+ 
+-    set_window_pos( &winpos, new_screen_rect.left - old_screen_rect.left,
+-                    new_screen_rect.top - old_screen_rect.top );
++    /* NEUTRON: a window that was hidden on entry is repositioned, not activated (see
++     * neutron_setparent_hidden_noactivate above) */
++    {
++        BOOL neutron_noact = neutron_setparent_hidden_noactivate( hwnd, was_visible );
++        HWND neutron_active_before = neutron_noact ? get_active_window() : 0;
++
++        if (neutron_noact) winpos.flags |= SWP_NOACTIVATE;
++
++        set_window_pos( &winpos, new_screen_rect.left - old_screen_rect.left,
++                        new_screen_rect.top - old_screen_rect.top );
++
++        if (neutron_noact && neutron_setparent_diag())
++            ERR( "neutron-setparent-hidden: hwnd=%p (style %08x) reparented under %p while hidden -> repositioned WITHOUT activation, active was %p, is %p\n",
++                 hwnd, (unsigned int)get_window_long( hwnd, GWL_STYLE ), parent,
++                 neutron_active_before, get_active_window() );
++    }
+ 
+     if (was_visible) NtUserShowWindow( hwnd, SW_SHOW );
+ 

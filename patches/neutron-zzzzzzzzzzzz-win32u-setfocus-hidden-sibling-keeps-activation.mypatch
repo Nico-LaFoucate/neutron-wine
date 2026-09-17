@@ -1,0 +1,215 @@
+win32u: SetFocus() into a hidden top-level of the thread that already owns the activation leaves the activation where it is (door 1 of 2 — see neutron-zzzzzzzzzzzzz-win32u-setparent-hidden-noactivate)
+
+⚠️ **2026-09-17, later the same day: the "REFUTED" verdict below was WRONG and is retracted.** The
+11.10-92 test shut THIS door and left a second one open: NtUserSetParent's reposition
+(set_window_pos with SWP_NOSIZE and no SWP_NOACTIVATE) activates the same hidden host from Premiere's
+main thread ~0.2 s later (premiere-20260916-185237.log, every cycle: `NtUserSetParent (0x30146 0x20144)`
+→ `set_foreground_window hwnd 0x30146`), which is why "nothing changed". Both doors are shut by
+`neutron-zzzzzzzzzzzzz-win32u-setparent-hidden-noactivate.mypatch`, which also flips this gate's
+DEFAULT BACK TO 1 (the hunk lives in that patch; the diff below still shows the 0 it found). A/B for
+the pair is in that patch's header. The block below is kept as history.
+
+⛔ **THIS DOES NOT FIX THE CLICK-BACK FOCUS BUG. Refuted 2026-09-17, kept only as a recorded negative.**
+Built as 11.10-92 and tested on `~/.premiere2025` with `NEUTRON_WL_DIAG=1`: the guard fired correctly and
+completely — 3 `neutron-setfocus-hidden … REFUSED` and **zero** `neutron-setfocus-fg`, i.e. the activation
+steal it targets was PREVENTED OUTRIGHT — and the operator reported *"Nothing changed"*
+(`premiere-20260917-143447.log`).
+
+⭐ **That is a clean elimination and it is the value of this patch: the activation steal by the hidden CEP
+host is NOT the mechanism of the click-back focus bug.** Do not re-open that line of attack. Prevent the
+steal entirely and the bug is untouched.
+
+**Therefore the gate defaults to 0.** It refuses `SetFocus` for hidden cross-thread windows — a real
+behaviour change with no demonstrated benefit and a plausible way to break a CEP extension panel that
+expects focus. Enable with `NEUTRON_SETFOCUS_HIDDEN_SIBLING=1` only to reproduce the negative.
+
+⭐ **Observation from the same log, NOT a conclusion:** with the steal gone, every click-back still shows
+TWO foreground transitions inside Premiere — focus arrives on the captioned popup that held it
+(`kbdfg 0x20144 FOREGROUNDING`), and ~170 ms later the foreground is the main frame `0x10120`. Our own
+`neutron-kbdfg` patch in winewayland `keyboard_handle_enter` performs the first. That double transition is
+the next lead; it has not been tested.
+
+--- original rationale below, still accurate as description, wrong as diagnosis ---
+
+
+Premiere Pro: click away to another app, click back, and about 0.65 s later the app loses focus
+and regains it. Operator: "this is a legitimate focus, unfocus, refocus process when clicking
+back on the app." Not intermittent; every click-back cycle. Tracks CEP extension hosts:
+~/Neutron-Prefixes/Adobe2026 runs 0 CEPHtmlEngine and never shows it, ~/.premiere2025 runs 10-34
+and shows it every cycle. Ranked #6 in RELEASE-CANDIDATE.md.
+
+MEASURED (premiere-20260917-134054.log, NEUTRON_WL_DIAG=1 WINEDEBUG=+timestamp, 11.10-91):
+
+    1126.016  neutron-wlkillfg 0x50288 DEACTIVATING            <- click away (frame 0x50288)
+    1127.718  neutron-kbdfg    0x50288 FOREGROUNDING           <- click back
+    1127.741  neutron-role 0x2001b6 PLUGPLUG_UI_NATIVE_WINDOW  style 04c80000 (hidden, owner=frame)
+    1127.745  neutron-role 0x60148  4b111f37-... style 86000000 VIS=0x0 owner=(nil) role=NONE
+    1128.378  neutron-setfocus-fg hwnd=0x1002bc top=0x60148 (thread 1a2c, not ours)
+              -> moved the foreground with the activation, was active 0x50288
+    1128.644  dcomp REGISTER chain: 0x1002BC[Chrome_WidgetWin_0,pid1792] <- 0x1A0284[CefBrowserWindow]
+              <- 0x60148[GUID host, pid Premiere] <- 0x2001B6[PLUGPLUG_UI_NATIVE_WINDOW] <- desktop
+
+Every cycle: PlugPlug creates a 0x0, WS_POPUP, never-shown host window on Premiere's main thread,
+a CEPHtmlEngine process parents a visible Chrome_WidgetWin_0 into it and runs Chromium's stock
+activate sequence -- SetForegroundWindow(child), refused because WS_CHILD, then SetFocus(child).
+NtUserSetFocus walks the child up to the hidden host and activates it, and the window the user is
+looking at is deactivated. 11.10-90 without the foreground pairing (premiere-20260916-185237.log,
++win): "0a10 set_active_window hwnd 0x30146, previous 0x10156, mouse 0, focus 0". Same steal, same
+source, also while extension panels load at startup (134054: 1115.590, 1120.111, 1120.284).
+
+Windows comparison (HANDOFF-61, Win11 26200, read-only instruments): Windows performs the SAME
+activation. Its control program (rc-scripts/ncact_child.py, T6) had a second process parent a
+WS_CHILD|WS_VISIBLE into a hidden 0x86000000 popup and run exactly that sequence:
+
+    [child proc] SetForegroundWindow(child) -> 0 err=0
+    [child proc] SetFocus(child) -> prev=1838536
+    STATE T6   fg=B active=B focus=B | ACTIVECAPTION: A=0 B=1
+
+and real Premiere on Windows moved fg/active to the GUID host on 13 of 13 click-backs, for
+240-320 ms. So the steal is not the divergence. What the user sees on Windows is nothing, for one
+reason: Premiere's frame WndProc (in dvaworkspace.dll), on WM_NCACTIVATE,
+forces wParam=TRUE whenever the window taking the activation is on its own thread,
+so the frame's WS_ACTIVECAPTION bit stayed 1 through all 13 steals and a 60 Hz screen sampler saw
+zero inactive frames. Wine answers every primitive that handler uses identically and the frame's
+caption stays active under Wine too: 185237 paints "nc_paint 0x10120 4" through every steal and
+"nc_paint 0x10120 0" only on the genuine click-away.
+
+What the shield does NOT cover is every window the application does not subclass. Wine's comdlg32
+#32770 file dialog is the measured case: with the Open dialog up, each steal paints
+"nc_paint 0x10272 0" and the dialog's caption goes inactive and back (premiere-20260915-134050.log,
+three cycles, 4 -> 0 -> 4). Every flicker-confirmed capture without a foreground move
+(20260916-161220 on 11.10-90, 20260916-200445 with NEUTRON_SETFOCUS_FOREGROUND=0) ran its cycles
+with a #32770 dialog (0x20156 / 0x30142, style 96cc20c4) as the foreground window. Whatever else
+in the application reacts to WM_ACTIVATE(WA_INACTIVE) / WM_KILLFOCUS / the foreground leaving the
+window it is showing is unshielded in the same way.
+
+Fix: the application declares, in that shield, that activation moving to a hidden sibling on its
+own thread is not a user-visible activation change. Apply the same rule one level down, at the
+only entry point the hosts use. In NtUserSetFocus, when the resolved top-level is not already
+active, the caller is not the thread that owns it, it has no WS_VISIBLE, and the activation
+already belongs to its thread, leave the activation where it is and fail the call (return 0, as
+Windows does when the focus cannot be set). Nothing can be typed into a window nobody can see, so
+the refused focus has no observable owner.
+
+What the guard excludes, and why the other apps cannot regress:
+  - a thread activating its own hidden window before showing it (same thread) -- upstream path;
+  - a hidden host that has been docked into a visible panel: it becomes WS_CHILD of the frame and
+    the WS_CHILD walk then resolves to the frame, already active (134054 1121.273:
+    "hwnd=0x3019c top=0x50288") -- never reaches this branch, so visible CEP panels (Captioneer,
+    Photoshop/AE/Illustrator/Animate extension panels) keep their focus handling;
+  - an activation coming from a thread whose windows do not hold the activation (another
+    application's window, a dialog on a worker thread) -- upstream path;
+  - active == 0 (nothing active, e.g. after our own click-away deactivation) -- upstream path.
+  Photoshop, After Effects, Illustrator, Animate, Lightroom Classic and Media Encoder reach this
+  branch only through the same CEP/CEF host pattern, where the refused target is by construction a
+  window with no WS_VISIBLE.
+
+This is a Neutron rule, not a restored Win32 semantic: Windows really does move the activation to
+the hidden host and lets Premiere's own handler hide the consequence. The rule reproduces Windows'
+visible outcome for every window the application does not shield. An earlier draft of the same
+idea (11.10-91 development) was dropped unbuilt and untested when HANDOFF-61 showed Windows
+activates the host; this one is written against that measurement, not in ignorance of it.
+
+Kill switch NEUTRON_SETFOCUS_HIDDEN_SIBLING=0 restores the upstream behaviour without a rebuild;
+NEUTRON_WL_DIAG=1 prints one neutron-setfocus-hidden line per refusal, at the outcome. With the
+gate on, the neutron-setfocus-fg line of the 11.10-91 patch no longer fires for these hosts (the
+branch is never reached); with it off, it fires as before. A/B on ONE prefix (~/.premiere2025):
+same gesture, gate on vs NEUTRON_SETFOCUS_HIDDEN_SIBLING=0, compare the operator's per-cycle
+report against the neutron-setfocus-hidden / neutron-setfocus-fg lines.
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2262,6 +2262,74 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON: SetFocus() from another thread into a HIDDEN top-level of the thread that already
++ * owns the activation.
++ *
++ * Premiere's CEP extension hosts (PlugPlug) create a 0x0, WS_POPUP, never-shown host window on
++ * the application's main thread and hand it to a CEPHtmlEngine (CEF) process, which parents a
++ * visible Chrome_WidgetWin_0 into it and runs Chromium's stock activate sequence:
++ * SetForegroundWindow(child) -- refused, WS_CHILD -- then SetFocus(child). The WS_CHILD walk
++ * above resolves hwndTop to that hidden host, and activating it takes the activation away from
++ * the window the user is looking at: the main frame, or whatever dialog is up. Premiere does this
++ * on every click-back into the app, ~0.65 s after the click (premiere-20260917-134054.log), once
++ * per extension host spawned, and again while extension panels load.
++ *
++ * Windows performs the same activation (HANDOFF-61 T6, Win11 26200: the second process's SetFocus
++ * leaves fg == active == focus == the hidden popup for 240-320 ms). What the user sees on Windows
++ * is nothing, for one reason only: Premiere's frame WndProc (in dvaworkspace.dll), on
++ * WM_NCACTIVATE, forces wParam=TRUE whenever the window
++ * taking the activation is one of its own thread's windows, so its caption never paints inactive.
++ * Wine answers every primitive in that handler the same way and the frame's caption stays active
++ * under Wine too (premiere-20260916-185237.log: nc_paint <frame> 4 through every steal). What is
++ * NOT shielded on either platform is every window the application does not subclass -- Wine's
++ * comdlg32 #32770 file dialog above all (nc_paint 0x10272 0 inside each steal,
++ * premiere-20260915-134050.log) -- and whatever else in the application reacts to WM_ACTIVATE /
++ * WM_KILLFOCUS / the foreground moving away from the window it is showing.
++ *
++ * The application itself declares, in that shield, that activation moving to a hidden sibling on
++ * its own thread is not a user-visible activation change. This applies the same rule one level
++ * down, at the only entry point the hosts use: when the caller is not the thread that owns the
++ * target, the target has no WS_VISIBLE, and the activation already belongs to the target's
++ * thread, the activation is left where it is and SetFocus fails (returns 0, as it does on Windows
++ * when the focus cannot be moved). Nothing can be typed into a window nobody can see, so the
++ * refused focus has no observable owner. A hidden host that is later docked into a panel becomes
++ * WS_CHILD of the frame (the walk then resolves to the frame, already active -- 134054 line
++ * 1121.273 'top=0x50288'), so visible extension panels never reach this branch; nor does a thread
++ * activating its own hidden window before showing it (same thread), nor an activation coming from
++ * another application's thread (activation not already on the target's thread).
++ *
++ * This is a Neutron rule, not a restored Win32 semantic: Windows really does move the activation
++ * to the hidden host and lets Premiere's own handler hide the consequence. The rule reproduces
++ * Windows' visible outcome for every window the application does not shield.
++ *
++ * Kill switch NEUTRON_SETFOCUS_HIDDEN_SIBLING=0 restores the upstream behaviour without a
++ * rebuild; NEUTRON_WL_DIAG=1 prints one neutron-setfocus-hidden line per refusal, at the outcome. */
++static BOOL neutron_setfocus_hidden_sibling_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SETFOCUS_HIDDEN_SIBLING" );
++        on = e ? (e[0] != '0') : 0;   /* NEUTRON: OFF by default -- refuted 2026-09-17, see header */
++        ERR( "neutron-gateresolved: NEUTRON_SETFOCUS_HIDDEN_SIBLING = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++static BOOL neutron_setfocus_refuse_hidden_sibling( HWND top, HWND active )
++{
++    DWORD top_thread;
++
++    if (!top || !active) return FALSE;              /* nothing is active: upstream path */
++    if (!neutron_setfocus_hidden_sibling_on()) return FALSE;
++    if (get_window_long( top, GWL_STYLE ) & WS_VISIBLE) return FALSE;   /* a window the user can see */
++    top_thread = get_window_thread( top, NULL );
++    if (top_thread == GetCurrentThreadId()) return FALSE;   /* a thread activating its own window */
++    if (top_thread != get_window_thread( active, NULL )) return FALSE;  /* activation is elsewhere */
++    return TRUE;
++}
++
+ HWND WINAPI NtUserSetFocus( HWND hwnd )
+ {
+     HWND hwndTop = hwnd, active;
+@@ -2302,6 +2370,18 @@
+         if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
+         if (hwndTop != active)
+         {
++            if (neutron_setfocus_refuse_hidden_sibling( hwndTop, active ))
++            {
++                /* the activation stays on the window the user is looking at; the focus cannot
++                 * move outside the active window, so the call fails as it would on Windows when
++                 * the focus cannot be set */
++                if (neutron_wl_diag())
++                    ERR( "neutron-setfocus-hidden: hwnd=%p top=%p is hidden (style %08x) on thread %04x, which owns the active window %p -> activation left in place, SetFocus REFUSED (caller thread %04x)\n",
++                         hwnd, hwndTop, (unsigned int)get_window_long( hwndTop, GWL_STYLE ),
++                         (unsigned int)get_window_thread( hwndTop, NULL ), active,
++                         (unsigned int)GetCurrentThreadId() );
++                return 0;
++            }
+             if (neutron_setfocus_moves_foreground( hwndTop, active ))
+             {
+                 /* set_foreground_window() activates hwndTop itself, keeping the pair in step */

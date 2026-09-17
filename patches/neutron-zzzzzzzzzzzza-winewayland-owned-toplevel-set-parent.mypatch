@@ -1,0 +1,143 @@
+HONEST LIMIT. That set_parent makes KWin hand focus back to the owner is how the protocol is
+specified; it has NOT been measured here. Hence the gate, so one launch answers it.
+
+Kill switch NEUTRON_TOPLEVEL_PARENT=0 restores the upstream behaviour (no parent ever set) without a
+rebuild; NEUTRON_WL_DIAG=1 prints one neutron-toplevelparent line per change, at the outcome.
+Compiled clean on both arches.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -588,6 +588,91 @@
+     ERR("Failed to assign toplevel role to wayland surface\n");
+ }
+ 
++/* NEUTRON: tell the compositor which toplevel OWNS this toplevel.
++ *
++ * Wine gives every visible, managed, owned window its own xdg_toplevel -- Premiere's New Project
++ * dialog, the comdlg32 #32770 file dialogs, the DroverLord home screen -- and never called
++ * xdg_toplevel.set_parent for any of them (`grep -rn set_parent dlls/winewayland.drv` returned
++ * nothing before this patch). The compositor therefore saw a flat set of unrelated toplevels that
++ * merely share an app_id, with no record that any of them is a dialog of the main frame.
++ *
++ * MEASURED from KWin's own side (windowActivated/windowAdded/windowRemoved script, 2026-09-17,
++ * operator idle after a SINGLE click back into the app):
++ *
++ *   18:57:43.459 ACTIVATED dolphin                                  <- operator clicks away
++ *   18:57:45.618 ACTIVATED premiere caption=""            652x515   <- clicks back, then HANDS OFF
++ *   18:57:50.109 ACTIVATED premiere caption="New Project" 402x275   <- +4.5 s, NO USER INPUT
++ *   18:57:50.110 REMOVED   premiere caption=""            652x515      the focused window is destroyed
++ *   18:57:51.045 ACTIVATED premiere caption="Adobe Premiere Pro 2025"
++ *   18:57:51.045 REMOVED   premiere caption="New Project"
++ *
++ * All reported popup=false transient=false. When the window holding the focus is destroyed the
++ * compositor must choose a successor; with no parent recorded it walks its own toplevel list
++ * instead of returning the focus to the owner, and the windows it lands on are themselves being
++ * torn down. That walk is the focus/unfocus/refocus the operator sees ~1 s after clicking back.
++ * It is NOT a repaint: win32u never paints either caption inactive
++ * (premiere-20260916-185237.log, nc_paint <frame> 4 throughout).
++ *
++ * xdg-shell specifies set_parent for exactly this: the parent is stacked behind the child and is
++ * the window to return to.
++ *
++ * (a) Not the xdg_popup path (wayland_surface_make_popup) -- that is for unmanaged menu-like
++ *     windows and already anchors to its owner. These are legitimately toplevels: managed,
++ *     captioned, independently movable dialogs, and must stay toplevels.
++ * (b) HONEST LIMIT: that set_parent makes the compositor hand focus back to the owner is how the
++ *     protocol is specified, not something measured here. Hence the gate.
++ *
++ * Kill switch NEUTRON_TOPLEVEL_PARENT=0 restores the upstream behaviour (no parent ever set)
++ * without a rebuild; NEUTRON_WL_DIAG=1 prints one neutron-toplevelparent line per change, at the
++ * outcome. */
++static BOOL neutron_wl_surf_diag(void);   /* NEUTRON: defined below, used by the parent diag */
++
++static BOOL neutron_toplevel_parent_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_TOPLEVEL_PARENT" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_TOPLEVEL_PARENT = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++/**********************************************************************
++ *          wayland_surface_set_toplevel_parent
++ *
++ * Records the owning toplevel for a toplevel surface (xdg_toplevel.set_parent).
++ * `parent` may be NULL, which clears the relationship.
++ */
++void wayland_surface_set_toplevel_parent(struct wayland_surface *surface,
++                                         struct wayland_surface *parent)
++{
++    struct xdg_toplevel *parent_toplevel;
++
++    if (!neutron_toplevel_parent_on()) return;
++    if (!surface || surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL || !surface->xdg_toplevel) return;
++
++    /* A parent is only meaningful if it is itself a mapped toplevel. */
++    parent_toplevel = (parent && parent->role == WAYLAND_SURFACE_ROLE_TOPLEVEL &&
++                       parent->xdg_toplevel) ? parent->xdg_toplevel : NULL;
++
++    if (parent_toplevel == surface->xdg_toplevel) return;              /* never parent to self */
++    if (surface->neutron_parent_toplevel == parent_toplevel) return;   /* unchanged */
++
++    xdg_toplevel_set_parent(surface->xdg_toplevel, parent_toplevel);
++    surface->neutron_parent_toplevel = parent_toplevel;
++    wl_surface_commit(surface->wl_surface);
++    wl_display_flush(process_wayland.wl_display);
++
++    if (neutron_wl_surf_diag())
++        ERR("neutron-toplevelparent: hwnd=%p -> parent hwnd=%p (%s) -- compositor can now return "
++            "focus to the owner when this one is destroyed\n",
++            surface->hwnd, parent_toplevel ? parent->hwnd : 0,
++            parent_toplevel ? "set" : "cleared");
++}
++
+ /**********************************************************************
+  *          wayland_surface_make_subsurface
+  *
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -390,6 +390,8 @@
+         struct
+         {
+             struct xdg_toplevel *xdg_toplevel;
++    /* NEUTRON: last xdg_toplevel handed to xdg_toplevel.set_parent, to avoid redundant calls */
++    struct xdg_toplevel *neutron_parent_toplevel;
+             struct xdg_toplevel_icon_v1 *xdg_toplevel_icon;
+             struct zxdg_toplevel_decoration_v1 *zxdg_toplevel_decoration_v1;
+         };
+@@ -459,6 +461,8 @@
+ struct wayland_surface *wayland_surface_create(HWND hwnd);
+ void wayland_surface_destroy(struct wayland_surface *surface);
+ void wayland_surface_make_toplevel(struct wayland_surface *surface, BOOL server_decor);
++void wayland_surface_set_toplevel_parent(struct wayland_surface *surface,
++                                         struct wayland_surface *parent);
+ void wayland_surface_make_subsurface(struct wayland_surface *surface,
+                                      struct wayland_surface *parent);
+ void wayland_surface_make_popup(struct wayland_surface *surface,
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -640,6 +640,19 @@
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         wayland_surface_make_toplevel(surface, server_decor);
++        /* NEUTRON: record the OWNING toplevel so the compositor returns focus to it when this
++         * window is destroyed, instead of walking its own toplevel list. See
++         * wayland_surface_set_toplevel_parent(). owner_surface is deliberately cleared by the
++         * popup/subsurface decision above, so take the owner from win32 the same way the
++         * neutron-role diagnostic does -- GW_OWNER is populated for these managed dialogs
++         * (verified: the diag prints owner=0x10120 for Premiere's #32770). */
++        {
++            HWND owner_hwnd = NtUserGetWindowRelative(data->hwnd, GW_OWNER);
++            struct wayland_win_data *parent_data =
++                (owner_hwnd && owner_hwnd != data->hwnd) ? wayland_win_data_get_nolock(owner_hwnd) : NULL;
++            wayland_surface_set_toplevel_parent(surface,
++                                                parent_data ? parent_data->wayland_surface : NULL);
++        }
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         wayland_surface_make_subsurface(surface, toplevel_surface);
