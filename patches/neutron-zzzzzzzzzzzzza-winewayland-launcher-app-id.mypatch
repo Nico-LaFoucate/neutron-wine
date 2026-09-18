@@ -1,0 +1,105 @@
+winewayland: honour a launcher-supplied Wayland app_id (NEUTRON_WAYLAND_APP_ID)
+
+Upstream derives the xdg_toplevel app_id from the EXE basename alone, so the same
+app installed in two prefixes advertises the IDENTICAL id. A desktop environment
+matches a running window back to a .desktop entry by that id (or by the
+StartupWMClass our generator fills with the same string), so it cannot tell the
+entries apart.
+
+MEASURED 2026-09-18: the operator launched Premiere from the pinned
+~/.premiere2025 entry and the task manager labelled the running window "Premiere
+Pro (Adobe2026)" while the window's own title read "Adobe Premiere Pro 2025".
+Confirmed by screenshot. The app was in the correct prefix throughout -- the
+desktop entry, the launch log, and every running process had
+WINEPREFIX=~/.premiere2025 -- so this is a label and window-grouping
+fault, not a routing one. It affects every app installed into more than one
+prefix.
+
+Fix: wayland_init_process_name() uses NEUTRON_WAYLAND_APP_ID when the launcher
+sets it. `neutron launch` now passes the .desktop basename for this app+prefix
+(e.g. neutron-premiere-premiere2025), which is the XDG convention -- an app_id
+equal to a desktop entry's basename binds to that entry directly, with no
+StartupWMClass guesswork -- and the entry generator writes the same string as
+StartupWMClass. Empty or whitespace-only is treated as unset, and with the
+variable unset Wine keeps the upstream EXE-name behaviour exactly, so an older
+runtime still binds by the fallback.
+
+waylanddrv_main.c had no debug channel; added WINE_DEFAULT_DEBUG_CHANNEL
+(waylanddrv) and string.h for the one diagnostic line. Compiled clean on both
+arches.
+
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -25,10 +25,14 @@
+ #include "config.h"
+ 
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "ntstatus.h"
+ 
+ #include "waylanddrv.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+ char *process_name = NULL;
+ 
+@@ -59,6 +63,42 @@
+     .pOpenGLInit = WAYLAND_OpenGLInit,
+ };
+ 
++/* NEUTRON: per-prefix Wayland app id.
++ *
++ * Upstream derives the xdg_toplevel app_id from the EXE name alone, so every prefix that has the
++ * same app installed reports the identical id -- "adobe premiere pro.exe" for Premiere in
++ * ~/.premiere2025 AND in ~/Neutron-Prefixes/Adobe2026. A desktop environment matches a running
++ * window back to a .desktop entry by that id (or by StartupWMClass, which our generator fills with
++ * the same string), so with the app installed in two prefixes it cannot tell the entries apart and
++ * picks whichever it finds first.
++ *
++ * MEASURED 2026-09-18: the operator launched Premiere from the pinned .premiere2025 entry; the task
++ * manager labelled the running window "Premiere Pro (Adobe2026)" while the window's own title read
++ * "Adobe Premiere Pro 2025". The app was in the right prefix throughout -- launcher, environment and
++ * every process had WINEPREFIX=~/.premiere2025 -- only the label was wrong. It affects every
++ * app installed into more than one prefix, not just Premiere, and it also breaks window grouping.
++ *
++ * Fix: honour NEUTRON_WAYLAND_APP_ID when the launcher sets it. `neutron launch` passes the id of the
++ * .desktop entry it is launching (e.g. "neutron-premiere-premiere2025"), which is the XDG convention
++ * -- an app_id equal to a desktop entry's basename is matched to that entry directly, with no
++ * StartupWMClass guesswork. Unset (a bare wine invocation) keeps the upstream EXE-name behaviour
++ * exactly.
++ *
++ * Empty or whitespace-only is treated as unset. No kill switch beyond that: not setting the variable
++ * IS the upstream path. */
++static char *neutron_env_app_id(void)
++{
++    const char *e = getenv( "NEUTRON_WAYLAND_APP_ID" );
++    size_t n;
++
++    if (!e) return NULL;
++    while (*e == ' ' || *e == '\t') e++;
++    if (!(n = strlen( e ))) return NULL;
++    while (n && (e[n - 1] == ' ' || e[n - 1] == '\t' || e[n - 1] == '\n')) n--;
++    if (!n) return NULL;
++    return strndup( e, n );
++}
++
+ static void wayland_init_process_name(void)
+ {
+     WCHAR *p, *appname;
+@@ -68,6 +108,14 @@
+     DWORD utf8_size;
+     int i;
+ 
++    /* NEUTRON: a launcher-supplied id wins over the EXE name (see neutron_env_app_id). */
++    if ((process_name = neutron_env_app_id()))
++    {
++        ERR( "neutron-appid: using launcher-supplied Wayland app_id \"%s\" (NEUTRON_WAYLAND_APP_ID)\n",
++             process_name );
++        return;
++    }
++
+     appname = RtlGetCurrentPeb()->ProcessParameters->ImagePathName.Buffer;
+     if ((p = wcsrchr(appname, '/'))) appname = p + 1;
+     if ((p = wcsrchr(appname, '\\'))) appname = p + 1;
