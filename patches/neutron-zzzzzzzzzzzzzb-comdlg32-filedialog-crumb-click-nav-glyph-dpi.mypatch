@@ -1,0 +1,633 @@
+comdlg32: file dialog follow-ups -- clickable breadcrumb segments; nav arrows drawn at the dialog's dpi
+
+Two follow-ups to the 11.10-85 restyle of the Common Item Dialog (ROADMAP.md item 1a), in
+the operator's words while daily-driving 11.10-89-r2:
+
+  1. "we should add the ability to click on the specific part of the tree as a secondary
+     method of navigation aside from the arrow buttons next to it."
+  2. "the Arrow icons themselves are currently too small and positioned too high of center."
+
+CLICKABLE BREADCRUMB. neutron_update_crumbs() now keeps the IShellItem for each segment
+next to its name; the painter lays each ancestor segment out as a hit rect (the text plus
+5px of air, as tall as a nav button, centred in the band) and paints the hot one with the
+same round NEUTRON_NAV_HOT / NEUTRON_NAV_PRESSED fill the nav buttons use. The dialog
+handles WM_MOUSEMOVE / WM_MOUSELEAVE / WM_LBUTTONDOWN / WM_LBUTTONUP / WM_CAPTURECHANGED /
+WM_SETCURSOR (hand cursor) for the band, and a release on the pressed segment calls
+IExplorerBrowser_BrowseToObject() on that segment's item -- the same call the Up button
+and SetFolder go through, so nothing about what the dialog returns changes. The nav arrows
+stay; this is the secondary method the operator asked for. The current folder (last
+segment) is not a target; the ellipsis is not a target.
+
+NAV ARROWS. MEASURED: the mockup (itemdlg.html, .tbtn) is a 2.6em x 2em button (34x26 at
+its 13px em) with the glyph flex-centred in it; in the 1134px render the arrow glyph
+centres sit on the band centre to within 0.5px (glyph cy 120.0-120.5, band 84..155). The
+11.10-85 captures at 96 dpi are also centred (glyph cy 81-82 in a 50..114 band) and the
+glyph is 12x12 px. So at 96 dpi there is no fault -- and both of the operator's prefixes
+run at LogPixels = 0xa3 = 163 (`neutron prefix provision` writes round(96 * 1.7)).
+
+At 163 dpi the code path is (comctl32/toolbar.c, read, not run): TB_ADDBITMAP of a
+standard strip fixes the bitmap at 24x24 and the image is drawn at that native size;
+TB_SETBUTTONSIZE is clamped to padding + bitmap, i.e. max(51,31) x max(44,30) = 51x44;
+TOOLBAR_DrawButton centres the image horizontally but top-anchors it at padding.cy/2 =
+3px. Net: a 12px glyph in a 51x44 button (0.27 of the height where the mockup and the
+96-dpi build have ~0.4) whose centre sits at y=15 of 44 -- 7px above the button centre.
+Too small and too high, at every dpi above 96.
+
+Fix, LOCAL to this dialog (the strip is shared by every toolbar in every app and is left
+alone): on_wm_notify() draws the three glyphs itself from the strip's own path data
+(build/art/gen_toolbar_icons.py: HIST_BACK, HIST_FORWARD, VIEW_PARENTFOLDER in a 24-box,
+stroke 2, round caps/joins), scaled to the dialog's dpi, 6x supersampled with a geometric
+pen, box-filtered to coverage and GdiAlphaBlend'ed centred in the button, and returns
+CDRF_SKIPDEFAULT. init_toolbar() declares a 1px bitmap so the clamp no longer forces
+31x30, and asks for the mockup's 34x26 (dpi-scaled). Colour is the mockup's .tbtn
+#b9bec4 (NEUTRON_NAV_GLYPH). At 96 dpi the glyph is the same 12px design in a 34x26
+button instead of 31x30; at 163 dpi it is 20px in a 58x44 button, centred.
+
+Kill switches (no rebuild): NEUTRON_CRUMB_CLICK=0 makes the breadcrumb static text again;
+NEUTRON_NAV_GLYPH=0 restores comctl32's native-size bitmaps and the 30x26 request.
+NEUTRON_WL_DIAG=1 prints, at the outcome, `neutron-crumb-nav: segment N <name> -> hr X`
+after each breadcrumb navigation and one `neutron-nav-glyph: dpi=.. button=WxH cell=..`
+line per dialog after the first glyph draw.
+
+Compiled clean on both arches (dlls/comdlg32/{x86_64,i386}-windows/itemdlg.o and the
+linked comdlg32.dll). Not yet seen on a screen: the 163-dpi arithmetic is from the
+comctl32 source, and the after-state needs a capture on a LogPixels=163 prefix.
+
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -19,6 +19,8 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #define COBJMACROS
+ #include "windef.h"
+@@ -157,6 +159,12 @@
+     RECT rc_filename_frame;     /* the painted field around the borderless filename edit */
+     LPWSTR *crumbs;             /* breadcrumb segments, root first */
+     UINT crumb_count;
++    IShellItem **crumb_items;   /* the folder each segment names, parallel to crumbs */
++    RECT *crumb_rects;          /* per-segment hit/hover rect, dialog client coords; laid out
++                                   by the painter, empty until then */
++    int crumb_hot, crumb_pressed;   /* segment index, or -1 */
++    BOOL crumb_tracking;        /* TrackMouseEvent(TME_LEAVE) armed on the dialog */
++    BOOL nav_glyph_reported;    /* NEUTRON_WL_DIAG: one metrics line per dialog, after the first draw */
+ } FileDialogImpl;
+ 
+ /**************************************************************************
+@@ -1835,13 +1843,68 @@
+     return sz.cx + neutron_scale(4, This->dpi_x);
+ }
+ 
++/*
++ * Kill switches, no rebuild needed:
++ *   NEUTRON_CRUMB_CLICK=0  the breadcrumb is static text again (no hover, no navigation)
++ *   NEUTRON_NAV_GLYPH=0    the nav arrows go back to comctl32's 24px standard bitmaps at their
++ *                          native size and the 30x26 button request
++ * NEUTRON_WL_DIAG=1 reports at the outcome: the HRESULT of each crumb navigation, and the nav
++ * button/glyph metrics once per dialog after the first glyph has been drawn.
++ */
++static BOOL neutron_env_on(const char *name, int *cache)
++{
++    if (*cache < 0)
++    {
++        const char *e = getenv(name);
++        *cache = e ? (e[0] != '0') : 1;
++        ERR("neutron-gateresolved: %s = %d (%s)\n", name, *cache, e ? "environment" : "default");
++    }
++    return *cache;
++}
++
++static BOOL neutron_crumb_click_on(void)
++{
++    static int on = -1;
++    return neutron_env_on("NEUTRON_CRUMB_CLICK", &on);
++}
++
++static BOOL neutron_nav_glyph_on(void)
++{
++    static int on = -1;
++    return neutron_env_on("NEUTRON_NAV_GLYPH", &on);
++}
++
++static BOOL neutron_wl_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_WL_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
+ static void neutron_free_crumbs(FileDialogImpl *This)
+ {
+     UINT i;
+-    for (i = 0; i < This->crumb_count; i++) CoTaskMemFree(This->crumbs[i]);
++    for (i = 0; i < This->crumb_count; i++)
++    {
++        CoTaskMemFree(This->crumbs[i]);
++        if (This->crumb_items && This->crumb_items[i]) IShellItem_Release(This->crumb_items[i]);
++    }
+     free(This->crumbs);
++    free(This->crumb_items);
++    free(This->crumb_rects);
+     This->crumbs = NULL;
++    This->crumb_items = NULL;
++    This->crumb_rects = NULL;
+     This->crumb_count = 0;
++    This->crumb_hot = This->crumb_pressed = -1;
++}
++
++/* the rects are only as good as the last paint; a relayout empties them until the next one */
++static void neutron_reset_crumb_rects(FileDialogImpl *This)
++{
++    UINT i;
++    for (i = 0; This->crumb_rects && i < This->crumb_count; i++)
++        SetRectEmpty(&This->crumb_rects[i]);
+ }
+ 
+ /* Rebuild the breadcrumb from psi_folder: the folder and its filesystem ancestors, stopping
+@@ -1850,6 +1913,7 @@
+ static void neutron_update_crumbs(FileDialogImpl *This)
+ {
+     IShellItem *item, *parent, *grandparent;
++    IShellItem *items[64];
+     LPWSTR names[64];
+     UINT count = 0, i;
+ 
+@@ -1874,7 +1938,11 @@
+                 memmove(name, name + len - 3, 3 * sizeof(WCHAR));
+             }
+         }
+-        names[count++] = name;
++        names[count] = name;
++        /* keep the folder itself: clicking the segment browses to it */
++        IShellItem_AddRef(item);
++        items[count] = item;
++        count++;
+ 
+         if (FAILED(IShellItem_GetParent(item, &parent))) parent = NULL;
+         IShellItem_Release(item);
+@@ -1895,28 +1963,56 @@
+     if (item) IShellItem_Release(item);
+ 
+     if (!count) return;
+-    if (!(This->crumbs = malloc(count * sizeof(*This->crumbs))))
+-    {
+-        for (i = 0; i < count; i++) CoTaskMemFree(names[i]);
++    This->crumbs = malloc(count * sizeof(*This->crumbs));
++    This->crumb_items = calloc(count, sizeof(*This->crumb_items));
++    This->crumb_rects = calloc(count, sizeof(*This->crumb_rects));
++    if (!This->crumbs || !This->crumb_items || !This->crumb_rects)
++    {
++        for (i = 0; i < count; i++)
++        {
++            CoTaskMemFree(names[i]);
++            IShellItem_Release(items[i]);
++        }
++        free(This->crumbs);
++        free(This->crumb_items);
++        free(This->crumb_rects);
++        This->crumbs = NULL;
++        This->crumb_items = NULL;
++        This->crumb_rects = NULL;
+         return;
+     }
+-    for (i = 0; i < count; i++) This->crumbs[i] = names[count - 1 - i];
++    for (i = 0; i < count; i++)
++    {
++        This->crumbs[i] = names[count - 1 - i];
++        This->crumb_items[i] = items[count - 1 - i];
++    }
+     This->crumb_count = count;
+     TRACE("neutron: %u crumbs, current %s\n", count, debugstr_w(This->crumbs[count - 1]));
+ }
+ 
+-static void neutron_paint_crumbs(FileDialogImpl *This, HDC hdc)
++/*
++ * Lay the breadcrumb out and, when `paint` is set, draw it. One routine for both so a segment's
++ * hit rect always comes from the same arithmetic as its pixels. Each segment's rect is the text
++ * plus a little air, as tall as a nav button and centred in the band; the hot segment gets the
++ * same round fill the nav buttons use (NEUTRON_NAV_HOT / NEUTRON_NAV_PRESSED). Only ancestors
++ * are targets: the last segment is the folder already shown.
++ */
++static void neutron_layout_crumbs(FileDialogImpl *This, HDC hdc, BOOL paint)
+ {
+     static const WCHAR sepW[] = L" \x203a ";      /* " > " */
+     static const WCHAR ellW[] = L"\x2026";        /* "..." */
+     HFONT font = (HFONT)SendMessageW(This->dlg_hwnd, WM_GETFONT, 0, 0), old_font = NULL;
+-    int widths[64], total = 0, avail, x, y, old_mode;
++    int widths[64], xs[64], total = 0, avail, x, y, old_mode;
++    const int pad = neutron_scale(5, This->dpi_x);
++    const int fill_h = neutron_scale(NEUTRON_NAV_BTN_H, This->dpi_y);
++    const int fill_top = (This->rc_crumbs.top + This->rc_crumbs.bottom - fill_h) / 2;
++    BOOL clickable = neutron_crumb_click_on();
+     SIZE sz, sep_sz, ell_sz;
+     UINT i, first = 0, last;
+ 
+-    TRACE("neutron: painting %u crumbs in %s\n", This->crumb_count, wine_dbgstr_rect(&This->rc_crumbs));
+-    if (!This->crumb_count) return;
++    if (!This->crumb_count || !This->crumb_rects) return;
+     last = This->crumb_count - 1;
++    neutron_reset_crumb_rects(This);
+ 
+     if (font) old_font = SelectObject(hdc, font);
+     old_mode = SetBkMode(hdc, TRANSPARENT);
+@@ -1938,26 +2034,44 @@
+         first++;
+     }
+ 
++    /* positions and hit rects first ... */
+     x = This->rc_crumbs.left;
+-    y = (This->rc_crumbs.top + This->rc_crumbs.bottom - sep_sz.cy) / 2;
+-    SetTextColor(hdc, NEUTRON_CRUMB_DIM);
+-    if (first)
+-    {
+-        TextOutW(hdc, x, y, ellW, 1);
+-        x += ell_sz.cx;
+-        TextOutW(hdc, x, y, sepW, 3);
+-        x += sep_sz.cx;
+-    }
++    if (first) x += ell_sz.cx + sep_sz.cx;
+     for (i = first; i <= last; i++)
+     {
+-        SetTextColor(hdc, i == last ? NEUTRON_CRUMB_CURRENT : NEUTRON_CRUMB_DIM);
+-        TextOutW(hdc, x, y, This->crumbs[i], lstrlenW(This->crumbs[i]));
+-        x += widths[i];
+-        if (i < last)
+-        {
+-            SetTextColor(hdc, NEUTRON_CRUMB_DIM);
+-            TextOutW(hdc, x, y, sepW, 3);
+-            x += sep_sz.cx;
++        xs[i] = x;
++        if (clickable && i < last)
++            SetRect(&This->crumb_rects[i], x - pad, fill_top, x + widths[i] + pad, fill_top + fill_h);
++        x += widths[i] + (i < last ? sep_sz.cx : 0);
++    }
++
++    if (paint)
++    {
++        /* ... then the hover fill, under everything ... */
++        if (This->crumb_hot >= first && (UINT)This->crumb_hot < last && clickable)
++            neutron_round_rect(hdc, &This->crumb_rects[This->crumb_hot],
++                               This->crumb_hot == This->crumb_pressed ? NEUTRON_NAV_PRESSED
++                                                                      : NEUTRON_NAV_HOT,
++                               CLR_NONE, neutron_scale(4, This->dpi_x));
++
++        /* ... then the text */
++        y = (This->rc_crumbs.top + This->rc_crumbs.bottom - sep_sz.cy) / 2;
++        SetTextColor(hdc, NEUTRON_CRUMB_DIM);
++        if (first)
++        {
++            x = This->rc_crumbs.left;
++            TextOutW(hdc, x, y, ellW, 1);
++            TextOutW(hdc, x + ell_sz.cx, y, sepW, 3);
++        }
++        for (i = first; i <= last; i++)
++        {
++            SetTextColor(hdc, i == last ? NEUTRON_CRUMB_CURRENT : NEUTRON_CRUMB_DIM);
++            TextOutW(hdc, xs[i], y, This->crumbs[i], lstrlenW(This->crumbs[i]));
++            if (i < last)
++            {
++                SetTextColor(hdc, NEUTRON_CRUMB_DIM);
++                TextOutW(hdc, xs[i] + widths[i], y, sepW, 3);
++            }
+         }
+     }
+ 
+@@ -1965,6 +2079,225 @@
+     if (old_font) SelectObject(hdc, old_font);
+ }
+ 
++static void neutron_paint_crumbs(FileDialogImpl *This, HDC hdc)
++{
++    TRACE("neutron: painting %u crumbs in %s\n", This->crumb_count, wine_dbgstr_rect(&This->rc_crumbs));
++    neutron_layout_crumbs(This, hdc, TRUE);
++}
++
++/* index of the ancestor segment under a dialog-client point, or -1 */
++static int neutron_crumb_hit(FileDialogImpl *This, int x, int y)
++{
++    POINT pt = { x, y };
++    UINT i;
++
++    if (!neutron_crumb_click_on() || This->crumb_count < 2 || !This->crumb_rects) return -1;
++    if (!PtInRect(&This->rc_crumbs, pt)) return -1;
++    for (i = 0; i + 1 < This->crumb_count; i++)
++        if (!IsRectEmpty(&This->crumb_rects[i]) && PtInRect(&This->crumb_rects[i], pt)) return i;
++    return -1;
++}
++
++static void neutron_set_crumb_hot(FileDialogImpl *This, int hot)
++{
++    if (hot == This->crumb_hot) return;
++    if (This->crumb_hot >= 0 && (UINT)This->crumb_hot < This->crumb_count)
++        InvalidateRect(This->dlg_hwnd, &This->crumb_rects[This->crumb_hot], TRUE);
++    This->crumb_hot = hot;
++    if (hot >= 0 && (UINT)hot < This->crumb_count)
++        InvalidateRect(This->dlg_hwnd, &This->crumb_rects[hot], TRUE);
++}
++
++/* Browse to the folder a segment names -- the same IExplorerBrowser call the Up button and
++ * SetFolder use, so nothing about what the dialog returns changes. OnNavigationComplete rebuilds
++ * the crumbs, so copy what the diagnostic needs before the call. */
++static void neutron_crumb_navigate(FileDialogImpl *This, int index)
++{
++    IShellItem *item;
++    WCHAR name[64];
++    HRESULT hr;
++
++    if (!This->peb || index < 0 || (UINT)index >= This->crumb_count || !This->crumb_items) return;
++    item = This->crumb_items[index];
++    if (!item) return;
++    lstrcpynW(name, This->crumbs[index], ARRAY_SIZE(name));
++    IShellItem_AddRef(item);
++    hr = IExplorerBrowser_BrowseToObject(This->peb, (IUnknown *)item, SBSP_DEFBROWSER);
++    IShellItem_Release(item);
++    TRACE("neutron: crumb %d %s -> %#lx\n", index, debugstr_w(name), hr);
++    if (neutron_wl_diag())
++        ERR("neutron-crumb-nav: segment %d %s -> hr %#lx\n", index, debugstr_w(name), hr);
++}
++
++static LRESULT on_crumb_mousemove(FileDialogImpl *This, LPARAM lparam)
++{
++    int hit = neutron_crumb_hit(This, (short)LOWORD(lparam), (short)HIWORD(lparam));
++
++    /* while a segment is pressed only that one lights, and only while the pointer is on it */
++    if (This->crumb_pressed >= 0 && hit != This->crumb_pressed) hit = -1;
++    neutron_set_crumb_hot(This, hit);
++    if (hit >= 0 && !This->crumb_tracking)
++    {
++        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, This->dlg_hwnd, 0 };
++        This->crumb_tracking = TrackMouseEvent(&tme);
++    }
++    return FALSE;
++}
++
++static LRESULT on_crumb_mouseleave(FileDialogImpl *This)
++{
++    This->crumb_tracking = FALSE;
++    neutron_set_crumb_hot(This, -1);
++    return FALSE;
++}
++
++static LRESULT on_crumb_lbuttondown(FileDialogImpl *This, LPARAM lparam)
++{
++    int hit = neutron_crumb_hit(This, (short)LOWORD(lparam), (short)HIWORD(lparam));
++
++    if (hit < 0) return FALSE;
++    This->crumb_pressed = hit;
++    SetCapture(This->dlg_hwnd);
++    neutron_set_crumb_hot(This, hit);
++    InvalidateRect(This->dlg_hwnd, &This->crumb_rects[hit], TRUE);
++    SetWindowLongPtrW(This->dlg_hwnd, DWLP_MSGRESULT, 0);
++    return TRUE;
++}
++
++static LRESULT on_crumb_lbuttonup(FileDialogImpl *This, LPARAM lparam)
++{
++    int pressed = This->crumb_pressed, hit;
++
++    if (pressed < 0) return FALSE;
++    This->crumb_pressed = -1;
++    if (GetCapture() == This->dlg_hwnd) ReleaseCapture();
++    hit = neutron_crumb_hit(This, (short)LOWORD(lparam), (short)HIWORD(lparam));
++    if ((UINT)pressed < This->crumb_count)
++        InvalidateRect(This->dlg_hwnd, &This->crumb_rects[pressed], TRUE);
++    if (hit == pressed) neutron_crumb_navigate(This, pressed);
++    SetWindowLongPtrW(This->dlg_hwnd, DWLP_MSGRESULT, 0);
++    return TRUE;
++}
++
++static LRESULT on_crumb_capturechanged(FileDialogImpl *This)
++{
++    int pressed = This->crumb_pressed;
++
++    if (pressed < 0) return FALSE;
++    This->crumb_pressed = -1;
++    if ((UINT)pressed < This->crumb_count)
++        InvalidateRect(This->dlg_hwnd, &This->crumb_rects[pressed], TRUE);
++    return FALSE;
++}
++
++static LRESULT on_crumb_setcursor(FileDialogImpl *This, WPARAM wparam, LPARAM lparam)
++{
++    POINT pt;
++
++    if ((HWND)wparam != This->dlg_hwnd || LOWORD(lparam) != HTCLIENT) return FALSE;
++    GetCursorPos(&pt);
++    ScreenToClient(This->dlg_hwnd, &pt);
++    if (neutron_crumb_hit(This, pt.x, pt.y) < 0) return FALSE;
++    SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
++    SetWindowLongPtrW(This->dlg_hwnd, DWLP_MSGRESULT, TRUE);
++    return TRUE;
++}
++
++/*
++ * The nav arrows, drawn at the dialog's dpi.
++ *
++ * comctl32 draws a toolbar's standard bitmaps at their native 24px whatever the dpi, and
++ * top-anchors the image at padding/2 (3px) rather than centring it; TB_SETBUTTONSIZE is
++ * clamped to padding + bitmap (31x30) so at 96 dpi that happens to be centred. At the 163 dpi
++ * our prefixes run (LogPixels = round(96 * 1.7)) the requested 51x44 button wins the clamp, the
++ * 24px image stays where it was, and the arrows read as too small and too high -- exactly the
++ * operator's report. Rather than change the shared strip (every toolbar in every app draws it),
++ * this dialog paints its three glyphs itself, from the strip's own path data, scaled to the dpi
++ * and centred in the button.
++ *
++ * Path data is the 24-box design in build/art/gen_toolbar_icons.py (HIST_BACK, HIST_FORWARD,
++ * VIEW_PARENTFOLDER): stroke 2/24 of the cell, round caps and joins. Rendered 6x supersampled
++ * with a geometric pen, box-filtered to coverage and alpha-blended, so it is anti-aliased at
++ * any size without a second raster asset.
++ */
++struct neutron_stroke { float pt[3][2]; int n; };
++static const struct neutron_stroke neutron_nav_back[] =
++    { {{{17, 12}, {7, 12}}, 2}, {{{12, 7}, {7, 12}, {12, 17}}, 3} };
++static const struct neutron_stroke neutron_nav_forward[] =
++    { {{{7, 12}, {17, 12}}, 2}, {{{12, 7}, {17, 12}, {12, 17}}, 3} };
++static const struct neutron_stroke neutron_nav_up[] =
++    { {{{12, 19}, {12, 6}}, 2}, {{{6.5f, 11.5f}, {12, 6}, {17.5f, 11.5f}}, 3} };
++
++static void neutron_draw_nav_glyph(HDC hdc, const RECT *btn, const struct neutron_stroke *strokes,
++                                   int nstrokes, int cell, COLORREF color, BOOL disabled)
++{
++    enum { SS = 6 };                     /* supersample factor: 36 coverage levels */
++    const int big = cell * SS;
++    const float f = (float)big / NEUTRON_NAV_CELL;
++    BITMAPINFO big_bmi = {{ sizeof(BITMAPINFOHEADER), big, -big, 1, 32, BI_RGB }};
++    BITMAPINFO out_bmi = {{ sizeof(BITMAPINFOHEADER), cell, -cell, 1, 32, BI_RGB }};
++    DWORD *big_bits = NULL, *out_bits = NULL;
++    HBITMAP big_bmp = NULL, out_bmp = NULL, old_big, old_out;
++    HDC big_dc = NULL, out_dc = NULL;
++    LOGBRUSH lb = { BS_SOLID, RGB(255, 255, 255), 0 };
++    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
++    HPEN pen, old_pen;
++    int i, x, y, r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
++
++    if (cell <= 0) return;
++    if (!(big_dc = CreateCompatibleDC(hdc)) || !(out_dc = CreateCompatibleDC(hdc))) goto done;
++    if (!(big_bmp = CreateDIBSection(big_dc, &big_bmi, DIB_RGB_COLORS, (void **)&big_bits, NULL, 0)) ||
++        !(out_bmp = CreateDIBSection(out_dc, &out_bmi, DIB_RGB_COLORS, (void **)&out_bits, NULL, 0)))
++        goto done;
++    old_big = SelectObject(big_dc, big_bmp);
++    old_out = SelectObject(out_dc, out_bmp);
++    memset(big_bits, 0, (size_t)big * big * 4);
++
++    pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND,
++                       max(1, (int)(2.0f * f + 0.5f)), &lb, 0, NULL);
++    old_pen = SelectObject(big_dc, pen);
++    for (i = 0; i < nstrokes; i++)
++    {
++        POINT pt[3];
++        int k;
++        for (k = 0; k < strokes[i].n; k++)
++        {
++            pt[k].x = (int)(strokes[i].pt[k][0] * f + 0.5f);
++            pt[k].y = (int)(strokes[i].pt[k][1] * f + 0.5f);
++        }
++        Polyline(big_dc, pt, strokes[i].n);
++    }
++    SelectObject(big_dc, old_pen);
++    DeleteObject(pen);
++    GdiFlush();
++
++    /* box-filter to coverage; premultiply for AlphaBlend */
++    for (y = 0; y < cell; y++)
++        for (x = 0; x < cell; x++)
++        {
++            unsigned int sum = 0, a;
++            int sx, sy;
++            for (sy = 0; sy < SS; sy++)
++                for (sx = 0; sx < SS; sx++)
++                    sum += big_bits[(y * SS + sy) * big + x * SS + sx] & 0xff;
++            a = sum / (SS * SS);
++            if (disabled) a = a * 2 / 5;
++            out_bits[y * cell + x] = (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255);
++        }
++
++    GdiAlphaBlend(hdc, btn->left + (btn->right - btn->left - cell) / 2,
++                  btn->top + (btn->bottom - btn->top - cell) / 2, cell, cell,
++                  out_dc, 0, 0, cell, cell, bf);
++
++    SelectObject(big_dc, old_big);
++    SelectObject(out_dc, old_out);
++done:
++    if (big_bmp) DeleteObject(big_bmp);
++    if (out_bmp) DeleteObject(out_bmp);
++    if (big_dc) DeleteDC(big_dc);
++    if (out_dc) DeleteDC(out_dc);
++}
++
+ static void neutron_draw_button(FileDialogImpl *This, const DRAWITEMSTRUCT *dis)
+ {
+     BOOL accent = dis->CtlID == IDOK;
+@@ -2196,6 +2529,7 @@
+ 
+     This->hbr_ground = CreateSolidBrush(NEUTRON_DLG_GROUND);
+     This->hbr_field = CreateSolidBrush(NEUTRON_FIELD_FILL);
++    This->crumb_hot = This->crumb_pressed = -1;
+ 
+     font = (HFONT)SendMessageW(This->dlg_hwnd, WM_GETFONT, 0, 0);
+     if (font && GetObjectW(font, sizeof(lf), &lf))
+@@ -2309,6 +2643,36 @@
+                                                                      : NEUTRON_NAV_HOT,
+                                CLR_NONE, neutron_scale(4, This->dpi_x));
+         }
++        if (neutron_nav_glyph_on())
++        {
++            const struct neutron_stroke *strokes = NULL;
++            int count = 0;
++
++            switch (cd->nmcd.dwItemSpec)     /* the button's command id */
++            {
++            case IDC_NAVBACK:    strokes = neutron_nav_back;    count = ARRAY_SIZE(neutron_nav_back);    break;
++            case IDC_NAVFORWARD: strokes = neutron_nav_forward; count = ARRAY_SIZE(neutron_nav_forward); break;
++            case IDC_NAVUP:      strokes = neutron_nav_up;      count = ARRAY_SIZE(neutron_nav_up);      break;
++            }
++            if (strokes)
++            {
++                RECT rc = cd->nmcd.rc;
++                int cell = neutron_scale(NEUTRON_NAV_CELL, This->dpi_x);
++
++                neutron_draw_nav_glyph(cd->nmcd.hdc, &rc, strokes, count, cell, NEUTRON_NAV_GLYPH,
++                                       (cd->nmcd.uItemState & CDIS_DISABLED) != 0);
++                if (!This->nav_glyph_reported)
++                {
++                    This->nav_glyph_reported = TRUE;
++                    if (neutron_wl_diag())
++                        ERR("neutron-nav-glyph: dpi=%u button=%ldx%ld cell=%d band=%ld\n",
++                            This->dpi_x, rc.right - rc.left, rc.bottom - rc.top, cell,
++                            This->rc_navband.bottom - This->rc_navband.top);
++                }
++                ret = CDRF_SKIPDEFAULT;
++                break;
++            }
++        }
+         ret = CDRF_DODEFAULT | TBCDRF_NOEDGES | TBCDRF_NOBACKGROUND | TBCDRF_NOOFFSET |
+               TBCDRF_NOMARK | TBCDRF_NOETCHEDEFFECT;
+         break;
+@@ -2467,6 +2831,7 @@
+         SetRect(&toolbar_rc, margin, 0, margin, nav_h);
+     SetRect(&This->rc_crumbs, toolbar_rc.right + neutron_scale(10, This->dpi_x), 0,
+             dialog_rc.right - margin, nav_h - 1);
++    neutron_reset_crumb_rects(This);
+ 
+     /* The ExplorerBrowser control. */
+     ebrowser_rc.left = margin;
+@@ -2646,10 +3011,24 @@
+     button[2].iString = 0;
+ 
+     SendMessageW(htoolbar, TB_ADDBUTTONSW, 3, (LPARAM)button);
+-    /* NEUTRON: the mockup's nav buttons are wider than tall (2.6em x 2em) */
+-    height = MulDiv(26, This->dpi_y, USER_DEFAULT_SCREEN_DPI);
+-    SendMessageW(htoolbar, TB_SETBUTTONSIZE, 0,
+-                 MAKELPARAM(MulDiv(30, This->dpi_x, USER_DEFAULT_SCREEN_DPI), height));
++    if (neutron_nav_glyph_on())
++    {
++        /* NEUTRON: the glyphs are drawn by on_wm_notify() at the dialog's dpi, so the 24px
++         * standard strip must not dictate the button. comctl32 clamps TB_SETBUTTONSIZE to
++         * padding + bitmap (31x30 at every dpi, image top-anchored at 3px); declaring a 1px
++         * bitmap lets the mockup's 2.6em x 2em box (34x26 at 96 dpi) win, dpi-scaled. */
++        SendMessageW(htoolbar, TB_SETBITMAPSIZE, 0, MAKELPARAM(1, 1));
++        SendMessageW(htoolbar, TB_SETBUTTONSIZE, 0,
++                     MAKELPARAM(neutron_scale(NEUTRON_NAV_BTN_W, This->dpi_x),
++                                neutron_scale(NEUTRON_NAV_BTN_H, This->dpi_y)));
++    }
++    else
++    {
++        /* the 11.10-85 metrics: the mockup's proportions, comctl32's bitmap and clamp */
++        height = MulDiv(26, This->dpi_y, USER_DEFAULT_SCREEN_DPI);
++        SendMessageW(htoolbar, TB_SETBUTTONSIZE, 0,
++                     MAKELPARAM(MulDiv(30, This->dpi_x, USER_DEFAULT_SCREEN_DPI), height));
++    }
+     SendMessageW(htoolbar, TB_AUTOSIZE, 0, 0);
+ }
+ 
+@@ -3001,6 +3380,13 @@
+     case WM_PAINT:            return on_wm_paint(This);
+     case WM_DRAWITEM:         return on_wm_drawitem(This, (const DRAWITEMSTRUCT *)lparam);
+     case WM_NOTIFY:           return on_wm_notify(This, lparam);
++    /* NEUTRON: the breadcrumb's segments are a second way to navigate */
++    case WM_MOUSEMOVE:        return on_crumb_mousemove(This, lparam);
++    case WM_MOUSELEAVE:       return on_crumb_mouseleave(This);
++    case WM_LBUTTONDOWN:      return on_crumb_lbuttondown(This, lparam);
++    case WM_LBUTTONUP:        return on_crumb_lbuttonup(This, lparam);
++    case WM_CAPTURECHANGED:   return on_crumb_capturechanged(This);
++    case WM_SETCURSOR:        return on_crumb_setcursor(This, wparam, lparam);
+     case WM_CTLCOLORDLG:
+     case WM_CTLCOLORBTN:
+         return (INT_PTR)This->hbr_ground;
+--- a/include/wine/neutronui.h
++++ b/include/wine/neutronui.h
+@@ -36,6 +36,11 @@
+ #define NEUTRON_NAV_PRESSED     RGB(0x3b, 0x3b, 0x3b)
+ #define NEUTRON_CRUMB_DIM       RGB(0x9a, 0xa0, 0xa6)   /* breadcrumb ancestors + separators */
+ #define NEUTRON_CRUMB_CURRENT   RGB(0xdc, 0xdc, 0xdc)   /* breadcrumb current folder       */
++#define NEUTRON_NAV_GLYPH       RGB(0xb9, 0xbe, 0xc4)   /* nav arrows (mockup .tbtn color)  */
++#define NEUTRON_NAV_BTN_W       34                      /* logical px: the mockup's 2.6em x  */
++#define NEUTRON_NAV_BTN_H       26                      /*   2em button at its 13px em      */
++#define NEUTRON_NAV_CELL        24                      /* the glyph design box (comctl32's */
++                                                        /*   standard 24px strip), dpi-scaled */
+ #define NEUTRON_LABEL_TEXT      RGB(0xb4, 0xb4, 0xb4)   /* "File name:" style labels       */
+ 
+ /* panels (tree and list) */
