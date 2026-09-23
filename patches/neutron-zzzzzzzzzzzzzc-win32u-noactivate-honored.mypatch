@@ -1,0 +1,98 @@
+win32u: a WS_EX_NOACTIVATE top-level is not activated by SetActiveWindow/SetFocus
+
+Premiere activates its own WS_EX_NOACTIVATE panel drop-down menus with SetActiveWindow/SetFocus.
+Under Wine the menu then held the activation, and the unconditional SetActiveWindow(<frame>) that
+PlugPlug issues when an extension window closes (PlugPlug.dll 0x1800d2fc0) took it away ~1.2 s after
+a click back into the app, closing a menu opened by that click. Operator: it stays open on Windows.
+
+Refuses explicit activation of a flagged top-level through these two entry points while another
+window is active. Kill switch NEUTRON_NOACTIVATE_HONOR=0; diag neutron-noactivate under
+NEUTRON_WL_DIAG=1. Evidence: premiere-premiere2025-20260922-230204.log.
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2154,6 +2154,52 @@
+     return !(style & WS_DISABLED);
+ }
+ 
++/* NEUTRON: a WS_EX_NOACTIVATE top-level is not activated by SetActiveWindow() / SetFocus().
++ *
++ * Premiere's panel drop-down menus are DroverLord popups with ex 08080088 (WS_EX_NOACTIVATE |
++ * WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST), and Premiere calls SetActiveWindow(menu) and
++ * SetFocus(menu) itself when it opens one. win32u never consulted WS_EX_NOACTIVATE, so under Wine
++ * the menu became the active window, and the next activation change on that thread took it away
++ * and closed the menu. After a click back into the application that change always comes:
++ * PlugPlug's extension-window teardown ends with an unconditional SetActiveWindow(<main frame>)
++ * (PlugPlug.dll 0x1800d2fc0), and a menu opened by the returning click vanished ~1.2 s later
++ * (premiere-premiere2025-20260922-230204.log: set_active_window <frame>, previous <menu>, then
++ * show_window <menu> cmd=0 in the same millisecond). The operator reports it stays open on Windows.
++ *
++ * INFERRED, not measured on Windows: the only Win32 difference in that trace is that the menu holds
++ * the activation at all. With the flag honoured the activation stays on the frame, the teardown's
++ * SetActiveWindow(<frame>) finds the frame already active and changes nothing, and the menu stays
++ * open. (MSDN's text says SetActiveWindow may still activate such a window; this gate is the A/B.)
++ *
++ * Only explicit activation of a top-level carrying the flag, through these two entry points, while
++ * another window is active: the activation is left where it is. SetActiveWindow returns the
++ * unchanged active window (as the WS_CHILD case does); SetFocus fails (returns 0) because the focus
++ * cannot move outside the active window. A flagged window that is already active keeps the upstream
++ * behaviour, and so does every other activation path.
++ *
++ * Kill switch NEUTRON_NOACTIVATE_HONOR=0 restores the upstream behaviour without a rebuild;
++ * NEUTRON_WL_DIAG=1 prints one neutron-noactivate line per refusal, at the outcome. */
++static BOOL neutron_noactivate_honor_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_NOACTIVATE_HONOR" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_NOACTIVATE_HONOR = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++static BOOL neutron_noactivate_refuse( HWND top, HWND active )
++{
++    if (!top || !active || top == active) return FALSE;
++    if (get_window_long( top, GWL_STYLE ) & WS_CHILD) return FALSE;
++    if (!(get_window_long( top, GWL_EXSTYLE ) & WS_EX_NOACTIVATE)) return FALSE;
++    return neutron_noactivate_honor_on();
++}
++
+ /**********************************************************************
+  *           NtUserSetActiveWindow    (win32u.@)
+  */
+@@ -2178,6 +2224,16 @@
+         if ((style & (WS_POPUP|WS_CHILD)) == WS_CHILD)
+             return get_active_window();  /* Windows doesn't seem to return an error here */
+ 
++        if (neutron_noactivate_refuse( hwnd, get_active_window() ))
++        {
++            HWND active = get_active_window();
++
++            if (neutron_wl_diag())
++                ERR( "neutron-noactivate: SetActiveWindow(%p) exstyle %08x is WS_EX_NOACTIVATE -> activation left on %p\n",
++                     hwnd, (unsigned int)get_window_long( hwnd, GWL_EXSTYLE ), active );
++            return active;
++        }
++
+         if ((style & WS_DISABLED) && neutron_setactive_disabled_on())
+         {
+             HWND popup = NtUserGetLastActivePopup( hwnd ), active = get_active_window();
+@@ -2372,6 +2428,14 @@
+         if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
+         if (hwndTop != active)
+         {
++            if (neutron_noactivate_refuse( hwndTop, active ))
++            {
++                /* the activation stays where it is, so the focus cannot follow */
++                if (neutron_wl_diag())
++                    ERR( "neutron-noactivate: SetFocus(%p) top=%p exstyle %08x is WS_EX_NOACTIVATE -> activation left on %p, SetFocus REFUSED\n",
++                         hwnd, hwndTop, (unsigned int)get_window_long( hwndTop, GWL_EXSTYLE ), active );
++                return 0;
++            }
+             if (neutron_setfocus_refuse_hidden_sibling( hwndTop, active ))
+             {
+                 /* the activation stays on the window the user is looking at; the focus cannot
