@@ -8,3 +8,9 @@ dist/
 Desktop/
 Files/
 prepare-tree-*.log
+
+# Internal material: kept locally for development, never published.
+/dll-backups/
+/vkd3d-proton.cache
+/Desktop
+/Files
