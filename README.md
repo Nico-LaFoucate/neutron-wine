@@ -60,10 +60,16 @@ engine consumes the manifest, and the patch-set/LGPL provenance notes. Per-patch
 
 ## License
 
-LGPL-2.1 (Wine's license). See [LICENSE](LICENSE). The patches are derivative works of Wine and are
-licensed accordingly. Neutron (the engine/CLI) is a separate LGPL-2.1 repo; Collider (the GUI) is Apache-2.0.
+LGPL-2.1-or-later, the same as Wine. See [LICENSE](LICENSE). The patches are derivative works of
+Wine and are licensed accordingly. Neutron (the CLI) is a separate LGPL-2.1-or-later repo; Collider (the
+GUI) and Mud Hut (the installer) are Apache-2.0.
 
 ## Status
 
-Experimental alpha. Target: Adobe Premiere Pro 2025 on Wayland (KDE) / X11, NVIDIA. Vendor-neutral by
-design; AMD/Intel expected to need fewer workarounds.
+Beta. Tested on three machines, all CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs. AMD and Intel
+GPUs aren't validated yet.
+
+## Disclaimer
+
+Neutron is an independent project by Nico LaFoucate and Ficus Media Group. Adobe and its product names
+are trademarks of Adobe Inc. Neutron is not affiliated with or endorsed by Adobe.
