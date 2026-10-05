@@ -17,6 +17,9 @@ TKG="$WORK/wine-tkg-git"
 
 mkdir -p "$WORK"
 
+# 0. Pre-flight: build dependencies present, and none about to be swept as orphans (Arch only).
+bash "$REPO/build/check-build-deps.sh" || exit 1
+
 # 1. Upstream wine-tkg build framework, PINNED to the commit in build/WINE_TKG_COMMIT.
 # The Wine base itself is pinned via customization.cfg, but wine-tkg's own patches and scripts
 # move with its HEAD: building from an unpinned clone means the published recipe can't reproduce
