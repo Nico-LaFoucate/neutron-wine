@@ -70,6 +70,21 @@ fi
 TREE="$(cd "$TREE" && pwd)"
 
 # ---------------------------------------------------------------------------
+# NO-HOME-PATH GATE. Nothing we ship may carry the builder's home directory. Wine compiles its
+# install prefix into ntdll.so (BINDIR/LIBDIR), so a tree built under $HOME embeds it in the
+# binaries themselves. Build releases from a neutral work dir:
+#     NEUTRON_WINE_WORK=/var/tmp/neutron-wine build/build.sh
+# Checked on the BUILT files, not the source: that is where 11.10-97 was caught.
+# ---------------------------------------------------------------------------
+_homehits="$(grep -rlF "$HOME/" "$TREE" 2>/dev/null | head -5 || true)"
+if [ -n "$_homehits" ]; then
+    echo "package.sh: ⛔ the built tree contains the home path ($HOME/):" >&2
+    printf '    %s\n' $_homehits >&2
+    echo "  Rebuild from a neutral work dir: NEUTRON_WINE_WORK=/var/tmp/neutron-wine build/build.sh" >&2
+    exit 6
+fi
+
+# ---------------------------------------------------------------------------
 # BASE-DRIFT GATE. `share/wine/wine.inf` is GENERATED from wine.inf.in at build time, so it is a
 # faithful fingerprint of the base tree the build actually saw. Compare it against EVERY installed
 # runtime, not just the newest.
@@ -152,10 +167,22 @@ stage() {  # stage <subdir> <leafname>
     local src dst="$TREE/share/wine/$1/$2"
     if [ -d "$dst" ]; then echo "  = share/wine/$1/$2 (already staged)"; return 0; fi
     if ! src="$(find_tree "$1" "$2")"; then
-        echo "error: no $2 tree found. The release would pop the Wine Mono/Gecko installer" >&2
-        echo "       on every tester's first boot. Stage it under ~/neutron/$1/ (or set" >&2
-        echo "       NEUTRON_MONO_GECKO_SRC) and re-run." >&2
-        exit 5
+        # Not staged locally: fetch WineHQ's official build of exactly this version.
+        local url cache="${XDG_CACHE_HOME:-$HOME/.cache}/neutron-wine/$1"
+        case "$1" in
+            mono)  url="https://dl.winehq.org/wine/wine-mono/$MONO_VER/$2-x86.tar.xz" ;;
+            gecko) url="https://dl.winehq.org/wine/wine-gecko/$GECKO_VER/$2.tar.xz" ;;
+        esac
+        mkdir -p "$cache"
+        echo "  fetching $url"
+        if ! curl -fsSL --retry 3 -o "$cache/$2.tar.xz" "$url" \
+           || ! tar -C "$cache" -xJf "$cache/$2.tar.xz"; then
+            echo "error: no $2 tree found locally and the WineHQ download failed ($url)." >&2
+            echo "       The release would pop the Wine Mono/Gecko installer on first boot." >&2
+            exit 5
+        fi
+        src="$cache/$2"
+        [ -d "$src" ] || { echo "error: $url did not unpack to $2/" >&2; exit 5; }
     fi
     mkdir -p "$(dirname "$dst")"
     cp -a "$src" "$dst"
@@ -165,6 +192,38 @@ stage() {  # stage <subdir> <leafname>
 stage mono  "wine-mono-$MONO_VER"
 stage gecko "wine-gecko-$GECKO_VER-x86"
 stage gecko "wine-gecko-$GECKO_VER-x86_64"
+
+# --- licenses/ + SOURCE --------------------------------------------------------
+# Every component's license travels with the binaries, and SOURCE names the exact recipe this
+# release was built from, so the published repo can rebuild what we shipped (LGPL).
+WINE_SRC="${NEUTRON_WINE_WORK:-$REPO/_work}/wine-tkg-git/wine-tkg-git/src/wine-git"
+rm -rf "$TREE/licenses"; mkdir -p "$TREE/licenses/wine"
+for f in COPYING.LIB LICENSE AUTHORS COPYING.arial COPYING.cour COPYING.msyh COPYING.times; do
+    [ -f "$WINE_SRC/$f" ] && cp "$WINE_SRC/$f" "$TREE/licenses/wine/"
+done
+[ -f "$TREE/licenses/wine/COPYING.LIB" ] \
+    || { echo "error: Wine's COPYING.LIB not found under $WINE_SRC" >&2; exit 7; }
+cat > "$TREE/licenses/README" <<LICENSES
+neutron-wine $VERSION bundles the following components.
+
+Wine (patched)    LGPL-2.1-or-later   licenses/wine/ (COPYING.LIB, LICENSE, AUTHORS, font licenses)
+Wine Mono $MONO_VER   MIT and others     https://gitlab.winehq.org/mono/wine-mono
+Wine Gecko $GECKO_VER  MPL-2.0            https://dl.winehq.org/wine/wine-gecko/$GECKO_VER/
+
+Neutron is an independent project by Nico LaFoucate and Ficus Media Group. Adobe and its product
+names are trademarks of Adobe Inc. Neutron is not affiliated with or endorsed by Adobe.
+LICENSES
+SRC_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
+git -C "$REPO" diff --quiet HEAD -- patches build || SRC_COMMIT="$SRC_COMMIT (with uncommitted changes)"
+TKG_COMMIT="$(cat "$REPO/build/WINE_TKG_COMMIT")"
+cat > "$TREE/SOURCE" <<SOURCEFILE
+neutron-wine $VERSION
+Source:        https://github.com/$SLUG
+Recipe commit: $SRC_COMMIT
+Wine base:     $WINE_BASE
+wine-tkg:      https://github.com/Frogging-Family/wine-tkg-git @ $TKG_COMMIT
+Rebuild:       see RELEASING.md in the source repository.
+SOURCEFILE
 
 # --- archive: contents land under  <NAME>/  ------------------------------------
 mkdir -p "$DIST"
@@ -192,7 +251,9 @@ cat > "$DIST/$NAME.manifest.json" <<JSON
   "size_bytes": $SIZE,
   "url": "$URL",
   "wine_bin": "bin/wine",
-  "unpack_root": "$NAME"
+  "unpack_root": "$NAME",
+  "source_commit": "$SRC_COMMIT",
+  "wine_tkg_commit": "$TKG_COMMIT"
 }
 JSON
 

@@ -23,19 +23,29 @@ The git tag is `v<VERSION>` (`v11.10-1`); the artifact is `neutron-wine-<VERSION
 ## Cut a release
 
 ```sh
-# 1. Build the patched Wine (fetches wine-tkg, applies patches/, builds → ./_work)
+# 1. Build the patched Wine from a NEUTRAL work dir. Wine compiles its install prefix into its
+#    binaries, so a build under your home directory would ship your home path; package.sh
+#    refuses such a tree. wine-tkg is pinned to build/WINE_TKG_COMMIT.
+export NEUTRON_WINE_WORK=/var/tmp/neutron-wine
 build/build.sh
 
-# 2. Package the built tree into dist/ (tarball + sha256 + manifest.json)
+# 2. Package the built tree into dist/ (tarball + sha256 + manifest.json; adds licenses/ and SOURCE)
 build/package.sh
 
-# 3. Tag and publish. Attach ALL THREE dist/ files to the release.
-git tag v$(cat build/VERSION)
-git push origin v$(cat build/VERSION)
-gh release create v$(cat build/VERSION) dist/* \
-    --title "neutron-wine $(cat build/VERSION)" \
+# 3. Tag and publish ONLY this version's three files.
+V=$(cat build/VERSION)
+git tag "v$V" && git push origin "v$V"
+gh release create "v$V" "dist/neutron-wine-$V.tar.xz" "dist/neutron-wine-$V.tar.xz.sha256" \
+    "dist/neutron-wine-$V.manifest.json" --prerelease \
+    --title "neutron-wine $V" \
     --notes "Wine base: $(cat build/WINE_BASE). See patches/MANIFEST.md for the patch set."
+
+# 4. After the clean-room test passes, promote it so `neutron setup` installs it by default:
+gh release edit "v$V" --prerelease=false --latest
 ```
+
+Releases start as **pre-releases**: testers can install them by version, but `neutron setup` only
+picks the release marked **Latest**. Promote a build only after the clean-room test passes.
 
 `build/package.sh` produces, for `dist/`:
 

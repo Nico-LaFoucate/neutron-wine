@@ -17,10 +17,22 @@ TKG="$WORK/wine-tkg-git"
 
 mkdir -p "$WORK"
 
-# 1. Upstream wine-tkg build framework (pinned base is set via customization.cfg).
+# 1. Upstream wine-tkg build framework, PINNED to the commit in build/WINE_TKG_COMMIT.
+# The Wine base itself is pinned via customization.cfg, but wine-tkg's own patches and scripts
+# move with its HEAD: building from an unpinned clone means the published recipe can't reproduce
+# a release (an LGPL requirement). Bump the pin deliberately, never by re-cloning.
+TKG_PIN="$(cat "$REPO/build/WINE_TKG_COMMIT")"
 if [ ! -d "$TKG/.git" ]; then
     git clone https://github.com/Frogging-Family/wine-tkg-git "$TKG"
 fi
+if [ "$(git -C "$TKG" rev-parse HEAD)" != "$TKG_PIN" ]; then
+    git -C "$TKG" fetch -q origin
+    # -f: the only local edits in this checkout are the ones this script re-applies below.
+    git -C "$TKG" checkout -q -f --detach "$TKG_PIN"
+fi
+[ "$(git -C "$TKG" rev-parse HEAD)" = "$TKG_PIN" ] \
+    || { echo "build.sh: wine-tkg is not at the pinned commit $TKG_PIN" >&2; exit 2; }
+echo "wine-tkg pinned at ${TKG_PIN:0:10}"
 TKGDIR="$TKG/wine-tkg-git"
 
 # 2. Pin the wine base/flavor (wine-11.10 staging + ntsync — see ../build/WINE_BASE).
@@ -56,14 +68,10 @@ fi
 # That cost a build on 2026-07-30, and it failed dangerously: only one hunk errored while
 # the rest applied with fuzz at offsets of -89..-163 lines against the wrong base. A
 # luckier misapply would have built silently-wrong binaries.
-ORDER_CHECK="$HOME/neutron/preserved-fixes/harnesses/check-patch-order.py"
-if [ -f "$ORDER_CHECK" ]; then
-    if ! python3 "$ORDER_CHECK" "$REPO/patches"; then
-        echo "build.sh: patch ordering check FAILED -- fix the names before building." >&2
-        exit 3
-    fi
-else
-    echo "build.sh: WARNING -- $ORDER_CHECK not found, ordering unverified" >&2
+ORDER_CHECK="$REPO/build/check-patch-order.py"
+if ! python3 "$ORDER_CHECK" "$REPO/patches"; then
+    echo "build.sh: patch ordering check FAILED -- fix the names before building." >&2
+    exit 3
 fi
 
 # 3b. Force non-interactive userpatch application. The default-tkg preset sources BOTH
