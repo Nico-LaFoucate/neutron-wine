@@ -1,0 +1,1046 @@
+diff --git a/libs/vkd3d/blit_to_window.h b/libs/vkd3d/blit_to_window.h
+new file mode 100644
+index 00000000..176cc402
+--- /dev/null
++++ b/libs/vkd3d/blit_to_window.h
+@@ -0,0 +1,736 @@
++/* blit_to_window.h  (TIMER-THREAD, scan-all-buffers build + IDENT probe)
++ *
++ * Background thread, every ~33 ms, scans every swapchain backbuffer, copies each
++ * to a host buffer, samples it, and GDI-blits the first non-empty one to
++ * chain->user_hwnd.  Logs each index's first sample so we can see which buffer
++ * (if any) Premiere actually renders the video into.
++ *
++ * Monitor backbuffer is VK_FORMAT_A2B10G10R10_UNORM_PACK32 (vk_format 64);
++ * unpacked to GDI 32bpp BGRA before blit.
++ *
++ * IDENT probe (added): paints chain->user_hwnd solid magenta, taking the HWND
++ * BY VALUE so it never dereferences `chain` and cannot use-after-free on teardown.
++ *
++ * #included textually into libs/vkd3d/swapchain.c.
++ */
++#ifndef VKD3D_BLIT_TO_WINDOW_H
++#define VKD3D_BLIT_TO_WINDOW_H
++
++typedef struct BTW_RECT { int left, top, right, bottom; } BTW_RECT;
++
++typedef struct BTW_BMIH
++{
++    uint32_t biSize; int32_t biWidth; int32_t biHeight;
++    uint16_t biPlanes; uint16_t biBitCount;
++    uint32_t biCompression; uint32_t biSizeImage;
++    int32_t biXPelsPerMeter; int32_t biYPelsPerMeter;
++    uint32_t biClrUsed; uint32_t biClrImportant;
++} BTW_BMIH;
++
++typedef struct BTW_BMI { BTW_BMIH bmiHeader; uint32_t bmiColors[1]; } BTW_BMI;
++
++typedef void *BTW_HDC;
++typedef BTW_HDC (*PFN_BTW_GetDC)(HWND);
++typedef int     (*PFN_BTW_ReleaseDC)(HWND, BTW_HDC);
++typedef int     (*PFN_BTW_GetClientRect)(HWND, BTW_RECT *);
++typedef int     (*PFN_BTW_SetStretchBltMode)(BTW_HDC, int);
++typedef int     (*PFN_BTW_StretchDIBits)(BTW_HDC, int, int, int, int,
++                                         int, int, int, int,
++                                         const void *, const BTW_BMI *, uint32_t, uint32_t);
++typedef void  (*PFN_BTW_Sleep)(uint32_t);
++typedef void *(*PFN_BTW_CreateThread)(void *, size_t, void *, void *, uint32_t, uint32_t *);
++
++#define BTW_BI_RGB 0u
++#define BTW_DIB_RGB_COLORS 0u
++#define BTW_SRCCOPY 0x00CC0020u
++#define BTW_COLORONCOLOR 3
++
++static PFN_BTW_GetDC             btw_GetDC;
++static PFN_BTW_ReleaseDC         btw_ReleaseDC;
++static PFN_BTW_GetClientRect     btw_GetClientRect;
++static PFN_BTW_SetStretchBltMode btw_SetStretchBltMode;
++static PFN_BTW_StretchDIBits     btw_StretchDIBits;
++static int                       btw_gdi_resolved;
++
++static VkDevice        btw_device;
++static VkBuffer        btw_buffer;
++static VkDeviceMemory  btw_memory;
++static void           *btw_mapped;
++static VkDeviceSize    btw_capacity;
++static VkCommandPool   btw_pool;
++static VkCommandBuffer btw_cmd;
++static VkFence         btw_fence;
++
++static int btw_idx_logged[8];
++
++/* ---- cold-start fix: capture serialization + teardown registry ---- */
++/* One lock guards the shared scratch resources (btw_buffer/btw_cmd/btw_fence/
++   btw_mapped) so the per-swapchain poller can run on multiple chains safely. */
++typedef void (WINAPI *PFN_BTW_InitCS)(CRITICAL_SECTION*);
++typedef void (WINAPI *PFN_BTW_EnterCS)(CRITICAL_SECTION*);
++typedef void (WINAPI *PFN_BTW_LeaveCS)(CRITICAL_SECTION*);
++static CRITICAL_SECTION btw_cap_cs;
++static int              btw_cap_cs_ready;
++static PFN_BTW_EnterCS  btw_enter_cs;
++static PFN_BTW_LeaveCS  btw_leave_cs;
++/* chains whose poller must stop (set under the lock during swapchain cleanup) */
++static void            *btw_stopped[64];
++static int              btw_stopped_count;
++
++static void btw_cap_lock_init(void)
++{
++    HMODULE k;
++    PFN_BTW_InitCS init;
++    if (btw_cap_cs_ready) return;
++    k = GetModuleHandleA("kernel32.dll");
++    if (!k) return;
++    init        = (PFN_BTW_InitCS)GetProcAddress(k, "InitializeCriticalSection");
++    btw_enter_cs = (PFN_BTW_EnterCS)GetProcAddress(k, "EnterCriticalSection");
++    btw_leave_cs = (PFN_BTW_LeaveCS)GetProcAddress(k, "LeaveCriticalSection");
++    if (!init || !btw_enter_cs || !btw_leave_cs) return;
++    init(&btw_cap_cs);
++    btw_cap_cs_ready = 1;
++}
++static void btw_cap_lock(void)   { if (btw_cap_cs_ready && btw_enter_cs) btw_enter_cs(&btw_cap_cs); }
++static void btw_cap_unlock(void) { if (btw_cap_cs_ready && btw_leave_cs) btw_leave_cs(&btw_cap_cs); }
++
++/* Mark a chain's poller to stop (called from swapchain cleanup, under lock). */
++void btw_mark_stopped(void *chain)
++{
++    int i;
++    btw_cap_lock_init();
++    btw_cap_lock();
++    for (i = 0; i < btw_stopped_count; i++)
++        if (btw_stopped[i] == chain) { btw_cap_unlock(); return; }
++    if (btw_stopped_count < 64) btw_stopped[btw_stopped_count++] = chain;
++    btw_cap_unlock();
++}
++static int btw_is_stopped(void *chain)
++{
++    int i, r = 0;
++    btw_cap_lock();
++    for (i = 0; i < btw_stopped_count; i++)
++        if (btw_stopped[i] == chain) { r = 1; break; }
++    btw_cap_unlock();
++    return r;
++}
++/* same check, but caller already holds btw_cap_cs */
++static int btw_is_stopped_locked(void *chain)
++{
++    int i;
++    for (i = 0; i < btw_stopped_count; i++)
++        if (btw_stopped[i] == chain) return 1;
++    return 0;
++}
++static int btw_dbg_ensure, btw_dbg_gdi, btw_dbg_paint;
++
++static void btw_resolve_gdi(void)
++{
++    HMODULE u, g;
++    if (btw_gdi_resolved) return;
++    btw_gdi_resolved = 1;
++    u = GetModuleHandleA("user32.dll"); if (!u) u = LoadLibraryA("user32.dll");
++    g = GetModuleHandleA("gdi32.dll");  if (!g) g = LoadLibraryA("gdi32.dll");
++    if (u)
++    {
++        btw_GetDC         = (PFN_BTW_GetDC)        GetProcAddress(u, "GetDC");
++        btw_ReleaseDC     = (PFN_BTW_ReleaseDC)    GetProcAddress(u, "ReleaseDC");
++        btw_GetClientRect = (PFN_BTW_GetClientRect)GetProcAddress(u, "GetClientRect");
++    }
++    if (g)
++    {
++        btw_SetStretchBltMode = (PFN_BTW_SetStretchBltMode)GetProcAddress(g, "SetStretchBltMode");
++        btw_StretchDIBits     = (PFN_BTW_StretchDIBits)    GetProcAddress(g, "StretchDIBits");
++    }
++}
++
++static uint32_t btw_find_host_mem_type(struct d3d12_device *device, uint32_t type_bits)
++{
++    const VkPhysicalDeviceMemoryProperties *mp = &device->memory_properties;
++    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    uint32_t i;
++    for (i = 0; i < mp->memoryTypeCount; i++)
++        if ((type_bits & (1u << i)) && (mp->memoryTypes[i].propertyFlags & want) == want)
++            return i;
++    return UINT32_MAX;
++}
++
++static bool btw_ensure_resources(struct dxgi_vk_swap_chain *chain, VkDeviceSize needed)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
++    struct d3d12_device *device = chain->queue->device;
++    VkDevice vk_device = device->vk_device;
++    VkResult vr;
++
++    if (btw_device != vk_device)
++    {
++        VkCommandPoolCreateInfo pool_info; VkCommandBufferAllocateInfo cb_info; VkFenceCreateInfo fence_info;
++        btw_pool = VK_NULL_HANDLE; btw_cmd = VK_NULL_HANDLE; btw_fence = VK_NULL_HANDLE;
++        btw_buffer = VK_NULL_HANDLE; btw_memory = VK_NULL_HANDLE; btw_mapped = NULL;
++        btw_capacity = 0; btw_device = vk_device;
++
++        memset(&pool_info, 0, sizeof(pool_info));
++        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++        pool_info.queueFamilyIndex = chain->queue->vkd3d_queue->vk_family_index;
++        pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        if ((vr = VK_CALL(vkCreateCommandPool(vk_device, &pool_info, NULL, &btw_pool))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkCreateCommandPool vr=%d\n", vr);} btw_pool=VK_NULL_HANDLE; return false; }
++
++        memset(&cb_info, 0, sizeof(cb_info));
++        cb_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++        cb_info.commandPool = btw_pool; cb_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cb_info.commandBufferCount = 1;
++        if ((vr = VK_CALL(vkAllocateCommandBuffers(vk_device, &cb_info, &btw_cmd))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkAllocateCommandBuffers vr=%d\n", vr);} btw_cmd=VK_NULL_HANDLE; return false; }
++
++        memset(&fence_info, 0, sizeof(fence_info));
++        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++        if ((vr = VK_CALL(vkCreateFence(vk_device, &fence_info, NULL, &btw_fence))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkCreateFence vr=%d\n", vr);} btw_fence=VK_NULL_HANDLE; return false; }
++    }
++
++    if (btw_buffer != VK_NULL_HANDLE && needed <= btw_capacity)
++        return true;
++
++    if (btw_buffer != VK_NULL_HANDLE)
++    {
++        if (btw_mapped) { VK_CALL(vkUnmapMemory(vk_device, btw_memory)); btw_mapped = NULL; }
++        VK_CALL(vkDestroyBuffer(vk_device, btw_buffer, NULL));
++        VK_CALL(vkFreeMemory(vk_device, btw_memory, NULL));
++        btw_buffer = VK_NULL_HANDLE; btw_memory = VK_NULL_HANDLE; btw_capacity = 0;
++    }
++
++    {
++        VkBufferCreateInfo buf_info; VkMemoryRequirements req; VkMemoryAllocateInfo alloc_info; VkBindBufferMemoryInfo bind_info; uint32_t mem_type;
++        memset(&buf_info, 0, sizeof(buf_info));
++        buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
++        buf_info.size = needed; buf_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT; buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        if ((vr = VK_CALL(vkCreateBuffer(vk_device, &buf_info, NULL, &btw_buffer))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkCreateBuffer vr=%d\n", vr);} btw_buffer=VK_NULL_HANDLE; return false; }
++
++        VK_CALL(vkGetBufferMemoryRequirements(vk_device, btw_buffer, &req));
++        mem_type = btw_find_host_mem_type(device, req.memoryTypeBits);
++        if (mem_type == UINT32_MAX)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: no host mem type\n");} VK_CALL(vkDestroyBuffer(vk_device, btw_buffer, NULL)); btw_buffer=VK_NULL_HANDLE; return false; }
++
++        memset(&alloc_info, 0, sizeof(alloc_info));
++        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        alloc_info.allocationSize = req.size; alloc_info.memoryTypeIndex = mem_type;
++        if ((vr = VK_CALL(vkAllocateMemory(vk_device, &alloc_info, NULL, &btw_memory))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkAllocateMemory vr=%d\n", vr);} VK_CALL(vkDestroyBuffer(vk_device, btw_buffer, NULL)); btw_buffer=VK_NULL_HANDLE; btw_memory=VK_NULL_HANDLE; return false; }
++
++        memset(&bind_info, 0, sizeof(bind_info));
++        bind_info.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO;
++        bind_info.buffer = btw_buffer; bind_info.memory = btw_memory; bind_info.memoryOffset = 0;
++        if ((vr = VK_CALL(vkBindBufferMemory2(vk_device, 1, &bind_info))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkBindBufferMemory2 vr=%d\n", vr);} return false; }
++
++        if ((vr = VK_CALL(vkMapMemory(vk_device, btw_memory, 0, VK_WHOLE_SIZE, 0, &btw_mapped))) != VK_SUCCESS)
++        { if(!btw_dbg_ensure){btw_dbg_ensure=1; ERR("blit-to-window: vkMapMemory vr=%d\n", vr);} btw_mapped=NULL; return false; }
++
++        btw_capacity = req.size;
++    }
++    return true;
++}
++
++/* copy backbuffers[index] into btw_mapped; out: width/height/fmt. returns false on skip/fail */
++static bool btw_copy_to_host(struct dxgi_vk_swap_chain *chain, uint32_t index,
++        uint32_t *out_w, uint32_t *out_h, VkFormat *out_fmt)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
++    VkDevice vk_device = chain->queue->device->vk_device;
++    struct d3d12_resource *res;
++    uint32_t width, height;
++    VkCommandBufferBeginInfo begin;
++    VkImageMemoryBarrier2 img_barrier;
++    VkBufferMemoryBarrier2 buf_barrier;
++    VkDependencyInfo dep;
++    VkBufferImageCopy2 region;
++    VkCopyImageToBufferInfo2 copy_info;
++    VkCommandBufferSubmitInfo cmd_si;
++    VkSubmitInfo2 submit;
++    VkQueue vk_queue;
++
++    res = chain->user.backbuffers[index];
++    if (!res) return false;
++    width = chain->desc.Width; height = chain->desc.Height;
++    if (!width || !height) return false;
++    if (!btw_ensure_resources(chain, (VkDeviceSize)width * height * 4u)) return false;
++
++    *out_w = width; *out_h = height; *out_fmt = res->format->vk_format;
++
++    VK_CALL(vkResetCommandBuffer(btw_cmd, 0));
++    memset(&begin, 0, sizeof(begin));
++    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    VK_CALL(vkBeginCommandBuffer(btw_cmd, &begin));
++
++    memset(&img_barrier, 0, sizeof(img_barrier));
++    img_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    img_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    img_barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
++    img_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++    img_barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
++    img_barrier.oldLayout = res->common_layout;            /* match the engine's tracked layout */
++    img_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    img_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    img_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    img_barrier.image = res->res.vk_image;
++    img_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    img_barrier.subresourceRange.levelCount = 1;
++    img_barrier.subresourceRange.layerCount = 1;
++    memset(&dep, 0, sizeof(dep));
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.imageMemoryBarrierCount = 1; dep.pImageMemoryBarriers = &img_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(btw_cmd, &dep));
++
++    memset(&region, 0, sizeof(region));
++    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
++    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.imageSubresource.layerCount = 1;
++    region.imageExtent.width = width; region.imageExtent.height = height; region.imageExtent.depth = 1;
++    memset(&copy_info, 0, sizeof(copy_info));
++    copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
++    copy_info.srcImage = res->res.vk_image;
++    copy_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    copy_info.dstBuffer = btw_buffer; copy_info.regionCount = 1; copy_info.pRegions = &region;
++    VK_CALL(vkCmdCopyImageToBuffer2(btw_cmd, &copy_info));
++
++    memset(&buf_barrier, 0, sizeof(buf_barrier));
++    buf_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
++    buf_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++    buf_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
++    buf_barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
++    buf_barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
++    buf_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    buf_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    buf_barrier.buffer = btw_buffer; buf_barrier.offset = 0; buf_barrier.size = VK_WHOLE_SIZE;
++    memset(&dep, 0, sizeof(dep));
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.bufferMemoryBarrierCount = 1; dep.pBufferMemoryBarriers = &buf_barrier;
++    VK_CALL(vkCmdPipelineBarrier2(btw_cmd, &dep));
++
++    /* restore the image to its original tracked layout so we don't corrupt the
++       engine's layout bookkeeping for the next present/use. */
++    {
++        VkImageMemoryBarrier2 restore_barrier;
++        VkDependencyInfo restore_dep;
++        memset(&restore_barrier, 0, sizeof(restore_barrier));
++        restore_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++        restore_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
++        restore_barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
++        restore_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++        restore_barrier.dstAccessMask = 0;
++        restore_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++        restore_barrier.newLayout = res->common_layout;
++        restore_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        restore_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++        restore_barrier.image = res->res.vk_image;
++        restore_barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++        restore_barrier.subresourceRange.levelCount = 1;
++        restore_barrier.subresourceRange.layerCount = 1;
++        memset(&restore_dep, 0, sizeof(restore_dep));
++        restore_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++        restore_dep.imageMemoryBarrierCount = 1;
++        restore_dep.pImageMemoryBarriers = &restore_barrier;
++        VK_CALL(vkCmdPipelineBarrier2(btw_cmd, &restore_dep));
++    }
++
++    VK_CALL(vkEndCommandBuffer(btw_cmd));
++
++    memset(&cmd_si, 0, sizeof(cmd_si));
++    cmd_si.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++    cmd_si.commandBuffer = btw_cmd;
++    memset(&submit, 0, sizeof(submit));
++    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++    submit.commandBufferInfoCount = 1; submit.pCommandBufferInfos = &cmd_si;
++
++    VK_CALL(vkResetFences(vk_device, 1, &btw_fence));
++    vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
++    VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit, btw_fence));
++    vkd3d_queue_release(chain->queue->vkd3d_queue);
++    VK_CALL(vkWaitForFences(vk_device, 1, &btw_fence, VK_TRUE, UINT64_MAX));
++    return true;
++}
++
++static void btw_unpack_and_paint(struct dxgi_vk_swap_chain *chain, uint32_t width, uint32_t height, VkFormat fmt)
++{
++    static int btw_disabled = -1;
++    HWND hwnd = chain->user_hwnd;
++    uint32_t *px = (uint32_t *)btw_mapped;
++    size_t count = (size_t)width * height, i;
++    /* NEUTRON diag: VKD3D_NEUTRON_DISABLE_BTW=1 disables the GDI blit-to-window path entirely,
++       so we can test whether the native Vulkan present alone displays the surface. Off by default. */
++    if (btw_disabled < 0)
++    {
++        char _e[8];
++        btw_disabled = (vkd3d_get_env_var("VKD3D_NEUTRON_DISABLE_BTW", _e, sizeof(_e)) && _e[0] == '1') ? 1 : 0;
++        if (btw_disabled) ERR("blit-to-window: DISABLED via VKD3D_NEUTRON_DISABLE_BTW (native present only)\n");
++    }
++    if (btw_disabled) return;
++
++    if (fmt == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
++        for (i = 0; i < count; i++)
++        { uint32_t v = px[i]; uint32_t r=((v>>0)&0x3FFu)>>2, g=((v>>10)&0x3FFu)>>2, b=((v>>20)&0x3FFu)>>2; px[i]=0xFF000000u|(r<<16)|(g<<8)|b; }
++    else if (fmt == VK_FORMAT_A2R10G10B10_UNORM_PACK32)
++        for (i = 0; i < count; i++)
++        { uint32_t v = px[i]; uint32_t b=((v>>0)&0x3FFu)>>2, g=((v>>10)&0x3FFu)>>2, r=((v>>20)&0x3FFu)>>2; px[i]=0xFF000000u|(r<<16)|(g<<8)|b; }
++    else if (fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB)
++    { unsigned char *p=(unsigned char*)btw_mapped; size_t n=count*4,j; for(j=0;j<n;j+=4){unsigned char t=p[j];p[j]=p[j+2];p[j+2]=t;} }
++
++    btw_resolve_gdi();
++    if (!hwnd || !btw_GetDC || !btw_StretchDIBits) return;
++    {
++        BTW_HDC hdc = btw_GetDC(hwnd);
++        if (!hdc) { if(!btw_dbg_gdi){btw_dbg_gdi=1; ERR("blit-to-window: GetDC NULL\n");} return; }
++        {
++            BTW_BMI bmi; BTW_RECT rc; int dw=(int)width, dh=(int)height;
++            memset(&bmi, 0, sizeof(bmi));
++            bmi.bmiHeader.biSize = sizeof(BTW_BMIH);
++            bmi.bmiHeader.biWidth = (int32_t)width;
++            bmi.bmiHeader.biHeight = -(int32_t)height;
++            bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BTW_BI_RGB;
++            if (btw_GetClientRect && btw_GetClientRect(hwnd, &rc))
++            { if(rc.right-rc.left>0) dw=rc.right-rc.left; if(rc.bottom-rc.top>0) dh=rc.bottom-rc.top; }
++            if (btw_SetStretchBltMode) btw_SetStretchBltMode(hdc, BTW_COLORONCOLOR);
++            btw_StretchDIBits(hdc, 0, 0, dw, dh, 0, 0, (int)width, (int)height, btw_mapped, &bmi, BTW_DIB_RGB_COLORS, BTW_SRCCOPY);
++            if (btw_ReleaseDC) btw_ReleaseDC(hwnd, hdc);
++            if (!btw_dbg_gdi) { btw_dbg_gdi = 1; ERR("blit-to-window: GDI blit OK dst=%dx%d\n", dw, dh); }
++        }
++    }
++}
++
++/* kept for the present-callback call site (harmless if present never runs) */
++static void blit_user_backbuffer_to_window(struct dxgi_vk_swap_chain *chain)
++{
++    uint32_t w, h; VkFormat fmt;
++    if (btw_copy_to_host(chain, chain->request.user_index, &w, &h, &fmt))
++        btw_unpack_and_paint(chain, w, h, fmt);
++}
++
++static unsigned long btw_thread_proc(void *arg)
++{
++    struct dxgi_vk_swap_chain *chain = arg;
++    HMODULE k = GetModuleHandleA("kernel32.dll");
++    PFN_BTW_Sleep pSleep = k ? (PFN_BTW_Sleep)GetProcAddress(k, "Sleep") : NULL;
++    ERR("blit-to-window: blit thread running chain=%p\n", chain);
++    {
++    unsigned int btw_iter = 0;     /* for throttled logging */
++    for (;;)
++    {
++        uint32_t count, idx, w, h, cur; VkFormat fmt; int painted = 0;
++        if (pSleep) pSleep(33);
++        /* teardown safety: stop if this swapchain is being destroyed, or if its
++           queue has already been released/NULL'd. */
++        if (btw_is_stopped(chain)) break;
++        if (!chain->queue || !chain->queue->device) break;
++        if (!chain->user_hwnd) continue;
++        ++btw_iter;
++        count = chain->desc.BufferCount;
++        cur = chain->user.index;       /* the buffer Premiere renders into now */
++
++        /* Try the live render-target index first, then the rest. This ordering
++           means we capture the freshest content and don't paint a stale buffer. */
++        for (idx = 0; idx < count + 1; idx++)
++        {
++            uint32_t nz, sampidx;
++            int got;
++            sampidx = (idx == 0) ? cur : (idx - 1);   /* idx 0 == current, then 0..count-1 */
++            if (sampidx >= count) continue;
++            if (idx > 0 && sampidx == cur) continue;  /* don't re-do current */
++
++            btw_cap_lock();
++            if (btw_is_stopped_locked(chain) || !chain->queue || !chain->queue->device)
++            { btw_cap_unlock(); painted = -1; break; }
++            got = btw_copy_to_host(chain, sampidx, &w, &h, &fmt);
++            if (!got) { btw_cap_unlock(); continue; }
++            {
++                uint32_t *px = (uint32_t *)btw_mapped;
++                size_t c = (size_t)(h / 2) * w + (w / 2);
++                nz = px[0] | px[c] | px[(size_t)w * h - 1];
++            }
++            /* throttled log of the CURRENT index over time (~once/sec at 33ms),
++               so we can see whether/when the live buffer gets content. */
++            if (sampidx == cur && (btw_iter % 30u) == 1u)
++                ERR("blit-to-window: cur idx %u sample center=0x%08x nonzero=%d fmt=%d (iter %u)\n",
++                    sampidx, ((uint32_t *)btw_mapped)[(size_t)(h/2)*w + w/2], nz != 0, (int)fmt, btw_iter);
++            if (nz)
++            { btw_unpack_and_paint(chain, w, h, fmt); painted = 1; if(!btw_dbg_paint){btw_dbg_paint=1; ERR("blit-to-window: painting from idx %u\n", sampidx);} btw_cap_unlock(); break; }
++            btw_cap_unlock();
++        }
++        if (painted < 0) break;   /* stopped mid-scan */
++        (void)painted;
++    }
++    }
++    return 0;
++}
++
++static struct dxgi_vk_swap_chain *btw_started[16];
++static int btw_started_count;
++
++static void btw_start_blit_thread(struct dxgi_vk_swap_chain *chain)
++{
++    HMODULE k; PFN_BTW_CreateThread pCreateThread; void *h;
++    btw_cap_lock_init();
++    /* NEUTRON: per-chain idempotent start (replaces the buggy never-cleared cap-16 global
++       array; safe to call from the present thread on every present). */
++    if (InterlockedExchange(&chain->btw_thread_started, 1)) return;
++    k = GetModuleHandleA("kernel32.dll");
++    pCreateThread = k ? (PFN_BTW_CreateThread)GetProcAddress(k, "CreateThread") : NULL;
++    if (pCreateThread)
++    { h = pCreateThread(NULL, 0, (void *)btw_thread_proc, chain, 0, NULL); ERR("blit-to-window: started blit thread chain=%p hwnd=%p handle=%p\n", chain, chain->user_hwnd, h); }
++    else ERR("blit-to-window: CreateThread unresolved\n");
++}
++
++/* ---- IDENT probe ---------------------------------------------------------
++ * Paint a window solid magenta so we can SEE on screen which window a given
++ * vkd3d swapchain's user_hwnd actually is. Takes the HWND BY VALUE (thread
++ * arg), so it never dereferences `chain` and cannot use-after-free when
++ * Premiere tears the swapchain down during scrubbing/teardown.
++ * -------------------------------------------------------------------------- */
++static int btw_ident_started;
++
++static unsigned long btw_ident_thread(void *arg)
++{
++    HWND hwnd = (HWND)arg;
++    HMODULE k = GetModuleHandleA("kernel32.dll");
++    PFN_BTW_Sleep pSleep = k ? (PFN_BTW_Sleep)GetProcAddress(k, "Sleep") : NULL;
++    /* 2x2 source DIB, all magenta. 32bpp BI_RGB pixel bytes are B,G,R,X
++     * (little-endian uint32 0x00RRGGBB) -> magenta (R=255,G=0,B=255)=0x00FF00FF. */
++    static const uint32_t magenta[4] = { 0x00FF00FFu, 0x00FF00FFu, 0x00FF00FFu, 0x00FF00FFu };
++    btw_resolve_gdi();
++    ERR("blit-to-window: IDENT thread painting hwnd=%p solid magenta\n", hwnd);
++    for (;;)
++    {
++        if (pSleep) pSleep(200);
++        if (!hwnd || !btw_GetDC || !btw_StretchDIBits) continue;
++        {
++            BTW_HDC hdc = btw_GetDC(hwnd);
++            BTW_BMI bmi; BTW_RECT rc; int dw = 256, dh = 256;
++            if (!hdc) { if(!btw_dbg_gdi){btw_dbg_gdi=1; ERR("blit-to-window: IDENT GetDC NULL hwnd=%p\n", hwnd);} continue; }
++            memset(&bmi, 0, sizeof(bmi));
++            bmi.bmiHeader.biSize = sizeof(BTW_BMIH);
++            bmi.bmiHeader.biWidth = 2; bmi.bmiHeader.biHeight = -2;
++            bmi.bmiHeader.biPlanes = 1; bmi.bmiHeader.biBitCount = 32; bmi.bmiHeader.biCompression = BTW_BI_RGB;
++            if (btw_GetClientRect && btw_GetClientRect(hwnd, &rc))
++            { if (rc.right - rc.left > 0) dw = rc.right - rc.left; if (rc.bottom - rc.top > 0) dh = rc.bottom - rc.top; }
++            if (btw_SetStretchBltMode) btw_SetStretchBltMode(hdc, BTW_COLORONCOLOR);
++            btw_StretchDIBits(hdc, 0, 0, dw, dh, 0, 0, 2, 2, magenta, &bmi, BTW_DIB_RGB_COLORS, BTW_SRCCOPY);
++            if (btw_ReleaseDC) btw_ReleaseDC(hwnd, hdc);
++            if (!btw_dbg_paint) { btw_dbg_paint = 1; ERR("blit-to-window: IDENT painted hwnd=%p %dx%d\n", hwnd, dw, dh); }
++        }
++    }
++    return 0;
++}
++
++static void btw_start_ident(HWND hwnd)
++{
++    HMODULE k; PFN_BTW_CreateThread pCreateThread;
++    if (btw_ident_started) return;
++    btw_ident_started = 1;
++    k = GetModuleHandleA("kernel32.dll");
++    pCreateThread = k ? (PFN_BTW_CreateThread)GetProcAddress(k, "CreateThread") : NULL;
++    if (pCreateThread)
++        pCreateThread(NULL, 0, (void *)btw_ident_thread, (void *)hwnd, 0, NULL);
++    else
++        ERR("blit-to-window: IDENT CreateThread unresolved\n");
++}
++
++/* ===== Neutron RT probe ====================================================
++ * Reads ONE specific vkd3d render target (captured by resource.c into the
++ * globals below) and paints it to chain->user_hwnd. Bounded ~20s loop so it
++ * exits on its own and cannot use-after-free against swapchain teardown.
++ * Globals are NON-static so resource.c can set them via a block-scope extern.
++ * Spliced textually into blit_to_window.h, before the include-guard #endif,
++ * so all the helpers above (btw_ensure_resources, btw_unpack_and_paint,
++ * btw_mapped/buffer/fence/cmd, PFN_BTW_*) are already in scope.
++ * ========================================================================= */
++VkImage        g_neutron_rt_image = VK_NULL_HANDLE;
++uint32_t       g_neutron_rt_w;
++uint32_t       g_neutron_rt_h;
++VkFormat       g_neutron_rt_fmt;
++VkImageLayout  g_neutron_rt_layout;
++
++/* Copy an arbitrary color VkImage (1 mip, 1 layer) into btw_mapped, going
++ * cur_layout -> GENERAL -> copy -> GENERAL -> cur_layout to preserve it. */
++static bool btw_copy_image_to_host(struct dxgi_vk_swap_chain *chain,
++        VkImage image, uint32_t width, uint32_t height, VkImageLayout cur_layout)
++{
++    /* neutron-rt teardown guard: the rt-probe thread can outlive the
++     * swapchain's queue. chain->queue is released/NULL'd during destroy,
++     * so bail instead of dereferencing chain->queue->device. The probe
++     * loop treats a false return as 'skip frame' and winds down safely. */
++    if (!chain || !chain->queue || !chain->queue->device)
++        return false;
++    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
++    VkDevice vk_device = chain->queue->device->vk_device;
++    VkCommandBufferBeginInfo begin;
++    VkImageMemoryBarrier2 to_copy, from_copy;
++    VkDependencyInfo dep;
++    VkBufferImageCopy2 region;
++    VkCopyImageToBufferInfo2 copy_info;
++    VkCommandBufferSubmitInfo cmd_si;
++    VkSubmitInfo2 submit;
++    VkQueue vk_queue;
++
++    if (image == VK_NULL_HANDLE || !width || !height)
++        return false;
++    if (!btw_ensure_resources(chain, (VkDeviceSize)width * height * 4u))
++        return false;
++
++    VK_CALL(vkResetCommandBuffer(btw_cmd, 0));
++    memset(&begin, 0, sizeof(begin));
++    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++    VK_CALL(vkBeginCommandBuffer(btw_cmd, &begin));
++
++    memset(&to_copy, 0, sizeof(to_copy));
++    to_copy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    to_copy.srcStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    to_copy.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
++    to_copy.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
++    to_copy.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
++    to_copy.oldLayout = cur_layout;
++    to_copy.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    to_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    to_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    to_copy.image = image;
++    to_copy.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    to_copy.subresourceRange.levelCount = 1;
++    to_copy.subresourceRange.layerCount = 1;
++    memset(&dep, 0, sizeof(dep));
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.imageMemoryBarrierCount = 1;
++    dep.pImageMemoryBarriers = &to_copy;
++    VK_CALL(vkCmdPipelineBarrier2(btw_cmd, &dep));
++
++    memset(&region, 0, sizeof(region));
++    region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
++    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.imageSubresource.layerCount = 1;
++    region.imageExtent.width = width;
++    region.imageExtent.height = height;
++    region.imageExtent.depth = 1;
++    memset(&copy_info, 0, sizeof(copy_info));
++    copy_info.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
++    copy_info.srcImage = image;
++    copy_info.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
++    copy_info.dstBuffer = btw_buffer;
++    copy_info.regionCount = 1;
++    copy_info.pRegions = &region;
++    VK_CALL(vkCmdCopyImageToBuffer2(btw_cmd, &copy_info));
++
++    memset(&from_copy, 0, sizeof(from_copy));
++    from_copy.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
++    from_copy.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
++    from_copy.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
++    from_copy.dstStageMask  = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
++    from_copy.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
++    from_copy.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
++    from_copy.newLayout = cur_layout;
++    from_copy.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    from_copy.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    from_copy.image = image;
++    from_copy.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    from_copy.subresourceRange.levelCount = 1;
++    from_copy.subresourceRange.layerCount = 1;
++    memset(&dep, 0, sizeof(dep));
++    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
++    dep.imageMemoryBarrierCount = 1;
++    dep.pImageMemoryBarriers = &from_copy;
++    VK_CALL(vkCmdPipelineBarrier2(btw_cmd, &dep));
++
++    VK_CALL(vkEndCommandBuffer(btw_cmd));
++
++    memset(&cmd_si, 0, sizeof(cmd_si));
++    cmd_si.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
++    cmd_si.commandBuffer = btw_cmd;
++    memset(&submit, 0, sizeof(submit));
++    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
++    submit.commandBufferInfoCount = 1;
++    submit.pCommandBufferInfos = &cmd_si;
++
++    VK_CALL(vkResetFences(vk_device, 1, &btw_fence));
++    vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
++    VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit, btw_fence));
++    vkd3d_queue_release(chain->queue->vkd3d_queue);
++    VK_CALL(vkWaitForFences(vk_device, 1, &btw_fence, VK_TRUE, UINT64_MAX));
++    return true;
++}
++
++static unsigned long btw_rt_probe_thread(void *arg)
++{
++    struct dxgi_vk_swap_chain *chain = arg;
++    HMODULE k = GetModuleHandleA("kernel32.dll");
++    PFN_BTW_Sleep pSleep = k ? (PFN_BTW_Sleep)GetProcAddress(k, "Sleep") : NULL;
++    int iter, logged_present = 0, logged_nz = 0;
++
++    ERR("neutron-rt: probe thread start chain=%p\n", chain);
++    for (iter = 0; iter < 3000; iter++)   /* ~100s diagnostic window */
++    {
++        VkImage img;
++        uint32_t w, h, nz = 0;
++        VkFormat fmt;
++        VkImageLayout lay;
++
++        if (pSleep)
++            pSleep(33);
++
++        img = g_neutron_rt_image;
++        w   = g_neutron_rt_w;
++        h   = g_neutron_rt_h;
++        fmt = g_neutron_rt_fmt;
++        lay = g_neutron_rt_layout;
++
++        if (img == VK_NULL_HANDLE || !w || !h)
++            continue;
++
++        if (!logged_present)
++        {
++            logged_present = 1;
++            ERR("neutron-rt: captured RT %ux%u vkfmt=%d layout=%d\n",
++                    w, h, (int)fmt, (int)lay);
++        }
++
++        btw_cap_lock();
++        if (!btw_copy_image_to_host(chain, img, w, h, lay))
++        { btw_cap_unlock(); continue; }
++
++        {
++            uint32_t *px = (uint32_t *)btw_mapped;
++            size_t c = (size_t)(h / 2) * w + (w / 2);
++            nz = px[0] | px[c] | px[(size_t)w * h - 1u];
++        }
++
++        if ((iter % 30) == 0)   /* ~once/sec time course */
++        {
++            (void)logged_nz;
++            ERR("neutron-rt: read center=0x%08x nonzero=%d iter=%d\n",
++                    ((uint32_t *)btw_mapped)[(size_t)(h / 2) * w + (w / 2)], nz != 0, iter);
++        }
++
++        if (nz)
++            btw_unpack_and_paint(chain, w, h, fmt);
++        btw_cap_unlock();
++    }
++    ERR("neutron-rt: probe thread exit (safe)\n");
++    return 0;
++}
++
++static int btw_rt_started;
++static void btw_start_rt_probe(struct dxgi_vk_swap_chain *chain)
++{
++    HMODULE k;
++    PFN_BTW_CreateThread pCreateThread;
++
++    if (btw_rt_started)
++        return;
++    btw_rt_started = 1;
++
++    k = GetModuleHandleA("kernel32.dll");
++    pCreateThread = k ? (PFN_BTW_CreateThread)GetProcAddress(k, "CreateThread") : NULL;
++    if (pCreateThread)
++        pCreateThread(NULL, 0, (void *)btw_rt_probe_thread, chain, 0, NULL);
++    else
++        ERR("neutron-rt: CreateThread unresolved\n");
++}
++#endif /* VKD3D_BLIT_TO_WINDOW_H */
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index cf68d8cf..93b76f36 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4447,6 +4447,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+     vkd3d_queue_timeline_trace_register_instantaneous(&device->queue_timeline_trace,
+             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMITTED_RESOURCE_ALLOCATION, object->res.cookie.index);
+ 
++if (object->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && object->desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM && (object->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) && /*DIAG_PROGRAM_RT*/ ((object->desc.Width == 1459 && object->desc.Height == 978) || (object->desc.Width == 1475 && object->desc.Height == 1088))) { extern VkImage g_neutron_rt_image; extern uint32_t g_neutron_rt_w, g_neutron_rt_h; extern VkFormat g_neutron_rt_fmt; extern VkImageLayout g_neutron_rt_layout; g_neutron_rt_image = object->res.vk_image; g_neutron_rt_w = (uint32_t)object->desc.Width; g_neutron_rt_h = object->desc.Height; g_neutron_rt_fmt = object->format->vk_format; g_neutron_rt_layout = object->common_layout; }
+     *resource = object;
+     return S_OK;
+ 
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index a8f208ee..6d251781 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -24,6 +24,50 @@
+ #include "vkd3d_private.h"
+ #include "vkd3d_timestamp_profiler.h"
+ 
++/* NEUTRON: swapchain lifecycle instrumentation (churn-vs-leak diagnosis). */
++static LONG g_neutron_sc_created;
++static LONG g_neutron_sc_destroyed;
++
++/* NEUTRON drawperf ② (Direction C experiment): env gate to disable the BTW GDI-blit
++   present path (set NEUTRON_DISABLE_BTW=1) so the real vkQueuePresentKHR / Vulkan present
++   stands alone -- lets us observe whether the winewayland subsurface shows the direct
++   present (or goes black = subsurface sync issue). Default (unset/0): BTW ON, behavior
++   identical to before this patch. Read once. */
++static int neutron_btw_disabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_DISABLE_BTW"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
++
++/* NEUTRON diag: NEUTRON_SC_TRACE=1 traces app calls on the swapchain frame-latency
++   interfaces (paired with the DXVK dxgi-side trace) -- inert by default. */
++static int neutron_sc_trace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_SC_TRACE"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
++
++/* NEUTRON diag gate for the render-target probe thread (2026-08-09).
++   The probe was started UNCONDITIONALLY, which is a shipping bug of the same class as the
++   nvcuda sampler that crashed every Premiere CUDA export (2026-08-08):
++     * it samples g_neutron_rt_image, a raw VkImage recorded in resource.c and NEVER cleared
++       when the resource is destroyed -- so it can submit GPU work against a dead image;
++     * it dereferences `chain` for ~100 s after start, outliving a released swapchain;
++     * on a hit it does GetDC/StretchDIBits, i.e. it PAINTS INTO THE APP'S WINDOW;
++     * it did not even consult neutron_btw_disabled(), so it ran for Photoshop, LrC and AE,
++       whose profiles set NEUTRON_DISABLE_BTW=1 precisely to stay off this path.
++   Now default OFF and separately armable. Its inner paint additionally checks
++   VKD3D_NEUTRON_DISABLE_BTW -- a DIFFERENT env name from the NEUTRON_DISABLE_BTW the
++   launchers set, so that gate was always inert; this one is the real guard. */
++static int neutron_rt_probe_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_VKD3D_RT_PROBE"); v = (e && *e && *e != '0') ? 1 : 0; }
++    return v;
++}
++
+ static inline bool vkd3d_swapchain_present_mode_parse(const char *string, VkPresentModeKHR *present_mode)
+ {
+     struct present_mode_entry
+@@ -172,6 +216,8 @@ struct dxgi_vk_swap_chain
+     UINT frame_latency;
+     UINT frame_latency_internal;
+     VkSurfaceKHR vk_surface;
++    HWND user_hwnd;
++    LONG btw_thread_started; /* NEUTRON: lazy btw-blit-thread start on first present (churn fix) */
+ 
+     struct low_latency_state requested_low_latency_state;
+     bool low_latency_update_requested;
+@@ -593,8 +639,22 @@ static void dxgi_vk_swap_chain_cleanup_common(struct dxgi_vk_swap_chain *chain)
+     }
+ }
+ 
++void btw_mark_stopped(void *chain); /* cold-start fix: declared before first use */
++
+ static void dxgi_vk_swap_chain_cleanup(struct dxgi_vk_swap_chain *chain)
+ {
++    {
++        LONG _nd = InterlockedIncrement(&g_neutron_sc_destroyed);
++        ERR("NEUTRON-SC-DESTROY destroyed=%ld created=%ld live=%ld hwnd=%p size=%ux%u chain=%p presents=%llu\n",
++            _nd, g_neutron_sc_created, g_neutron_sc_created - _nd,
++            chain->user_hwnd, chain->desc.Width, chain->desc.Height, chain,
++            (unsigned long long)chain->present.present_count);
++    }
++
++    /* cold-start fix: stop the per-swapchain blit poller before freeing
++       anything, so it cannot use-after-free chain / chain->queue. */
++    btw_mark_stopped(chain);
++
+     /* Join with waiter thread first to avoid any sync issues. */
+     dxgi_vk_swap_chain_cleanup_waiter_thread(chain);
+ 
+@@ -750,6 +810,9 @@ static HANDLE STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameLatencyEvent(IDXGIVkS
+     duplicated_handle = fd >= 0 ? (HANDLE)(intptr_t)fd : NULL;
+ #endif
+ 
++    if (neutron_sc_trace())
++        ERR("neutron-sctrace: vkd3d GetFrameLatencyEvent hwnd=%p -> handle=%p (latency=%u)\n",
++            swapchain->user_hwnd, duplicated_handle, swapchain->frame_latency);
+     return duplicated_handle;
+ }
+ 
+@@ -946,6 +1009,9 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapC
+     if (MaxLatency > chain->frame_latency)
+         vkd3d_native_sync_handle_release(chain->frame_latency_event, MaxLatency - chain->frame_latency);
+ 
++    if (neutron_sc_trace())
++        ERR("neutron-sctrace: vkd3d SetFrameLatency hwnd=%p old=%u new=%u\n",
++            chain->user_hwnd, chain->frame_latency, MaxLatency);
+     chain->frame_latency = MaxLatency;
+     return S_OK;
+ }
+@@ -1049,6 +1115,9 @@ static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *ch
+ }
+ 
+ static void dxgi_vk_swap_chain_present_callback(void *chain);
++static void btw_start_blit_thread(struct dxgi_vk_swap_chain *chain);
++static void btw_start_ident(HWND hwnd);
++static void btw_start_rt_probe(struct dxgi_vk_swap_chain *chain);
+ 
+ static void dxgi_vk_swap_chain_wait_internal_handle(struct dxgi_vk_swap_chain *chain, bool low_latency_enable)
+ {
+@@ -1129,6 +1198,34 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+             iface, SyncInterval, PresentFlags, pPresentParameters);
+     (void)pPresentParameters;
+ 
++    if (neutron_sc_trace())
++    {
++        /* NEUTRON 2026-08-04 (Animate canvas playback artifacts): vkd3d DISCARDS
++         * pPresentParameters (see the (void) cast above) and always blits the WHOLE
++         * back buffer. On Windows, Present1 dirty rects mean "only these regions
++         * changed in this buffer; take the rest from what was previously presented",
++         * so an app may render ONLY the dirty region. Blitting the whole buffer then
++         * publishes the untouched areas, which with BufferCount=2 hold content from
++         * TWO frames ago -> stale fragments during playback that vanish on a full
++         * redraw (pause). This trace answers the one open question: does the app
++         * actually pass dirty rects here? dirtyN=-1 means pPresentParameters==NULL
++         * (plain Present) and the theory is dead. */
++        if (pPresentParameters && pPresentParameters->DirtyRectsCount)
++        {
++            const RECT *r0 = pPresentParameters->pDirtyRects;
++            ERR("neutron-sctrace: vkd3d Present hwnd=%p sync=%u flags=0x%x dirtyN=%u first=(%ld,%ld)-(%ld,%ld) scroll=%p\n",
++                chain->user_hwnd, SyncInterval, PresentFlags,
++                pPresentParameters->DirtyRectsCount,
++                r0 ? (long)r0->left : -1, r0 ? (long)r0->top : -1,
++                r0 ? (long)r0->right : -1, r0 ? (long)r0->bottom : -1,
++                (void *)pPresentParameters->pScrollRect);
++        }
++        else
++            ERR("neutron-sctrace: vkd3d Present hwnd=%p sync=%u flags=0x%x dirtyN=%d\n",
++                chain->user_hwnd, SyncInterval, PresentFlags,
++                pPresentParameters ? 0 : -1);
++    }
++
+     if (dxgi_vk_swap_chain_present_is_occluded(chain))
+         return DXGI_STATUS_OCCLUDED;
+     if (PresentFlags & DXGI_PRESENT_TEST)
+@@ -1217,6 +1314,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+      * All interesting works happens in the callback. */
+     chain->user.blit_count += 1;
+     d3d12_command_queue_enqueue_callback(chain->queue, dxgi_vk_swap_chain_present_callback, chain);
++{static int e_; if(!e_){e_=1; ERR("blit-dbg PRESENT reached ");}}
+ 
+     chain->user.index = (chain->user.index + 1) % chain->desc.BufferCount;
+ 
+@@ -1497,6 +1595,24 @@ static void dxgi_vk_swap_chain_update_wait_timing_capabilities(struct dxgi_vk_sw
+             chain->queue->device->device_info.present_wait_features.presentWait ||
+             chain->present.wait2;
+ 
++    /* NEUTRON: a windowless composition/dcomp swapchain (user_hwnd == NULL, e.g. when the
++     * DXVK dcomp-bridge fails to hand a target window to vkd3d) never presents to a real
++     * surface, so vkWaitForPresent[2]KHR never completes and blocks the presenting thread
++     * forever. This was observed wedging Adobe Photoshop's document-open: the main thread
++     * armed KHR_present_wait on this dummy swapchain and hung while holding a global
++     * critical section, starving the open-document worker so the home screen never
++     * dismissed. Force the non-present_wait fallback (present_request_done_event) for such
++     * windowless swapchains; the affected swapchain is offscreen, so the "latency will
++     * increase" tradeoff has no visible effect. */
++    if (!chain->user_hwnd)
++    {
++        chain->present.wait = false;
++        chain->present.wait2 = false;
++        chain->present.timing = false;
++        chain->present.timing_relative = false;
++        chain->present.timing_absolute = false;
++    }
++
+     if (!chain->present.wait)
+         FIXME_ONCE("Implementation supports neither present_wait1 or present_wait2. Latency will increase.\n");
+ 
+@@ -1537,6 +1653,42 @@ static HRESULT dxgi_vk_swap_chain_create_surface(struct dxgi_vk_swap_chain *chai
+     vk_instance = device->vkd3d_instance->vk_instance;
+     vk_physical_device = device->vk_physical_device;
+     vr = IDXGIVkSurfaceFactory_CreateSurface(pFactory, vk_instance, vk_physical_device, &chain->vk_surface);
++    {
++        HMODULE dch = GetModuleHandleA("dcomp.dll");
++        HWND (*dcomp_get)(void);
++        if (!dch) dch = LoadLibraryA("dcomp.dll");
++        dcomp_get = dch ? (HWND (*)(void))GetProcAddress(dch, "dcomp_get_pending_hwnd") : NULL;
++        if (dcomp_get) chain->user_hwnd = dcomp_get();
++        ERR("dcomp-bridge vkd3d user_hwnd=%p\n", chain->user_hwnd);
++        if (chain->user_hwnd)
++        {
++            HWND _w = chain->user_hwnd;
++            HWND _parent = GetAncestor(_w, GA_PARENT);
++            HWND _root   = GetAncestor(_w, GA_ROOT);
++            HWND _owner  = GetWindow(_w, GW_OWNER);
++            LONG _style  = GetWindowLongW(_w, GWL_STYLE);
++            LONG _ex     = GetWindowLongW(_w, GWL_EXSTYLE);
++            RECT _wr, _cr;
++            BOOL _vis = IsWindowVisible(_w);
++            memset(&_wr, 0, sizeof(_wr)); memset(&_cr, 0, sizeof(_cr));
++            GetWindowRect(_w, &_wr);
++            GetClientRect(_w, &_cr);
++            ERR("vkd3d-winlog: hwnd=%p parent=%p root=%p owner=%p style=0x%08lx exstyle=0x%08lx "
++                "child=%d visible=%d winrect=(%ld,%ld,%ld,%ld) client=(%ldx%ld)\n",
++                _w, _parent, _root, _owner, (unsigned long)_style, (unsigned long)_ex,
++                (_style & WS_CHILD) ? 1 : 0, _vis ? 1 : 0,
++                _wr.left, _wr.top, _wr.right, _wr.bottom,
++                _cr.right - _cr.left, _cr.bottom - _cr.top);
++        }
++        /* NEUTRON churn fix: blit thread now starts lazily on first real present (see
++           present_iteration), so the ~600 never-presented composition swapchains created
++           during a make don't each spawn (and join) a blit thread. */
++        /* DIAG, default OFF: one RT probe samples g_neutron_rt_image over time.
++           Requires NEUTRON_VKD3D_RT_PROBE=1 -- see neutron_rt_probe_enabled() above for
++           why an ungated version of this was dangerous. */
++        if (neutron_rt_probe_enabled())
++        { static int btw_diag_probe_started = 0; if (chain->user_hwnd && !btw_diag_probe_started) { btw_diag_probe_started = 1; btw_start_rt_probe(chain); } }
++    }
+ 
+     if (vr < 0)
+     {
+@@ -3157,9 +3309,22 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+             vk_prepend_struct(&present_info, &timings_info);
+     }
+ 
++    /* NEUTRON churn fix: start the per-window blit thread lazily on first real present
++       (idempotent via chain->btw_thread_started). The ~600 never-presented composition
++       swapchains created during a make never reach here, so they never spawn a thread. */
++    if (chain->user_hwnd && !neutron_btw_disabled())
++        btw_start_blit_thread(chain);
++
+     vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+     VKD3D_REGION_BEGIN(queue_present);
+     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
++    /* vkd3d-presentlog DIAG: what did we just present, and for which HWND/surface */
++    ERR("vkd3d-presentlog: QUEUEPRESENT user_hwnd=%p vk_swapchain=0x%016llx vk_surface=0x%016llx "
++        "img_index=%u vr=%d vk_result=%d\n",
++        chain->user_hwnd,
++        (unsigned long long)(uintptr_t)chain->present.vk_swapchain,
++        (unsigned long long)(uintptr_t)chain->vk_surface,
++        swapchain_index, (int)vr, (int)vk_result);
+     VKD3D_REGION_END(queue_present);
+     vkd3d_queue_release(chain->queue->vkd3d_queue);
+ 
+@@ -3238,6 +3403,7 @@ static void dxgi_vk_swap_chain_update_present_timing(struct dxgi_vk_swap_chain *
+     }
+ }
+ 
++#include "blit_to_window.h"
+ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+ {
+     const struct dxgi_vk_swap_chain_present_request *next_request;
+@@ -3266,6 +3432,18 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+     /* A present iteration may or may not render to backbuffer. We'll apply best effort here.
+      * Forward progress must be ensured, so if we cannot get anything on-screen in a reasonable amount of retries, ignore it. */
+     dxgi_vk_swap_chain_present_iteration(chain, next_present_count, 0);
++    /* NEUTRON: keep the present-path blit for LOW-LATENCY live stroke feedback (the poller
++       alone is only ~30fps and visibly lags while drawing). But serialize it under the same
++       btw_cap_lock the per-window poller threads use, so it no longer races the shared btw
++       scratch (btw_mapped/btw_cmd/btw_fence) -- that unsynchronized race was what made
++       inactive canvases mirror the active one. */
++    if (!neutron_btw_disabled())
++    {
++        btw_cap_lock_init();
++        btw_cap_lock();
++        blit_user_backbuffer_to_window(chain);
++        btw_cap_unlock();
++    }
+ 
+     /* When this is signalled, lets main thread know that it's safe to free user buffers.
+      * Signal this just once on the outside since we might have retries, which complicates command buffer recycling. */
+@@ -3955,6 +4133,13 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
+     INFO("Creating swapchain (%u x %u), BufferCount = %u.\n",
+             pDesc->Width, pDesc->Height, pDesc->BufferCount);
+ 
++    {
++        LONG _nc = InterlockedIncrement(&g_neutron_sc_created);
++        ERR("NEUTRON-SC-CREATE created=%ld destroyed=%ld live=%ld size=%ux%u chain=%p\n",
++            _nc, g_neutron_sc_destroyed, _nc - g_neutron_sc_destroyed,
++            pDesc->Width, pDesc->Height, chain);
++    }
++
+     if (FAILED(hr = dxgi_vk_swap_chain_reallocate_user_buffers(chain)))
+         goto cleanup_common;
+ 

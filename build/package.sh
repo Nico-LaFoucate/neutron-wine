@@ -9,6 +9,7 @@
 #   neutron-wine-<version>.tar.xz            the compiled Wine fork (the "wine core")
 #   neutron-wine-<version>.tar.xz.sha256     checksum (sha256sum -c compatible)
 #   neutron-wine-<version>.manifest.json     machine-readable release manifest
+#   neutron-wine-<version>-source.tar.xz     complete source of this release (build/source-archive.sh)
 #
 # Usage:
 #   build/package.sh [path-to-wine-tree]
@@ -68,6 +69,11 @@ if [ ! -d "$TREE" ] || { [ ! -x "$TREE/bin/wine" ] && [ ! -x "$TREE/bin/wine64" 
     exit 1
 fi
 TREE="$(cd "$TREE" && pwd)"
+
+# --- DXVK, vkd3d-proton, NVIDIA wrappers, ucrtbase shim -------------------------
+# Built from external/sources.conf + external/patches and installed into the tree (lib/wine/<project>/,
+# share/neutron/natives.json, licenses/<project>/) BEFORE the gates below, so they cover these too.
+bash "$REPO/external/build-external.sh" "$TREE" || { echo "error: external/build-external.sh failed" >&2; exit 8; }
 
 # ---------------------------------------------------------------------------
 # NO-HOME-PATH GATE. Nothing we ship may carry the builder's home directory. Wine compiles its
@@ -197,7 +203,7 @@ stage gecko "wine-gecko-$GECKO_VER-x86_64"
 # Every component's license travels with the binaries, and SOURCE names the exact recipe this
 # release was built from, so the published repo can rebuild what we shipped (LGPL).
 WINE_SRC="${NEUTRON_WINE_WORK:-$REPO/_work}/wine-tkg-git/wine-tkg-git/src/wine-git"
-rm -rf "$TREE/licenses"; mkdir -p "$TREE/licenses/wine"
+rm -rf "$TREE/licenses/wine"; mkdir -p "$TREE/licenses/wine"
 for f in COPYING.LIB LICENSE AUTHORS COPYING.arial COPYING.cour COPYING.msyh COPYING.times; do
     [ -f "$WINE_SRC/$f" ] && cp "$WINE_SRC/$f" "$TREE/licenses/wine/"
 done
@@ -209,6 +215,16 @@ neutron-wine $VERSION bundles the following components.
 Wine (patched)    LGPL-2.1-or-later   licenses/wine/ (COPYING.LIB, LICENSE, AUTHORS, font licenses)
 Wine Mono $MONO_VER   MIT and others     https://gitlab.winehq.org/mono/wine-mono
 Wine Gecko $GECKO_VER  MPL-2.0            https://dl.winehq.org/wine/wine-gecko/$GECKO_VER/
+
+DXVK              zlib                licenses/dxvk/          (d3d8, d3d9, d3d10core, d3d11, dxgi)
+vkd3d-proton      LGPL-2.1            licenses/vkd3d-proton/  (d3d12, d3d12core)
+dxvk-nvapi        MIT                 licenses/dxvk-nvapi/    (nvapi, nvapi64, nvofapi64)
+nvcuda            LGPL-2.1            licenses/nvcuda/
+nvenc             LGPL-2.1            licenses/nvenc/         (nvcuvid, nvencodeapi64)
+wine-nvoptix      LGPL-2.1 and MIT    licenses/wine-nvoptix/  (nvoptix)
+ucrtbase shim     LGPL-2.1-or-later   part of neutron-wine (external/ucrtshim)
+Exact upstream commits, and which of these carry Neutron patches: share/neutron/natives.json.
+The complete source of this release is attached to it as $NAME-source.tar.xz.
 
 Neutron is an independent project by Nico LaFoucate and Ficus Media Group. Adobe and its product
 names are trademarks of Adobe Inc. Neutron is not affiliated with or endorsed by Adobe.
@@ -222,6 +238,8 @@ Source:        https://github.com/$SLUG
 Recipe commit: $SRC_COMMIT
 Wine base:     $WINE_BASE
 wine-tkg:      https://github.com/Frogging-Family/wine-tkg-git @ $TKG_COMMIT
+External:      $(awk '!/^#/ && NF { printf "%s%s @ %s%s", sep, $2, $3, ($4 == "-" ? "" : " + external/patches/" $4); sep = "\n               " }' "$REPO/external/sources.conf")
+Full source:   $NAME-source.tar.xz (attached to the release)
 Rebuild:       see RELEASING.md in the source repository.
 SOURCEFILE
 
@@ -236,6 +254,8 @@ tar -C "$(dirname "$TREE")" \
     -cJf "$TARBALL" "$BASE"
 
 # --- checksum + manifest --------------------------------------------------------
+bash "$REPO/build/source-archive.sh" "$DIST/$NAME-source.tar.xz" \
+    || { echo "error: build/source-archive.sh failed" >&2; exit 9; }
 ( cd "$DIST" && sha256sum "$NAME.tar.xz" > "$NAME.tar.xz.sha256" )
 SHA="$(awk '{print $1}' "$DIST/$NAME.tar.xz.sha256")"
 SIZE="$(stat -c%s "$TARBALL")"
@@ -253,7 +273,8 @@ cat > "$DIST/$NAME.manifest.json" <<JSON
   "wine_bin": "bin/wine",
   "unpack_root": "$NAME",
   "source_commit": "$SRC_COMMIT",
-  "wine_tkg_commit": "$TKG_COMMIT"
+  "wine_tkg_commit": "$TKG_COMMIT",
+  "source_archive": "$NAME-source.tar.xz"
 }
 JSON
 
@@ -261,5 +282,5 @@ echo
 echo "done. dist/:"
 ls -1 "$DIST" | sed 's/^/  /'
 echo
-echo "Next: create a GitHub release tagged v$VERSION and upload the three dist/ files."
+echo "Next: create a GitHub release tagged v$VERSION and upload this version's four dist/ files."
 echo "      (see RELEASING.md)"

@@ -1,0 +1,1593 @@
+diff --git a/src/d3d11/d3d11_on_12.cpp b/src/d3d11/d3d11_on_12.cpp
+index 268bd759..a73fe23c 100644
+--- a/src/d3d11/d3d11_on_12.cpp
++++ b/src/d3d11/d3d11_on_12.cpp
+@@ -109,6 +109,7 @@ namespace dxvk {
+   void STDMETHODCALLTYPE D3D11on12Device::ReleaseWrappedResources(
+           ID3D11Resource* const*  ppResources,
+           UINT                    ResourceCount) {
++    { static uint32_t n_NEUTRON_UXP_PROBE = 0; if (n_NEUTRON_UXP_PROBE++ < 8) Logger::warn(str::format("NEUTRON_UXP_PROBE ReleaseWrappedResources count=", ResourceCount)); }
+     Com<ID3D12DXVKInteropDevice> interopDevice;
+     m_d3d12Device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice), reinterpret_cast<void**>(&interopDevice));
+ 
+@@ -130,6 +131,7 @@ namespace dxvk {
+   void STDMETHODCALLTYPE D3D11on12Device::AcquireWrappedResources(
+           ID3D11Resource* const*  ppResources,
+           UINT                    ResourceCount) {
++    { static uint32_t n_NEUTRON_UXP_PROBEA = 0; if (n_NEUTRON_UXP_PROBEA++ < 8) Logger::warn(str::format("NEUTRON_UXP_PROBE AcquireWrappedResources count=", ResourceCount)); }
+     Com<ID3D12DXVKInteropDevice> interopDevice;
+     m_d3d12Device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice), reinterpret_cast<void**>(&interopDevice));
+ 
+diff --git a/src/d3d11/d3d11_resource.cpp b/src/d3d11/d3d11_resource.cpp
+index 8f2bc998..ea12b8ee 100644
+--- a/src/d3d11/d3d11_resource.cpp
++++ b/src/d3d11/d3d11_resource.cpp
+@@ -9,6 +9,11 @@
+ 
+ namespace dxvk {
+ 
++  // NEUTRON: private-data slot carrying { allocation size, allocation offset } as two uint64s,
++  // set on a texture whose memory we made exportable for CUDA interop. Read by Wine's nvcuda.
++  static const GUID NeutronAllocInfoGuid =
++    {0x6e657574,0x726f,0x6e01,{0xa1,0x00,0x00,0x00,0x00,0x00,0x00,0x01}};
++
+   D3D11DXGIKeyedMutex::D3D11DXGIKeyedMutex(
+           ID3D11Resource* pResource,
+           D3D11Device*    pDevice)
+@@ -321,6 +326,25 @@ namespace dxvk {
+         attr.Attributes = OBJ_CASE_INSENSITIVE;
+     }
+ 
++    // NEUTRON 2026-08-03: an earlier attempt short-circuited to the legacy Proton sharedHandle()
++    // here, on the theory that D3DKMTShareObjects produced a handle nvcuda could not resolve. That
++    // was the wrong end to fix: the D3DKMT handle is correct for this Wine, and nvcuda now opens it
++    // through the wineserver's own d3dkmt_object_open request. Standard order restored.
++    //
++    // Publish the image's REAL allocation size and offset for nvcuda. CUDA refused to map this
++    // memory as an array under every possible array-flag combination, returning a bare
++    // CUDA_ERROR_INVALID_VALUE that names nothing -- and the two values nvcuda was guessing at are
++    // exactly these. It estimated the size as width*height*4 (tiling and alignment make the real
++    // allocation larger) and assumed offset 0 (wrong the moment DXVK suballocates). Neither is
++    // visible from the D3D11 side, so hand them over instead of having CUDA guess along with us.
++    if (env::getEnvVar("NEUTRON_DXVK_EXPORT_TEXTURES") == "1") {
++      auto memInfo = texture->GetImage()->storage()->getMemoryInfo();
++      uint64_t info[2] = { memInfo.size, memInfo.offset };
++      Logger::info(str::format("neutron-export: ", texture->Desc()->Width, "x", texture->Desc()->Height,
++        " allocation size ", memInfo.size, " offset ", memInfo.offset));
++      m_resource->SetPrivateData(NeutronAllocInfoGuid, sizeof(info), info);
++    }
++
+     D3DKMT_HANDLE local = texture->GetImage()->storage()->kmtLocal();
+     auto keyedMutex = texture->GetImage()->getKeyedMutex();
+     if (keyedMutex) {
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index cbcc3c6c..c6fd77e5 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -4,8 +4,12 @@
+ 
+ #include "../dxvk/dxvk_latency_builtin.h"
+ 
++#include "../dxgi/dxgi_surface.h"
++
+ #include "../util/util_win32_compat.h"
+ 
++#include <unordered_map>
++
+ namespace dxvk {
+ 
+   static uint16_t MapGammaControlPoint(float x) {
+@@ -66,6 +70,23 @@ namespace dxvk {
+     m_desc(*pDesc),
+     m_device(pDevice->GetDXVKDevice()),
+     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
++    // neutron round-38 N2-HYBRID: bitblt-model chains (DISCARD/SEQUENTIAL --
++    // on Windows these presents compose via GDI into ONE surface, temporally)
++    // take the synchronous GDI present path: no Vulkan swapchain, no wayland
++    // subsurface. FLIP-model (video/games) chains are NEVER caught here.
++    if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD
++     || m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL) {
++      m_gdiPresent = env::getEnvVar("NEUTRON_GDI_PRESENT") == "1";
++    }
++
++    if (m_gdiPresent) {
++      HWND hwnd = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
++      Logger::warn(str::format("neutron-gdi-present: hwnd=", (void*)hwnd,
++        " ", m_desc.Width, "x", m_desc.Height,
++        " fmt=", m_desc.Format, " effect=", m_desc.SwapEffect,
++        " bufCount=", m_desc.BufferCount));
++    }
++
+     CreateFrameLatencyEvent();
+     CreatePresenter();
+     CreateBackBuffers();
+@@ -79,8 +100,9 @@ namespace dxvk {
+     if (this_thread::isInModuleDetachment())
+       return;
+ 
+-    m_presenter->destroyResources();
+-    
++    if (m_presenter != nullptr)
++      m_presenter->destroyResources();
++
+     DestroyFrameLatencyEvent();
+     DestroyLatencyTracker();
+   }
+@@ -102,6 +124,13 @@ namespace dxvk {
+       return S_OK;
+     }
+ 
++    // neutron-bounded-acquire: private stamp interface for the dcomp bridge
++    if (riid == __uuidof(INeutronBoundedAcquire)) {
++      AddRef();
++      *ppvObject = static_cast<INeutronBoundedAcquire*>(this);
++      return S_OK;
++    }
++
+     if (logQueryInterfaceError(__uuidof(IDXGIVkSwapChain), riid)) {
+       Logger::warn("D3D11SwapChain::QueryInterface: Unknown interface query");
+       Logger::warn(str::format(riid));
+@@ -111,6 +140,20 @@ namespace dxvk {
+   }
+ 
+ 
++  HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetBoundedAcquire() {
++    // neutron-bounded-acquire: the dcomp bridge readback-blits this swapchain;
++    // bound the presenter's WSI waits so a never-compositing surface cannot
++    // wedge the shared D3D10 device lock. Sticky by design (bridge-managed
++    // chains stay bridge-managed).
++    m_neutronBounded = true;
++
++    if (m_presenter != nullptr)
++      m_presenter->setBoundedAcquire(true);
++
++    return S_OK;
++  }
++
++
+   HRESULT STDMETHODCALLTYPE D3D11SwapChain::GetDesc(
+           DXGI_SWAP_CHAIN_DESC1*    pDesc) {
+     *pDesc = m_desc;
+@@ -175,14 +218,16 @@ namespace dxvk {
+     const DXGI_SWAP_CHAIN_DESC1*    pDesc,
+     const UINT*                     pNodeMasks,
+           IUnknown* const*          ppPresentQueues) {
+-    if (m_desc.Format != pDesc->Format)
++    if (m_presenter != nullptr && m_desc.Format != pDesc->Format)
+       m_presenter->setSurfaceFormat(GetSurfaceFormat(pDesc->Format));
+ 
+-    if (m_desc.Width != pDesc->Width || m_desc.Height != pDesc->Height)
++    if (m_presenter != nullptr && (m_desc.Width != pDesc->Width || m_desc.Height != pDesc->Height))
+       m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
+ 
+     m_desc = *pDesc;
+     CreateBackBuffers();
++    m_gdiStaging = nullptr; /* neutron N2: staging matches backbuffer size */
++    m_gdiStagingW = m_gdiStagingH = 0;
+     return S_OK;
+   }
+ 
+@@ -261,6 +306,8 @@ namespace dxvk {
+       if (hr != S_OK)
+         return hr;
+ 
++      if (m_gdiPresent)
++        return S_OK; /* neutron N2: GDI path is never occluded-blocked */
+       VkResult status = m_presenter->checkSwapChainStatus();
+       return status == VK_SUCCESS ? S_OK : DXGI_STATUS_OCCLUDED;
+     }
+@@ -304,6 +351,10 @@ namespace dxvk {
+ 
+     VkColorSpaceKHR vkColorSpace = ConvertColorSpace(ColorSpace);
+ 
++    if (m_gdiPresent) /* neutron N2: sRGB only */
++      return (vkColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++        ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT : 0;
++
+     if (m_presenter->supportsColorSpace(vkColorSpace))
+       supportFlags |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+ 
+@@ -315,6 +366,13 @@ namespace dxvk {
+           DXGI_COLOR_SPACE_TYPE     ColorSpace) {
+     VkColorSpaceKHR colorSpace = ConvertColorSpace(ColorSpace);
+ 
++    if (m_gdiPresent) { /* neutron N2 */
++      if (colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++        return E_INVALIDARG;
++      m_colorSpace = colorSpace;
++      return S_OK;
++    }
++
+     if (!m_presenter->supportsColorSpace(colorSpace))
+       return E_INVALIDARG;
+ 
+@@ -328,7 +386,7 @@ namespace dxvk {
+   HRESULT STDMETHODCALLTYPE D3D11SwapChain::SetHDRMetaData(
+     const DXGI_VK_HDR_METADATA*     pMetaData) {
+     // For some reason this call always seems to succeed on Windows
+-    if (pMetaData->Type == DXGI_HDR_METADATA_TYPE_HDR10)
++    if (pMetaData->Type == DXGI_HDR_METADATA_TYPE_HDR10 && m_presenter != nullptr)
+       m_presenter->setHdrMetadata(ConvertHDRMetadata(pMetaData->HDR10));
+ 
+     return S_OK;
+@@ -341,6 +399,342 @@ namespace dxvk {
+   }
+ 
+ 
++  // neutron ROOTDUMP: write a 32-bit BGRA buffer as a bottom-up BMP (no PNG lib in
++  // DXVK; the capture script converts BMP->PNG). Pure Win32 file I/O.
++  static void NeutronDumpBmp(const wchar_t* path, const void* bgra, int w, int h, int pitch) {
++    if (!bgra || w <= 0 || h <= 0) return;
++    HANDLE f = ::CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (f == INVALID_HANDLE_VALUE) return;
++    uint32_t rowBytes = uint32_t(w) * 4u, imgBytes = rowBytes * uint32_t(h);
++    uint8_t fh[14] = { }; uint8_t ih[40] = { };
++    uint32_t off = 54, fsz = 54 + imgBytes;
++    fh[0]='B'; fh[1]='M';
++    fh[2]=uint8_t(fsz); fh[3]=uint8_t(fsz>>8); fh[4]=uint8_t(fsz>>16); fh[5]=uint8_t(fsz>>24);
++    fh[10]=uint8_t(off); fh[11]=uint8_t(off>>8);
++    ih[0]=40;
++    ih[4]=uint8_t(w); ih[5]=uint8_t(w>>8); ih[6]=uint8_t(w>>16); ih[7]=uint8_t(w>>24);
++    ih[8]=uint8_t(h); ih[9]=uint8_t(h>>8); ih[10]=uint8_t(h>>16); ih[11]=uint8_t(h>>24); // +h => bottom-up
++    ih[12]=1; ih[14]=32;
++    DWORD wr = 0;
++    ::WriteFile(f, fh, 14, &wr, nullptr);
++    ::WriteFile(f, ih, 40, &wr, nullptr);
++    // BMP is bottom-up: write rows from bottom
++    for (int y = h - 1; y >= 0; --y)
++      ::WriteFile(f, reinterpret_cast<const uint8_t*>(bgra) + size_t(y) * pitch, rowBytes, &wr, nullptr);
++    ::CloseHandle(f);
++  }
++
++  // neutron ROOTDUMP output directory: %TEMP%\neutron-rootdump\ (created on first use).
++  static const std::wstring& NeutronRootdumpDir() {
++    static const std::wstring dir = [] {
++      wchar_t tmp[MAX_PATH] = L"";
++      DWORD n = ::GetTempPathW(MAX_PATH, tmp);
++      std::wstring d = (n && n < MAX_PATH) ? std::wstring(tmp, n) : std::wstring(L".\\");
++      d += L"neutron-rootdump\\";
++      ::CreateDirectoryW(d.c_str(), nullptr);
++      return d;
++    }();
++    return dir;
++  }
++
++  // neutron round-38 N2 perf counters (5s cadence)
++  static std::atomic<uint64_t> g_gdiPresents = { 0u };
++  static std::atomic<uint64_t> g_gdiBlitUs   = { 0u };
++  static std::atomic<uint64_t> g_gdiMaxUs    = { 0u };
++  static std::atomic<uint64_t> g_gdiSkips    = { 0u }; // round-41: fully-covered skip
++  static std::atomic<uint64_t> g_gdiBandPx   = { 0u }; // round-41: pixels actually read back
++
++  HRESULT D3D11SwapChain::PresentImageGdi() {
++    // neutron round-38 N2-HYBRID synchronous GDI present:
++    //   backbuffer -> staging (CopyResource) -> Map (waits for the GPU copy;
++    //   this is the ONLY wait, bounded by copy speed) -> StretchDIBits into
++    //   GetDC(hwnd) -> the ONE toplevel GDI window surface.
++    // Faithful to Windows bitblt-model semantics:
++    //   * temporal painter's-algorithm composition with GDI + CEP content
++    //     (whoever painted last wins) -- fixes home-blank / hover-to-see;
++    //   * a stable, persistent backbuffer (no vk image rotation) -- partial
++    //     D2D redraws accumulate exactly like on Windows;
++    //   * pixels persist in the window surface across present-idle gaps;
++    //   * GetDC clipping handles hidden/minimized states like Windows.
++    // Runs on the app thread under the (recursive) device lock it already
++    // holds; no other thread, no SEH, no vk WSI, no starvation, no wedge.
++    auto t0 = dxvk::high_resolution_clock::now();
++
++    HWND hwnd = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
++    ID3D11DeviceContext* ctx = m_parent->GetContext();
++
++    if (m_backBuffers.empty() || !hwnd)
++      return S_OK;
++
++    // ============ neutron ROOTDUMP (env NEUTRON_ROOTDUMP=1): grounded localization ============
++    // Dump (1) the RAW mapped staging = EXACTLY what Premiere's D2D rendered into the DXGI
++    // backbuffer, BEFORE any StretchDIBits/scale/clip, and (2) the post-present window surface,
++    // per window, first few frames, as BMP to %TEMP%\neutron-rootdump\. Filename carries hwnd +
++    // class + WxH + fmt + frame so the Tools panel / timeline are identifiable. No behavior change.
++    static const bool s_rootdump = env::getEnvVar("NEUTRON_ROOTDUMP") == "1";
++    if (s_rootdump) {
++      // per-hwnd frame counter (small static map)
++      static dxvk::mutex s_dmtx;
++      static std::unordered_map<HWND, uint32_t> s_dframes;
++      uint32_t frame;
++      { std::lock_guard<dxvk::mutex> lk(s_dmtx); frame = s_dframes[hwnd]++; }
++      if (frame < 4u) {
++        wchar_t cls[64] = L"?"; ::GetClassNameW(hwnd, cls, 63);
++        RECT cr = { }; ::GetClientRect(hwnd, &cr);
++        // sanitize class for filename
++        for (wchar_t* p = cls; *p; ++p) if (*p==L' '||*p==L'\\'||*p==L'/'||*p==L':') *p=L'_';
++        wchar_t path[320];
++        // RAW: full backbuffer via a throwaway staging (independent of the band staging)
++        D3D11_TEXTURE2D_DESC dd = { };
++        dd.Width = m_desc.Width; dd.Height = m_desc.Height; dd.MipLevels = 1; dd.ArraySize = 1;
++        dd.Format = m_desc.Format; dd.SampleDesc.Count = 1;
++        dd.Usage = D3D11_USAGE_STAGING; dd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++        Com<ID3D11Texture2D> dtex;
++        if (SUCCEEDED(m_parent->CreateTexture2D(&dd, nullptr, &dtex))) {
++          ctx->CopyResource(dtex.ptr(), m_backBuffers[0].ptr());
++          D3D11_MAPPED_SUBRESOURCE dm = { };
++          if (SUCCEEDED(ctx->Map(dtex.ptr(), 0, D3D11_MAP_READ, 0, &dm))) {
++            _snwprintf(path, 320, L"%ls%08llx_%ls_%ldx%ld_fmt%d_f%u_RAW.bmp",
++              NeutronRootdumpDir().c_str(), (unsigned long long)(ULONG_PTR)hwnd, cls, cr.right, cr.bottom, m_desc.Format, frame);
++            NeutronDumpBmp(path, dm.pData, int(m_desc.Width), int(m_desc.Height), int(dm.RowPitch));
++            ctx->Unmap(dtex.ptr(), 0);
++          }
++        }
++        Logger::warn(str::format("neutron-rootdump: hwnd=", (void*)hwnd,
++          " ", m_desc.Width, "x", m_desc.Height, " fmt=", m_desc.Format,
++          " effect=", m_desc.SwapEffect, " frame=", frame));
++      }
++    }
++
++    // neutron round-43 RPC epoch: signal winewayland that THIS flush is a chain
++    // present of `hwnd` (band = full window in toplevel client coords), so it
++    // fills the shadow FROM the surface. Interlocked seqlock (odd during write);
++    // winewayland reads it in the flush repair. DXVK stays dumb -- 6 stores.
++    static const LONG NeutronRpcRing = 512;
++    struct NeutronRpcEntry { LONG hwnd, bl, bt, br, bb; };
++    struct NeutronRpcEpoch { volatile LONG head, vl, vt, vr, vb; NeutronRpcEntry ring[NeutronRpcRing]; };
++    static NeutronRpcEpoch* s_epoch = [] () -> NeutronRpcEpoch* {
++      HANDLE h = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
++        sizeof(NeutronRpcEpoch), L"__neutron_rpc_epoch");
++      return h ? reinterpret_cast<NeutronRpcEpoch*>(
++        ::MapViewOfFile(h, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(NeutronRpcEpoch))) : nullptr;
++    }();
++    if (s_epoch) {
++      HWND root = ::GetAncestor(hwnd, GA_ROOT);
++      POINT o = { 0, 0 };
++      ::MapWindowPoints(hwnd, root, &o, 1);
++      RECT cr = { }; ::GetClientRect(hwnd, &cr);
++      LONG slot = ::InterlockedIncrement(&s_epoch->head) - 1; // reserve a ring slot
++      NeutronRpcEntry* e = &s_epoch->ring[slot & (NeutronRpcRing - 1)];
++      e->hwnd = LONG(reinterpret_cast<ULONG_PTR>(hwnd));
++      e->bl = o.x; e->bt = o.y; e->br = o.x + cr.right; e->bb = o.y + cr.bottom;
++    }
++
++    // neutron round-41 (audit): CLIP-FIRST. Compute the visually-owned region
++    // BEFORE any GPU readback. Wine's GetDC honors DCX_CLIPCHILDREN (from style
++    // via DCX_USESTYLE, and we force it) -- Adobe's sub-toplevel containers all
++    // carry WS_CLIPCHILDREN; direct-child rects geometrically cover all
++    // descendants; live sibling-leaf overlaps are ZERO (r34 ztree), so the r39
++    // manual sibling walk is DELETED (it was pure cost: 937us avg / 40ms max).
++    //   * empty clip (window fully covered by children -- the 8 BLACK 4K
++    //     containers) => SKIP readback+Map+blit ENTIRELY (kills the 13-40ms
++    //     spikes at the source);
++    //   * partial clip => read back and blit ONLY the uncovered band
++    //     (CopySubresourceRegion; toplevel band ~3840x130 vs 3840x2031 = ~16x
++    //     less synchronous readback on the app thread).
++    static const bool traceBlits = env::getEnvVar("NEUTRON_TRACE") == "1";
++
++    HDC dc = ::GetDCEx(hwnd, nullptr,
++      DCX_CACHE | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN);
++    if (!dc)
++      return S_OK;
++
++    // neutron round-42 (probe-named live writer): the TOPLEVEL (the one chain
++    // host lacking WS_CLIPCHILDREN) wiped panels when its children were
++    // MOMENTARILY HIDDEN at present time -- DC clipping legitimately sees no
++    // children then (probe-proven: forced DCX_CLIPCHILDREN works with visible
++    // children, region goes simple/full when they hide), the black backbuffer
++    // lands over the panel areas, and re-shown children stay stale-black until
++    // their next present = the flicker tied to app actions. FIX: for chain
++    // hosts LACKING WS_CLIPCHILDREN, exclude direct-child RECTS regardless of
++    // visibility -- a briefly-hidden panel's stale pixels beat a black wipe
++    // (the child's next WM_PAINT present refreshes them). Scoped: windows WITH
++    // the style keep wine's working clipping (clipType 1/3 observed live).
++    int savedDc = 0;
++    if (!(::GetWindowLongW(hwnd, GWL_STYLE) & WS_CLIPCHILDREN)) {
++      savedDc = ::SaveDC(dc);
++      uint32_t n = 0;
++      for (HWND c = ::GetWindow(hwnd, GW_CHILD); c && n < 64u;
++           c = ::GetWindow(c, GW_HWNDNEXT), ++n) {
++        RECT cr = { };
++        if (!::GetWindowRect(c, &cr))
++          continue; /* no visibility filter: that IS the lifecycle race */
++        ::MapWindowPoints(HWND_DESKTOP, hwnd, reinterpret_cast<POINT*>(&cr), 2);
++        if (cr.right > cr.left && cr.bottom > cr.top)
++          ::ExcludeClipRect(dc, cr.left, cr.top, cr.right, cr.bottom);
++      }
++    }
++
++    RECT clip = { };
++    int clipType = ::GetClipBox(dc, &clip);
++    RECT full = { 0, 0, LONG(m_desc.Width), LONG(m_desc.Height) };
++    RECT band = { };
++    bool haveBand = (clipType == SIMPLEREGION || clipType == COMPLEXREGION)
++                 && ::IntersectRect(&band, &clip, &full);
++
++    if (traceBlits) {
++      Logger::warn(str::format("neutron-blit: hwnd=", (void*)hwnd,
++        " tid=", ::GetCurrentThreadId(), " t=", ::GetTickCount64(),
++        " clipType=", clipType,
++        " band=", band.left, ",", band.top, "-", band.right, ",", band.bottom,
++        haveBand ? "" : " SKIP"));
++    }
++
++    if (!haveBand) {
++      // fully covered: nothing we own is visible; skip all GPU+blit work
++      if (savedDc) ::RestoreDC(dc, savedDc);
++      ::ReleaseDC(hwnd, dc);
++      g_gdiSkips.fetch_add(1, std::memory_order_relaxed);
++    } else {
++      // cached staging texture, recreated on size/format change
++      if (m_gdiStaging == nullptr
++       || m_gdiStagingW != m_desc.Width
++       || m_gdiStagingH != m_desc.Height) {
++        m_gdiStaging = nullptr;
++
++        D3D11_TEXTURE2D_DESC desc = { };
++        desc.Width            = m_desc.Width;
++        desc.Height           = m_desc.Height;
++        desc.MipLevels        = 1;
++        desc.ArraySize        = 1;
++        desc.Format           = m_desc.Format;
++        desc.SampleDesc.Count = 1;
++        desc.Usage            = D3D11_USAGE_STAGING;
++        desc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
++
++        Com<ID3D11Texture2D> tex;
++        if (FAILED(m_parent->CreateTexture2D(&desc, nullptr, &tex))) {
++          Logger::err("neutron-gdi-present: staging creation failed, dropping frame");
++          if (savedDc) ::RestoreDC(dc, savedDc);
++          ::ReleaseDC(hwnd, dc);
++          return S_OK;
++        }
++        m_gdiStaging  = tex;
++        m_gdiStagingW = m_desc.Width;
++        m_gdiStagingH = m_desc.Height;
++      }
++
++      // read back ONLY the uncovered band
++      D3D11_BOX box = { };
++      box.left   = UINT(band.left);
++      box.top    = UINT(band.top);
++      box.front  = 0;
++      box.right  = UINT(band.right);
++      box.bottom = UINT(band.bottom);
++      box.back   = 1;
++      ctx->CopySubresourceRegion(m_gdiStaging.ptr(), 0,
++        box.left, box.top, 0, m_backBuffers[0].ptr(), 0, &box);
++
++      D3D11_MAPPED_SUBRESOURCE map = { };
++      if (SUCCEEDED(ctx->Map(m_gdiStaging.ptr(), 0, D3D11_MAP_READ, 0, &map))) {
++        UINT bw = UINT(band.right - band.left);
++        UINT bh = UINT(band.bottom - band.top);
++
++        BITMAPINFO bmi = { };
++        bmi.bmiHeader.biSize        = sizeof(bmi.bmiHeader);
++        bmi.bmiHeader.biWidth       = LONG(map.RowPitch / 4u);
++        bmi.bmiHeader.biHeight      = -LONG(bh); /* top-down band */
++        bmi.bmiHeader.biPlanes      = 1;
++        bmi.bmiHeader.biBitCount    = 32;
++        bmi.bmiHeader.biCompression = BI_RGB;
++
++        // bits base offset to the band's first row avoids top-down ySrc quirks
++        const uint8_t* bits = reinterpret_cast<const uint8_t*>(map.pData)
++                            + size_t(band.top) * map.RowPitch;
++
++        ::StretchDIBits(dc, band.left, band.top, bw, bh,
++                        band.left, 0, bw, bh,
++                        bits, &bmi, DIB_RGB_COLORS, SRCCOPY);
++        ctx->Unmap(m_gdiStaging.ptr(), 0);
++      }
++      if (savedDc) ::RestoreDC(dc, savedDc);
++      ::ReleaseDC(hwnd, dc);
++      g_gdiBandPx.fetch_add(uint64_t(band.right - band.left) * uint64_t(band.bottom - band.top),
++        std::memory_order_relaxed);
++    }
++
++    // neutron ROOTDUMP (2): the POST-present window surface for this window (what our
++    // StretchDIBits actually produced on the shared surface). GetDC(hwnd)+BitBlt into a
++    // DIB, save BMP. Compare against the RAW dump to localize the artifact.
++    if (s_rootdump) {
++      static dxvk::mutex s_pmtx;
++      static std::unordered_map<HWND, uint32_t> s_pframes;
++      uint32_t pf;
++      { std::lock_guard<dxvk::mutex> lk(s_pmtx); pf = s_pframes[hwnd]++; }
++      if (pf < 4u) {
++        RECT cr = { }; ::GetClientRect(hwnd, &cr);
++        int w = cr.right, h = cr.bottom;
++        if (w > 0 && h > 0 && w <= 8192 && h <= 8192) {
++          HDC wdc = ::GetDC(hwnd);
++          if (wdc) {
++            HDC mdc = ::CreateCompatibleDC(wdc);
++            BITMAPINFO bi = { };
++            bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
++            bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
++            bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
++            void* bits = nullptr;
++            HBITMAP dib = ::CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
++            if (dib && bits) {
++              HGDIOBJ old = ::SelectObject(mdc, dib);
++              ::BitBlt(mdc, 0, 0, w, h, wdc, 0, 0, SRCCOPY);
++              wchar_t cls[64] = L"?"; ::GetClassNameW(hwnd, cls, 63);
++              for (wchar_t* p = cls; *p; ++p) if (*p==L' '||*p==L'\\'||*p==L'/'||*p==L':') *p=L'_';
++              wchar_t path[320];
++              _snwprintf(path, 320, L"%ls%08llx_%ls_%dx%d_f%u_PRESENTED.bmp",
++                NeutronRootdumpDir().c_str(), (unsigned long long)(ULONG_PTR)hwnd, cls, w, h, pf);
++              NeutronDumpBmp(path, bits, w, h, w * 4);
++              ::SelectObject(mdc, old); ::DeleteObject(dib);
++            }
++            ::DeleteDC(mdc); ::ReleaseDC(hwnd, wdc);
++          }
++        }
++      }
++    }
++
++    // preserve DISCARD/SEQUENTIAL multi-buffer rotation semantics
++    if (m_backBuffers.size() > 1u)
++      RotateBackBuffers(m_parent->GetContext());
++
++    // frame-latency bookkeeping: presents complete synchronously here
++    m_frameId += 1;
++    m_frameLatencySignal->signal(m_frameId);
++
++    // perf stats
++    {
++      uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
++        dxvk::high_resolution_clock::now() - t0).count();
++      uint64_t n = g_gdiPresents.fetch_add(1, std::memory_order_relaxed) + 1;
++      g_gdiBlitUs.fetch_add(us, std::memory_order_relaxed);
++      uint64_t prev = g_gdiMaxUs.load(std::memory_order_relaxed);
++      while (us > prev && !g_gdiMaxUs.compare_exchange_weak(prev, us)) {}
++
++      static std::atomic<uint64_t> lastLogMs = { 0u };
++      uint64_t now = uint64_t(dxvk::high_resolution_clock::now().time_since_epoch().count() / 1000000);
++      uint64_t last = lastLogMs.load(std::memory_order_relaxed);
++      if (now - last > 5000 && lastLogMs.compare_exchange_strong(last, now)) {
++        Logger::warn(str::format("neutron-gdi-stats: presents=", n,
++          " totalBlitMs=", g_gdiBlitUs.load() / 1000,
++          " avgUs=", g_gdiBlitUs.load() / (n ? n : 1),
++          " maxUs=", g_gdiMaxUs.load(),
++          " covSkips=", g_gdiSkips.load(),
++          " bandMPx=", g_gdiBandPx.load() / 1000000));
++      }
++    }
++
++    return S_OK;
++  }
++
++
+   void STDMETHODCALLTYPE D3D11SwapChain::GetFrameStatistics(
+           DXGI_VK_FRAME_STATISTICS* pFrameStatistics) {
+     std::lock_guard<dxvk::mutex> lock(m_frameStatisticsLock);
+@@ -382,6 +776,12 @@ namespace dxvk {
+     immediateContext->EndFrame(m_latency);
+     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+ 
++    // neutron round-38 N2-HYBRID: bitblt-model chains present synchronously
++    // via GDI into the toplevel window surface (Windows-faithful temporal
++    // composition; SyncInterval is ignored -- bitblt presents are unpaced).
++    if (m_gdiPresent)
++      return PresentImageGdi();
++
+     m_presenter->setSyncInterval(SyncInterval);
+ 
+     // Presentation semaphores and WSI swap chain image
+@@ -503,8 +903,17 @@ namespace dxvk {
+ 
+ 
+   void D3D11SwapChain::CreatePresenter() {
++    // neutron round-38 N2: GDI-present chains have NO Vulkan presenter at all
++    // (no vk swapchain, no wayland subsurface, no latency tracker).
++    if (m_gdiPresent)
++      return;
++
+     PresenterDesc presenterDesc = { };
+     presenterDesc.deferSurfaceCreation = m_parent->GetOptions()->deferSurfaceCreation;
++    // neutron-bounded-acquire: hand the app HWND to the presenter so it can
++    // test the Wine dcomp bridge mark. m_surfaceFactory is always a
++    // DxgiSurfaceFactory (sole implementer of IDXGIVkSurfaceFactory).
++    presenterDesc.window = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
+ 
+     m_presenter = new Presenter(m_device, m_frameLatencySignal, presenterDesc, [
+       cAdapter  = m_device->adapter(),
+@@ -519,6 +928,22 @@ namespace dxvk {
+     m_presenter->setSurfaceExtent({ m_desc.Width, m_desc.Height });
+     m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
+ 
++    // neutron-bounded-acquire: re-apply the bridge stamp if it arrived
++    // before the presenter existed (or across a presenter recreation).
++    if (m_neutronBounded)
++      m_presenter->setBoundedAcquire(true);
++
++    // neutron round-35 (native pivot): scope the bounded WSI waits by SWAP
++    // EFFECT, independent of the dcomp stamp. Bitblt-model chains (DISCARD/
++    // SEQUENTIAL) are D2D-UI/readback-class surfaces -- on Windows their
++    // presents compose via GDI semantics and are never vsync-paced, so a
++    // bounded wait (frame-skip on starvation) is the correct behavior and
++    // protects the shared D3D10 device lock even with the bridge dormant.
++    // FLIP-model chains (video/games) keep infinite waits + present-wait pacing.
++    if (m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD
++     || m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL)
++      m_presenter->setBoundedAcquire(true);
++
+     m_latency = m_device->createLatencyTracker(m_presenter);
+ 
+     Com<D3D11ReflexDevice> reflex = GetReflexDevice();
+@@ -570,7 +995,9 @@ namespace dxvk {
+          dxgiUsage |= DXGI_USAGE_DISCARD_ON_PRESENT;
+ 
+       m_backBuffers.push_back(new D3D11Texture2D(
+-        m_parent, this, &desc, dxgiUsage));
++        // neutron-bounded-acquire: disambiguate IUnknown (two COM branches)
++        m_parent, static_cast<IUnknown*>(static_cast<IDXGIVkSwapChain2*>(this)),
++        &desc, dxgiUsage));
+ 
+       dxgiUsage |= DXGI_USAGE_READ_ONLY;
+     }
+@@ -613,6 +1040,8 @@ namespace dxvk {
+ 
+ 
+   void D3D11SwapChain::DestroyLatencyTracker() {
++    if (m_latency == nullptr) /* neutron N2: GDI chains have no tracker */
++      return;
+     // Need to make sure the context stops using
+     // the tracker for submissions
+     m_parent->GetContext()->InjectCs(DxvkCsQueue::Ordered, [
+diff --git a/src/d3d11/d3d11_swapchain.h b/src/d3d11/d3d11_swapchain.h
+index 99f09450..95f493e2 100644
+--- a/src/d3d11/d3d11_swapchain.h
++++ b/src/d3d11/d3d11_swapchain.h
+@@ -14,7 +14,9 @@ namespace dxvk {
+   class D3D11Device;
+   class D3D11DXGIDevice;
+ 
+-  class D3D11SwapChain : public ComObject<IDXGIVkSwapChain2> {
++  // neutron-bounded-acquire: also implements INeutronBoundedAcquire so the
++  // Wine dcomp bridge can stamp readback-blitted swapchains (see dxgi_interfaces.h).
++  class D3D11SwapChain : public ComObject<IDXGIVkSwapChain2>, public INeutronBoundedAcquire {
+     constexpr static uint32_t DefaultFrameLatency = 1;
+   public:
+ 
+@@ -30,6 +32,21 @@ namespace dxvk {
+             REFIID                    riid,
+             void**                    ppvObject);
+ 
++    // neutron-bounded-acquire: with two IUnknown branches (ComObject +
++    // INeutronBoundedAcquire) the ref-count methods must be declared here in
++    // the most-derived class to override BOTH; they forward to ComObject's.
++    ULONG STDMETHODCALLTYPE AddRef() {
++      return ComObject<IDXGIVkSwapChain2>::AddRef();
++    }
++
++    ULONG STDMETHODCALLTYPE Release() {
++      return ComObject<IDXGIVkSwapChain2>::Release();
++    }
++
++    // neutron-bounded-acquire: called by the Wine dcomp bridge (via QI) when it
++    // registers this swapchain for readback-blitting; bounds the presenter's waits.
++    HRESULT STDMETHODCALLTYPE SetBoundedAcquire();
++
+     HRESULT STDMETHODCALLTYPE GetDesc(
+             DXGI_SWAP_CHAIN_DESC1*    pDesc);
+ 
+@@ -102,6 +119,20 @@ namespace dxvk {
+     D3D11Device*              m_parent;
+     Com<IDXGIVkSurfaceFactory> m_surfaceFactory;
+ 
++    // neutron-bounded-acquire: sticky flag set by the dcomp bridge stamp;
++    // propagated to the Presenter (and re-applied if it is ever recreated).
++    bool m_neutronBounded = false;
++
++    // neutron round-38 N2-HYBRID: bitblt-model (DISCARD/SEQUENTIAL) chains
++    // present via SYNCHRONOUS GDI into the toplevel window surface (Windows-
++    // faithful temporal composition; no Vulkan swapchain, no subsurface).
++    // Env-gated NEUTRON_GDI_PRESENT=1; FLIP chains always keep the Vulkan path.
++    bool m_gdiPresent = false;
++    Com<ID3D11Texture2D> m_gdiStaging;
++    UINT m_gdiStagingW = 0, m_gdiStagingH = 0;
++
++    HRESULT PresentImageGdi();
++
+     DXGI_SWAP_CHAIN_DESC1     m_desc;
+ 
+     Rc<DxvkDevice>            m_device;
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index 6ea1b0e6..4719f846 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -51,6 +51,34 @@ namespace dxvk {
+ 
+     const auto sharingFlags = D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_NTHANDLE|D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+ 
++
++    // NEUTRON 2026-08-02 (env NEUTRON_DXVK_EXPORT_TEXTURES=1, off by default):
++    // CUDA<->D3D11 interop needs the texture's memory to be EXPORTABLE, and Vulkan can only
++    // export memory that was created with external-memory handle types. Windows has no such
++    // requirement -- CUDA and D3D11 are the same driver talking about the same allocation -- so
++    // applications register plain, non-shared textures for interop and it just works. After
++    // Effects does exactly that for its UI-overlay texture (2734x1174, MiscFlags=0,
++    // BIND_UNORDERED_ACCESS), and our nvcuda then has nothing it can hand to CUDA.
++    //
++    // When the gate is on, mark such textures shared so their allocation is exportable. Scoped
++    // deliberately to the interop-plausible shape -- plain 2D, one sample, one mip, one layer,
++    // GPU-only, no CPU access, UNORDERED_ACCESS, and at least 512x512 -- because a shared
++    // allocation is dedicated and bypasses DXVK's suballocator. The first cut only required "a
++    // bind flag" and forced 992 textures shared, including 38x31/28x28 UI ones; that is pure
++    // waste. AE's overlay texture is 2734x1174 with BIND_UNORDERED_ACCESS. Never on by default.
++    if (!(m_desc.MiscFlags & sharingFlags)
++     && Dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D
++     && m_desc.SampleDesc.Count == 1 && m_desc.ArraySize == 1 && m_desc.MipLevels == 1
++     && m_desc.Usage == D3D11_USAGE_DEFAULT && !m_desc.CPUAccessFlags
++     && (m_desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
++     && m_desc.Width >= 512 && m_desc.Height >= 512
++     && pDevice->GetFeatureLevel() >= D3D_FEATURE_LEVEL_10_0
++     && env::getEnvVar("NEUTRON_DXVK_EXPORT_TEXTURES") == "1") {
++      Logger::info(str::format("neutron-export: making ", m_desc.Width, "x", m_desc.Height,
++        " fmt=", m_desc.Format, " bind=", m_desc.BindFlags, " exportable for CUDA interop"));
++      m_desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
++    }
++
+     if (m_desc.MiscFlags & sharingFlags) {
+       if (pDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_0 ||
+           (m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) == (D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) ||
+diff --git a/src/dxgi/dxgi_interfaces.h b/src/dxgi/dxgi_interfaces.h
+index 390eee55..9360fd4f 100644
+--- a/src/dxgi/dxgi_interfaces.h
++++ b/src/dxgi/dxgi_interfaces.h
+@@ -65,9 +65,25 @@ IDXGIVkSurfaceFactory : public IUnknown {
+ };
+ 
+ 
++/**
++ * \brief Neutron bounded-acquire handshake (private)
++ *
++ * Implemented by DXVK's D3D11 swap chain. The Wine dcomp bridge QIs each
++ * swapchain it registers for readback-blitting and calls SetBoundedAcquire,
++ * so the presenter bounds its otherwise-infinite WSI waits (image acquire,
++ * present fences, present-wait) for exactly those chains. Composition
++ * swapchains carry a DXVK-internal dummy HWND, so a window-property mark
++ * alone cannot scope them -- this stamp is handle-independent.
++ */
++MIDL_INTERFACE("b5d0f6a1-7c4e-4d2a-9b8e-3f5a2c1d0e9f")
++INeutronBoundedAcquire : public IUnknown {
++  virtual HRESULT STDMETHODCALLTYPE SetBoundedAcquire() = 0;
++};
++
++
+ /**
+  * \brief Private DXGI presenter
+- * 
++ *
+  * Presenter interface that allows the DXGI swap
+  * chain implementation to remain API-agnostic,
+  * so that common code can stay in one class.
+@@ -480,4 +496,5 @@ __CRT_UUID_DECL(IDXGIVkSwapChain,          0xe4a9059e,0xb569,0x46ab,0x8d,0xe7,0x
+ __CRT_UUID_DECL(IDXGIVkSwapChain1,         0x785326d4,0xb77b,0x4826,0xae,0x70,0x8d,0x08,0x30,0x8e,0xe6,0xd1);
+ __CRT_UUID_DECL(IDXGIVkSwapChain2,         0xaed91093,0xe02e,0x458c,0xbd,0xef,0xa9,0x7d,0xa1,0xa7,0xe6,0xd2);
+ __CRT_UUID_DECL(IDXGIVkSwapChainFactory,   0xe7d6c3ca,0x23a0,0x4e08,0x9f,0x2f,0xea,0x52,0x31,0xdf,0x66,0x33);
++__CRT_UUID_DECL(INeutronBoundedAcquire,    0xb5d0f6a1,0x7c4e,0x4d2a,0x9b,0x8e,0x3f,0x5a,0x2c,0x1d,0x0e,0x9f);
+ #endif
+diff --git a/src/dxgi/dxgi_surface.cpp b/src/dxgi/dxgi_surface.cpp
+index 0c11b0c2..463a6bc3 100644
+--- a/src/dxgi/dxgi_surface.cpp
++++ b/src/dxgi/dxgi_surface.cpp
+@@ -44,6 +44,16 @@ namespace dxvk {
+           VkInstance                Instance,
+           VkPhysicalDevice          Adapter,
+           VkSurfaceKHR*             pSurface) {
++    {
++      static void (*dcomp_set)(HWND) = nullptr;
++      if (!dcomp_set) {
++        HMODULE h = ::GetModuleHandleA("dcomp.dll");
++        if (!h) h = ::LoadLibraryA("dcomp.dll");
++        if (h) dcomp_set = reinterpret_cast<void(*)(HWND)>(::GetProcAddress(h, "dcomp_set_pending_hwnd"));
++      }
++      if (dcomp_set) dcomp_set(m_window);
++      Logger::err(str::format("dcomp-bridge SET m_window=", (void*)m_window, " resolved=", dcomp_set != nullptr));
++    }
+     return wsi::createSurface(m_window, m_vkGetInstanceProcAddr, Instance, pSurface);
+   }
+ 
+diff --git a/src/dxgi/dxgi_surface.h b/src/dxgi/dxgi_surface.h
+index 4a5c36f6..18e1f1e0 100644
+--- a/src/dxgi/dxgi_surface.h
++++ b/src/dxgi/dxgi_surface.h
+@@ -33,6 +33,10 @@ namespace dxvk {
+             VkPhysicalDevice          Adapter,
+             VkSurfaceKHR*             pSurface);
+ 
++    // neutron-bounded-acquire: expose the app HWND so the presenter can test
++    // the Wine dcomp bridge mark. Non-virtual: sole implementer of the iface.
++    HWND GetWindow() const { return m_window; }
++
+   private:
+ 
+     PFN_vkGetInstanceProcAddr m_vkGetInstanceProcAddr = nullptr;
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index 0aa3fc70..cf4294d8 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -3,11 +3,26 @@
+ #include "dxgi_swapchain.h"
+ 
+ #include "../util/util_misc.h"
++#include "../util/util_env.h"
+ 
+ #include <d3d12.h>
+ 
+ namespace dxvk {
+-  
++
++  /* NEUTRON diagnostic (env-gated, inert by default): NEUTRON_SC_TRACE=1 logs every
++   * app call into a DxgiSwapChain so we can see the LAST call an app makes before a
++   * present stall (Premiere's D3D12 presentation path in DisplaySurface never Presents on
++   * winewayland with DS.DisableDirectXDisplay=false — this pins where it stops). */
++  static bool scTraceEnabled() {
++    static int v = -1;
++    if (v < 0)
++      v = env::getEnvVar("NEUTRON_SC_TRACE") == "1" ? 1 : 0;
++    return v == 1;
++  }
++
++#define NEUTRON_SC_TRACE(...) do { if (scTraceEnabled()) \
++    Logger::err(str::format("neutron-sctrace: win=", (void*)m_window, " d3d12=", m_is_d3d12, " ", __VA_ARGS__)); } while (0)
++
+   DxgiSwapChain::DxgiSwapChain(
+           DxgiFactory*                pFactory,
+           IDXGIVkSwapChain*           pPresenter,
+@@ -75,6 +90,8 @@ namespace dxvk {
+     if (ppvObject == nullptr)
+       return E_POINTER;
+ 
++    NEUTRON_SC_TRACE("QueryInterface riid=", riid);
++
+     *ppvObject = nullptr;
+     
+     if (riid == __uuidof(IUnknown)
+@@ -93,7 +110,12 @@ namespace dxvk {
+       *ppvObject = ref(&m_destructionNotifier);
+       return S_OK;
+     }
+-    
++
++    // neutron-bounded-acquire: the Wine dcomp bridge stamps readback-blitted
++    // swapchains via this private interface; it lives on the presenter.
++    if (riid == __uuidof(INeutronBoundedAcquire))
++      return m_presenter->QueryInterface(riid, ppvObject);
++
+     if (logQueryInterfaceError(__uuidof(IDXGISwapChain), riid)) {
+       Logger::warn("DxgiSwapChain::QueryInterface: Unknown interface query");
+       Logger::warn(str::format(riid));
+@@ -114,12 +136,19 @@ namespace dxvk {
+   
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) {
+-    return m_presenter->GetImage(Buffer, riid, ppSurface);
++    HRESULT hr = m_presenter->GetImage(Buffer, riid, ppSurface);
++    if (FAILED(hr))
++      NEUTRON_SC_TRACE("GetBuffer idx=", Buffer, " riid=", riid, " hr=", hr);
++    else
++      NEUTRON_SC_TRACE("GetBuffer idx=", Buffer, " hr=", hr);
++    return hr;
+   }
+ 
+ 
+   UINT STDMETHODCALLTYPE DxgiSwapChain::GetCurrentBackBufferIndex() {
+-    return m_presenter->GetImageIndex();
++    UINT idx = m_presenter->GetImageIndex();
++    NEUTRON_SC_TRACE("GetCurrentBackBufferIndex -> ", idx);
++    return idx;
+   }
+   
+   
+@@ -134,12 +163,15 @@ namespace dxvk {
+     if (m_target == nullptr) {
+       HRESULT hr = GetOutputFromMonitor(wsi::getWindowMonitor(m_window), &output);
+ 
+-      if (FAILED(hr))
++      if (FAILED(hr)) {
++        NEUTRON_SC_TRACE("GetContainingOutput FAILED hr=", hr);
+         return hr;
++      }
+     } else {
+       output = m_target;
+     }
+ 
++    NEUTRON_SC_TRACE("GetContainingOutput ok");
+     *ppOutput = output.ref();
+     return S_OK;
+   }
+@@ -177,8 +209,13 @@ namespace dxvk {
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetBackgroundColor(
+           DXGI_RGBA*                pColor) {
+-    Logger::err("DxgiSwapChain::GetBackgroundColor: Not implemented");
+-    return E_NOTIMPL;
++    if (!pColor)
++      return E_INVALIDARG;
++
++    std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
++    *pColor = m_backgroundColor;
++    NEUTRON_SC_TRACE("GetBackgroundColor -> S_OK");
++    return S_OK;
+   }
+   
+   
+@@ -343,6 +380,49 @@ namespace dxvk {
+           UINT                      PresentFlags,
+     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+ 
++    /* NEUTRON DIRTYRECTS de-risk (b) (env NEUTRON_DIRTYRECTS=1): confirm LIVE that
++     * every UI/timeline present arriving here is a PLAIN Present (pPresentParameters
++     * == nullptr) with no Present1 dirty rects / scroll -- i.e. wine d2d1 discards
++     * the RETAIN_CONTENTS partial-redraw intent before it reaches DXVK, and DXVK in
++     * turn passes nullptr to the presenter (see below). If the manufactured-rect
++     * fix lands, these lines should start showing dirtyN>0. Read-only. */
++    {
++      static int ndr = -1;
++      if (ndr < 0) { std::string e = dxvk::env::getEnvVar("NEUTRON_DIRTYRECTS"); ndr = (e == "1") ? 1 : 0; }
++      if (ndr) {
++        if (!pPresentParameters) {
++          Logger::err(str::format("neutron-dr: DXVK-PRESENT hwnd=", (void*)m_window,
++            " PLAIN (no Present1 params) flags=", PresentFlags));
++        } else {
++          std::string rects;
++          for (UINT i = 0; i < pPresentParameters->DirtyRectsCount && i < 8; i++) {
++            const RECT& r = pPresentParameters->pDirtyRects[i];
++            rects += str::format("(", r.left, ",", r.top, ",", r.right, ",", r.bottom, ")");
++          }
++          Logger::err(str::format("neutron-dr: DXVK-PRESENT hwnd=", (void*)m_window,
++            " Present1 dirtyN=", pPresentParameters->DirtyRectsCount, " ", rects,
++            " scrollRect=", (void*)pPresentParameters->pScrollRect,
++            " scrollOffset=", (void*)pPresentParameters->pScrollOffset,
++            " flags=", PresentFlags));
++        }
++      }
++    }
++
++    {
++      static void (*dcomp_reg)(HWND, IUnknown*) = nullptr;
++      Logger::err(str::format("dcomp-hook PresentBase m_window=", (void*)m_window, " is_d3d12=", m_is_d3d12));
++      if (!dcomp_reg) {
++        HMODULE h = ::GetModuleHandleA("dcomp.dll");
++        if (!h) h = ::LoadLibraryA("dcomp.dll");
++        if (h) dcomp_reg = reinterpret_cast<void(*)(HWND, IUnknown*)>(::GetProcAddress(h, "dcomp_register_external"));
++      }
++      /* gluon-present-register: do NOT require m_window here. Composition swapchains
++       * have m_window == 0; the dcomp side falls back to the pending hwnd (the real
++       * target window the surface factory resolved) so the frame still blits to the
++       * correct window (e.g. Premiere's program monitor). */
++      if (dcomp_reg)
++        dcomp_reg(m_window, static_cast<IUnknown*>(static_cast<IDXGISwapChain*>(this)));
++    }
+     if (SyncInterval > 4)
+       return DXGI_ERROR_INVALID_CALL;
+ 
+@@ -548,8 +628,20 @@ namespace dxvk {
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetBackgroundColor(
+     const DXGI_RGBA*                pColor) {
+-    Logger::err("DxgiSwapChain::SetBackgroundColor: Not implemented");
+-    return E_NOTIMPL;
++    if (!pColor)
++      return E_INVALIDARG;
++
++    /* Windows validates that all components are within [0,1]. */
++    if (pColor->r < 0.0f || pColor->r > 1.0f
++     || pColor->g < 0.0f || pColor->g > 1.0f
++     || pColor->b < 0.0f || pColor->b > 1.0f
++     || pColor->a < 0.0f || pColor->a > 1.0f)
++      return E_INVALIDARG;
++
++    std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
++    m_backgroundColor = *pColor;
++    NEUTRON_SC_TRACE("SetBackgroundColor(", pColor->r, ",", pColor->g, ",", pColor->b, ",", pColor->a, ") -> S_OK");
++    return S_OK;
+   }
+   
+   
+@@ -565,10 +657,14 @@ namespace dxvk {
+   
+   
+   HANDLE STDMETHODCALLTYPE DxgiSwapChain::GetFrameLatencyWaitableObject() {
+-    if (!(m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))
++    if (!(m_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {
++      NEUTRON_SC_TRACE("GetFrameLatencyWaitableObject -> NULL (no waitable flag)");
+       return nullptr;
++    }
+ 
+-    return m_presenter->GetFrameLatencyEvent();
++    HANDLE h = m_presenter->GetFrameLatencyEvent();
++    NEUTRON_SC_TRACE("GetFrameLatencyWaitableObject -> handle=", h);
++    return h;
+   }
+ 
+ 
+@@ -587,6 +683,7 @@ namespace dxvk {
+ 
+     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
+     *pMaxLatency = m_presenter->GetFrameLatency();
++    NEUTRON_SC_TRACE("GetMaximumFrameLatency -> ", *pMaxLatency);
+     return S_OK;
+   }
+ 
+@@ -615,7 +712,9 @@ namespace dxvk {
+       return DXGI_ERROR_INVALID_CALL;
+ 
+     std::lock_guard<dxvk::recursive_mutex> lock(m_lockWindow);
+-    return m_presenter->SetFrameLatency(MaxLatency);
++    HRESULT hr = m_presenter->SetFrameLatency(MaxLatency);
++    NEUTRON_SC_TRACE("SetMaximumFrameLatency(", MaxLatency, ") hr=", hr);
++    return hr;
+   }
+ 
+ 
+@@ -646,6 +745,7 @@ namespace dxvk {
+     else
+       *pColorSpaceSupport = 0;
+ 
++    NEUTRON_SC_TRACE("CheckColorSpaceSupport(cs=", uint32_t(ColorSpace), ") -> support=", *pColorSpaceSupport);
+     return S_OK;
+   }
+ 
+@@ -653,8 +753,10 @@ namespace dxvk {
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetColorSpace1(DXGI_COLOR_SPACE_TYPE ColorSpace) {
+     std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
+ 
+-    if (!ValidateColorSpaceSupport(m_desc.Format, ColorSpace))
++    if (!ValidateColorSpaceSupport(m_desc.Format, ColorSpace)) {
++      NEUTRON_SC_TRACE("SetColorSpace1(cs=", uint32_t(ColorSpace), ") -> E_INVALIDARG (unsupported)");
+       return E_INVALIDARG;
++    }
+ 
+     // Write back color space if setting it up succeeded. This way, we preserve
+     // the current color space even if the swap chain temporarily switches to a
+@@ -664,6 +766,7 @@ namespace dxvk {
+     if (SUCCEEDED(hr))
+       m_colorSpace = ColorSpace;
+ 
++    NEUTRON_SC_TRACE("SetColorSpace1(cs=", uint32_t(ColorSpace), ") hr=", hr);
+     return hr;
+   }
+ 
+@@ -694,7 +797,9 @@ namespace dxvk {
+     }
+ 
+     std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
+-    return m_presenter->SetHDRMetaData(&metadata);
++    HRESULT hrHdr = m_presenter->SetHDRMetaData(&metadata);
++    NEUTRON_SC_TRACE("SetHDRMetaData(type=", uint32_t(Type), ") hr=", hrHdr);
++    return hrHdr;
+   }
+   
+   
+diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
+index 85857ac1..f1bc5e0b 100644
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -204,6 +204,13 @@ namespace dxvk {
+ 
+     DXGI_COLOR_SPACE_TYPE           m_colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+ 
++    /* NEUTRON: Get/SetBackgroundColor were E_NOTIMPL stubs; Adobe Premiere's
++     * D3D12 presentation path (DisplaySurface.dll) treats the failure as fatal
++     * each frame and never reaches Present() -> program monitor stays black
++     * with DS.DisableDirectXDisplay=false. Store/return the color (opaque
++     * black default). The letterbox background itself is cosmetic. */
++    DXGI_RGBA                       m_backgroundColor = { 0.0f, 0.0f, 0.0f, 1.0f };
++
+     uint32_t                        m_globalHDRStateSerial = 0;
+     bool                            m_hasLatencyControl = false;
+ 
+diff --git a/src/dxgi/dxgi_swapchain_dispatcher.h b/src/dxgi/dxgi_swapchain_dispatcher.h
+index d5c00cae..6a28717d 100644
+--- a/src/dxgi/dxgi_swapchain_dispatcher.h
++++ b/src/dxgi/dxgi_swapchain_dispatcher.h
+@@ -61,6 +61,12 @@ namespace dxvk {
+         return S_OK;
+       }
+ 
++      // neutron-bounded-acquire: the dcomp bridge may hold the dispatcher
++      // (app-visible pointer via the visual-tree path); forward the private
++      // stamp interface to the real swap chain underneath.
++      if (m_dispatch != nullptr && riid == __uuidof(INeutronBoundedAcquire))
++        return m_dispatch->QueryInterface(riid, ppvObject);
++
+       if (logQueryInterfaceError(__uuidof(IDXGISwapChain), riid)) {
+         Logger::warn("DxgiSwapChainDispatcher::QueryInterface: Unknown interface query");
+         Logger::warn(str::format(riid));
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index f0d26515..b84c2918 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -5,8 +5,48 @@
+ 
+ #include "../wsi/wsi_window.h"
+ 
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ namespace dxvk {
+ 
++  // neutron-bounded-acquire: how long to wait for WSI operations (image
++  // acquire, present fences) on a dcomp-bridge-managed (readback-blitted)
++  // swapchain before giving up. These UI/panel swapchains are copied out of
++  // the backbuffer and GDI-blitted by the Wine dcomp bridge; their Wayland
++  // surface may never composite, so their acquire semaphores and present
++  // fences may never signal -> an infinite wait would wedge the shared D3D10
++  // device lock. 8 ms is well above a healthy wait (which completes
++  // immediately when an image/fence is free) yet imperceptible as a stutter,
++  // and since the frame is readback-blitted a timeout just reuses the last
++  // content. Presenters NOT stamped by the bridge keep the infinite waits,
++  // so real-present (video) frame pacing is untouched.
++  static constexpr uint64_t NeutronBoundedAcquireNs = 8'000'000ull; // 8 ms
++
++  // neutron round-36 perf counters (issue-3 diagnosis): how often do bounded
++  // waits actually fire? Logged ~every 5s from the app acquire path.
++  static std::atomic<uint64_t> g_neutronAcquires = { 0u };
++  static std::atomic<uint64_t> g_neutronAcqTimeouts = { 0u };
++  static std::atomic<uint64_t> g_neutronFenceTimeouts = { 0u };
++  static std::atomic<uint64_t> g_neutronAcqWaitUs = { 0u };  // total acquire wall time (us)
++  static std::atomic<uint64_t> g_neutronAcqMaxUs = { 0u };   // worst single acquire (us)
++  static std::atomic<uint64_t> g_neutronFenceWaitUs = { 0u };// total present-fence wait (us)
++
++  // Validation-only override (NEUTRON_ACQUIRE_TIMEOUT_NS): lets the offline
++  // harness force a tiny timeout to prove the VK_TIMEOUT -> VK_NOT_READY ->
++  // DXGI_STATUS_OCCLUDED -> lock-release path end-to-end. Inert unless set.
++  static uint64_t neutronBoundedTimeoutNs() {
++    static const uint64_t t = [] () -> uint64_t {
++      std::string v = env::getEnvVar("NEUTRON_ACQUIRE_TIMEOUT_NS");
++      if (!v.empty()) {
++        try { return uint64_t(std::stoull(v)); } catch (...) { }
++      }
++      return NeutronBoundedAcquireNs;
++    }();
++    return t;
++  }
++
+   const std::array<std::pair<VkColorSpaceKHR, VkColorSpaceKHR>, 2> Presenter::s_colorSpaceFallbacks = {{
+     { VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT, VK_COLOR_SPACE_HDR10_ST2084_EXT },
+ 
+@@ -22,7 +62,8 @@ namespace dxvk {
+   : m_device(device), m_signal(signal),
+     m_vki(device->instance()->vki()),
+     m_vkd(device->vkd()),
+-    m_surfaceProc(std::move(proc)) {
++    m_surfaceProc(std::move(proc)),
++    m_window(desc.window) {
+     // Only enable FSE if the user explicitly opts in. On Windows, FSE
+     // is required to support VRR or HDR, but blocks alt-tabbing or
+     // overlapping windows, which breaks a number of games.
+@@ -78,16 +119,89 @@ namespace dxvk {
+   }
+ 
+ 
++  void Presenter::setBoundedAcquire(bool bounded) {
++    // neutron-bounded-acquire: called via the INeutronBoundedAcquire stamp
++    // (dcomp bridge -> DxgiSwapChain -> D3D11SwapChain -> here).
++    m_boundedAcquire.store(bounded, std::memory_order_relaxed);
++  }
++
++
++  bool Presenter::isBoundedAcquire() {
++    if (m_boundedAcquire.load(std::memory_order_relaxed))
++      return true;
++#ifdef _WIN32
++    // Fallback for hwnd-backed chains whose presented window carries the
++    // bridge mark directly. Promote to the sticky flag so non-app-threads
++    // (CS/frame threads) only ever read the atomic.
++    if (m_window && GetPropW(reinterpret_cast<HWND>(m_window), L"__wine_dcomp_blit")) {
++      m_boundedAcquire.store(true, std::memory_order_relaxed);
++      return true;
++    }
++#endif
++    return false;
++  }
++
++
+   VkResult Presenter::acquireNextImage(PresenterSync& sync, Rc<DxvkImage>& image) {
+     std::unique_lock lock(m_surfaceMutex);
+ 
+     // Don't acquire more than one image at a time
+     VkResult status = VK_SUCCESS;
+ 
+-    m_surfaceCond.wait(lock, [this, &status] {
++    bool bounded = isBoundedAcquire();
++
++    // neutron-acq-diag (read-only): first few acquires per presenter + any
++    // bounded-state change. Shows m_window, the window mark, and the stamp --
++    // i.e. WHY a presenter is (not) bounded -- for both UI and video paths.
++    if (m_diagLogCount < 3 || bounded != m_diagLastBounded) {
++      void* prop = nullptr;
++#ifdef _WIN32
++      if (m_window)
++        prop = GetPropW(reinterpret_cast<HWND>(m_window), L"__wine_dcomp_blit");
++#endif
++      Logger::warn(str::format("neutron-acq-diag: presenter=", this,
++        " m_window=", m_window, " winProp=", prop,
++        " stamped=", m_boundedAcquire.load(std::memory_order_relaxed),
++        " bounded=", bounded,
++        " timeoutNs=", bounded ? neutronBoundedTimeoutNs() : ~0ull));
++      m_diagLogCount += 1;
++      m_diagLastBounded = bounded;
++    }
++
++    // neutron round-36 perf stats (5s cadence; runs on EVERY acquire call)
++    {
++      uint64_t acq = g_neutronAcquires.fetch_add(1, std::memory_order_relaxed);
++      static std::atomic<uint64_t> lastLogMs = { 0u };
++      uint64_t now = uint64_t(dxvk::high_resolution_clock::now().time_since_epoch().count() / 1000000);
++      uint64_t last = lastLogMs.load(std::memory_order_relaxed);
++      if (now - last > 5000 && lastLogMs.compare_exchange_strong(last, now)) {
++        Logger::warn(str::format("neutron-acq-stats: acquires=", acq,
++          " acqTimeouts=", g_neutronAcqTimeouts.load(),
++          " fenceTimeouts=", g_neutronFenceTimeouts.load(),
++          " acqWaitMs=", g_neutronAcqWaitUs.load() / 1000,
++          " acqMaxUs=", g_neutronAcqMaxUs.load(),
++          " fenceWaitMs=", g_neutronFenceWaitUs.load() / 1000));
++      }
++    }
++
++    auto donePred = [this, &status] {
+       status = m_device->getDeviceStatus();
+       return !m_presentPending || status < 0;
+-    });
++    };
++
++    if (bounded) {
++      // neutron-bounded-acquire: m_presentPending is held across the CS
++      // thread's entire presentImage body; if that wedges on a starved
++      // surface this wait would block forever WITH the caller holding the
++      // shared D3D10 device lock. The CS-side waits are bounded too, so this
++      // generous cap should never fire -- it is a belt-and-braces guarantee
++      // that the device lock cannot be held indefinitely. Timeout -> skip
++      // the frame (VK_NOT_READY -> DXGI_STATUS_OCCLUDED).
++      if (!m_surfaceCond.wait_for(lock, std::chrono::milliseconds(100), donePred))
++        return VK_NOT_READY;
++    } else {
++      m_surfaceCond.wait(lock, donePred);
++    }
+ 
+     if (status < 0)
+       return status;
+@@ -101,11 +215,44 @@ namespace dxvk {
+     if (m_acquireStatus == VK_NOT_READY && m_swapchain) {
+       PresenterSync sync = m_semaphores.at(m_frameIndex);
+ 
+-      waitForSwapchainFence(sync);
++      // neutron-bounded-acquire: sync.fence is a PRESENT fence
++      // (VkSwapchainPresentFenceInfoKHR) -- on a bridged surface the
++      // compositor may never consume the present, so it may never signal.
++      // Bound the wait; on timeout skip the frame WITHOUT touching the
++      // in-flight semaphores (they must not be reused before the fence).
++      auto tf0 = dxvk::high_resolution_clock::now();
++      bool fenceOk = waitForSwapchainFence(sync, bounded ? neutronBoundedTimeoutNs() : ~0ull);
++      auto tf1 = dxvk::high_resolution_clock::now();
++      g_neutronFenceWaitUs.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(tf1 - tf0).count(), std::memory_order_relaxed);
++      if (!fenceOk) {
++        g_neutronFenceTimeouts.fetch_add(1, std::memory_order_relaxed);
++        return VK_NOT_READY;
++      }
+ 
++      auto ta0 = dxvk::high_resolution_clock::now();
+       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+-        m_swapchain, std::numeric_limits<uint64_t>::max(),
++        m_swapchain,
++        bounded ? neutronBoundedTimeoutNs() : std::numeric_limits<uint64_t>::max(),
+         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++      {
++        uint64_t us = std::chrono::duration_cast<std::chrono::microseconds>(dxvk::high_resolution_clock::now() - ta0).count();
++        g_neutronAcqWaitUs.fetch_add(us, std::memory_order_relaxed);
++        uint64_t prev = g_neutronAcqMaxUs.load(std::memory_order_relaxed);
++        while (us > prev && !g_neutronAcqMaxUs.compare_exchange_weak(prev, us)) {}
++      }
++
++      // neutron-bounded-acquire: a timeout on a dcomp-bridge surface is not
++      // an error. Skip this frame (the bridge re-blits the last content) and
++      // return VK_NOT_READY so PresentImage returns DXGI_STATUS_OCCLUDED,
++      // WITHOUT recreating the swapchain. Critically, this returns control to
++      // D3D11SwapChain::PresentImage, whose RAII immediateContextLock then
++      // RELEASES the shared D3D10 device lock the main UI thread spins on.
++      // Leave m_acquireStatus == VK_NOT_READY so the next call re-acquires.
++      if (m_acquireStatus == VK_TIMEOUT) {
++        g_neutronAcqTimeouts.fetch_add(1, std::memory_order_relaxed);
++        m_acquireStatus = VK_NOT_READY;
++        return VK_NOT_READY;
++      }
+     }
+ 
+     // This is a normal occurence, but may be useful for
+@@ -249,11 +396,28 @@ namespace dxvk {
+     // order to hide potential delays from the application thread.
+     if (status == VK_SUCCESS) {
+       PresenterSync& nextSync = m_semaphores.at(m_frameIndex);
+-      waitForSwapchainFence(nextSync);
+ 
+-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+-        m_swapchain, std::numeric_limits<uint64_t>::max(),
+-        nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++      // neutron-bounded-acquire: this runs on the CS thread while
++      // m_presentPending is held TRUE -- an infinite present-fence wait or
++      // acquire here wedges every app thread in acquireNextImage's condition
++      // wait (which runs under the shared D3D10 device lock). Bound both for
++      // bridged presenters; on fence timeout skip the eager acquire entirely
++      // (m_acquireStatus is already VK_NOT_READY, the next app-side acquire
++      // retries with its own bounded waits).
++      bool bounded = isBoundedAcquire();
++
++      if (waitForSwapchainFence(nextSync, bounded ? neutronBoundedTimeoutNs() : ~0ull)) {
++        m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
++          m_swapchain,
++          bounded ? neutronBoundedTimeoutNs() : std::numeric_limits<uint64_t>::max(),
++          nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++
++        // neutron-bounded-acquire: normalize a bridge-surface timeout to
++        // VK_NOT_READY so the next acquireNextImage() re-acquires (bounded)
++        // via its own path instead of falling into the recreate branch.
++        if (m_acquireStatus == VK_TIMEOUT)
++          m_acquireStatus = VK_NOT_READY;
++      }
+     }
+ 
+     // Recreate the swapchain on the next acquire, even if we get suboptimal.
+@@ -1119,12 +1283,23 @@ namespace dxvk {
+           uint32_t                  numSupported,
+     const VkPresentModeKHR*         pSupported,
+           uint32_t                  syncInterval) {
+-    std::array<VkPresentModeKHR, 2> desired = { };
++    std::array<VkPresentModeKHR, 3> desired = { };
+     uint32_t numDesired = 0;
+ 
+     Tristate tearFree = m_device->config().tearFree;
+ 
+-    if (!syncInterval) {
++    // neutron round-36 (UI perf): bounded (bitblt-model D2D-UI) chains must
++    // never FIFO-block or starve -- on Windows their presents compose via GDI
++    // and are unpaced. MAILBOX guarantees a free image even when the compositor
++    // withholds consumption (covered/occluded subsurfaces), eliminating both
++    // the 8ms bounded-acquire timeouts (which serialize the shared D3D10
++    // device lock) and FIFO backpressure across ~37 chains on one CS thread.
++    // Tearing is a non-issue for these (full-frame UI panel updates).
++    // FLIP/video chains are never bounded and keep their stock selection.
++    if (isBoundedAcquire()) {
++      desired[numDesired++] = VK_PRESENT_MODE_MAILBOX_KHR;
++      desired[numDesired++] = VK_PRESENT_MODE_IMMEDIATE_KHR;
++    } else if (!syncInterval) {
+       if (tearFree != Tristate::True)
+         desired[numDesired++] = VK_PRESENT_MODE_IMMEDIATE_KHR;
+       desired[numDesired++] = VK_PRESENT_MODE_MAILBOX_KHR;
+@@ -1204,14 +1379,48 @@ namespace dxvk {
+ 
+     // Wait for the presentWait worker to finish using
+     // the swapchain before destroying it.
+-    std::unique_lock lock(m_frameMutex);
++    //
++    /* neutron-teardown: tell the frame thread to stop waiting for these
++     * frames to appear on screen. If the window backing this swapchain is
++     * hidden or unmapped (e.g. a CEF panel retired on a workspace switch
++     * under Wayland), the final FIFO frames are never presented and
++     * vkWaitForPresentKHR never returns, so an unconditional drain wait
++     * here would block forever and leak the entire swapchain. Skipping
++     * the present-id wait is safe: it is purely observational and holds
++     * no GPU resources; actual resource lifetime is guarded by the
++     * present fences / queue drain below. */
++    { std::unique_lock lock(m_frameMutex);
++
++      m_frameDrainRequested = true;
++      m_frameCond.notify_all();
++
++      m_frameDrain.wait(lock, [this] {
++        return m_frameQueue.empty();
++      });
++
++      m_frameDrainRequested = false;
++    }
+ 
+-    m_frameDrain.wait(lock, [this] {
+-      return m_frameQueue.empty();
+-    });
++    /* neutron-teardown: bound the present-fence waits. For frames that
++     * were queued but never presented, the present fence may not signal
++     * in a timely fashion (or ever). In that case fall back to draining
++     * the GPU queues entirely: after waitForIdle, all queue operations
++     * that could reference the swapchain images or semaphores (including
++     * the semaphore waits performed by the present operations) have
++     * completed, so destruction below is safe. Note this must run without
++     * m_frameMutex held: waitForIdle waits for the queue worker, which
++     * takes m_frameMutex in signalFrame. */
++    bool fencesDrained = true;
+ 
+     for (auto& sem : m_semaphores)
+-      waitForSwapchainFence(sem);
++      fencesDrained &= waitForSwapchainFence(sem, 1'000'000'000ull);
++
++    if (!fencesDrained) {
++      Logger::warn("Presenter: Teardown: present fence not signaled within 1s, draining GPU queue instead");
++      m_device->waitForIdle();
++    }
++
++    std::unique_lock lock(m_frameMutex);
+ 
+     for (const auto& sem : m_semaphores) {
+       m_vkd->vkDestroySemaphore(m_vkd->device(), sem.acquire, nullptr);
+@@ -1256,13 +1465,21 @@ namespace dxvk {
+   }
+ 
+ 
+-  void Presenter::waitForSwapchainFence(
+-          PresenterSync&            sync) {
++  bool Presenter::waitForSwapchainFence(
++          PresenterSync&            sync,
++          uint64_t                  timeout) {
+     if (!sync.fenceSignaled)
+-      return;
++      return true;
+ 
+     VkResult vr = m_vkd->vkWaitForFences(m_vkd->device(),
+-      1, &sync.fence, VK_TRUE, ~0ull);
++      1, &sync.fence, VK_TRUE, timeout);
++
++    /* neutron-teardown: bounded waits may legitimately time out for
++     * presents that the compositor never picked up; report this to the
++     * caller without resetting the fence so it can drain the GPU queue
++     * instead. */
++    if (vr == VK_TIMEOUT)
++      return false;
+ 
+     if (vr)
+       Logger::err(str::format("Presenter: Failed to wait for WSI fence: ", vr));
+@@ -1271,6 +1488,7 @@ namespace dxvk {
+       Logger::err(str::format("Presenter: Failed to reset WSI fence: ", vr));
+ 
+     sync.fenceSignaled = VK_FALSE;
++    return true;
+   }
+ 
+ 
+@@ -1300,18 +1518,52 @@ namespace dxvk {
+       // If the present operation has succeeded, actually wait for it to complete.
+       // Don't bother with it on MAILBOX / IMMEDIATE modes since doing so would
+       // restrict us to the display refresh rate on some platforms (XWayland).
+-      if (frame.result >= 0 && (frame.mode == VK_PRESENT_MODE_FIFO_KHR || frame.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
+-        VkResult vr;
+-
+-        if (m_device->features().khrPresentWait2.presentWait2) {
+-          VkPresentWait2InfoKHR waitInfo = { VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR };
+-          waitInfo.presentId = frame.frameId;
+-          waitInfo.timeout = std::numeric_limits<uint64_t>::max();
+-
+-          vr = m_vkd->vkWaitForPresent2KHR(m_vkd->device(), m_swapchain, &waitInfo);
+-        } else {
+-          vr = m_vkd->vkWaitForPresentKHR(m_vkd->device(),
+-            m_swapchain, frame.frameId, std::numeric_limits<uint64_t>::max());
++      //
++      // neutron-teardown: wait in bounded slices rather than with an infinite
++      // timeout, and re-check m_frameDrainRequested between slices. Frames
++      // presented to a window that gets hidden or unmapped (Wayland) may
++      // never reach the screen, in which case the present-id wait would
++      // otherwise block this thread forever and wedge swapchain teardown.
++      /* neutron-bounded-acquire: never present-wait for a bridged
++       * (readback-blitted) presenter -- a starved surface's presents may
++       * NEVER complete, which would spin this loop forever, starve the
++       * frame-latency signal, and permanently wedge every presenting thread
++       * in SyncFrameLatency once the latency budget is exhausted. Pacing is
++       * meaningless for these chains (content transport is the bridge's
++       * 16 ms blit thread), so treat them like MAILBOX and signal right away. */
++      if (frame.result >= 0 && !isBoundedAcquire() && (frame.mode == VK_PRESENT_MODE_FIFO_KHR || frame.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)) {
++        VkResult vr = VK_TIMEOUT;
++
++        while (vr == VK_TIMEOUT) {
++          constexpr uint64_t sliceTimeout = 100'000'000ull; /* 100 ms */
++
++          { std::unique_lock lock(m_frameMutex);
++
++            if (m_frameDrainRequested) {
++              /* Swapchain is being torn down; this frame will never be
++               * presented. Stop waiting so the queue can drain. */
++              vr = VK_SUCCESS;
++              break;
++            }
++          }
++
++          /* neutron-bounded-acquire: the stamp can arrive while a frame is
++           * already blocked in a wait slice; exit at the next slice bound. */
++          if (isBoundedAcquire()) {
++            vr = VK_SUCCESS;
++            break;
++          }
++
++          if (m_device->features().khrPresentWait2.presentWait2) {
++            VkPresentWait2InfoKHR waitInfo = { VK_STRUCTURE_TYPE_PRESENT_WAIT_2_INFO_KHR };
++            waitInfo.presentId = frame.frameId;
++            waitInfo.timeout = sliceTimeout;
++
++            vr = m_vkd->vkWaitForPresent2KHR(m_vkd->device(), m_swapchain, &waitInfo);
++          } else {
++            vr = m_vkd->vkWaitForPresentKHR(m_vkd->device(),
++              m_swapchain, frame.frameId, sliceTimeout);
++          }
+         }
+ 
+         if (vr < 0 && vr != VK_ERROR_OUT_OF_DATE_KHR && vr != VK_ERROR_SURFACE_LOST_KHR)
+diff --git a/src/dxvk/dxvk_presenter.h b/src/dxvk/dxvk_presenter.h
+index 48fa2928..cb823770 100644
+--- a/src/dxvk/dxvk_presenter.h
++++ b/src/dxvk/dxvk_presenter.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <functional>
+ #include <optional>
+ #include <queue>
+@@ -35,6 +36,10 @@ namespace dxvk {
+    */
+   struct PresenterDesc {
+     bool deferSurfaceCreation = false;
++    // neutron-bounded-acquire: the app HWND this presenter draws to, used
++    // only to test the Wine dcomp bridge mark (__wine_dcomp_blit). void*
++    // keeps this header platform-agnostic; it is an HWND on Win32.
++    void* window = nullptr;
+   };
+ 
+   /**
+@@ -118,7 +123,11 @@ namespace dxvk {
+     VkResult acquireNextImage(
+             PresenterSync&  sync,
+             Rc<DxvkImage>&  image);
+-    
++
++    // neutron-bounded-acquire: mark this presenter as dcomp-bridge-managed
++    // (readback-blitted). All otherwise-infinite WSI waits become bounded.
++    void setBoundedAcquire(bool bounded);
++
+     /**
+      * \brief Presents current image
+      * 
+@@ -269,6 +278,20 @@ namespace dxvk {
+ 
+     PresenterSurfaceProc        m_surfaceProc;
+ 
++    // neutron-bounded-acquire: app HWND (as void*) for the dcomp-bridge mark
++    // test and diagnostics. NOTE: for composition swapchains this is a
++    // DXVK-internal dummy window, NOT the bridge-marked host -- which is why
++    // the stamp (m_boundedAcquire, set via INeutronBoundedAcquire) is the
++    // primary scoping signal and the window mark only a fallback.
++    void*                       m_window = nullptr;
++
++    // neutron-bounded-acquire: sticky "this chain is readback-blitted" flag
++    std::atomic<bool>           m_boundedAcquire = { false };
++
++    // neutron-acq-diag: throttled diagnostics state (app path, under m_surfaceMutex)
++    uint32_t                    m_diagLogCount = 0;
++    bool                        m_diagLastBounded = false;
++
+     dxvk::mutex                 m_surfaceMutex;
+     dxvk::condition_variable    m_surfaceCond;
+ 
+@@ -318,6 +341,13 @@ namespace dxvk {
+     dxvk::thread                m_frameThread;
+     std::queue<PresenterFrame>  m_frameQueue;
+ 
++    /* neutron-teardown: when set, the frame thread stops waiting for
++     * presents to complete on screen and drains its queue immediately.
++     * Used during swapchain teardown, where remaining FIFO frames may
++     * never be picked up by the compositor (e.g. hidden or unmapped
++     * Wayland surfaces), so vkWaitForPresentKHR would block forever. */
++    bool                        m_frameDrainRequested = false;
++
+     uint64_t                    m_lastSignaled = 0u;
+     uint64_t                    m_lastCompleted = 0u;
+ 
+@@ -382,8 +412,14 @@ namespace dxvk {
+ 
+     void destroyLatencySemaphore();
+ 
+-    void waitForSwapchainFence(
+-            PresenterSync&            sync);
++    bool waitForSwapchainFence(
++            PresenterSync&            sync,
++            uint64_t                  timeout = ~0ull);
++
++    // neutron-bounded-acquire: true if this presenter's WSI waits must be
++    // bounded (stamped by the dcomp bridge, or its window carries the
++    // __wine_dcomp_blit mark -- the latter promotes to the sticky flag).
++    bool isBoundedAcquire();
+ 
+     void runFrameThread();
+ 

@@ -1,0 +1,953 @@
+diff --git a/dlls/nvcuda/internal.c b/dlls/nvcuda/internal.c
+index a5b8685..762140c 100644
+--- a/dlls/nvcuda/internal.c
++++ b/dlls/nvcuda/internal.c
+@@ -145,6 +145,86 @@ int get_shared_resource_fd(HANDLE win32_handle)
+     return unix_fd;
+ }
+ 
++/* NEUTRON 2026-08-03 -- resolve an NT shared-GPU-resource handle to its host file descriptor.
++ *
++ * WHY THIS EXISTS: get_shared_resource_fd() above speaks IOCTL_SHARED_GPU_RESOURCE_GET_UNIX_RESOURCE,
++ * which is a *Proton* invention. Our Wine does not have it at all -- it implements shared GPU
++ * resources through its own D3DKMT object subsystem in win32u instead, so that ioctl failed every
++ * single time and the CUDA <-> D3D11 interop dead-ended one step from working.
++ *
++ * The route that DOES exist: a shared texture's memory is Vulkan memory that winevulkan exported
++ * as an opaque fd and handed to the wineserver, which wraps it in a D3DKMT object. Re-opening that
++ * object by its NT handle gives back a server handle over the very same fd. win32u does exactly
++ * this internally -- dlls/win32u/vulkan.c calls d3dkmt_open_resource() then d3dkmt_object_get_fd()
++ * -- but neither helper is exported, and adding a win32u syscall thunk to reach them would put a
++ * core, every-app-in-every-prefix component at risk for one app's overlay. Both helpers are thin
++ * wrappers over plain wineserver requests, which any winelib DLL may issue, so we issue them here.
++ *
++ * VERIFIED, not assumed: the request opcode (index 302 in `enum request`) and the byte layout of
++ * d3dkmt_object_open_request/_reply and `enum d3dkmt_type` are identical between the protocol
++ * headers this DLL is built against and the running runtime's -- checked field by field before
++ * writing this, because a silent opcode shift would invoke a completely different server request.
++ *
++ * Returns a host fd suitable for cuImportExternalMemory(OPAQUE_FD), or -1. */
++int get_shared_resource_fd_d3dkmt(HANDLE shared)
++{
++    unsigned int status, runtime_size = 0;
++    HANDLE object = NULL;
++    void *runtime = NULL;
++    int unix_fd = -1;
++
++    SERVER_START_REQ( d3dkmt_object_query )
++    {
++        req->type   = D3DKMT_RESOURCE;
++        req->global = 0;
++        req->handle = wine_server_obj_handle( shared );
++        status = wine_server_call( req );
++        runtime_size = reply->runtime_size;
++    }
++    SERVER_END_REQ;
++
++    if (status)
++    {
++        ERR("neutron-d3dkmt: the server does not know shared handle %p as a resource (status %#x)\n",
++             shared, status);
++        return -1;
++    }
++
++    /* mirror win32u's d3dkmt_open_resource(): query for the runtime-data size, then open with a
++     * buffer that big. The data itself is the DXGI descriptor and we have no use for it. */
++    if (runtime_size && !(runtime = malloc( runtime_size )))
++        return -1;
++
++    SERVER_START_REQ( d3dkmt_object_open )
++    {
++        req->type   = D3DKMT_RESOURCE;
++        req->global = 0;
++        req->handle = wine_server_obj_handle( shared );
++        if (runtime) wine_server_set_reply( req, runtime, runtime_size );
++        status = wine_server_call( req );
++        object = wine_server_ptr_handle( reply->handle );
++    }
++    SERVER_END_REQ;
++    free( runtime );
++
++    if (status || !object)
++    {
++        ERR("neutron-d3dkmt: failed to open resource %p (status %#x)\n", shared, status);
++        return -1;
++    }
++
++    status = wine_server_handle_to_fd( object, GENERIC_ALL, &unix_fd, NULL );
++    NtClose( object );
++
++    if (status || unix_fd < 0)
++    {
++        ERR("neutron-d3dkmt: resource object has no fd (status %#x)\n", status);
++        return -1;
++    }
++
++    return unix_fd;
++}
++
+ static const CUuuid UUID_Relay1                     = {{0x6B, 0xD5, 0xFB, 0x6C, 0x5B, 0xF4, 0xE7, 0x4A,
+                                                         0x89, 0x87, 0xD9, 0x39, 0x12, 0xFD, 0x9D, 0xF9}};
+                                                     // {6bd5fb6c-5bf4-e74a-8987-d93912fd9df9}
+diff --git a/dlls/nvcuda/nvcuda.c b/dlls/nvcuda/nvcuda.c
+index ce21d18..5b9f23d 100644
+--- a/dlls/nvcuda/nvcuda.c
++++ b/dlls/nvcuda/nvcuda.c
+@@ -32,12 +32,53 @@
+ #include "winbase.h"
+ #include "winternl.h"
+ #include "wine/debug.h"
++#include "wine/server.h"   /* NEUTRON: wine_server_handle_to_fd for D3D11 interop */
+ #include "wine/list.h"
+ #include "wine/wgl.h"
+ #include "cuda.h"
+ #include "nvcuda.h"
++#define COBJMACROS   /* NEUTRON: must precede d3d9/d3d11/dxgi for the C helper macros */
++#include "initguid.h"   /* NEUTRON: instantiate IID_ID3D11Texture2D / IID_IDXGIResource1 here */
+ #include "d3d9.h"
+ #include "d3d11.h"
++#include "dxgi1_2.h"
++#include <unistd.h>
++
++#define NEUTRON_GFX_MAGIC 0x4E455543  /* 'NEUC' */
++
++struct neutron_gfx_resource
++{
++    struct list entry;
++    DWORD magic;
++    void *ext_mem;              /* CUexternalMemory */
++    CUmipmappedArray mipmap;
++    unsigned int width, height;
++    int fd;
++};
++
++static struct list neutron_gfx_list = LIST_INIT( neutron_gfx_list );
++static pthread_mutex_t neutron_gfx_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* The CUDA_ARRAY3D_* flag combination this driver accepts for DXVK-exported images, learned once
++ * at the first successful registration (see wine_cuGraphicsD3D11RegisterResource). -1 = not known
++ * yet. A benign race: the worst case is two threads each walking the ladder. */
++static int neutron_mip_flags = -1;
++
++/* Only ever treat a CUgraphicsResource as ours if we handed it out: never dereference a handle
++ * that belongs to the real driver. */
++static struct neutron_gfx_resource *neutron_gfx_find(CUgraphicsResource res)
++{
++    struct neutron_gfx_resource *r, *found = NULL;
++
++    pthread_mutex_lock(&neutron_gfx_lock);
++    LIST_FOR_EACH_ENTRY(r, &neutron_gfx_list, struct neutron_gfx_resource, entry)
++    {
++        if ((CUgraphicsResource)r == res) { found = r; break; }
++    }
++    pthread_mutex_unlock(&neutron_gfx_lock);
++    return found;
++}
++
+ #include "function_mappings.h"
+ 
+ #define DEV_PTR "%llu" /* CUdeviceptr_v2 */
+@@ -2077,7 +2118,15 @@ CUresult WINAPI wine_cuGraphicsGLRegisterImage(CUgraphicsResource *pCudaResource
+ 
+ CUresult WINAPI wine_cuGraphicsMapResources(unsigned int count, CUgraphicsResource *resources, CUstream hStream)
+ {
++    unsigned int i;
++
+     TRACE("(%u, %p, %p)\n", count, resources, hStream);
++
++    /* NEUTRON: our D3D11-interop resources are already resident external memory -- there is
++     * nothing to map or unmap. Only hand the driver handles it actually owns. */
++    for (i = 0; i < count; i++)
++        if (neutron_gfx_find(resources[i])) return CUDA_SUCCESS;
++
+     return pcuGraphicsMapResources(count, resources, hStream);
+ }
+ 
+@@ -2108,19 +2157,51 @@ CUresult WINAPI wine_cuGraphicsResourceSetMapFlags(CUgraphicsResource resource,
+ CUresult WINAPI wine_cuGraphicsSubResourceGetMappedArray(CUarray *pArray, CUgraphicsResource resource,
+                                                          unsigned int arrayIndex, unsigned int mipLevel)
+ {
++    struct neutron_gfx_resource *res;
++
+     TRACE("(%p, %p, %u, %u)\n", pArray, resource, arrayIndex, mipLevel);
++
++    /* NEUTRON: serve the level out of the mipmapped array we mapped at registration time. */
++    if ((res = neutron_gfx_find(resource)))
++    {
++        if (arrayIndex) return CUDA_ERROR_INVALID_VALUE;
++        return pcuMipmappedArrayGetLevel(pArray, res->mipmap, mipLevel);
++    }
++
+     return pcuGraphicsSubResourceGetMappedArray(pArray, resource, arrayIndex, mipLevel);
+ }
+ 
+ CUresult WINAPI wine_cuGraphicsUnmapResources(unsigned int count, CUgraphicsResource *resources, CUstream hStream)
+ {
++    unsigned int i;
++
+     TRACE("(%u, %p, %p)\n", count, resources, hStream);
++
++    for (i = 0; i < count; i++)
++        if (neutron_gfx_find(resources[i])) return CUDA_SUCCESS;
++
+     return pcuGraphicsUnmapResources(count, resources, hStream);
+ }
+ 
+ CUresult WINAPI wine_cuGraphicsUnregisterResource(CUgraphicsResource resource)
+ {
++    struct neutron_gfx_resource *res;
++
+     TRACE("(%p)\n", resource);
++
++    if ((res = neutron_gfx_find(resource)))
++    {
++        pthread_mutex_lock(&neutron_gfx_lock);
++        list_remove(&res->entry);
++        pthread_mutex_unlock(&neutron_gfx_lock);
++        /* ext_mem is NULL for a detached-fallback resource, which owns a standalone array instead */
++        if (res->ext_mem) pcuDestroyExternalMemory(res->ext_mem);
++        else if (res->mipmap) pcuMipmappedArrayDestroy(res->mipmap);
++        if (res->fd >= 0) close(res->fd);
++        free(res);
++        return CUDA_SUCCESS;
++    }
++
+     return pcuGraphicsUnregisterResource(resource);
+ }
+ 
+@@ -2253,10 +2334,309 @@ CUresult WINAPI wine_cuMemAllocPitch_v2(CUdeviceptr_v2 *dptr, size_t *pPitch, si
+     return pcuMemAllocPitch_v2(dptr, pPitch, WidthInBytes, Height, ElementSizeBytes);
+ }
+ 
++/* ===== Neutron LIVE presenter =========================================== */
++/* ⚠️ EXPERIMENT, OFF BY DEFAULT -- set NEUTRON_CUDA_PLAYBACK_EXPERIMENT=1 to arm.
++ *
++ * This is the old "present Premiere's playback buffer ourselves" experiment. It is NOT
++ * diagnostics: neutron_present_thread() locates the PROGRAM MONITOR window via
++ * neutron_find_monitor() and BLITS its own BGRA buffer into that window every 50 ms, and
++ * neutron_live_thread() reads live GPU allocations back to the host once a second.
++ *
++ * It used to arm ITSELF, with no env gate, as soon as a 69,918,720-byte CUDA allocation
++ * appeared -- which is exactly what Premiere allocates for playback. Rebuilding nvcuda.dll for
++ * the After Effects CUDA interop on 2026-08-03 restaged it into the live prefix, and Premiere's
++ * Program Monitor went BLACK with smearing on resize, because this thread was painting over it.
++ *
++ * That cost a full day: the symptom looked exactly like a present-path bug, so the search went
++ * through dcomp, DXVK, win32u, opengl32 and winewayland before reaching the one component that
++ * was actually drawing on the window. Anything that WRITES to a window must be env-gated off by
++ * default -- a passive-looking name ("capture", "live") is not a licence to run in production. */
++static int neutron_playback_experiment(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        const char *e = getenv("NEUTRON_CUDA_PLAYBACK_EXPERIMENT");
++        v = (e && e[0] == '1') ? 1 : 0;
++    }
++    return v;
++}
++
++static CUcontext      g_neutron_ctx;
++static CUdeviceptr_v2 g_neutron_cand[32];
++static int            g_neutron_cand_n;
++static int            g_neutron_present_started;
++
++typedef struct { int left, top, right, bottom; } N_RECT;
++typedef struct { unsigned biSize; int biWidth, biHeight; unsigned short biPlanes, biBitCount;
++                 unsigned biCompression, biSizeImage; int biXPPM, biYPPM; unsigned biClrUsed, biClrImp; } N_BMIH;
++typedef struct { N_BMIH h; unsigned colors[1]; } N_BMI;
++typedef void* N_HDC;
++
++typedef N_HDC (WINAPI *PFN_GetDC)(HWND);
++typedef int   (WINAPI *PFN_ReleaseDC)(HWND, N_HDC);
++typedef int   (WINAPI *PFN_GetClientRect)(HWND, N_RECT*);
++typedef int   (WINAPI *PFN_SetStretchBltMode)(N_HDC, int);
++typedef int   (WINAPI *PFN_StretchDIBits)(N_HDC,int,int,int,int,int,int,int,int,const void*,const N_BMI*,unsigned,unsigned);
++typedef int   (WINAPI *PFN_EnumWindows)(void*, LPARAM);
++typedef int   (WINAPI *PFN_EnumChildWindows)(HWND, void*, LPARAM);
++
++static PFN_GetDC             p_GetDC;
++static PFN_ReleaseDC         p_ReleaseDC;
++static PFN_GetClientRect     p_GetClientRect;
++static PFN_SetStretchBltMode p_SetStretchBltMode;
++static PFN_StretchDIBits     p_StretchDIBits;
++static PFN_EnumWindows       p_EnumWindows;
++static PFN_EnumChildWindows  p_EnumChildWindows;
++static HWND g_best_hwnd;
++static int  g_best_area;
++
++static BOOL WINAPI neutron_enum_proc(HWND hwnd, LPARAM lp)
++{
++    N_RECT r;
++    if (p_GetClientRect && p_GetClientRect(hwnd, &r))
++    {
++        int w = r.right - r.left, h = r.bottom - r.top;
++        if (w >= 1200 && h >= 600 && w > h)
++        {
++            int area = w * h;
++            ERR("neutron-win: hwnd=%p %dx%d\n", hwnd, w, h);
++            if (area > g_best_area) { g_best_area = area; g_best_hwnd = hwnd; }
++        }
++    }
++    if (p_EnumChildWindows) p_EnumChildWindows(hwnd, neutron_enum_proc, 0);
++    return TRUE;
++}
++
++static HWND neutron_find_monitor(void)
++{
++    HMODULE u = GetModuleHandleA("user32.dll");
++    HMODULE g = GetModuleHandleA("gdi32.dll");
++    const char *env = getenv("NEUTRON_HWND");
++    if (!u || !g) { ERR("neutron-win: user32/gdi32 missing u=%p g=%p\n", u, g); return NULL; }
++    p_GetDC             = (PFN_GetDC)GetProcAddress(u, "GetDC");
++    p_ReleaseDC         = (PFN_ReleaseDC)GetProcAddress(u, "ReleaseDC");
++    p_GetClientRect     = (PFN_GetClientRect)GetProcAddress(u, "GetClientRect");
++    p_EnumWindows       = (PFN_EnumWindows)GetProcAddress(u, "EnumWindows");
++    p_EnumChildWindows  = (PFN_EnumChildWindows)GetProcAddress(u, "EnumChildWindows");
++    p_SetStretchBltMode = (PFN_SetStretchBltMode)GetProcAddress(g, "SetStretchBltMode");
++    p_StretchDIBits     = (PFN_StretchDIBits)GetProcAddress(g, "StretchDIBits");
++    if (env && *env)
++    {
++        unsigned long long h = strtoull(env, NULL, 0);
++        ERR("neutron-win: using NEUTRON_HWND=%#llx\n", h);
++        return (HWND)(UINT_PTR)h;
++    }
++    g_best_hwnd = NULL; g_best_area = 0;
++    if (p_EnumWindows) p_EnumWindows((void*)neutron_enum_proc, 0);
++    ERR("neutron-win: chosen hwnd=%p area=%d\n", g_best_hwnd, g_best_area);
++    return g_best_hwnd;
++}
++
++static void neutron_paint(HWND hwnd, const unsigned char *bgra, unsigned w, unsigned h)
++{
++    N_HDC dc; N_RECT rc; N_BMI bmi;
++    if (!hwnd || !p_GetDC || !p_StretchDIBits || !p_GetClientRect) return;
++    if (!p_GetClientRect(hwnd, &rc)) return;
++    dc = p_GetDC(hwnd);
++    if (!dc) return;
++    memset(&bmi, 0, sizeof(bmi));
++    bmi.h.biSize = sizeof(N_BMIH);
++    bmi.h.biWidth = (int)w;
++    bmi.h.biHeight = -(int)h;          /* top-down */
++    bmi.h.biPlanes = 1;
++    bmi.h.biBitCount = 32;
++    bmi.h.biCompression = 0;           /* BI_RGB */
++    if (p_SetStretchBltMode) p_SetStretchBltMode(dc, 3 /*COLORONCOLOR*/);
++    p_StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
++                    0, 0, (int)w, (int)h, bgra, &bmi, 0 /*DIB_RGB_COLORS*/, 0x00CC0020 /*SRCCOPY*/);
++    p_ReleaseDC(hwnd, dc);
++}
++
++static DWORD WINAPI neutron_present_thread(LPVOID arg)
++{
++    const unsigned N = 2560, H = 1707;
++    size_t full = (size_t)N * H * 16ull;
++    const char *cs = getenv("NEUTRON_CAND");
++    int cand = cs ? atoi(cs) : 0;
++    int auto_track = (cs == NULL);     /* no NEUTRON_CAND => follow freshest buffer */
++    int gamma_on = (getenv("NEUTRON_GAMMA") != NULL);
++    int last_sel = -1, clk = 0;
++    unsigned long long sig[32];
++    int gen[32];
++    float smp[4096];                   /* 16 KB center sample for change detection */
++    float *host;
++    unsigned char *bgra;
++    HWND hwnd;
++    int it;
++
++    Sleep(8000);
++    if (g_neutron_ctx) pcuCtxSetCurrent(g_neutron_ctx);
++    host = VirtualAlloc(NULL, full, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
++    bgra = VirtualAlloc(NULL, (size_t)N * H * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
++    hwnd = neutron_find_monitor();
++    ERR("neutron-present: start hwnd=%p cand=%d cand_n=%d host=%p bgra=%p\n",
++        hwnd, cand, g_neutron_cand_n, host, bgra);
++    if (!host || !bgra) { ERR("neutron-present: host alloc fail\n"); return 0; }
++    memset(sig, 0, sizeof(sig));
++    memset(gen, 0, sizeof(gen));
++    ERR("neutron-track: auto=%d (NEUTRON_CAND %s)\n", auto_track, cs ? cs : "unset");
++
++    for (it = 0; it < 100000; it++)        /* continuous; kill -9 to stop */
++    {
++        CUdeviceptr_v2 p;
++        CUresult r;
++        unsigned i, n = N * H;
++        int sel, k;
++        Sleep(50);
++        if (!hwnd || g_neutron_cand_n <= 0) continue;
++        if (auto_track)
++        {
++            int best = -1, bestgen = -1;
++            size_t soff = ((size_t)(H / 2) * N + (N / 2)) * 16ull;
++            clk++;
++            for (k = 0; k < g_neutron_cand_n; k++)
++            {
++                CUdeviceptr_v2 cp = g_neutron_cand[k];
++                unsigned long long s = 1469598103934665603ull;
++                int z;
++                if (!cp) continue;
++                if (pcuMemcpyDtoH_v2(smp, cp + soff, sizeof(smp))) continue;
++                for (z = 0; z < (int)(sizeof(smp) / sizeof(smp[0])); z++)
++                {
++                    unsigned bits;
++                    memcpy(&bits, &smp[z], sizeof(bits));
++                    s = (s ^ bits) * 1099511628211ull;
++                }
++                if (s != sig[k]) { sig[k] = s; gen[k] = clk; }
++                if (gen[k] > bestgen) { bestgen = gen[k]; best = k; }
++            }
++            sel = (best >= 0) ? best : ((cand >= 0 && cand < g_neutron_cand_n) ? cand : 0);
++        }
++        else
++        {
++            sel = (cand >= 0 && cand < g_neutron_cand_n) ? cand : 0;
++        }
++        if (sel != last_sel) { ERR("neutron-track: presenting cand[%d] of %d\n", sel, g_neutron_cand_n); last_sel = sel; }
++        p = g_neutron_cand[sel];
++        if (!p) continue;
++        r = pcuMemcpyDtoH_v2(host, p, full);
++        if (r) continue;
++        for (i = 0; i < n; i++)
++        {
++            float b = host[i*4+0], g = host[i*4+1], rr = host[i*4+2];  /* BGRA: ch0=B, ch2=R */
++            if (b < 0) b = 0; if (b > 1) b = 1;
++            if (g < 0) g = 0; if (g > 1) g = 1;
++            if (rr < 0) rr = 0; if (rr > 1) rr = 1;
++            if (gamma_on) { b = __builtin_sqrtf(b); g = __builtin_sqrtf(g); rr = __builtin_sqrtf(rr); }
++            bgra[i*4+0] = (unsigned char)(b  * 255.0f + 0.5f);  /* GDI memory order B,G,R,A */
++            bgra[i*4+1] = (unsigned char)(g  * 255.0f + 0.5f);
++            bgra[i*4+2] = (unsigned char)(rr * 255.0f + 0.5f);
++            bgra[i*4+3] = 255;
++        }
++        neutron_paint(hwnd, bgra, N, H);
++    }
++    return 0;
++}
++
++static void neutron_start_present(void)
++{
++    if (g_neutron_present_started) return;
++    g_neutron_present_started = 1;
++    CreateThread(NULL, 0, neutron_present_thread, NULL, 0, NULL);
++}
++
++/* ----- Neutron live-buffer finder (diagnostic) ----- */
++static CUdeviceptr_v2 g_all[64];
++static size_t         g_all_sz[64];
++static int            g_all_n;
++static int            g_live_started;
++
++static DWORD WINAPI neutron_live_thread(LPVOID arg)
++{
++    static unsigned long long sig[64];
++    static unsigned char buf[8192];
++    int it, k;
++    Sleep(8000);
++    if (g_neutron_ctx) pcuCtxSetCurrent(g_neutron_ctx);
++    ERR("neutron-live: finder start n=%d\n", g_all_n);
++    for (it = 0; it < 120; it++)
++    {
++        Sleep(1000);
++        for (k = 0; k < g_all_n; k++)
++        {
++            CUdeviceptr_v2 p = g_all[k];
++            size_t sz = g_all_sz[k];
++            size_t off = (sz / 2) & ~((size_t)15);
++            unsigned long long s = 1469598103934665603ull;
++            double sum = 0.0;
++            int z;
++            if (!p) continue;
++            if (off + sizeof(buf) > sz) off = 0;
++            if (pcuMemcpyDtoH_v2(buf, p + off, sizeof(buf))) continue;
++            for (z = 0; z < (int)sizeof(buf); z++) { s = (s ^ buf[z]) * 1099511628211ull; sum += buf[z]; }
++            if (s != sig[k])
++            {
++                sig[k] = s;
++                ERR("neutron-live: CHANGED idx=%d ptr=%#llx size=%zu mean=%.1f\n",
++                    k, (unsigned long long)p, sz, sum / (double)sizeof(buf));
++            }
++        }
++    }
++    ERR("neutron-live: finder exit\n");
++    return 0;
++}
++
++static void neutron_live_record(CUresult _r, CUdeviceptr_v2 *dptr, size_t bytesize)
++{
++    CUdeviceptr_v2 p;
++    int i;
++    if (_r != CUDA_SUCCESS || bytesize < 4000000ull || g_all_n >= 64) return;
++    p = dptr ? *dptr : 0;
++    if (!p) return;
++    for (i = 0; i < g_all_n; i++) if (g_all[i] == p) return;
++    g_all[g_all_n] = p; g_all_sz[g_all_n] = bytesize; g_all_n++;
++    if (!g_live_started)
++    {
++        g_live_started = 1;
++        if (g_neutron_ctx == NULL) pcuCtxGetCurrent(&g_neutron_ctx);
++        CreateThread(NULL, 0, neutron_live_thread, NULL, 0, NULL);
++    }
++}
++/* ---------------------------------------------------- */
++
++static void neutron_capture(CUresult _r, CUdeviceptr_v2 *dptr, size_t bytesize)
++{
++    CUdeviceptr_v2 p;
++    int i;
++    if (_r != CUDA_SUCCESS) return;
++    /* Single choke point for the whole experiment: no recording, no live thread, and above all
++     * no present thread painting into the Program Monitor, unless explicitly armed. */
++    if (!neutron_playback_experiment()) return;
++    neutron_live_record(_r, dptr, bytesize);
++    if (bytesize >= 8000000ull)
++        ERR("neutron-allocsz: %zu\n", (size_t)bytesize);   /* discover playback buffer sizes */
++    if (bytesize != 69918720ull || g_neutron_cand_n >= 32) return;
++    p = dptr ? *dptr : 0;
++    if (!p) return;
++    for (i = 0; i < g_neutron_cand_n; i++) if (g_neutron_cand[i] == p) return;
++    pcuCtxGetCurrent(&g_neutron_ctx);
++    g_neutron_cand[g_neutron_cand_n++] = p;
++    ERR("neutron-cap: cand[%d] ptr=%#llx\n", g_neutron_cand_n - 1, (unsigned long long)p);
++    neutron_start_present();
++}
++/* ======================================================================== */
++
+ CUresult WINAPI wine_cuMemAlloc_v2(CUdeviceptr_v2 *dptr, size_t bytesize)
+ {
+     TRACE("(%p, %zu)\n", dptr, bytesize);
+-    return pcuMemAlloc_v2(dptr, bytesize);
++    {
++        CUresult _r = pcuMemAlloc_v2(dptr, bytesize);
++    neutron_capture(_r, dptr, bytesize);
++        ERR("neutron-alloc: size=%zu (%.2f MB) ptr=%#llx ret=%d\n", bytesize,
++            (double)bytesize / 1048576.0, (unsigned long long)(dptr ? *dptr : 0), _r);
++        return _r;
++    }
+ }
+ 
+ CUresult WINAPI wine_cuMemFree(CUdeviceptr_v1 dptr)
+@@ -2343,22 +2723,31 @@ CUresult WINAPI wine_cuMemcpy(CUdeviceptr_v2 dst, CUdeviceptr_v2 src, size_t Byt
+     return pcuMemcpy(dst, src, ByteCount);
+ }
+ 
++static void neutron_2d_log(const CUDA_MEMCPY2D *pCopy)
++{
++    if (!pCopy) return;
++    if (pCopy->Height >= 64 && pCopy->Height <= 2400 && pCopy->WidthInBytes >= 1024)
++        ERR("neutron-2d: dst=%#llx WInB=%zu H=%zu dstPitch=%zu dstMemTy=%d\n",
++            (unsigned long long)pCopy->dstDevice, (size_t)pCopy->WidthInBytes,
++            (size_t)pCopy->Height, (size_t)pCopy->dstPitch, (int)pCopy->dstMemoryType);
++}
++
+ CUresult WINAPI wine_cuMemcpy2D(const CUDA_MEMCPY2D *pCopy)
+ {
+     TRACE("(%p)\n", pCopy);
+-    return pcuMemcpy2D(pCopy);
++    neutron_2d_log(pCopy); return pcuMemcpy2D(pCopy);
+ }
+ 
+ CUresult WINAPI wine_cuMemcpy2DAsync(const CUDA_MEMCPY2D *pCopy, CUstream hStream)
+ {
+     TRACE("(%p, %p)\n", pCopy, hStream);
+-    return pcuMemcpy2DAsync(pCopy, hStream);
++    neutron_2d_log(pCopy); return pcuMemcpy2DAsync(pCopy, hStream);
+ }
+ 
+ CUresult WINAPI wine_cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *pCopy, CUstream hStream)
+ {
+     TRACE("(%p, %p)\n", pCopy, hStream);
+-    return pcuMemcpy2DAsync_v2(pCopy, hStream);
++    neutron_2d_log(pCopy); return pcuMemcpy2DAsync_v2(pCopy, hStream);
+ }
+ 
+ CUresult WINAPI wine_cuMemcpy2DUnaligned(const CUDA_MEMCPY2D *pCopy)
+@@ -2376,7 +2765,7 @@ CUresult WINAPI wine_cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D *pCopy)
+ CUresult WINAPI wine_cuMemcpy2D_v2(const CUDA_MEMCPY2D *pCopy)
+ {
+     TRACE("(%p)\n", pCopy);
+-    return pcuMemcpy2D_v2(pCopy);
++    neutron_2d_log(pCopy); return pcuMemcpy2D_v2(pCopy);
+ }
+ 
+ CUresult WINAPI wine_cuMemcpy3D(const CUDA_MEMCPY3D *pCopy)
+@@ -3307,7 +3696,14 @@ CUresult WINAPI wine_cuGLGetDevices_v2(unsigned int *pCudaDeviceCount, CUdevice
+                                        unsigned int cudaDeviceCount, CUGLDeviceList deviceList)
+ {
+     TRACE("(%p, %p, %u, %d)\n", pCudaDeviceCount, pCudaDevices, cudaDeviceCount, deviceList);
+-    return pcuGLGetDevices_v2(pCudaDeviceCount, pCudaDevices, cudaDeviceCount, deviceList);
++    {
++        CUresult _r = pcuGLGetDevices_v2(pCudaDeviceCount, pCudaDevices, cudaDeviceCount, deviceList);
++        ERR("neutron-gl: cuGLGetDevices_v2 ret=%d count=%u dev0=%d list=%d\n", _r,
++            (pCudaDeviceCount ? *pCudaDeviceCount : 0),
++            (pCudaDevices && pCudaDeviceCount && *pCudaDeviceCount > 0) ? (int)pCudaDevices[0] : -1,
++            (int)deviceList);
++        return _r;
++    }
+ }
+ 
+ CUresult WINAPI wine_cuGraphicsResourceSetMapFlags_v2(CUgraphicsResource resource, unsigned int flags)
+@@ -3882,6 +4278,10 @@ CUresult WINAPI wine_cuDeviceGetUuid(CUuuid *uuid, CUdevice dev)
+     else return CUDA_ERROR_INVALID_VALUE;
+ }
+ 
++/* Neutron: DXGI adapter LUID captured in cuD3D11GetDevice, echoed by cuDeviceGetLuid. */
++static LUID g_neutron_adapter_luid;
++static int  g_neutron_adapter_luid_valid;
++
+ CUresult WINAPI wine_cuDeviceGetLuid(char *luid, unsigned int *deviceNodeMask, CUdevice dev)
+ {
+     CUresult ret;
+@@ -3893,6 +4293,14 @@ CUresult WINAPI wine_cuDeviceGetLuid(char *luid, unsigned int *deviceNodeMask, C
+     DWORD size, i = 0;
+ 
+     TRACE("(%p, %p, %d)\n", luid, deviceNodeMask, dev);
++    if (g_neutron_adapter_luid_valid)
++    {
++        memcpy(luid, &g_neutron_adapter_luid, sizeof(LUID));
++        if (deviceNodeMask) *deviceNodeMask = 1;
++        ERR("neutron-luid: cuDeviceGetLuid dev=%d -> forced adapter LUID %08x:%08x\n",
++            dev, (unsigned)g_neutron_adapter_luid.HighPart, (unsigned)g_neutron_adapter_luid.LowPart);
++        return CUDA_SUCCESS;
++    }
+ 
+     if ((ret = pcuDeviceGetUuid(&uuid, dev)) != CUDA_SUCCESS)
+     {
+@@ -4492,13 +4900,13 @@ CUresult WINAPI wine_cuDeviceGetNvSciSyncAttributes(void *nvSciSyncAttrList, CUd
+ CUresult WINAPI wine_cuMemAllocAsync(CUdeviceptr_v2 *dptr, size_t bytesize, CUstream hStream)
+ {
+     TRACE("(%p, %zu, %p)\n", dptr, bytesize, hStream);
+-    return pcuMemAllocAsync(dptr, bytesize, hStream);
++    { CUresult _r = pcuMemAllocAsync(dptr, bytesize, hStream); neutron_capture(_r, dptr, bytesize); return _r; }
+ }
+ 
+ CUresult WINAPI wine_cuMemAllocAsync_ptsz(CUdeviceptr_v2 *dptr, size_t bytesize, CUstream hStream)
+ {
+     TRACE("(%p, %zu, %p)\n", dptr, bytesize, hStream);
+-    return pcuMemAllocAsync_ptsz(dptr, bytesize, hStream);
++    { CUresult _r = pcuMemAllocAsync_ptsz(dptr, bytesize, hStream); neutron_capture(_r, dptr, bytesize); return _r; }
+ }
+ 
+ CUresult WINAPI wine_cuMemFreeAsync(CUdeviceptr_v2 dptr, CUstream hStream)
+@@ -4612,13 +5020,13 @@ CUresult WINAPI wine_cuCtxResetPersistingL2Cache(void)
+ CUresult WINAPI wine_cuMemAllocFromPoolAsync(CUdeviceptr_v2 *dptr, size_t bytesize, CUmemoryPool pool, CUstream hStream)
+ {
+     TRACE("(%p, %zu, %p, %p)\n", dptr, bytesize, pool, hStream);
+-    return pcuMemAllocFromPoolAsync(dptr, bytesize, pool, hStream);
++    { CUresult _r = pcuMemAllocFromPoolAsync(dptr, bytesize, pool, hStream); neutron_capture(_r, dptr, bytesize); return _r; }
+ }
+ 
+ CUresult WINAPI wine_cuMemAllocFromPoolAsync_ptsz(CUdeviceptr_v2 *dptr, size_t bytesize, CUmemoryPool pool, CUstream hStream)
+ {
+     TRACE("(%p, %zu, %p, %p)\n", dptr, bytesize, pool, hStream);
+-    return pcuMemAllocFromPoolAsync_ptsz(dptr, bytesize, pool, hStream);
++    { CUresult _r = pcuMemAllocFromPoolAsync_ptsz(dptr, bytesize, pool, hStream); neutron_capture(_r, dptr, bytesize); return _r; }
+ }
+ 
+ CUresult WINAPI wine_cuMemPoolTrimTo(CUmemoryPool pool, size_t minBytesToKeep)
+@@ -6485,18 +6893,289 @@ CUresult WINAPI wine_cuGraphicsD3D10RegisterResource(CUgraphicsResource *pCudaRe
+ CUresult WINAPI wine_cuD3D11GetDevice(CUdevice *pCudaDevice, IDXGIAdapter *pAdapter)
+ {
+     FIXME("(%p, %p) - semi-stub\n", pCudaDevice, pAdapter);
++    if (pAdapter)
++    {
++        DXGI_ADAPTER_DESC _nd;
++        if (SUCCEEDED(pAdapter->lpVtbl->GetDesc(pAdapter, &_nd)))
++        {
++            g_neutron_adapter_luid = _nd.AdapterLuid;
++            g_neutron_adapter_luid_valid = 1;
++            ERR("neutron-luid: D3D adapter LUID=%08x:%08x\n",
++                (unsigned)_nd.AdapterLuid.HighPart, (unsigned)_nd.AdapterLuid.LowPart);
++        }
++        else ERR("neutron-luid: IDXGIAdapter_GetDesc failed\n");
++    }
+     /* DXGI adapters don't have an OpenGL context assigned yet, otherwise we could use cuGLGetDevices */
+     return pcuDeviceGet(pCudaDevice, 0);
+ }
+ 
++/* NEUTRON 2026-08-02: CUDA <-> Direct3D 11 interop.
++ *
++ * Linux's libcuda has NO cuD3D11 / cuGraphicsD3D entry points at all, so this can never be a
++ * pass-through. It used to return CUDA_ERROR_UNKNOWN unconditionally, which cost us After
++ * Effects' composition viewer: AE registers its UI-overlay texture here on every blit, turns the
++ * failure into 0xA00F0001, throws it, and latches its hardware blit off for the whole process
++ * (measured: 161 failed registrations == 161 latches).
++ *
++ * What DOES exist on Linux is the Vulkan external-memory route, and DXVK backs every D3D11
++ * texture with a VkImage. So: export the resource as an NT shared handle, convert it to a host fd
++ * the same way cuImportExternalMemory already does, import that as CUDA external memory, and map
++ * it as a mipmapped array. The CUgraphicsResource we hand back is our own object; the cuGraphics*
++ * entry points below recognise it and service it, and pass everything else through untouched.
++ *
++ * Each step logs on failure, because the one thing that cannot be settled by reading source is
++ * whether the texture's Vulkan memory was allocated EXPORTABLE -- DXVK only does that for
++ * resources created shared. If it was not, CreateSharedHandle fails and we are no worse off than
++ * the old stub. */
++struct neutron_mipmap_desc   /* CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC */
++{
++    unsigned long long offset;
++    CUDA_ARRAY3D_DESCRIPTOR arrayDesc;
++    unsigned int numLevels;
++    unsigned int reserved[16];
++};
++
++#define NEUTRON_CU_AD_FORMAT_UNSIGNED_INT8 0x01
++#define NEUTRON_CUDA_ARRAY3D_SURFACE_LDST  0x02
++#define NEUTRON_CUDA_ARRAY3D_COLOR_ATTACHMENT 0x20
++#define NEUTRON_CUDA_EXTERNAL_MEMORY_DEDICATED 0x1
++
++/* Matches NeutronAllocInfoGuid in DXVK's d3d11_resource.cpp -- the private-data slot on an
++ * exportable texture holding { allocation size, allocation offset } as two uint64s. */
++static const GUID NEUTRON_ALLOC_INFO_GUID =
++    {0x6e657574,0x726f,0x6e01,{0xa1,0x00,0x00,0x00,0x00,0x00,0x00,0x01}};
++
+ CUresult WINAPI wine_cuGraphicsD3D11RegisterResource(CUgraphicsResource *pCudaResource, ID3D11Resource *pD3DResource, unsigned int Flags)
+ {
+-    FIXME("(%p, %p, %u) - semi-stub\n", pCudaResource, pD3DResource, Flags);
+-    /* Not able to handle spesific flags at this time */
+-    if(Flags > 0)
+-      return CUDA_ERROR_INVALID_VALUE;
++    struct neutron_gfx_resource *res;
++    CUDA_EXTERNAL_MEMORY_HANDLE_DESC desc;
++    struct neutron_mipmap_desc mip;
++    D3D11_TEXTURE2D_DESC tex_desc;
++    ID3D11Texture2D *tex = NULL;
++    IDXGIResource1 *dxgi_res = NULL;
++    HANDLE shared = NULL;
++    CUmipmappedArray mipmap;
++    void *ext_mem = NULL;
++    unsigned long long alloc_size = 0, alloc_offset = 0;
++    CUresult ret;
++    HRESULT hr;
++    int fd = -1;
+ 
+-    /* pD3DResource is unknown at this time and cannot be "registered" */
++    TRACE("(%p, %p, %u)\n", pCudaResource, pD3DResource, Flags);
++
++    if (!pCudaResource || !pD3DResource) return CUDA_ERROR_INVALID_VALUE;
++
++    if (FAILED(hr = ID3D11Resource_QueryInterface(pD3DResource, &IID_ID3D11Texture2D, (void **)&tex)))
++    {
++        ERR("neutron-d3d11interop: not a Texture2D (hr %#lx) -- only 2D textures are supported\n", hr);
++        return CUDA_ERROR_UNKNOWN;
++    }
++    ID3D11Texture2D_GetDesc(tex, &tex_desc);
++    TRACE("neutron-d3d11interop: %ux%u fmt=%u misc=%#x bind=%#x usage=%u\n", tex_desc.Width,
++          tex_desc.Height, tex_desc.Format, tex_desc.MiscFlags, tex_desc.BindFlags, tex_desc.Usage);
++
++    if (FAILED(hr = ID3D11Texture2D_QueryInterface(tex, &IID_IDXGIResource1, (void **)&dxgi_res)))
++    {
++        ERR("neutron-d3d11interop: no IDXGIResource1 (hr %#lx)\n", hr);
++        goto fail;
++    }
++    /* Needs D3D11_RESOURCE_MISC_SHARED_NTHANDLE on the texture. If the app did not ask for a
++     * shared resource there is no exportable allocation and nothing we can do here. */
++    if (FAILED(hr = IDXGIResource1_CreateSharedHandle(dxgi_res, NULL,
++            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, &shared)))
++    {
++        ERR("neutron-d3d11interop: CreateSharedHandle failed (hr %#lx) -- texture %ux%u misc=%#x "
++            "is not shared/exportable, so its Vulkan memory cannot be handed to CUDA\n",
++            hr, tex_desc.Width, tex_desc.Height, tex_desc.MiscFlags);
++        goto fail;
++    }
++    /* Three ways to reach the host fd, best first.
++     *
++     * 1. Re-open the resource as a D3DKMT object through the wineserver and ask for its fd. This
++     *    is what THIS Wine actually implements, and it is the same two-step win32u performs
++     *    internally for Vulkan imports. See get_shared_resource_fd_d3dkmt() for the full why.
++     * 2. Ask the server for the shared handle's own fd. Cheap to try; the shared handle is a
++     *    D3DKMT shared object rather than an fd-backed one, so this normally fails.
++     * 3. get_shared_resource_fd(), which speaks IOCTL_SHARED_GPU_RESOURCE_GET_UNIX_RESOURCE.
++     *    ⚠️ That ioctl is a PROTON invention and does NOT exist in this Wine tree at all
++     *    (grep IOCTL_SHARED_GPU_RESOURCE -> nothing), which is why it failed 87 times. Kept only
++     *    so this DLL still works on a Proton-derived runtime. */
++    if ((fd = get_shared_resource_fd_d3dkmt(shared)) >= 0)
++        ERR("neutron-d3d11interop: got unix fd %d via the D3DKMT object route\n", fd);
++    else
++    {
++        NTSTATUS status = wine_server_handle_to_fd(shared, GENERIC_ALL, &fd, NULL);
++        if (status || fd < 0)
++        {
++            TRACE("neutron-d3d11interop: direct fd fetch failed (status %#x), trying the ioctl\n",
++                  (unsigned int)status);
++            fd = get_shared_resource_fd(shared);
++        }
++        else ERR("neutron-d3d11interop: got unix fd %d directly from the shared handle\n", fd);
++    }
++    if (fd < 0)
++    {
++        ERR("neutron-d3d11interop: could not get a unix fd for the shared handle\n");
++        goto fail;
++    }
++
++    memset(&desc, 0, sizeof(desc));
++    desc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
++    desc.handle.fd = fd;
++    /* DXVK publishes the allocation's true size and offset here when it makes a texture
++     * exportable for us (see d3d11_resource.cpp). Authoritative -- prefer it over any guess. */
++    {
++        unsigned long long info[2] = {0, 0};
++        UINT info_size = sizeof(info);
++
++        if (SUCCEEDED(ID3D11Texture2D_GetPrivateData(tex, &NEUTRON_ALLOC_INFO_GUID, &info_size, info))
++            && info_size == sizeof(info) && info[0])
++        {
++            alloc_size = info[0];
++            alloc_offset = info[1];
++            ERR("neutron-d3d11interop: DXVK reports allocation size %llu offset %llu\n",
++                alloc_size, alloc_offset);
++        }
++    }
++    /* Without DXVK's answer, fall back to seeking the fd to its end -- that works for a dmabuf but
++     * not for an NVIDIA opaque fd -- and finally to a naive width*height*bpp estimate, which is
++     * almost certainly too small once tiling and alignment are accounted for. Both are guesses and
++     * both are logged as such, because a wrong size here fails much later with an error that names
++     * nothing. */
++    if (!alloc_size)
++    {
++        off_t sz = lseek(fd, 0, SEEK_END);
++        if (sz > 0)
++        {
++            alloc_size = (unsigned long long)sz;
++            lseek(fd, 0, SEEK_SET);
++            ERR("neutron-d3d11interop: no size from DXVK; fd seeks to %llu\n", alloc_size);
++        }
++        else
++        {
++            alloc_size = (unsigned long long)tex_desc.Width * tex_desc.Height * 4;
++            ERR("neutron-d3d11interop: no size from DXVK and fd is not seekable; ESTIMATING %llu\n",
++                alloc_size);
++        }
++    }
++    /* cuImportExternalMemory wants the size of the whole memory object; the array mapping is then
++     * placed at alloc_offset inside it. */
++    desc.size = alloc_size + alloc_offset;
++    desc.flags = NEUTRON_CUDA_EXTERNAL_MEMORY_DEDICATED;
++
++    if ((ret = pcuImportExternalMemory(&ext_mem, &desc)))
++    {
++        ERR("neutron-d3d11interop: cuImportExternalMemory failed: %d (size %llu for %ux%u)\n",
++            ret, desc.size, tex_desc.Width, tex_desc.Height);
++        goto fail;
++    }
++    fd = -1;   /* CUDA owns the fd once the import succeeds */
++
++    memset(&mip, 0, sizeof(mip));
++    mip.offset = alloc_offset;
++    mip.arrayDesc.Width = tex_desc.Width;
++    mip.arrayDesc.Height = tex_desc.Height;
++    mip.arrayDesc.Depth = 0;
++    mip.arrayDesc.Format = NEUTRON_CU_AD_FORMAT_UNSIGNED_INT8;
++    mip.arrayDesc.NumChannels = 4;
++    mip.numLevels = 1;
++
++    /* Which array flags CUDA accepts depends on the Vulkan *usage* bits DXVK gave the image, and
++     * that is not visible from the D3D11 side. CUDA_ARRAY3D_COLOR_ATTACHMENT asserts the image has
++     * VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; AE's texture is BIND_UNORDERED_ACCESS only (bind=0x80),
++     * so DXVK likely created it with STORAGE usage and CUDA rejects that claim with a bare
++     * CUDA_ERROR_INVALID_VALUE that names nothing. Rather than guess one combination per test run,
++     * walk a short ladder the first time and remember what worked -- one run answers it. */
++    ret = CUDA_ERROR_INVALID_VALUE;
++    if (neutron_mip_flags >= 0)
++    {
++        mip.arrayDesc.Flags = neutron_mip_flags;
++        ret = pcuExternalMemoryGetMappedMipmappedArray(&mipmap, ext_mem, &mip);
++    }
++    if (ret)
++    {
++        static const unsigned int ladder[] = {
++            NEUTRON_CUDA_ARRAY3D_SURFACE_LDST,
++            NEUTRON_CUDA_ARRAY3D_SURFACE_LDST | NEUTRON_CUDA_ARRAY3D_COLOR_ATTACHMENT,
++            0,
++            NEUTRON_CUDA_ARRAY3D_COLOR_ATTACHMENT,
++        };
++        static int ladder_logged;
++        unsigned int i;
++
++        for (i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++)
++        {
++            mip.arrayDesc.Flags = ladder[i];
++            if (!(ret = pcuExternalMemoryGetMappedMipmappedArray(&mipmap, ext_mem, &mip)))
++            {
++                if (neutron_mip_flags != (int)ladder[i])
++                    ERR("neutron-d3d11interop: mipmapped array ACCEPTED with array Flags %#x\n", ladder[i]);
++                neutron_mip_flags = ladder[i];
++                break;
++            }
++            if (!ladder_logged)
++                ERR("neutron-d3d11interop: array Flags %#x rejected: %d\n", ladder[i], ret);
++        }
++        ladder_logged = 1;
++    }
++
++    if (ret)
++    {
++        /* Every flag combination was refused, so this image's memory cannot be viewed as a CUDA
++         * array at all. NEUTRON_CUDA_DETACHED_FALLBACK trades correctness for one decisive piece of
++         * evidence: hand back a CUDA array of the right shape that is NOT the D3D texture. The
++         * overlay's pixels then go nowhere -- rulers, guides and selection handles will be missing
++         * -- but registration SUCCEEDS, so if the composition itself renders we have proved the
++         * whole black-comp chain really was this one failing call. Never a shipping default. */
++        if (getenv("NEUTRON_CUDA_DETACHED_FALLBACK"))
++        {
++            CUDA_ARRAY3D_DESCRIPTOR own = mip.arrayDesc;
++            own.Flags = NEUTRON_CUDA_ARRAY3D_SURFACE_LDST;
++            if (!(ret = pcuMipmappedArrayCreate(&mipmap, &own, 1)))
++            {
++                ERR("neutron-d3d11interop: DETACHED fallback -- registered a standalone %ux%u array. "
++                    "Overlay pixels are discarded; this only tests whether the failure was the latch.\n",
++                    tex_desc.Width, tex_desc.Height);
++                pcuDestroyExternalMemory(ext_mem);
++                ext_mem = NULL;
++            }
++        }
++        if (ret)
++        {
++            ERR("neutron-d3d11interop: cuExternalMemoryGetMappedMipmappedArray failed: %d\n", ret);
++            pcuDestroyExternalMemory(ext_mem);
++            goto fail;
++        }
++    }
++
++    if (!(res = calloc(1, sizeof(*res))))
++    {
++        pcuDestroyExternalMemory(ext_mem);
++        goto fail;
++    }
++    res->magic = NEUTRON_GFX_MAGIC;
++    res->ext_mem = ext_mem;
++    res->mipmap = mipmap;
++    res->width = tex_desc.Width;
++    res->height = tex_desc.Height;
++    res->fd = -1;
++    pthread_mutex_lock(&neutron_gfx_lock);
++    list_add_tail(&neutron_gfx_list, &res->entry);
++    pthread_mutex_unlock(&neutron_gfx_lock);
++
++    *pCudaResource = (CUgraphicsResource)res;
++    ERR("neutron-d3d11interop: REGISTERED %ux%u as %p (flags %#x)\n",
++        tex_desc.Width, tex_desc.Height, res, Flags);
++
++    IDXGIResource1_Release(dxgi_res);
++    ID3D11Texture2D_Release(tex);
++    return CUDA_SUCCESS;
++
++fail:
++    if (fd >= 0) close(fd);
++    if (shared) NtClose(shared);
++    if (dxgi_res) IDXGIResource1_Release(dxgi_res);
++    if (tex) ID3D11Texture2D_Release(tex);
+     return CUDA_ERROR_UNKNOWN;
+ }
+ 
+diff --git a/dlls/nvcuda/nvcuda.h b/dlls/nvcuda/nvcuda.h
+index fd24aca..c1bdfeb 100644
+--- a/dlls/nvcuda/nvcuda.h
++++ b/dlls/nvcuda/nvcuda.h
+@@ -27,6 +27,7 @@
+ void __attribute((visibility("hidden"))) cuda_process_tls_callbacks(DWORD reason);
+ CUresult __attribute((visibility("hidden"))) cuda_get_table(const void **table, const CUuuid *uuid, const void *orig_table, CUresult orig_result);
+ int __attribute((visibility("hidden"))) get_shared_resource_fd(HANDLE win32_handle);
++int __attribute((visibility("hidden"))) get_shared_resource_fd_d3dkmt(HANDLE shared);
+ HANDLE __attribute((visibility("hidden"))) get_shared_resource_kmt_handle(HANDLE shared_resource);
+ 
+ #endif
