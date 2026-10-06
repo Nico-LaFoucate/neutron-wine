@@ -39,20 +39,24 @@ description of each. Production patches live in `patches/`; env-gated diagnostic
 ## Build
 
 ```sh
-build/build.sh            # fetch wine-tkg, drop in patches/, apply the pinned config, build
-build/package.sh          # wrap the built tree into a versioned release artifact (see Releases)
+export NEUTRON_WINE_WORK=/var/tmp/neutron-wine   # a neutral path: Wine compiles its location in
+build/build.sh            # fetch wine-tkg at its pinned commit, apply patches/, build
+build/package.sh          # build external/ (DXVK, vkd3d-proton, NVIDIA wrappers), package -> dist/
 ```
-The result is a complete Wine tree; point Neutron at it with `NEUTRON_WINE=<…>/wine`.
-See [`build/build.sh`](build/build.sh) for prerequisites and detail. (Requires the usual Wine build
-deps + `wine-tkg-git`'s.)
+
+On Arch-based systems `build/build.sh` checks its build dependencies first and says what to
+install; elsewhere you need Wine's usual build dependencies plus wine-tkg-git's, `meson`, `ninja`,
+`glslang` and `mingw-w64-gcc`. A from-scratch build (downloads included) takes about **11.5
+minutes** on a 24-thread desktop CPU (i9-12900KF); `package.sh` adds a few more for `external/` and
+compression. The result is `dist/neutron-wine-<ver>.tar.xz` with its checksum, manifest and source
+archive.
 
 ## Releases
 
-Users don't build Wine — they download a prebuilt, versioned runtime.
-[`build/package.sh`](build/package.sh) wraps a built tree into a release artifact
-(`neutron-wine-<ver>.tar.xz` + `.sha256` + `manifest.json`) that attaches to a GitHub Release;
-Neutron's engine resolves and verifies it from the manifest (via `neutron runtime install`). The
-release version is pinned in [`build/VERSION`](build/VERSION).
+Users don't build Wine: `neutron setup` downloads the release GitHub marks **Latest** and checks it
+against its manifest. Each release carries four files: `neutron-wine-<ver>.tar.xz`, its `.sha256`,
+`manifest.json`, and `neutron-wine-<ver>-source.tar.xz` (the complete source). The release version
+is pinned in [`build/VERSION`](build/VERSION).
 
 **Full packaging & release runbook:** [`RELEASING.md`](RELEASING.md) — how to cut a release, how the
 engine consumes the manifest, and the patch-set/LGPL provenance notes. Per-patch descriptions live in
