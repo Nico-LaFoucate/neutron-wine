@@ -14,7 +14,7 @@ provision` copies them into each prefix and writes their DLL overrides.
 | nvcuda | [SveSop/nvcuda](https://github.com/SveSop/nvcuda) | `nvcuda` | yes | LGPL-2.1 |
 | nvenc | [SveSop/nvenc](https://github.com/SveSop/nvenc) | `nvcuvid`, `nvencodeapi64` | no | LGPL-2.1 |
 | wine-nvoptix | [SveSop/wine-nvoptix](https://github.com/SveSop/wine-nvoptix) | `nvoptix` | no | LGPL-2.1 / MIT |
-| dxvk-nvapi v0.9.2 | [jp7677/dxvk-nvapi](https://github.com/jp7677/dxvk-nvapi) | `nvapi64`, `nvofapi64`, x86 `nvapi` | no | MIT |
+| dxvk-nvapi v0.9.2 | [jp7677/dxvk-nvapi](https://github.com/jp7677/dxvk-nvapi) | `nvapi64`, `nvofapi64`, x86 `nvapi` | SveSop's | MIT |
 | ucrtbase shim | this repo (`ucrtshim/`) | x64 `ucrtbase` | ours | LGPL-2.1-or-later |
 
 Exact commits are in [`sources.conf`](sources.conf).
@@ -29,6 +29,12 @@ Exact commits are in [`sources.conf`](sources.conf).
   it (Photoshop, Lightroom Classic, After Effects) set in their launch profiles.
 - **nvcuda** (`patches/nvcuda/`): `cuGraphicsD3D11RegisterResource` and the D3D11/CUDA interop
   that After Effects needs to render compositions.
+- **dxvk-nvapi** (`patches/dxvk-nvapi/`): not ours. These are Sveinar Søpler's 11 commits from
+  [SveSop/dxvk-nvapi](https://github.com/SveSop/dxvk-nvapi), exported with `git format-patch`
+  so his authorship is kept. They add the V2 `NvAPI_GPU_CudaEnumComputeCapableGpus`, newer GPU
+  architectures in `NvAPI_GPU_GetGPUInfo`, and clock, P-state and fan queries. This is the exact
+  build (`69998887`) the runtime was validated with. He has since rebased these commits onto newer
+  upstream code, so that commit is on no branch any more; the patches keep it buildable.
 
 The patches also keep a few diagnostics and tuning switches that do nothing unless their
 environment variable is set: `NEUTRON_TRACE`, `NEUTRON_ROOTDUMP`, `NEUTRON_UXP_PROBE`,

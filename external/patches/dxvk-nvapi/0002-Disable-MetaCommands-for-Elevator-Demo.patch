@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 15:00:06 +0200
+Subject: [PATCH 02/11] Disable MetaCommands for Elevator Demo
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The "Elevator Demo" (Star wars) nvidia demo disregards info from this
+call, and will attempt to call other MetaCommands functions regardless,
+so report NoImplementation for this demo.
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_d3d12.cpp   |  3 +++
+ src/util/util_env.cpp | 12 ++++++++++++
+ src/util/util_env.h   |  2 ++
+ 3 files changed, 17 insertions(+)
+
+diff --git a/src/nvapi_d3d12.cpp b/src/nvapi_d3d12.cpp
+index cb1e442..d3d5208 100644
+--- a/src/nvapi_d3d12.cpp
++++ b/src/nvapi_d3d12.cpp
+@@ -39,6 +39,9 @@ NVAPI_FUNCTION NvAPI_D3D12_EnumerateMetaCommands(ID3D12Device* pDevice, NvU32* p
+     if (log::tracing())
+         log::trace(n, log::fmt::ptr(pDevice), log::fmt::ptr(pNumMetaCommands), log::fmt::ptr(pDescs));
+ 
++    if (env::noEnumerateMetaCommands())
++        return NotSupported(n);
++
+     if (!pDevice || !pNumMetaCommands)
+         return InvalidArgument(n);
+ 
+diff --git a/src/util/util_env.cpp b/src/util/util_env.cpp
+index 7cbd167..afe4eca 100644
+--- a/src/util/util_env.cpp
++++ b/src/util/util_env.cpp
+@@ -144,6 +144,10 @@ namespace dxvk::env {
+         return false;
+     }
+ 
++    bool isElevatorDemo() {
++        return getExecutableName() == std::string("ElevatorDemo-Win64-Shipping.exe");
++    }
++
+     bool needsSucceededGpuQuery() {
+         if (getExecutableName() == std::string("tlou-i.exe") || getExecutableName() == std::string("tlou-i-l.exe")) {
+             log::info("Faking GPU query success due to detecting tlou-i.exe/tlou-i-l.exe (The Last of Us Part I)");
+@@ -200,6 +204,14 @@ namespace dxvk::env {
+         return false;
+     }
+ 
++    bool noEnumerateMetaCommands() {
++        if (isElevatorDemo()) {
++            log::info("Returning not supported for NvAPI_D3D12_EnumerateMetaCommands for Elevator demo");
++            return true;
++        }
++        return false;
++    }
++
+     std::optional<NV_GPU_ARCHITECTURE_ID> getGpuArchitectureOverride() {
+         constexpr auto gpuArchEnvName = "DXVK_NVAPI_GPU_ARCH";
+         NV_GPU_ARCHITECTURE_ID override{};
+diff --git a/src/util/util_env.h b/src/util/util_env.h
+index 4331729..8d2ae50 100644
+--- a/src/util/util_env.h
++++ b/src/util/util_env.h
+@@ -17,5 +17,7 @@ namespace dxvk::env {
+ 
+     bool isD3d12NvShaderExtnEnabled();
+ 
++    bool noEnumerateMetaCommands();
++
+     std::optional<NV_GPU_ARCHITECTURE_ID> needsGpuArchitectureSpoofing(NV_GPU_ARCHITECTURE_ID architectureId, void* returnAddress);
+ }

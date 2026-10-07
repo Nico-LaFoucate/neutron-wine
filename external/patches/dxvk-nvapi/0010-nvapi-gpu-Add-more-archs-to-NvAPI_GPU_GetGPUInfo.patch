@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 18:28:39 +0200
+Subject: [PATCH 10/11] nvapi-gpu: Add more archs to NvAPI_GPU_GetGPUInfo
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_gpu.cpp | 34 +++++++++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index e6307e8..57c3776 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -713,6 +713,8 @@ NVAPI_FUNCTION NvAPI_GPU_GetGPUInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_INF
+     if (log::tracing())
+         log::trace(n, log::fmt::hnd(hPhysicalGpu), log::fmt::ptr(pGpuInfo));
+ 
++    auto returnAddress = _ReturnAddress();
++
+     if (!nvapiAdapterRegistry)
+         return ApiNotInitialized(n);
+ 
+@@ -730,15 +732,37 @@ NVAPI_FUNCTION NvAPI_GPU_GetGPUInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_INF
+             pGpuInfoV1->version = NV_GPU_INFO_VER1;
+             break;
+         }
+-        case NV_GPU_INFO_VER2:
++        case NV_GPU_INFO_VER2: {
+             *pGpuInfo = {};
+             pGpuInfo->version = NV_GPU_INFO_VER2;
+-            if (adapter->GetArchitectureId() >= NV_GPU_ARCHITECTURE_TU100) {
+-                // Values are taken from RTX4080
+-                pGpuInfo->rayTracingCores = 76;
+-                pGpuInfo->tensorCores = 304;
++            auto architectureId = adapter->GetArchitectureId();
++            architectureId = env::needsGpuArchitectureSpoofing(architectureId, returnAddress).value_or(architectureId);
++            switch (architectureId) {
++                case NV_GPU_ARCHITECTURE_AD100:
++                    // Values are taken from RTX4080
++                    pGpuInfo->rayTracingCores = 76;
++                    pGpuInfo->tensorCores = 304;
++                    break;
++                case NV_GPU_ARCHITECTURE_GA100:
++                    // Values are taken from RTX3080
++                    pGpuInfo->rayTracingCores = 70;
++                    pGpuInfo->tensorCores = 280;
++                    break;
++                case NV_GPU_ARCHITECTURE_TU100:
++                    // Values are tekane from RTX2080
++                    pGpuInfo->rayTracingCores = 46;
++                    pGpuInfo->tensorCores = 368;
++                    break;
++                default:
++                    // Values are taken from RTX5080
++                    if (architectureId >= NV_GPU_ARCHITECTURE_GB200) {
++                        pGpuInfo->rayTracingCores = 84;
++                        pGpuInfo->tensorCores = 336;
++                    }
++                    break;
+             }
+             break;
++        }
+         default:
+             return IncompatibleStructVersion(n, pGpuInfo->version);
+     }

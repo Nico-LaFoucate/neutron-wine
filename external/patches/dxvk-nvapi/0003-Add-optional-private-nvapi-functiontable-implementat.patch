@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 15:10:09 +0200
+Subject: [PATCH 03/11] Add optional private nvapi functiontable implementation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ package-release.sh            | 27 ++++++++++++++-------------
+ src/nvapi_interface.cpp       | 11 +++++++++--
+ src/nvapi_interface_private.h |  6 ++++++
+ src/nvapi_private.h           |  1 +
+ src/nvapi_private_functions.h | 11 +++++++++++
+ validate-methods.py           | 11 +++++++++--
+ 6 files changed, 50 insertions(+), 17 deletions(-)
+ create mode 100644 src/nvapi_interface_private.h
+ create mode 100644 src/nvapi_private_functions.h
+
+diff --git a/package-release.sh b/package-release.sh
+index 6e4c732..53c3acc 100755
+--- a/package-release.sh
++++ b/package-release.sh
+@@ -48,19 +48,20 @@ while [ $# -gt 0 ]; do
+ done
+ 
+ function prepare {
+-  python3 validate-methods.py \
+-    src/nvapi.cpp             \
+-    src/nvapi_sys.cpp         \
+-    src/nvapi_disp.cpp        \
+-    src/nvapi_mosaic.cpp      \
+-    src/nvapi_ngx.cpp         \
+-    src/nvapi_drs.cpp         \
+-    src/nvapi_gpu.cpp         \
+-    src/nvapi_d3d.cpp         \
+-    src/nvapi_d3d11.cpp       \
+-    src/nvapi_d3d12.cpp       \
+-    src/nvapi_vulkan.cpp      \
+-    src/nvapi_interface.cpp   \
++  python3 validate-methods.py     \
++    src/nvapi.cpp                 \
++    src/nvapi_sys.cpp             \
++    src/nvapi_disp.cpp            \
++    src/nvapi_mosaic.cpp          \
++    src/nvapi_ngx.cpp             \
++    src/nvapi_drs.cpp             \
++    src/nvapi_gpu.cpp             \
++    src/nvapi_d3d.cpp             \
++    src/nvapi_d3d11.cpp           \
++    src/nvapi_d3d12.cpp           \
++    src/nvapi_vulkan.cpp          \
++    src/nvapi_interface.cpp       \
++    src/nvapi_interface_private.h \
+     external/nvapi/nvapi_interface.h
+ }
+ 
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index 8e29477..e04beb7 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -1,5 +1,6 @@
+ #include "nvapi_private.h"
+ #include "nvapi_interface.h"
++#include "nvapi_interface_private.h"
+ #include "util/util_string.h"
+ #include "util/util_log.h"
+ 
+@@ -60,8 +61,14 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+         [id](const auto& item) { return item.id == id; });
+ 
+     if (it == std::end(nvapi_interface_table)) {
+-        log::info(str::format(n, " (0x", std::hex, id, "): Unknown function ID"));
+-        return registry.insert({id, nullptr}).first->second;
++        it = std::find_if(
++            std::begin(nvapi_interface_private_table),
++            std::end(nvapi_interface_private_table),
++            [id](const auto& item) { return item.id == id; });
++        if (it == std::end(nvapi_interface_private_table)) {
++            log::info(str::format(n," (0x", std::hex, id, "): Unknown function ID"));
++            return registry.insert({id, nullptr}).first->second;
++        }
+     }
+ 
+     auto name = std::string_view(it->func);
+diff --git a/src/nvapi_interface_private.h b/src/nvapi_interface_private.h
+new file mode 100644
+index 0000000..94ef411
+--- /dev/null
++++ b/src/nvapi_interface_private.h
+@@ -0,0 +1,6 @@
++#pragma once
++
++struct NVAPI_INTERFACE_TABLE nvapi_interface_private_table[] = {
++    // Non documented function pointers
++    { " ", 0x0 },
++};
+diff --git a/src/nvapi_private.h b/src/nvapi_private.h
+index cef584e..ea42345 100644
+--- a/src/nvapi_private.h
++++ b/src/nvapi_private.h
+@@ -51,6 +51,7 @@
+ #define NVAPI_INTERNAL 1
+ #define __NVAPI_EMPTY_SAL
+ #include <nvapi.h>
++#include "nvapi_private_functions.h"
+ #undef __NVAPI_EMPTY_SAL
+ #include <nvapi_lite_salend.h>
+ 
+diff --git a/src/nvapi_private_functions.h b/src/nvapi_private_functions.h
+new file mode 100644
+index 0000000..a0baf1b
+--- /dev/null
++++ b/src/nvapi_private_functions.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Non documented functions
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/validate-methods.py b/validate-methods.py
+index f7ec2b5..d8a8765 100644
+--- a/validate-methods.py
++++ b/validate-methods.py
+@@ -13,7 +13,7 @@ if len(sys.argv) < 3:
+ 
+ expectedMethods = []
+ regex = re.compile("^NVAPI_FUNCTION +(\\w+)")
+-for i in range(1, len(sys.argv) - 2):
++for i in range(1, len(sys.argv) - 3):
+     with open(sys.argv[i]) as file:
+         for line in file:
+             result = regex.match(line)
+@@ -23,7 +23,7 @@ for i in range(1, len(sys.argv) - 2):
+ fetch = False
+ foundMethods = []
+ regex = re.compile("^ *\\w+\\((\\w+)\\)")
+-with open(sys.argv[len(sys.argv) - 2]) as file:
++with open(sys.argv[len(sys.argv) - 3]) as file:
+     for line in file:
+         if line.strip() == "/* End */":
+             fetch = False
+@@ -36,6 +36,13 @@ with open(sys.argv[len(sys.argv) - 2]) as file:
+ 
+ availableMethods = []
+ regex = re.compile("^ *{ \\\"(\\w+)\\\", \\w+ },$")
++
++with open(sys.argv[len(sys.argv) - 2]) as file:
++    for line in file:
++        result = regex.match(line)
++        if result:
++            availableMethods.append(result.group(1))
++
+ with open(sys.argv[len(sys.argv) - 1]) as file:
+     for line in file:
+         result = regex.match(line)

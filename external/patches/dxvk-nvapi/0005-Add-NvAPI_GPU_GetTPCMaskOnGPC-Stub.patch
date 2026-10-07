@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 15:42:47 +0200
+Subject: [PATCH 05/11] Add NvAPI_GPU_GetTPCMaskOnGPC - Stub
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_gpu.cpp             | 56 +++++++++++++++++++++++++++++++++++
+ src/nvapi_interface.cpp       |  1 +
+ src/nvapi_interface_private.h |  1 +
+ src/nvapi_private_functions.h |  7 +++++
+ 4 files changed, 65 insertions(+)
+
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index 9610231..70b48f4 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -1479,3 +1479,59 @@ NVAPI_FUNCTION NvAPI_GPU_GetGPCMask(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSu
+ 
+     return Ok(str::format(n, " GPCMask support: ", *pSupport));
+ }
++
++NVAPI_FUNCTION NvAPI_GPU_GetTPCMaskOnGPC(NvPhysicalGpuHandle hPhysicalGpu, NvU32 Info, NvU32 *pSupport) {
++    // Completely unknown. Experimental!
++    constexpr auto n = __func__;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::hnd(hPhysicalGpu), Info, log::fmt::ptr(pSupport));
++
++    auto returnAddress = _ReturnAddress();
++
++    if (!nvapiAdapterRegistry)
++        return ApiNotInitialized(n);
++
++    if (!pSupport)
++        return InvalidArgument(n);
++
++    auto adapter = reinterpret_cast<NvapiAdapter*>(hPhysicalGpu);
++    if (!nvapiAdapterRegistry->IsAdapter(adapter))
++        return ExpectedPhysicalGpuHandle(n);
++
++    auto architectureId = adapter->GetArchitectureId();
++    architectureId = env::needsGpuArchitectureSpoofing(architectureId, returnAddress).value_or(architectureId);
++
++    // The caller should use the amount of GPC's obtained using NvAPI_Get_GPCMask and check the layout of the TPC's
++    // This is ofc impossible to figure out, as this is higly dependant on GPU model.
++    // However, the total amount of TPC's should more or less be SM's / 2. (Each TPC has 2 SM's)
++    // So attempt to use some sort of calculation based on X080 type cards SM amounts, and end up with a correct
++    // Total even if the actual layout is not correct.
++    switch (architectureId) {
++        case NV_GPU_ARCHITECTURE_GB200:
++            *pSupport = 63;
++            break;
++        case NV_GPU_ARCHITECTURE_AD100:
++            if (Info < 4)
++                *pSupport = 63;
++            else
++                *pSupport = 63;
++            break;
++        case NV_GPU_ARCHITECTURE_GA100:
++            if (Info == 5)
++                *pSupport = 63;
++            else
++                *pSupport = 62;
++            break;
++        case NV_GPU_ARCHITECTURE_TU100:
++            if (Info == 5)
++                *pSupport = 7;
++            else
++                *pSupport = 15;
++            break;
++        default:
++            return NotSupported(n);
++    }
++
++    return Ok(str::format(n, " TPCMaskOnGPC info: ", Info, " support: ", *pSupport));
++}
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index c32752b..b306228 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -228,6 +228,7 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_Initialize)
+     // Non documented functions
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetGPCMask)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetTPCMaskOnGPC)
+     /* End */
+ 
+ #undef INSERT_AND_RETURN_WHEN_EQUALS
+diff --git a/src/nvapi_interface_private.h b/src/nvapi_interface_private.h
+index cd20222..1e5c060 100644
+--- a/src/nvapi_interface_private.h
++++ b/src/nvapi_interface_private.h
+@@ -3,4 +3,5 @@
+ struct NVAPI_INTERFACE_TABLE nvapi_interface_private_table[] = {
+     // Non documented function pointers
+     { "NvAPI_GPU_GetGPCMask", 0x7dbe90ab },
++    { "NvAPI_GPU_GetTPCMaskOnGPC", 0xed74af30 },
+ };
+diff --git a/src/nvapi_private_functions.h b/src/nvapi_private_functions.h
+index 81f77db..5e252be 100644
+--- a/src/nvapi_private_functions.h
++++ b/src/nvapi_private_functions.h
+@@ -13,6 +13,13 @@ extern "C" {
+ ///////////////////////////////////////////////////////////////////////////////
+ NVAPI_INTERFACE NvAPI_GPU_GetGPCMask(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSupport);
+ 
++///////////////////////////////////////////////////////////////////////////////
++// FUNCTION NAME:   NvAPI_GPU_GetTPCMaskOnGPC
++//
++//! DESCRIPTION:     This API is unknown and experimental
++///////////////////////////////////////////////////////////////////////////////
++NVAPI_INTERFACE NvAPI_GPU_GetTPCMaskOnGPC(NvPhysicalGpuHandle hPhysicalGpu, NvU32 Info, NvU32 *pSupport);
++
+ #ifdef __cplusplus
+ }
+ #endif

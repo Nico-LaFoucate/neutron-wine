@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 15:34:33 +0200
+Subject: [PATCH 04/11] Add NvAPI_GPU_GetGPCMask - Stub
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_gpu.cpp             | 44 +++++++++++++++++++++++++++++++++++
+ src/nvapi_interface.cpp       |  2 ++
+ src/nvapi_interface_private.h |  2 +-
+ src/nvapi_private_functions.h |  7 ++++++
+ 4 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index 28286a1..9610231 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -1435,3 +1435,47 @@ NVAPI_FUNCTION NvAPI_GPU_GetPstates20(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_P
+ 
+     return Ok(n, alreadyLoggedOk);
+ }
++
++NVAPI_FUNCTION NvAPI_GPU_GetGPCMask(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSupport) {
++    // Completely unknown. Experimental!
++    constexpr auto n = __func__;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::hnd(hPhysicalGpu), log::fmt::ptr(pSupport));
++
++    auto returnAddress = _ReturnAddress();
++
++    if (!nvapiAdapterRegistry)
++        return ApiNotInitialized(n);
++
++    if (!pSupport)
++        return InvalidArgument(n);
++
++    auto adapter = reinterpret_cast<NvapiAdapter*>(hPhysicalGpu);
++    if (!nvapiAdapterRegistry->IsAdapter(adapter))
++        return ExpectedPhysicalGpuHandle(n);
++
++    auto architectureId = adapter->GetArchitectureId();
++    architectureId = env::needsGpuArchitectureSpoofing(architectureId, returnAddress).value_or(architectureId);
++
++    // This is a "bitmask" setting the amount of GPC's. This can vary between different cards, so use X080 type values
++    // Eg. a 4080 has 7 GPC's - 0x01111111 = 127;
++    switch (architectureId) {
++        case NV_GPU_ARCHITECTURE_GB200:
++            *pSupport = 127;
++            break;
++        case NV_GPU_ARCHITECTURE_AD100:
++            *pSupport = 127;
++            break;
++        case NV_GPU_ARCHITECTURE_GA100:
++            *pSupport = 63;
++            break;
++        case NV_GPU_ARCHITECTURE_TU100:
++            *pSupport = 63;
++            break;
++        default:
++            return NotSupported(n);
++    }
++
++    return Ok(str::format(n, " GPCMask support: ", *pSupport));
++}
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index e04beb7..c32752b 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -226,6 +226,8 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GetErrorMessage)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_Unload)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_Initialize)
++    // Non documented functions
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetGPCMask)
+     /* End */
+ 
+ #undef INSERT_AND_RETURN_WHEN_EQUALS
+diff --git a/src/nvapi_interface_private.h b/src/nvapi_interface_private.h
+index 94ef411..cd20222 100644
+--- a/src/nvapi_interface_private.h
++++ b/src/nvapi_interface_private.h
+@@ -2,5 +2,5 @@
+ 
+ struct NVAPI_INTERFACE_TABLE nvapi_interface_private_table[] = {
+     // Non documented function pointers
+-    { " ", 0x0 },
++    { "NvAPI_GPU_GetGPCMask", 0x7dbe90ab },
+ };
+diff --git a/src/nvapi_private_functions.h b/src/nvapi_private_functions.h
+index a0baf1b..81f77db 100644
+--- a/src/nvapi_private_functions.h
++++ b/src/nvapi_private_functions.h
+@@ -6,6 +6,13 @@ extern "C" {
+ 
+ // Non documented functions
+ 
++///////////////////////////////////////////////////////////////////////////////
++// FUNCTION NAME:   NvAPI_GPU_GetGPCMask
++//
++//! DESCRIPTION:     This API is unknown and experimental
++///////////////////////////////////////////////////////////////////////////////
++NVAPI_INTERFACE NvAPI_GPU_GetGPCMask(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pSupport);
++
+ #ifdef __cplusplus
+ }
+ #endif

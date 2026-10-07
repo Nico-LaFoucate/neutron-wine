@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 16:25:07 +0200
+Subject: [PATCH 09/11] Add NvAPI_GPU_ClientFanCoolersGetStatus
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi/nvml.cpp            | 14 ++++++
+ src/nvapi/nvml.h              |  4 ++
+ src/nvapi_gpu.cpp             | 91 ++++++++++++++++++++++++++++++++++-
+ src/nvapi_interface.cpp       |  1 +
+ src/nvapi_interface_private.h |  1 +
+ src/nvapi_private_functions.h | 29 +++++++++++
+ 6 files changed, 139 insertions(+), 1 deletion(-)
+
+diff --git a/src/nvapi/nvml.cpp b/src/nvapi/nvml.cpp
+index b6c92f4..923a0f7 100644
+--- a/src/nvapi/nvml.cpp
++++ b/src/nvapi/nvml.cpp
+@@ -29,6 +29,8 @@ namespace dxvk {
+         GETPROCADDR(nvmlDeviceGetMaxClockInfo);
+         GETPROCADDR(nvmlDeviceGetTemperatureV);
+         GETPROCADDR(nvmlDeviceGetThermalSettings);
++        GETPROCADDR(nvmlDeviceGetNumFans);
++        GETPROCADDR(nvmlDeviceGetFanSpeed_v2);
+         GETPROCADDR(nvmlDeviceGetFanSpeedRPM);
+         GETPROCADDR(nvmlDeviceGetPerformanceState);
+         GETPROCADDR(nvmlDeviceGetUtilizationRates);
+@@ -115,6 +117,18 @@ namespace dxvk {
+             : NVML_ERROR_FUNCTION_NOT_FOUND;
+     }
+ 
++    nvmlReturn_t Nvml::DeviceGetNumFans(nvmlDevice_t device, unsigned int* numFans) const {
++        return m_nvmlDeviceGetNumFans
++            ? m_nvmlDeviceGetNumFans(device, numFans)
++            : NVML_ERROR_FUNCTION_NOT_FOUND;
++    }
++
++    nvmlReturn_t Nvml::DeviceGetFanSpeed_v2(nvmlDevice_t device, unsigned int fan, unsigned int* speed) const {
++        return m_nvmlDeviceGetFanSpeed_v2
++            ? m_nvmlDeviceGetFanSpeed_v2(device, fan, speed)
++            : NVML_ERROR_FUNCTION_NOT_FOUND;
++    }
++
+     nvmlReturn_t Nvml::DeviceGetFanSpeedRPM(nvmlDevice_t device, nvmlFanSpeedInfo_t* fanSpeed) const {
+         return m_nvmlDeviceGetFanSpeedRPM
+             ? m_nvmlDeviceGetFanSpeedRPM(device, fanSpeed)
+diff --git a/src/nvapi/nvml.h b/src/nvapi/nvml.h
+index 1ce7c0b..d0f52ee 100644
+--- a/src/nvapi/nvml.h
++++ b/src/nvapi/nvml.h
+@@ -18,6 +18,8 @@ namespace dxvk {
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetMaxClockInfo(nvmlDevice_t device, nvmlClockType_t type, unsigned int* clock) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetTemperatureV(nvmlDevice_t device, nvmlTemperature_t* temperature) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetThermalSettings(nvmlDevice_t device, unsigned int sensorIndex, nvmlGpuThermalSettings_t* pThermalSettings) const;
++        [[nodiscard]] virtual nvmlReturn_t DeviceGetNumFans(nvmlDevice_t device, unsigned int *numFans) const;
++        [[nodiscard]] virtual nvmlReturn_t DeviceGetFanSpeed_v2(nvmlDevice_t device, unsigned int fan, unsigned int *speed) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetFanSpeedRPM(nvmlDevice_t device, nvmlFanSpeedInfo_t* fanSpeed) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetPerformanceState(nvmlDevice_t device, nvmlPstates_t* pState) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetUtilizationRates(nvmlDevice_t device, nvmlUtilization_t* utilization) const;
+@@ -48,6 +50,8 @@ namespace dxvk {
+         DECLARE_PFN(nvmlDeviceGetMaxClockInfo);
+         DECLARE_PFN(nvmlDeviceGetTemperatureV);
+         DECLARE_PFN(nvmlDeviceGetThermalSettings);
++        DECLARE_PFN(nvmlDeviceGetNumFans);
++        DECLARE_PFN(nvmlDeviceGetFanSpeed_v2);
+         DECLARE_PFN(nvmlDeviceGetFanSpeedRPM);
+         DECLARE_PFN(nvmlDeviceGetPerformanceState);
+         DECLARE_PFN(nvmlDeviceGetUtilizationRates);
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index e41bac2..e6307e8 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -1618,7 +1618,7 @@ NVAPI_FUNCTION NvAPI_GPU_GetPstatesInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU
+     if (!pPstatesInfo)
+         return InvalidArgument(n);
+ 
+-    if(pPstatesInfo->version != NV_GPU_PERF_PSTATES_INFO_VER1 && pPstatesInfo->version != NV_GPU_PERF_PSTATES_INFO_VER2 && pPstatesInfo->version != NV_GPU_PERF_PSTATES_INFO_V>
++    if(pPstatesInfo->version != NV_GPU_PERF_PSTATES_INFO_VER1 && pPstatesInfo->version != NV_GPU_PERF_PSTATES_INFO_VER2 && pPstatesInfo->version != NV_GPU_PERF_PSTATES_INFO_VER)
+         return IncompatibleStructVersion(n, pPstatesInfo->version);
+ 
+     auto adapter = reinterpret_cast<NvapiAdapter*>(hPhysicalGpu);
+@@ -1695,3 +1695,92 @@ NVAPI_FUNCTION NvAPI_GPU_GetPstatesInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU
+ 
+     return Ok(n, alreadyLoggedOk);
+ }
++
++NVAPI_FUNCTION NvAPI_GPU_ClientFanCoolersGetStatus(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_FANCOOLERSTATUS* pFanCoolerStatus) {
++    constexpr auto n = __func__;
++    thread_local bool alreadyLoggedNoNvml = false;
++    thread_local bool alreadyLoggedHandleInvalidated = false;
++    thread_local bool alreadyLoggedOk = false;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::hnd(hPhysicalGpu), log::fmt::ptr(pFanCoolerStatus));
++
++    if (!nvapiAdapterRegistry)
++        return ApiNotInitialized(n);
++
++    if (!pFanCoolerStatus)
++        return InvalidArgument(n);
++
++    if(pFanCoolerStatus->version != NV_GPU_FANCOOLERSTATUS_VER)
++        return IncompatibleStructVersion(n, pFanCoolerStatus->version);
++
++    auto adapter = reinterpret_cast<NvapiAdapter*>(hPhysicalGpu);
++    if (!nvapiAdapterRegistry->IsAdapter(adapter))
++        return ExpectedPhysicalGpuHandle(n);
++
++    auto nvml = adapter->GetNvml();
++    if (!nvml) {
++        if (env::needsSucceededGpuQuery())
++            return Ok(n, alreadyLoggedOk);
++
++         return NoImplementation(n, alreadyLoggedNoNvml);
++    }
++
++    auto nvmlDevice = adapter->GetNvmlDevice();
++    if (!nvmlDevice)
++        return HandleInvalidated(str::format(n, ": NVML available but current adapter is not NVML compatible"), alreadyLoggedHandleInvalidated);
++
++    unsigned int numFans{};
++    switch (auto resultNum = nvml->DeviceGetNumFans(nvmlDevice, &numFans)) {
++        case NVML_SUCCESS:
++            pFanCoolerStatus->fanCount = numFans;
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            return NotSupported(n);
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultNum)));
++    }
++
++    unsigned int speed{};
++    nvmlFanSpeedInfo_t fanSpeedInfo{};
++    fanSpeedInfo.version = nvmlFanSpeedInfo_v1;
++
++    for (unsigned int i = 0; i < numFans; i++) {
++        auto resultSpeed = nvml->DeviceGetFanSpeed_v2(nvmlDevice, i, &speed);
++        switch (resultSpeed) {
++            case NVML_SUCCESS:
++                pFanCoolerStatus->fanCoolersStatusEntries[i].coolerId = i;
++                pFanCoolerStatus->fanCoolersStatusEntries[i].currentLevel = speed;
++                pFanCoolerStatus->fanCoolersStatusEntries[i].minimumLevel = 25;  // Assume some starting %
++                pFanCoolerStatus->fanCoolersStatusEntries[i].maximumLevel = 100; // Hopefully 100%
++                break;
++            case NVML_ERROR_NOT_SUPPORTED:
++                break;
++            case NVML_ERROR_GPU_IS_LOST:
++                return HandleInvalidated(n);
++            default:
++                return Error(str::format(n, ": ", nvml->ErrorString(resultSpeed)));
++        }
++
++        fanSpeedInfo.fan = i;
++        auto resultRPM = nvml->DeviceGetFanSpeedRPM(nvmlDevice, &fanSpeedInfo);
++        switch (resultRPM) {
++            case NVML_SUCCESS:
++                pFanCoolerStatus->fanCoolersStatusEntries[i].currentRPM = fanSpeedInfo.speed;
++                break;
++            case NVML_ERROR_NOT_SUPPORTED:
++                break;
++            case NVML_ERROR_GPU_IS_LOST:
++                return HandleInvalidated(n);
++            default:
++                return Error(str::format(n, ": ", nvml->ErrorString(resultRPM)));
++        }
++
++        if (resultSpeed == NVML_ERROR_NOT_SUPPORTED && resultRPM == NVML_ERROR_NOT_SUPPORTED)
++            return NotSupported(n);
++    }
++
++    return Ok(n, alreadyLoggedOk);
++}
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index aee50f1..6fa5769 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -231,6 +231,7 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetTPCMaskOnGPC)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_CUDA_EnumComputeCapableByTopology)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetPstatesInfo)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_ClientFanCoolersGetStatus)
+     /* End */
+ 
+ #undef INSERT_AND_RETURN_WHEN_EQUALS
+diff --git a/src/nvapi_interface_private.h b/src/nvapi_interface_private.h
+index 4293990..40b325b 100644
+--- a/src/nvapi_interface_private.h
++++ b/src/nvapi_interface_private.h
+@@ -6,4 +6,5 @@ struct NVAPI_INTERFACE_TABLE nvapi_interface_private_table[] = {
+     { "NvAPI_GPU_GetTPCMaskOnGPC", 0xed74af30 },
+     { "NvAPI_CUDA_EnumComputeCapableByTopology", 0x36e39e6b },
+     { "NvAPI_GPU_GetPstatesInfo", 0xba94c56e },
++    { "NvAPI_GPU_ClientFanCoolersGetStatus", 0x35aed5e8 },
+ };
+diff --git a/src/nvapi_private_functions.h b/src/nvapi_private_functions.h
+index 5841035..810366f 100644
+--- a/src/nvapi_private_functions.h
++++ b/src/nvapi_private_functions.h
+@@ -24,6 +24,28 @@ typedef NV_CUDA_COMPUTE_V2         NV_CUDA_COMPUTE;
+ #define NV_CUDA_COMPUTE_VER2       MAKE_NVAPI_VERSION(NV_CUDA_COMPUTE_V2, 2)
+ #define NV_CUDA_COMPUTE_VER        NV_CUDA_COMPUTE_VER2
+ 
++#define MAX_NUMBER_OF_FAN_COOLER_STATUS_ENTRIES 32
++typedef struct {
++        NvU32 coolerId;
++        NvU32 currentRPM;
++        NvU32 minimumLevel;
++        NvU32 maximumLevel;
++        NvU32 currentLevel;
++        NvU32 Reserved[8];
++} NV_GPU_FANCOOLERSTATUS_ENTRY;
++
++typedef struct {
++        NvU32 version;
++        NvU32 fanCount;
++        NvU32 reserved[8];
++        NV_GPU_FANCOOLERSTATUS_ENTRY fanCoolersStatusEntries[MAX_NUMBER_OF_FAN_COOLER_STATUS_ENTRIES];
++} NV_GPU_FANCOOLERSTATUS_V1;
++
++typedef NV_GPU_FANCOOLERSTATUS_V1 NV_GPU_FANCOOLERSTATUS;
++
++#define NV_GPU_FANCOOLERSTATUS_VER1 MAKE_NVAPI_VERSION(NV_GPU_FANCOOLERSTATUS_V1,1)
++#define NV_GPU_FANCOOLERSTATUS_VER NV_GPU_FANCOOLERSTATUS_VER1
++
+ ///////////////////////////////////////////////////////////////////////////////
+ // FUNCTION NAME:   NvAPI_GPU_GetGPCMask
+ //
+@@ -52,6 +74,13 @@ NVAPI_INTERFACE NvAPI_CUDA_EnumComputeCapableByTopology(NV_CUDA_COMPUTE* compute
+ ///////////////////////////////////////////////////////////////////////////////
+ NVAPI_INTERFACE NvAPI_GPU_GetPstatesInfo(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_PERF_PSTATES_INFO *pPstatesInfo);
+ 
++///////////////////////////////////////////////////////////////////////////////
++// FUNCTION NAME:   NvAPI_GPU_ClientFanCoolersGetStatus
++//
++//! DESCRIPTION:     This API is unknown and experimental
++///////////////////////////////////////////////////////////////////////////////
++NVAPI_INTERFACE NvAPI_GPU_ClientFanCoolersGetStatus(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_FANCOOLERSTATUS* pFanCoolerStatus);
++
+ #ifdef __cplusplus
+ }
+ #endif

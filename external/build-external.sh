@@ -191,6 +191,9 @@ must = {
     "dxvk/x86_64-windows/dxgi.dll": [b"NEUTRON_SC_TRACE"],
     "vkd3d-proton/x86_64-windows/d3d12core.dll": [b"NEUTRON_DISABLE_BTW", b"NEUTRON_VKD3D_RT_PROBE"],
     "nvidia-libs/x86_64-unix/nvcuda.dll": [b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT"],
+    # SveSop's additions (patches/dxvk-nvapi), absent from plain v0.9.2.
+    "nvapi/x86_64-windows/nvapi64.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
+    "nvapi/i386-windows/nvapi.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
 }
 never = [b"neutron-rtlog"]
 home_needles = [home.encode() + b"/", (home + "/").encode("utf-16-le"),

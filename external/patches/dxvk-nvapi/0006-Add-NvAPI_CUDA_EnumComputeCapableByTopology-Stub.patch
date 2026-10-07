@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 15:48:54 +0200
+Subject: [PATCH 06/11] Add NvAPI_CUDA_EnumComputeCapableByTopology - Stub
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Somewhat speculative call used in PhysX Snippets from PhysX SDK
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_gpu.cpp             | 52 +++++++++++++++++++++++++++++++++++
+ src/nvapi_interface.cpp       |  1 +
+ src/nvapi_interface_private.h |  1 +
+ src/nvapi_private_functions.h | 25 +++++++++++++++++
+ 4 files changed, 79 insertions(+)
+
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index 70b48f4..8e36795 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -1535,3 +1535,55 @@ NVAPI_FUNCTION NvAPI_GPU_GetTPCMaskOnGPC(NvPhysicalGpuHandle hPhysicalGpu, NvU32
+ 
+     return Ok(str::format(n, " TPCMaskOnGPC info: ", Info, " support: ", *pSupport));
+ }
++
++NVAPI_FUNCTION NvAPI_CUDA_EnumComputeCapableByTopology(NV_CUDA_COMPUTE* computeInfo, NvU32 flags) {
++    // Experimental. Unknown struct!
++    constexpr auto n = __func__;
++
++    if (log::tracing())
++        log::trace(n, log::fmt::ptr(computeInfo), log::fmt::flags(flags));
++
++    if (!nvapiAdapterRegistry)
++        return ApiNotInitialized(n);
++
++    // Unknown struct V1 not supported
++    if (computeInfo->version != NV_CUDA_COMPUTE_VER)
++        return IncompatibleStructVersion(n, computeInfo->version);
++
++    auto cudaCapableGpus = std::vector<NvPhysicalGpuHandle>(0);
++    for (auto i = 0U; i < nvapiAdapterRegistry->GetAdapterCount(); i++) {
++        auto adapter = nvapiAdapterRegistry->GetAdapter(i);
++        if (!adapter->HasNvProprietaryDriver() || adapter->GetArchitectureId() < NV_GPU_ARCHITECTURE_GM000) // Maxwell is the oldest generation we can detect
++            continue;
++
++        cudaCapableGpus.push_back(reinterpret_cast<NvPhysicalGpuHandle>(adapter));
++    }
++
++    // It seems this function retreives number of adapters first in computeInfo->count
++    // Then it is the callers responsibility to allocate memory to hold info for "count" amount of adapters
++    if (!computeInfo->count) {
++        computeInfo->count = cudaCapableGpus.size();
++        return Ok(n);
++    }
++
++    // This checks if the caller has allocated memory for nodeInfo
++    if (!computeInfo->nodeInfo)
++        return InvalidArgument(n);
++
++    // Write required adapter info - Assume caller has only allocated size gpuCount to the array
++    // Compare possible size given in the array vs. adapters available
++    auto count = computeInfo->count < cudaCapableGpus.size()
++            ? computeInfo->count
++            : cudaCapableGpus.size();
++
++    for (auto i = 0U; i < count; i++) {
++        computeInfo->nodeInfo[i].hPhysicalGpu = cudaCapableGpus[i];
++        computeInfo->nodeInfo[i].data0 = 0x0b; // Speculative value
++        computeInfo->nodeInfo[i].data1 = 0x01; // Speculative value
++    }
++
++    // Return adaptercount
++    computeInfo->count = cudaCapableGpus.size();
++
++    return Ok(n);
++}
+diff --git a/src/nvapi_interface.cpp b/src/nvapi_interface.cpp
+index b306228..d4e96da 100644
+--- a/src/nvapi_interface.cpp
++++ b/src/nvapi_interface.cpp
+@@ -229,6 +229,7 @@ NVAPI_QUERY_INTERFACE nvapi_QueryInterface(NvU32 id) {
+     // Non documented functions
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetGPCMask)
+     INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_GPU_GetTPCMaskOnGPC)
++    INSERT_AND_RETURN_WHEN_EQUALS(NvAPI_CUDA_EnumComputeCapableByTopology)
+     /* End */
+ 
+ #undef INSERT_AND_RETURN_WHEN_EQUALS
+diff --git a/src/nvapi_interface_private.h b/src/nvapi_interface_private.h
+index 1e5c060..7862fa8 100644
+--- a/src/nvapi_interface_private.h
++++ b/src/nvapi_interface_private.h
+@@ -4,4 +4,5 @@ struct NVAPI_INTERFACE_TABLE nvapi_interface_private_table[] = {
+     // Non documented function pointers
+     { "NvAPI_GPU_GetGPCMask", 0x7dbe90ab },
+     { "NvAPI_GPU_GetTPCMaskOnGPC", 0xed74af30 },
++    { "NvAPI_CUDA_EnumComputeCapableByTopology", 0x36e39e6b },
+ };
+diff --git a/src/nvapi_private_functions.h b/src/nvapi_private_functions.h
+index 5e252be..d1cf14d 100644
+--- a/src/nvapi_private_functions.h
++++ b/src/nvapi_private_functions.h
+@@ -6,6 +6,24 @@ extern "C" {
+ 
+ // Non documented functions
+ 
++typedef struct
++{
++    NvPhysicalGpuHandle hPhysicalGpu;
++    NvU8 data0 : 4;
++    NvU8 data1 : 4;
++} NODE_INFO;
++
++typedef struct _NV_CUDA_COMPUTE
++{
++    NvU32   version;        //structure version
++    NvU32   count;
++    NODE_INFO* nodeInfo;
++} NV_CUDA_COMPUTE_V2;
++
++typedef NV_CUDA_COMPUTE_V2         NV_CUDA_COMPUTE;
++#define NV_CUDA_COMPUTE_VER2       MAKE_NVAPI_VERSION(NV_CUDA_COMPUTE_V2, 2)
++#define NV_CUDA_COMPUTE_VER        NV_CUDA_COMPUTE_VER2
++
+ ///////////////////////////////////////////////////////////////////////////////
+ // FUNCTION NAME:   NvAPI_GPU_GetGPCMask
+ //
+@@ -20,6 +38,13 @@ NVAPI_INTERFACE NvAPI_GPU_GetGPCMask(NvPhysicalGpuHandle hPhysicalGpu, NvU32 *pS
+ ///////////////////////////////////////////////////////////////////////////////
+ NVAPI_INTERFACE NvAPI_GPU_GetTPCMaskOnGPC(NvPhysicalGpuHandle hPhysicalGpu, NvU32 Info, NvU32 *pSupport);
+ 
++///////////////////////////////////////////////////////////////////////////////
++// FUNCTION NAME:   NvAPI_CUDA_EnumComputeCapableByTopology
++//
++//! DESCRIPTION:     This API is unknown and experimental
++///////////////////////////////////////////////////////////////////////////////
++NVAPI_INTERFACE NvAPI_CUDA_EnumComputeCapableByTopology(NV_CUDA_COMPUTE* computeInfo, NvU32 flags);
++
+ #ifdef __cplusplus
+ }
+ #endif

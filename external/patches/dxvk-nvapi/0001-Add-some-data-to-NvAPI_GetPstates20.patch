@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 14:49:02 +0200
+Subject: [PATCH 01/11] Add some data to NvAPI_GetPstates20
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi/nvml.cpp |   7 +++
+ src/nvapi/nvml.h   |   2 +
+ src/nvapi_gpu.cpp  | 135 +++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 140 insertions(+), 4 deletions(-)
+
+diff --git a/src/nvapi/nvml.cpp b/src/nvapi/nvml.cpp
+index 3695d96..b6c92f4 100644
+--- a/src/nvapi/nvml.cpp
++++ b/src/nvapi/nvml.cpp
+@@ -26,6 +26,7 @@ namespace dxvk {
+         GETPROCADDR(nvmlDeviceGetMemoryInfo_v2);
+         GETPROCADDR(nvmlDeviceGetPciInfo_v3);
+         GETPROCADDR(nvmlDeviceGetClockInfo);
++        GETPROCADDR(nvmlDeviceGetMaxClockInfo);
+         GETPROCADDR(nvmlDeviceGetTemperatureV);
+         GETPROCADDR(nvmlDeviceGetThermalSettings);
+         GETPROCADDR(nvmlDeviceGetFanSpeedRPM);
+@@ -96,6 +97,12 @@ namespace dxvk {
+             : NVML_ERROR_FUNCTION_NOT_FOUND;
+     }
+ 
++    nvmlReturn_t Nvml::DeviceGetMaxClockInfo(nvmlDevice_t device, nvmlClockType_t type, unsigned int* clock) const {
++        return m_nvmlDeviceGetMaxClockInfo
++            ? m_nvmlDeviceGetMaxClockInfo(device, type, clock)
++            : NVML_ERROR_FUNCTION_NOT_FOUND;
++    }
++
+     nvmlReturn_t Nvml::DeviceGetTemperatureV(nvmlDevice_t device, nvmlTemperature_t* temperature) const {
+         return m_nvmlDeviceGetTemperatureV
+             ? m_nvmlDeviceGetTemperatureV(device, temperature)
+diff --git a/src/nvapi/nvml.h b/src/nvapi/nvml.h
+index d73e74d..1ce7c0b 100644
+--- a/src/nvapi/nvml.h
++++ b/src/nvapi/nvml.h
+@@ -15,6 +15,7 @@ namespace dxvk {
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t* memory) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetPciInfo_v3(nvmlDevice_t device, nvmlPciInfo_t* pci) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetClockInfo(nvmlDevice_t device, nvmlClockType_t type, unsigned int* clock) const;
++        [[nodiscard]] virtual nvmlReturn_t DeviceGetMaxClockInfo(nvmlDevice_t device, nvmlClockType_t type, unsigned int* clock) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetTemperatureV(nvmlDevice_t device, nvmlTemperature_t* temperature) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetThermalSettings(nvmlDevice_t device, unsigned int sensorIndex, nvmlGpuThermalSettings_t* pThermalSettings) const;
+         [[nodiscard]] virtual nvmlReturn_t DeviceGetFanSpeedRPM(nvmlDevice_t device, nvmlFanSpeedInfo_t* fanSpeed) const;
+@@ -44,6 +45,7 @@ namespace dxvk {
+         DECLARE_PFN(nvmlDeviceGetMemoryInfo_v2);
+         DECLARE_PFN(nvmlDeviceGetPciInfo_v3);
+         DECLARE_PFN(nvmlDeviceGetClockInfo);
++        DECLARE_PFN(nvmlDeviceGetMaxClockInfo);
+         DECLARE_PFN(nvmlDeviceGetTemperatureV);
+         DECLARE_PFN(nvmlDeviceGetThermalSettings);
+         DECLARE_PFN(nvmlDeviceGetFanSpeedRPM);
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index c7d8f8b..28286a1 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -1286,6 +1286,7 @@ NVAPI_FUNCTION NvAPI_GPU_GetAllClockFrequencies(NvPhysicalGpuHandle hPhysicalGpu
+ NVAPI_FUNCTION NvAPI_GPU_GetPstates20(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_PERF_PSTATES20_INFO* pPstatesInfo) {
+     constexpr auto n = __func__;
+     thread_local bool alreadyLoggedNoImplementation = false;
++    thread_local bool alreadyLoggedHandleInvalidated = false;
+     thread_local bool alreadyLoggedOk = false;
+ 
+     if (log::tracing())
+@@ -1297,14 +1298,140 @@ NVAPI_FUNCTION NvAPI_GPU_GetPstates20(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_P
+     if (!pPstatesInfo)
+         return InvalidArgument(n);
+ 
++    if(pPstatesInfo->version != NV_GPU_PERF_PSTATES20_INFO_VER1 && pPstatesInfo->version != NV_GPU_PERF_PSTATES20_INFO_VER2 && pPstatesInfo->version != NV_GPU_PERF_PSTATES20_INFO_VER)
++       return IncompatibleStructVersion(n, pPstatesInfo->version);
++
+     auto adapter = reinterpret_cast<NvapiAdapter*>(hPhysicalGpu);
+     if (!nvapiAdapterRegistry->IsAdapter(adapter))
+         return ExpectedPhysicalGpuHandle(n);
+ 
+-    if (env::needsSucceededGpuQuery()) {
+-        pPstatesInfo->numPstates = 0;
+-        return Ok(n, alreadyLoggedOk);
++    auto nvml = adapter->GetNvml();
++    if (!nvml) {
++        if (env::needsSucceededGpuQuery()) {
++            pPstatesInfo->numPstates = 0;
++
++            return Ok(n, alreadyLoggedOk);
++        }
++        return NoImplementation(n, alreadyLoggedNoImplementation);
+     }
+ 
+-    return NoImplementation(n, alreadyLoggedNoImplementation);
++    auto nvmlDevice = adapter->GetNvmlDevice();
++    if (!nvmlDevice)
++        return HandleInvalidated(str::format(n, ": NVML available but current adapter is not NVML compatible"), alreadyLoggedHandleInvalidated);
++
++    // Set some default values. Only setting 1 performance mode - P0
++    NV_GPU_PERF_PSTATE_ID pState = NVAPI_GPU_PERF_PSTATE_P0;
++    pPstatesInfo->bIsEditable = 0;
++    pPstatesInfo->reserved = 0;
++    pPstatesInfo->numPstates = 1;
++    pPstatesInfo->numClocks = 3;
++    pPstatesInfo->numBaseVoltages = 0;
++    pPstatesInfo->pstates[pState].reserved = 0;
++    pPstatesInfo->pstates[pState].bIsEditable = 0;
++    pPstatesInfo->pstates[pState].pstateId = NVAPI_GPU_PERF_PSTATE_P0;
++    if (pPstatesInfo->version == NV_GPU_PERF_PSTATES20_INFO_VER2 || pPstatesInfo->version == NV_GPU_PERF_PSTATES20_INFO_VER3)
++        pPstatesInfo->ov.numVoltages = 0;
++
++    unsigned int clock{};
++
++    // Do nvml call on a "per clock unit" to get the clock
++    auto resultGpuCur = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_GRAPHICS, &clock);
++    switch (resultGpuCur) {
++        case NVML_SUCCESS:
++            pPstatesInfo->pstates[pState].clocks[0].data.single.freq_kHz = (clock * 1000);
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            break;
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultGpuCur)));
++    }
++
++    auto resultGpuMax = nvml->DeviceGetMaxClockInfo(nvmlDevice, NVML_CLOCK_GRAPHICS, &clock);
++    switch (resultGpuMax) {
++        case NVML_SUCCESS:
++            pPstatesInfo->pstates[pState].clocks[0].typeId = NVAPI_GPU_PERF_PSTATE20_CLOCK_TYPE_RANGE;
++            pPstatesInfo->pstates[pState].clocks[0].domainId = NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS;
++            pPstatesInfo->pstates[pState].clocks[0].freqDelta_kHz.value = 0;
++            pPstatesInfo->pstates[pState].clocks[0].data.range.minFreq_kHz = 210000; // Set some minimum frequency of 210 MHz
++            pPstatesInfo->pstates[pState].clocks[0].data.range.maxFreq_kHz = (clock * 1000);
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            break;
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultGpuMax)));
++    }
++
++    auto resultMemCur = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_MEM, &clock);
++    switch (resultMemCur) {
++        case NVML_SUCCESS:
++            pPstatesInfo->pstates[pState].clocks[1].data.single.freq_kHz = (clock * 1000);
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            break;
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultMemCur)));
++    }
++
++    auto resultMemMax = nvml->DeviceGetMaxClockInfo(nvmlDevice, NVML_CLOCK_MEM, &clock);
++    switch (resultMemMax) {
++        case NVML_SUCCESS:
++            pPstatesInfo->pstates[pState].clocks[1].typeId = NVAPI_GPU_PERF_PSTATE20_CLOCK_TYPE_RANGE;
++            pPstatesInfo->pstates[pState].clocks[1].domainId = NVAPI_GPU_PUBLIC_CLOCK_MEMORY;
++            pPstatesInfo->pstates[pState].clocks[1].freqDelta_kHz.value = 0;
++            pPstatesInfo->pstates[pState].clocks[1].data.range.minFreq_kHz = 1000000; // Set some minimum frequency of 1000 MHz
++            pPstatesInfo->pstates[pState].clocks[1].data.range.maxFreq_kHz = (clock * 1000);
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            break;
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultMemMax)));
++    }
++
++    auto resultVidCur = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_VIDEO, &clock);
++    switch (resultVidCur) {
++        case NVML_SUCCESS:
++            pPstatesInfo->pstates[pState].clocks[2].data.single.freq_kHz = (clock * 1000);
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            break;
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultVidCur)));
++    }
++
++    auto resultVidMax = nvml->DeviceGetMaxClockInfo(nvmlDevice, NVML_CLOCK_VIDEO, &clock);
++    switch (resultVidMax) {
++        case NVML_SUCCESS:
++            pPstatesInfo->pstates[pState].clocks[2].typeId = NVAPI_GPU_PERF_PSTATE20_CLOCK_TYPE_RANGE;
++            pPstatesInfo->pstates[pState].clocks[2].domainId = NVAPI_GPU_PUBLIC_CLOCK_VIDEO;
++            pPstatesInfo->pstates[pState].clocks[2].freqDelta_kHz.value = 0;
++            pPstatesInfo->pstates[pState].clocks[2].data.range.minFreq_kHz = 1000000; // Set some minimum frequency of 1000 MHz
++            pPstatesInfo->pstates[pState].clocks[2].data.range.maxFreq_kHz = (clock * 1000);
++            break;
++        case NVML_ERROR_NOT_SUPPORTED:
++            break;
++        case NVML_ERROR_GPU_IS_LOST:
++            return HandleInvalidated(n);
++        default:
++            return Error(str::format(n, ": ", nvml->ErrorString(resultVidMax)));
++    }
++
++    if (resultGpuCur == NVML_ERROR_NOT_SUPPORTED
++        && resultGpuMax == NVML_ERROR_NOT_SUPPORTED
++        && resultMemCur == NVML_ERROR_NOT_SUPPORTED
++        && resultMemMax == NVML_ERROR_NOT_SUPPORTED
++        && resultVidCur == NVML_ERROR_NOT_SUPPORTED
++        && resultVidMax == NVML_ERROR_NOT_SUPPORTED)
++        return NotSupported(n);
++
++    return Ok(n, alreadyLoggedOk);
+ }

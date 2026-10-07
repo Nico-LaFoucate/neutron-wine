@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 16:03:17 +0200
+Subject: [PATCH 07/11] Add BOOST clock to NvAPI_GPU_GetAllClockFrequencies
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_gpu.cpp            | 33 ++++++++++----
+ tests/mocks/nvml_mocks.h     |  1 +
+ tests/nvapi_sysinfo_nvml.cpp | 88 ++++++++++++++++++++++++++----------
+ 3 files changed, 88 insertions(+), 34 deletions(-)
+
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index 8e36795..b3fc168 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -1141,7 +1141,6 @@ NVAPI_FUNCTION NvAPI_GPU_GetCurrentPstate(NvPhysicalGpuHandle hPhysicalGpu, NV_G
+ 
+ NVAPI_FUNCTION NvAPI_GPU_GetAllClockFrequencies(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_CLOCK_FREQUENCIES* pClkFreqs) {
+     constexpr auto n = __func__;
+-    thread_local bool alreadyLoggedNotSupported = false;
+     thread_local bool alreadyLoggedNoNvml = false;
+     thread_local bool alreadyLoggedHandleInvalidated = false;
+     thread_local bool alreadyLoggedOk = false;
+@@ -1158,11 +1157,6 @@ NVAPI_FUNCTION NvAPI_GPU_GetAllClockFrequencies(NvPhysicalGpuHandle hPhysicalGpu
+     if (pClkFreqs->version != NV_GPU_CLOCK_FREQUENCIES_VER_1 && pClkFreqs->version != NV_GPU_CLOCK_FREQUENCIES_VER_2 && pClkFreqs->version != NV_GPU_CLOCK_FREQUENCIES_VER_3)
+         return IncompatibleStructVersion(n, pClkFreqs->version);
+ 
+-    // Only check for CURRENT_FREQ, and not for the other types i.e. BOOST or DEFAULT for now
+-    if ((pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_2 || pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_3)
+-        && pClkFreqs->ClockType != static_cast<NvU32>(NV_GPU_CLOCK_FREQUENCIES_CURRENT_FREQ))
+-        return NotSupported(n, alreadyLoggedNotSupported);
+-
+     auto adapter = reinterpret_cast<NvapiAdapter*>(hPhysicalGpu);
+     if (!nvapiAdapterRegistry->IsAdapter(adapter))
+         return ExpectedPhysicalGpuHandle(n);
+@@ -1192,7 +1186,16 @@ NVAPI_FUNCTION NvAPI_GPU_GetAllClockFrequencies(NvPhysicalGpuHandle hPhysicalGpu
+     unsigned int clock{};
+     // Seemingly we need to do nvml call on a "per clock unit" to get the clock
+     // Set the availability of the clock to TRUE and the nvml read clock in the nvapi struct
+-    auto resultGpu = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_GRAPHICS, &clock);
++
++    // Check if we only need "current" clock, and use "MaxClock" obtained from NVML for BOOST and BASE clocks.
++    // TODO: Would be nice to use nvmlDeviceGetClock with NVML_CLOCK_ID_APP_CLOCK_DEFAULT or NVML_CLOCK_ID_CUSTOMER_BOOST_MAX
++    nvmlReturn_t resultGpu;
++    if ((pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_2 || pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_3)
++        && pClkFreqs->ClockType != static_cast<NvU32>(NV_GPU_CLOCK_FREQUENCIES_CURRENT_FREQ))
++            resultGpu = nvml->DeviceGetMaxClockInfo(nvmlDevice, NVML_CLOCK_GRAPHICS, &clock);
++    else
++        resultGpu = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_GRAPHICS, &clock);
++
+     switch (resultGpu) {
+         case NVML_SUCCESS:
+             switch (pClkFreqs->version) {
+@@ -1221,7 +1224,13 @@ NVAPI_FUNCTION NvAPI_GPU_GetAllClockFrequencies(NvPhysicalGpuHandle hPhysicalGpu
+             return Error(str::format(n, ": ", nvml->ErrorString(resultGpu)));
+     }
+ 
+-    auto resultMem = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_MEM, &clock);
++    nvmlReturn_t resultMem;
++    if ((pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_2 || pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_3)
++        && pClkFreqs->ClockType != static_cast<NvU32>(NV_GPU_CLOCK_FREQUENCIES_CURRENT_FREQ))
++        resultMem = nvml->DeviceGetMaxClockInfo(nvmlDevice, NVML_CLOCK_MEM, &clock);
++    else
++        resultMem = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_MEM, &clock);
++
+     switch (resultMem) {
+         case NVML_SUCCESS:
+             switch (pClkFreqs->version) {
+@@ -1248,7 +1257,13 @@ NVAPI_FUNCTION NvAPI_GPU_GetAllClockFrequencies(NvPhysicalGpuHandle hPhysicalGpu
+             return Error(str::format(n, ": ", nvml->ErrorString(resultMem)));
+     }
+ 
+-    auto resultVid = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_VIDEO, &clock);
++    nvmlReturn_t resultVid;
++    if ((pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_2 || pClkFreqs->version == NV_GPU_CLOCK_FREQUENCIES_VER_3)
++        && pClkFreqs->ClockType != static_cast<NvU32>(NV_GPU_CLOCK_FREQUENCIES_CURRENT_FREQ))
++        resultVid = nvml->DeviceGetMaxClockInfo(nvmlDevice, NVML_CLOCK_VIDEO, &clock);
++    else
++        resultVid = nvml->DeviceGetClockInfo(nvmlDevice, NVML_CLOCK_VIDEO, &clock);
++
+     switch (resultVid) {
+         case NVML_SUCCESS:
+             switch (pClkFreqs->version) {
+diff --git a/tests/mocks/nvml_mocks.h b/tests/mocks/nvml_mocks.h
+index 1ba7bea..868dfb5 100644
+--- a/tests/mocks/nvml_mocks.h
++++ b/tests/mocks/nvml_mocks.h
+@@ -10,6 +10,7 @@ class NvmlMock final : public trompeloeil::mock_interface<dxvk::Nvml> {
+     IMPLEMENT_CONST_MOCK2(DeviceGetMemoryInfo_v2);
+     IMPLEMENT_CONST_MOCK2(DeviceGetPciInfo_v3);
+     IMPLEMENT_CONST_MOCK3(DeviceGetClockInfo);
++    IMPLEMENT_CONST_MOCK3(DeviceGetMaxClockInfo);
+     IMPLEMENT_CONST_MOCK2(DeviceGetTemperatureV);
+     IMPLEMENT_CONST_MOCK3(DeviceGetThermalSettings);
+     IMPLEMENT_CONST_MOCK2(DeviceGetFanSpeedRPM);
+diff --git a/tests/nvapi_sysinfo_nvml.cpp b/tests/nvapi_sysinfo_nvml.cpp
+index dba44f1..52865c8 100644
+--- a/tests/nvapi_sysinfo_nvml.cpp
++++ b/tests/nvapi_sysinfo_nvml.cpp
+@@ -385,6 +385,15 @@ TEST_CASE("NVML related sysinfo methods succeed", "[.sysinfo-nvml]") {
+             ALLOW_CALL(*t->Nvml(), DeviceGetClockInfo(_, NVML_CLOCK_VIDEO, _))
+                 .LR_SIDE_EFFECT(*_3 = videoClock)
+                 .RETURN(NVML_SUCCESS);
++            ALLOW_CALL(*t->Nvml(), DeviceGetMaxClockInfo(_, NVML_CLOCK_GRAPHICS, _))
++                .LR_SIDE_EFFECT(*_3 = graphicsClock)
++                .RETURN(NVML_SUCCESS);
++            ALLOW_CALL(*t->Nvml(), DeviceGetMaxClockInfo(_, NVML_CLOCK_MEM, _))
++                .LR_SIDE_EFFECT(*_3 = memoryClock)
++                .RETURN(NVML_SUCCESS);
++            ALLOW_CALL(*t->Nvml(), DeviceGetMaxClockInfo(_, NVML_CLOCK_VIDEO, _))
++                .LR_SIDE_EFFECT(*_3 = videoClock)
++                .RETURN(NVML_SUCCESS);
+ 
+             REQUIRE(NvAPI_Initialize() == NVAPI_OK);
+ 
+@@ -403,7 +412,7 @@ TEST_CASE("NVML related sysinfo methods succeed", "[.sysinfo-nvml]") {
+                 REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
+             }
+ 
+-            SECTION("GetAllClockFrequencies (V2) returns OK") {
++            SECTION("GetAllClockFrequencies Current Frequency (V2) returns OK") {
+                 NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
+                 frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_2;
+                 frequencies.ClockType = NV_GPU_CLOCK_FREQUENCIES_CURRENT_FREQ;
+@@ -416,7 +425,33 @@ TEST_CASE("NVML related sysinfo methods succeed", "[.sysinfo-nvml]") {
+                 REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
+             }
+ 
+-            SECTION("GetAllClockFrequencies (V3) returns OK") {
++            SECTION("GetAllClockFrequencies Base Clock (V2) returns OK") {
++                NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
++                frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_2;
++                frequencies.ClockType = NV_GPU_CLOCK_FREQUENCIES_BASE_CLOCK;
++                REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) == NVAPI_OK);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency == graphicsClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency == memoryClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
++            }
++
++            SECTION("GetAllClockFrequencies Boost Clock (V2) returns OK") {
++                NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
++                frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_2;
++                frequencies.ClockType = NV_GPU_CLOCK_FREQUENCIES_BOOST_CLOCK;
++                REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) == NVAPI_OK);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency == graphicsClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency == memoryClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
++            }
++
++            SECTION("GetAllClockFrequencies Current Frequency (V3) returns OK") {
+                 NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
+                 frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_3;
+                 frequencies.ClockType = NV_GPU_CLOCK_FREQUENCIES_CURRENT_FREQ;
+@@ -429,6 +464,32 @@ TEST_CASE("NVML related sysinfo methods succeed", "[.sysinfo-nvml]") {
+                 REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
+             }
+ 
++            SECTION("GetAllClockFrequencies Base Clock (V3) returns OK") {
++                NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
++                frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_3;
++                frequencies.ClockType = NV_GPU_CLOCK_FREQUENCIES_BASE_CLOCK;
++                REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) == NVAPI_OK);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency == graphicsClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency == memoryClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
++            }
++
++            SECTION("GetAllClockFrequencies Boost Clock (V3) returns OK") {
++                NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
++                frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_3;
++                frequencies.ClockType = NV_GPU_CLOCK_FREQUENCIES_BOOST_CLOCK;
++                REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) == NVAPI_OK);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_GRAPHICS].frequency == graphicsClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_MEMORY].frequency == memoryClock * 1000);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].bIsPresent == 1);
++                REQUIRE(frequencies.domain[NVAPI_GPU_PUBLIC_CLOCK_VIDEO].frequency == videoClock * 1000);
++            }
++
+             SECTION("GetAllClockFrequencies with unknown struct version returns incompatible-struct-version") {
+                 NV_GPU_CLOCK_FREQUENCIES frequencies;
+                 frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_3 + 1;
+@@ -441,29 +502,6 @@ TEST_CASE("NVML related sysinfo methods succeed", "[.sysinfo-nvml]") {
+                 frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER;
+                 REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) != NVAPI_INCOMPATIBLE_STRUCT_VERSION);
+             }
+-
+-            SECTION("GetAllClockFrequencies returns not-supported for base/boost clock types") {
+-                struct Data {
+-                    NV_GPU_CLOCK_FREQUENCIES_CLOCK_TYPE clockType;
+-                };
+-                auto args = GENERATE(
+-                    Data{NV_GPU_CLOCK_FREQUENCIES_BASE_CLOCK},
+-                    Data{NV_GPU_CLOCK_FREQUENCIES_BOOST_CLOCK});
+-
+-                SECTION("GetAllClockFrequencies (V2) returns not-supported") {
+-                    NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
+-                    frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_2;
+-                    frequencies.ClockType = args.clockType;
+-                    REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) == NVAPI_NOT_SUPPORTED);
+-                }
+-
+-                SECTION("GetAllClockFrequencies (V3) returns not-supported") {
+-                    NV_GPU_CLOCK_FREQUENCIES_V2 frequencies;
+-                    frequencies.version = NV_GPU_CLOCK_FREQUENCIES_VER_3;
+-                    frequencies.ClockType = args.clockType;
+-                    REQUIRE(NvAPI_GPU_GetAllClockFrequencies(handle, &frequencies) == NVAPI_NOT_SUPPORTED);
+-                }
+-            }
+         }
+     }
+ 

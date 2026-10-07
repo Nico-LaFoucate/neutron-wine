@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sveinar=20S=C3=B8pler?= <cybermax@dexter.no>
+Date: Tue, 5 May 2026 19:52:35 +0200
+Subject: [PATCH 11/11] nvapi_gpu: Add V2 struct to
+ NvAPI_GPU_CudaEnumComputeCapableGpus
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Sveinar Søpler <cybermax@dexter.no>
+---
+ src/nvapi_gpu.cpp | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/nvapi_gpu.cpp b/src/nvapi_gpu.cpp
+index 57c3776..9cdf346 100644
+--- a/src/nvapi_gpu.cpp
++++ b/src/nvapi_gpu.cpp
+@@ -675,7 +675,7 @@ NVAPI_FUNCTION NvAPI_GPU_CudaEnumComputeCapableGpus(NV_COMPUTE_GPU_TOPOLOGY* pCo
+     if (!pComputeTopo)
+         return InvalidArgument(n);
+ 
+-    if (pComputeTopo->version != NV_COMPUTE_GPU_TOPOLOGY_VER1)
++    if (pComputeTopo->version != NV_COMPUTE_GPU_TOPOLOGY_VER1 && pComputeTopo->version != NV_COMPUTE_GPU_TOPOLOGY_VER)
+         return IncompatibleStructVersion(n, pComputeTopo->version);
+ 
+     auto cudaCapableGpus = std::vector<NvPhysicalGpuHandle>(0);
+@@ -700,6 +700,34 @@ NVAPI_FUNCTION NvAPI_GPU_CudaEnumComputeCapableGpus(NV_COMPUTE_GPU_TOPOLOGY* pCo
+             }
+             break;
+         }
++        case NV_COMPUTE_GPU_TOPOLOGY_VER: {
++            auto pComputeTopoV2 = reinterpret_cast<NV_COMPUTE_GPU_TOPOLOGY_V2*>(pComputeTopo);
++
++            // If caller only wants to check gpuCount, but has not allocated memory for computeGpus
++            if (!pComputeTopoV2->gpuCount) {
++                pComputeTopoV2->gpuCount = cudaCapableGpus.size();
++                return Ok(n);
++            }
++            // Safeguard in case caller has not allocated memory for computeGpus struct
++            if (!pComputeTopoV2->computeGpus)
++                return InvalidArgument(n);
++
++            // Write required adapter info - Assume caller has only allocated size gpuCount to the array
++            // Compare possible size given in the array vs. adapters available
++            auto count = pComputeTopoV2->gpuCount < cudaCapableGpus.size()
++            ? pComputeTopoV2->gpuCount
++            : cudaCapableGpus.size();
++
++            // Fill in physical info in the array
++            for (auto i = 0U; i < count; i++) {
++                pComputeTopoV2->computeGpus[i].hPhysicalGpu = cudaCapableGpus[i];
++                pComputeTopoV2->computeGpus[i].flags = flags;
++            }
++
++            // Return total number of adapters in gpuCount
++            pComputeTopoV2->gpuCount = cudaCapableGpus.size();
++            break;
++        }
+         default:
+             return Error(n); // Unreachable, but just to be sure
+     }
