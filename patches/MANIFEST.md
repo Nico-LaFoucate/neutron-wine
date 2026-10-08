@@ -26,9 +26,8 @@ plumbing.
 
 **Why it matters:** Premiere's display surface runs on the **OpenGL** backend
 (`DS.DisableDirectXDisplay=true`), so without this extension its **Program Monitor renders BLACK**
-while the rest of the UI looks perfectly fine. Bisected in both directions 2026-08-03 (see
-`~/neutron/docs/wiki/INCIDENTS.md`): reverting these three binaries alone blacks the monitor;
-reverting `dxcore` alone does not.
+while the rest of the UI looks perfectly fine. Bisected in both directions 2026-08-03: reverting
+these three binaries alone blacks the monitor; reverting `dxcore` alone does not.
 
 ⛔ **The three binaries move as ONE SET** (`win32u.so`, `opengl32.so`, `opengl32.dll`) — they share
 the `dlls/opengl32/unixlib.h` win32u↔opengl32 interface. Mixing vintages gives
@@ -54,10 +53,10 @@ would swallow their hunks. Leave it alone; add to `zzzzz` instead.
 Verified: full-set apply reproduces `effect.c` and `d2d1_private.h` byte-for-byte.
 
 ### Regenerating a patch
-Use `~/neutron/preserved-fixes/harnesses/regen-mypatch.sh <patch> <file>...`. It rebuilds the true
-base (HEAD + every earlier patch in **system collation order**, seeding every file they touch) and
-diffs against the dev tree. **Only valid when no later patch touches the same files** — otherwise
-you capture theirs too. It refuses any file wine-staging modifies, since HEAD is then the wrong base.
+Rebuild the true base (HEAD + every earlier patch in **system collation order**, seeding every file
+they touch) and diff your working tree against it. **Only valid when no later patch touches the same
+files** — otherwise you capture theirs too. Don't do it for a file wine-staging modifies, since HEAD
+is then the wrong base. For a new patch, use [`../build/mkpatch.sh`](../build/mkpatch.sh).
 
 
 
@@ -298,7 +297,7 @@ unimplemented-function exception and **crashes the app on File → New**. Touche
 
 ### `neutron-adobe-winrt-launch.mypatch`
 The WinRT/launch fixes genuine Photoshop 2026 (27.8) needs to reach its licensed home screen
-(snapshot 2026-07-08, converted from `neutron` repo `patches/staging-20260708-adobe-winrt/`):
+(snapshot 2026-07-08):
 - **windows.graphics**: implements the `DisplayInformation` WinRT class (`GetForCurrentView`,
   DPI/orientation properties) with a `weakref.{c,h}` helper (copied verbatim from upstream
   `dlls/windows.ui/weakref.{c,h}`). PS queries display info via WinRT at startup.
@@ -405,7 +404,7 @@ stall. The datafile mapping is demand-paged (no section layout), ~190× faster (
 the version-resource `FindResource`/`LoadResource` path returns byte-identical data (verified: same
 816-byte `VS_VERSION_INFO`, same parsed ProductVersion). Measured: Size+Get on Photoshop.exe
 121.7 ms → 0.42 ms (288×); the LrC submenu stall dropped ~10 s → ~100 ms. Touches:
-`dlls/kernelbase/version.c`. Upstreamable. Plain-English writeup: neutron `docs/wiki/PERFORMANCE.md`.
+`dlls/kernelbase/version.c`. Upstreamable.
 
 ## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
 
@@ -462,8 +461,8 @@ would have been silently lost. **Cut patches against the patched tree, never the
 ❌ Does NOT by itself make the composition appear — and the "second bug" named here was
 **misdiagnosed**. AE's UI-overlay draw does not fail on D2D command lists: it fails because
 `cuGraphicsD3D11RegisterResource` returns `CUDA_ERROR_UNKNOWN` (161 failures = 161 latches, 1:1).
-Fixed outside Wine, in nvcuda + DXVK — see
-`~/neutron/preserved-fixes/patches/README-cuda-d3d11-interop.md`. ✅ With both, the composition
+Fixed outside Wine, in nvcuda + DXVK — see `external/patches/nvcuda` and `external/patches/dxvk`
+([`../external/README.md`](../external/README.md)). ✅ With both, the composition
 renders **and** the UI overlay draws (user-confirmed 2026-08-03).
 
 **`neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen:**
