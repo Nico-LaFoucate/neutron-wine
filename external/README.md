@@ -7,7 +7,8 @@ provision` copies them into each prefix and writes their DLL overrides.
 
 | Project | Upstream | Ships | Neutron patch | License |
 |---|---|---|---|---|
-| DXVK | [doitsujin/dxvk](https://github.com/doitsujin/dxvk) | x64 `d3d11`, `dxgi` | yes | zlib |
+| DXVK | [doitsujin/dxvk](https://github.com/doitsujin/dxvk) | x64 `d3d11` | yes | zlib |
+| DXVK (bridge hooks only) | same | x64 `dxgi` | yes (`patches/dxvk-dxgi`) | zlib |
 | DXVK (unmodified) | same | x64 `d3d8`, `d3d9`, `d3d10core`; all x86 | no | zlib |
 | vkd3d-proton | [HansKristian-Work/vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) | x64 `d3d12`, `d3d12core` | yes | LGPL-2.1 |
 | vkd3d-proton v3.0.1 | same | x86 `d3d12`, `d3d12core` | no | LGPL-2.1 |
@@ -24,6 +25,10 @@ Exact commits are in [`sources.conf`](sources.conf).
 - **DXVK** (`patches/dxvk/`): presents the app's swapchain through GDI into the window
   (`NEUTRON_GDI_PRESENT`), which is what makes Premiere Pro's GPU-drawn interface reach the
   screen under Wayland. Also exports textures for CUDA interop and adds bounded-wait acquire.
+- **dxgi** (`patches/dxvk-dxgi/`): only the two hooks that hand swapchains to Wine's
+  DirectComposition bridge, exactly what the validated dxgi carried. `patches/dxvk` also changes
+  dxgi (forwarding the bounded-wait handshake, storing the background colour, tracing), but those
+  changes never ran in daily use, so dxgi is built without them and the build checks that.
 - **vkd3d-proton** (`patches/vkd3d-proton/`): the blit-to-window present path
   (`libs/vkd3d/blit_to_window.h`) and `NEUTRON_DISABLE_BTW`, which apps that draw better without
   it (Photoshop, Lightroom Classic, After Effects) set in their launch profiles.
@@ -36,8 +41,9 @@ Exact commits are in [`sources.conf`](sources.conf).
   build (`69998887`) the runtime was validated with. He has since rebased these commits onto newer
   upstream code, so that commit is on no branch any more; the patches keep it buildable.
 
-The patches also keep a few diagnostics and tuning switches that do nothing unless their
-environment variable is set: `NEUTRON_TRACE`, `NEUTRON_ROOTDUMP`, `NEUTRON_UXP_PROBE`,
+A few log lines are always on, as they were in the validated builds (for example dxgi's
+`dcomp-hook PresentBase` on every present). The patches also keep diagnostics and tuning switches
+that do nothing unless their environment variable is set: `NEUTRON_TRACE`, `NEUTRON_ROOTDUMP`, `NEUTRON_UXP_PROBE`,
 `NEUTRON_SC_TRACE`, `NEUTRON_DIRTYRECTS`, `NEUTRON_ACQUIRE_TIMEOUT_NS`, `NEUTRON_VKD3D_RT_PROBE`,
 `NEUTRON_CUDA_PLAYBACK_EXPERIMENT`.
 

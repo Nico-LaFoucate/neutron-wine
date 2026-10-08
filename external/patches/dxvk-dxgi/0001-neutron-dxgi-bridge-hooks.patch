@@ -1,0 +1,47 @@
+diff --git a/src/dxgi/dxgi_surface.cpp b/src/dxgi/dxgi_surface.cpp
+index 0c11b0c2..463a6bc3 100644
+--- a/src/dxgi/dxgi_surface.cpp
++++ b/src/dxgi/dxgi_surface.cpp
+@@ -44,6 +44,16 @@ namespace dxvk {
+           VkInstance                Instance,
+           VkPhysicalDevice          Adapter,
+           VkSurfaceKHR*             pSurface) {
++    {
++      static void (*dcomp_set)(HWND) = nullptr;
++      if (!dcomp_set) {
++        HMODULE h = ::GetModuleHandleA("dcomp.dll");
++        if (!h) h = ::LoadLibraryA("dcomp.dll");
++        if (h) dcomp_set = reinterpret_cast<void(*)(HWND)>(::GetProcAddress(h, "dcomp_set_pending_hwnd"));
++      }
++      if (dcomp_set) dcomp_set(m_window);
++      Logger::err(str::format("dcomp-bridge SET m_window=", (void*)m_window, " resolved=", dcomp_set != nullptr));
++    }
+     return wsi::createSurface(m_window, m_vkGetInstanceProcAddr, Instance, pSurface);
+   }
+ 
+diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
+index 0aa3fc70..7f8c9f68 100644
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -343,6 +343,21 @@ namespace dxvk {
+           UINT                      PresentFlags,
+     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+ 
++    {
++      static void (*dcomp_reg)(HWND, IUnknown*) = nullptr;
++      Logger::err(str::format("dcomp-hook PresentBase m_window=", (void*)m_window, " is_d3d12=", m_is_d3d12));
++      if (!dcomp_reg) {
++        HMODULE h = ::GetModuleHandleA("dcomp.dll");
++        if (!h) h = ::LoadLibraryA("dcomp.dll");
++        if (h) dcomp_reg = reinterpret_cast<void(*)(HWND, IUnknown*)>(::GetProcAddress(h, "dcomp_register_external"));
++      }
++      /* gluon-present-register: do NOT require m_window here. Composition swapchains
++       * have m_window == 0; the dcomp side falls back to the pending hwnd (the real
++       * target window the surface factory resolved) so the frame still blits to the
++       * correct window (e.g. Premiere's program monitor). */
++      if (dcomp_reg)
++        dcomp_reg(m_window, static_cast<IUnknown*>(static_cast<IDXGISwapChain*>(this)));
++    }
+     if (SyncInterval > 4)
+       return DXGI_ERROR_INVALID_CALL;
+ 

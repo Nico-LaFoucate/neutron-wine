@@ -110,6 +110,7 @@ else
     for n in "${NAMES[@]}"; do fetch "$n"; done
 
     build dxvk          dxvk64        build-win64.txt
+    build dxvk-dxgi     dxvk-dxgi64   build-win64.txt
     build dxvk-stock    dxvk-stock64  build-win64.txt
     build dxvk-stock    dxvk-stock32  build-win32.txt
     build vkd3d-proton  vkd3d64       build-win64.txt
@@ -121,7 +122,8 @@ else
     build dxvk-nvapi    nvapi32       build-win32.txt -Denable_tests=false
 
     L="$OUT/lib/wine"
-    for f in d3d11 dxgi;             do take dxvk64       $f.dll "$L/dxvk/x86_64-windows"; done
+    take dxvk64      d3d11.dll "$L/dxvk/x86_64-windows"
+    take dxvk-dxgi64 dxgi.dll  "$L/dxvk/x86_64-windows"
     for f in d3d8 d3d9 d3d10core;    do take dxvk-stock64 $f.dll "$L/dxvk/x86_64-windows"; done
     for f in d3d8 d3d9 d3d10core d3d11 dxgi; do take dxvk-stock32 $f.dll "$L/dxvk/i386-windows"; done
     for f in d3d12 d3d12core;        do take vkd3d64      $f.dll "$L/vkd3d-proton/x86_64-windows"; done
@@ -137,7 +139,7 @@ else
         "$L/neutron/x86_64-windows/ucrtbase.dll"
 
     # Licenses: every LICENSE/COPYING/NOTICE file in each source tree, submodules included.
-    declare -A PROJ=( [dxvk]=dxvk [dxvk-stock]=dxvk [vkd3d-proton]=vkd3d-proton [vkd3d-x86]=vkd3d-proton
+    declare -A PROJ=( [dxvk]=dxvk [dxvk-dxgi]=dxvk [dxvk-stock]=dxvk [vkd3d-proton]=vkd3d-proton [vkd3d-x86]=vkd3d-proton
                       [nvcuda]=nvcuda [nvenc]=nvenc [wine-nvoptix]=wine-nvoptix [dxvk-nvapi]=dxvk-nvapi )
     for n in "${NAMES[@]}"; do
         ( cd "$WORK/src/$n" && find . -maxdepth 5 -type f \
@@ -174,7 +176,9 @@ def data(rel):
 rows = []
 for a, d in (("x86_64-windows", "system32"), ("i386-windows", "syswow64")):
     for dll in ("d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"):
-        s = "dxvk" if (a == "x86_64-windows" and dll in ("d3d11", "dxgi")) else "dxvk-stock"
+        s = "dxvk-stock"
+        if a == "x86_64-windows" and dll == "d3d11": s = "dxvk"
+        if a == "x86_64-windows" and dll == "dxgi": s = "dxvk-dxgi"
         rows.append((f"dxvk/{a}/{dll}.dll", s, dll, "native", d))
     for dll in ("d3d12", "d3d12core"):
         rows.append((f"vkd3d-proton/{a}/{dll}.dll", "vkd3d-proton" if a == "x86_64-windows" else "vkd3d-x86", dll, "native", d))
@@ -188,7 +192,7 @@ rows.append(("neutron/x86_64-windows/ucrtbase.dll", "ucrtshim", "*ucrtbase", "na
 # Our changes must be in the patched DLLs, and nowhere else.
 must = {
     "dxvk/x86_64-windows/d3d11.dll": [b"NEUTRON_GDI_PRESENT", b"NEUTRON_DXVK_EXPORT_TEXTURES"],
-    "dxvk/x86_64-windows/dxgi.dll": [b"NEUTRON_SC_TRACE"],
+    "dxvk/x86_64-windows/dxgi.dll": [b"dcomp_register_external", b"dcomp_set_pending_hwnd"],
     "vkd3d-proton/x86_64-windows/d3d12core.dll": [b"NEUTRON_DISABLE_BTW", b"NEUTRON_VKD3D_RT_PROBE"],
     "nvidia-libs/x86_64-unix/nvcuda.dll": [b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT"],
     # SveSop's additions (patches/dxvk-nvapi), absent from plain v0.9.2.
@@ -196,10 +200,13 @@ must = {
     "nvapi/i386-windows/nvapi.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
 }
 never = [b"neutron-rtlog"]
+# dxgi must behave like the validated 2026-07-23 build: the bridge hooks above and nothing else.
+dxgi_never = [b"\xa1\xf6\xd0\xb5\x4e\x7c\x2a\x4d\x9b\x8e\x3f\x5a\x2c\x1d\x0e\x9f",  # IID_INeutronBoundedAcquire
+              b"NEUTRON_", b"neutron-acq", b"neutron-sctrace", b"GetBackgroundColor -> S_OK"]
 home_needles = [home.encode() + b"/", (home + "/").encode("utf-16-le"),
                 home.replace("/", "\\").encode(), home.replace("/", "\\").encode("utf-16-le")]
 # DXVK's version is `git describe --dirty=+`; the hash abbreviation length varies by clone.
-dxvk_ver = {"dxvk": rb"v2\.7\.1-634-g3c6f508[0-9a-f]*\+", "dxvk-stock": rb"v2\.7\.1-609-g02bcc98[0-9a-f]*"}
+dxvk_ver = {"dxvk": rb"v2\.7\.1-634-g3c6f508[0-9a-f]*\+", "dxvk-dxgi": rb"v2\.7\.1-634-g3c6f508[0-9a-f]*\+", "dxvk-stock": rb"v2\.7\.1-609-g02bcc98[0-9a-f]*"}
 files = []
 for rel, s, key, val, dest in rows:
     p = os.path.join(L, rel)
@@ -212,6 +219,9 @@ for rel, s, key, val, dest in rows:
         errors.append(f"{rel}: built from unmodified {s} but contains NEUTRON_ strings")
     for m in never:
         if m in b: errors.append(f"{rel}: contains {m.decode()}")
+    if rel == "dxvk/x86_64-windows/dxgi.dll":
+        for m in dxgi_never:
+            if m in b: errors.append(f"{rel}: contains {m!r}, which the validated dxgi did not have")
     for m in home_needles:
         if m in b: errors.append(f"{rel}: contains the builder's home path")
     if "-unix/" in rel:
