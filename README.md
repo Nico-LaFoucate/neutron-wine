@@ -8,33 +8,44 @@ This repository is the **Neutron wine fork as a patch set + build recipe** (the 
 **not** a full copy of the Wine source tree. It pins an upstream Wine base and a set of Neutron patches
 that, applied and built, produce the Wine that Neutron's engine runs.
 
-> Phase note: Neutron owns its wine (Proton-style). The Neutron CLI's launch path uses this build via
-> `$NEUTRON_WINE` / a packaged dist path; today that resolves to a local build of this repo, later to a
-> versioned, bundled runtime artifact.
+The runtime built from this repo also carries the graphics and NVIDIA translation layers the apps run
+on (DXVK, vkd3d-proton, the NVIDIA wrappers) and a ucrtbase shim. They are built from upstream source
+at pinned commits, with our patches, from [`external/`](external/). The current version is
+**11.10-99** ([`build/VERSION`](build/VERSION)).
 
 ## Upstream base
 
 - **Wine:** `wine-11.10`, **staging**, with **ntsync** (TkG Staging-NTsync flavor).
 - Built reference: `wine-11.10.r0.gf45e84d7`.
-- Build framework: [`wine-tkg-git`](https://github.com/Frogging-Family/wine-tkg-git) — the config is
-  pinned in [`build/customization.cfg`](build/customization.cfg).
+- Build framework: [`wine-tkg-git`](https://github.com/Frogging-Family/wine-tkg-git), pinned to commit
+  `8359b3d5` ([`build/WINE_TKG_COMMIT`](build/WINE_TKG_COMMIT)); its config is in
+  [`build/customization.cfg`](build/customization.cfg).
 
 ## Patches
 
-Applied on top of the upstream base. See [`patches/MANIFEST.md`](patches/MANIFEST.md) for a one-line
-description of each. Production patches live in `patches/`; env-gated diagnostics live in
-`patches/diagnostic/`.
+Applied on top of the upstream base by [`build/build.sh`](build/build.sh).
+[`patches/MANIFEST.md`](patches/MANIFEST.md) has notes on some of them.
 
-| Patch | Purpose |
-| --- | --- |
-| `neutron-winewayland-fractional-scale` | Crisp HiDPI UI under `winewayland.drv` via `wp_fractional_scale_v1` (1:1 buffer→output). |
-| `neutron-winewayland-xdg-popup` | Menu-bar dropdowns as `xdg_popup` (not `wl_subsurface`) so KWin stops clipping their bottom. |
-| `neutron-present-pacer` | X11 software frame pacer in `winex11.drv` (kills program-monitor playback judder). |
-| `neutron-dcomp-bridge` | DirectComposition device impl + DXVK/vkd3d swapchain→window present bridge. |
-| `neutron-jsonobject-homescreen` | UXP home-screen locale/i18n fix. |
-| `windows-web-jsonobjectstatics` | Supporting JSONObject statics fix. |
-| `diagnostic/neutron-present-timing` | Present-cadence timing probe (`NEUTRON_PRESENT_DEBUG`). |
-| `diagnostic/neutron-uxp-present-probe` | UXP surface present probe. |
+| Path | What it holds | Built? |
+| --- | --- | --- |
+| `patches/*.mypatch` | The production patch set. | Yes |
+| `patches/diagnostic/` | Diagnostic probes, off unless their environment variable is set. | Only with `INCLUDE_DIAGNOSTIC=1` |
+| `patches/unverified/` | Work kept for later that hasn't been reviewed and tested yet. | No |
+| `patches/disproven/`, `patches/retired/` | Patches kept for the record. | No |
+| `external/patches/` | Our DXVK, vkd3d-proton and nvcuda patches, and SveSop's dxvk-nvapi commits. See [`external/README.md`](external/README.md). | Yes, by `build/package.sh` |
+
+The production set covers:
+
+- the Wayland driver (`winewayland.drv`): fractional scaling, popups and menus, subsurfaces, drag
+  and drop, focus and the work area;
+- Direct2D (`d2d1`): geometry, layers and masks, effects, WIC render targets;
+- windowing and GDI (`win32u`, `user32`, `gdi32`);
+- DirectComposition (`dcomp`) and `dxcore`;
+- DirectWrite (`dwrite`) and WIC;
+- the file dialog and common controls (`comdlg32`, `comctl32`), and the window decorations (caption
+  buttons, frame and menu bar colors);
+- smaller fixes in ntdll, wineserver, I/O completion ports, mshtml, WinRT, winhttp, WinTab (pen
+  input), the IME, OpenGL/Direct3D interop and more.
 
 ## Build
 
@@ -64,14 +75,23 @@ engine consumes the manifest, and the patch-set/LGPL provenance notes. Per-patch
 
 ## License
 
-LGPL-2.1-or-later, the same as Wine. See [LICENSE](LICENSE). The patches are derivative works of
-Wine and are licensed accordingly. Neutron (the CLI) is a separate LGPL-2.1-or-later repo; Collider (the
-GUI) and Mud Hut (the installer) are Apache-2.0.
+neutron-wine is licensed under the **GNU Lesser General Public License, version 2.1 or later**
+(`LGPL-2.1-or-later`), the same as Wine. See [`LICENSE`](LICENSE) for the full text. Each patch file
+carries the license of the project it modifies: Wine's for `patches/`, and each upstream project's for
+`external/patches/` (listed in [`external/README.md`](external/README.md)). Neutron (the CLI) is a
+separate LGPL-2.1-or-later repo; Collider (the GUI) and Mud Hut (the installer) are Apache-2.0.
 
 ## Status
 
 Beta. Tested on three machines, all CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs. AMD and Intel
-GPUs aren't validated yet.
+GPUs, other distributions and other desktops aren't validated yet.
+
+## Reporting bugs
+
+Bugs in any Neutron piece, including neutron-wine, go to
+[Neutron's Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose). Questions go to
+[Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions). Report security problems
+privately: see [`SECURITY.md`](SECURITY.md). To contribute, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Disclaimer
 
