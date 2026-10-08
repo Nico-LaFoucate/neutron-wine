@@ -1,0 +1,53 @@
+name: Bug report
+description: A bug in the neutron-wine runtime itself.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. This form is for the neutron-wine runtime itself: building or packaging it, or a Wine bug you've traced to the runtime.
+        If an Adobe app misbehaves while running and you aren't sure why, report it on [Neutron's Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose) instead. Please report one bug per issue.
+  - type: input
+    id: runtime-version
+    attributes:
+      label: Runtime version
+      description: The neutron-wine line from `neutron --version`, or the version you built (`build/VERSION`).
+      placeholder: e.g. 11.10-99
+    validations:
+      required: true
+  - type: dropdown
+    id: app
+    attributes:
+      label: App
+      options:
+        - Premiere Pro
+        - After Effects
+        - Photoshop
+        - Lightroom Classic
+        - Illustrator
+        - Media Encoder
+        - Animate
+        - Lightroom (cloud, experimental)
+        - None (building or packaging)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Drag the relevant log file in here, or paste the part that matters. Launches from Collider or the app menu write a log to `~/.local/share/neutron/logs/`, named after the app and prefix (from a terminal, add `--log` to `neutron launch`). For a build problem, paste the end of the build output.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution, desktop and GPU
+      placeholder: e.g. CachyOS, KDE Plasma on Wayland, NVIDIA RTX 3080

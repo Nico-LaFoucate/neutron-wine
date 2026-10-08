@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: An Adobe app misbehaves while running
+    url: https://github.com/Nico-LaFoucate/Neutron/issues/new/choose
+    about: Launching and running the apps is handled in Neutron. Report it on Neutron's Issues.
+  - name: Questions and help
+    url: https://github.com/Nico-LaFoucate/Neutron/discussions
+    about: Ask questions and get help in GitHub Discussions on Neutron.
+  - name: Security problem
+    url: https://github.com/Nico-LaFoucate/Neutron/security/advisories/new
+    about: Report security problems privately, never in a public issue.

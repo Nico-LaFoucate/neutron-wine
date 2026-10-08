@@ -7,7 +7,9 @@ The short version:
 
 - Sign off every commit (`git commit -s`, the Developer Certificate of Origin). There is no CLA.
 - Test your change on a real Adobe app, and say in the pull request what you tested.
-- Report bugs on [Neutron's Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose).
-  Questions go to [Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions).
+- Report bugs on this repository's [Issues](https://github.com/Nico-LaFoucate/neutron-wine/issues/new/choose).
+  An Adobe app misbehaving while running goes to
+  [Neutron's Issues](https://github.com/Nico-LaFoucate/Neutron/issues/new/choose). Questions go to
+  [Discussions](https://github.com/Nico-LaFoucate/Neutron/discussions).
 
 Building: see the [Build](README.md#build) section of the README (`build/build.sh`, then `build/package.sh`).
