@@ -74,6 +74,13 @@ is pinned in [`build/VERSION`](build/VERSION).
 engine consumes the manifest, and the patch-set/LGPL provenance notes. Notes on some of the patches are in
 [`patches/MANIFEST.md`](patches/MANIFEST.md); most patch files also open with their own description.
 
+## Support Neutron
+
+Neutron was made for free, and every donation helps keep the project alive and in development.
+
+- [Patreon](https://patreon.com/neutronproject): monthly support
+- [Ko-fi](https://ko-fi.com/neutroncollider): one-time or monthly
+
 ## License
 
 neutron-wine is licensed under the **GNU Lesser General Public License, version 2.1 or later**
