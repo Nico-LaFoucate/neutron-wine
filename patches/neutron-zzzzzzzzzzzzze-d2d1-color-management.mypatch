@@ -1,0 +1,662 @@
+d2d1: Color Management effect (pass-through stub) and color contexts
+
+Lightroom (the cloud app) quit during startup with "Error initializing Lightroom.
+CreateD2DDeviceResources failed. HResult: 0x88990028". 0x88990028 is
+D2DERR_EFFECT_IS_NOT_REGISTERED, and the only unregistered effect in the log was
+CLSID_D2D1ColorManagement ({1a28524c-fdd6-4aa4-ae8f-837eb8267b37}).
+
+- Register Color Management as a stub, the same way as Unpremultiply/Premultiply: its six real
+  properties in Windows' order (source/destination color context, both rendering intents, alpha
+  mode, quality), so the app can set and read them; the two color-context properties hold their
+  own reference. It is added to the neutron_passthrough whitelist, so DrawImage() draws its input
+  unchanged. No color conversion is done yet.
+- Implement color contexts. All five CreateColorContext* methods returned E_NOTIMPL. A context
+  now stores what it was created from (a D2D1_COLOR_SPACE plus an ICC profile, a DXGI color
+  space, or a simple profile) and reports it back through ID2D1ColorContext1.
+- Both are OFF unless NEUTRON_D2D_COLOR_MANAGEMENT=1, which only the Lightroom (cloud) launch
+  profile sets. Premiere, After Effects, Media Encoder, Photoshop and Illustrator all reference
+  CLSID_D2D1ColorManagement (aedisplay.dll, dynamic-torqnative.dll, FilmImpact plugins); today
+  they get "not registered" and take their own fallback. A pass-through in its place would change
+  what they draw, untested. With the switch off, d2d1 behaves exactly as before (same FIXMEs,
+  same E_NOTIMPL, same D2DERR_EFFECT_IS_NOT_REGISTERED).
+
+Verified 2026-10-09 in the clean room (fresh HOME, fresh prefix, Lightroom 9.6 installed by
+Mud Hut), same prefix and runtime for both arms: switch off, the 0x88990028 dialog and
+"Effect id {1a28524c-...} not found", exactly as with 11.10-99; switch on, Lightroom opens its
+main window and Adobe's sign-in page.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -1593,6 +1593,7 @@
+ };
+ 
+ ID2D1Image *d2d_effect_image_get_source(ID2D1Image *iface);
++BOOL neutron_d2d_color_management(void);
+ HRESULT d2d_effect_create(struct d2d_device_context *context, const CLSID *effect_id,
+         ID2D1Effect **effect);
+ void d2d_effect_init_properties(struct d2d_effect *effect, struct d2d_effect_properties *properties);
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -18,6 +18,7 @@
+ 
+ #include <float.h>
+ #include "d2d1_private.h"
++#include "wincodec.h"
+ #include <d3dcompiler.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(d2d);
+@@ -3948,32 +3949,356 @@
+     return hr;
+ }
+ 
++/* NEUTRON: NEUTRON_D2D_COLOR_MANAGEMENT=1 turns on the Color Management effect and color contexts.
++ * OFF by default, set only by the Lightroom (cloud) launch profile. The effect does not convert
++ * colors yet, and Premiere, After Effects, Media Encoder, Photoshop and Illustrator all reference
++ * CLSID_D2D1ColorManagement (aedisplay.dll, dynamic-torqnative.dll, FilmImpact plugins): today
++ * they get "not registered" and take their own fallback, which may do the conversion properly.
++ * Handing them a pass-through instead would change what they draw, untested. When the effect
++ * converts for real, make this the default. */
++BOOL neutron_d2d_color_management(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_D2D_COLOR_MANAGEMENT"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++/* NEUTRON: color contexts. All five CreateColorContext* methods were stubs returning E_NOTIMPL,
++ * so an app that sets up color management could not start (Lightroom hands a source and a
++ * destination context to the Color Management effect). A context only describes a color space:
++ * a D2D1_COLOR_SPACE plus an ICC profile, a DXGI color space, or a simple profile. This object
++ * stores that description and reports it back; nothing converts colors with it yet. */
++struct d2d_color_context
++{
++    ID2D1ColorContext1 ID2D1ColorContext1_iface;
++    LONG refcount;
++
++    ID2D1Factory *factory;
++    D2D1_COLOR_CONTEXT_TYPE type;
++    D2D1_COLOR_SPACE space;
++    DXGI_COLOR_SPACE_TYPE dxgi_color_space;
++    D2D1_SIMPLE_COLOR_PROFILE simple_profile;
++    BYTE *profile;
++    UINT32 profile_size;
++};
++
++static inline struct d2d_color_context *impl_from_ID2D1ColorContext1(ID2D1ColorContext1 *iface)
++{
++    return CONTAINING_RECORD(iface, struct d2d_color_context, ID2D1ColorContext1_iface);
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_color_context_QueryInterface(ID2D1ColorContext1 *iface,
++        REFIID iid, void **out)
++{
++    TRACE("iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_ID2D1ColorContext1)
++            || IsEqualGUID(iid, &IID_ID2D1ColorContext)
++            || IsEqualGUID(iid, &IID_ID2D1Resource)
++            || IsEqualGUID(iid, &IID_IUnknown))
++    {
++        ID2D1ColorContext1_AddRef(iface);
++        *out = iface;
++        return S_OK;
++    }
++
++    WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++    *out = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_color_context_AddRef(ID2D1ColorContext1 *iface)
++{
++    struct d2d_color_context *context = impl_from_ID2D1ColorContext1(iface);
++    ULONG refcount = InterlockedIncrement(&context->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", iface, refcount);
++    return refcount;
++}
++
++static ULONG STDMETHODCALLTYPE d2d_color_context_Release(ID2D1ColorContext1 *iface)
++{
++    struct d2d_color_context *context = impl_from_ID2D1ColorContext1(iface);
++    ULONG refcount = InterlockedDecrement(&context->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
++
++    if (!refcount)
++    {
++        ID2D1Factory_Release(context->factory);
++        free(context->profile);
++        free(context);
++    }
++    return refcount;
++}
++
++static void STDMETHODCALLTYPE d2d_color_context_GetFactory(ID2D1ColorContext1 *iface, ID2D1Factory **factory)
++{
++    struct d2d_color_context *context = impl_from_ID2D1ColorContext1(iface);
++
++    TRACE("iface %p, factory %p.\n", iface, factory);
++
++    ID2D1Factory_AddRef(*factory = context->factory);
++}
++
++static D2D1_COLOR_SPACE STDMETHODCALLTYPE d2d_color_context_GetColorSpace(ID2D1ColorContext1 *iface)
++{
++    TRACE("iface %p.\n", iface);
++
++    return impl_from_ID2D1ColorContext1(iface)->space;
++}
++
++static UINT32 STDMETHODCALLTYPE d2d_color_context_GetProfileSize(ID2D1ColorContext1 *iface)
++{
++    TRACE("iface %p.\n", iface);
++
++    return impl_from_ID2D1ColorContext1(iface)->profile_size;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_color_context_GetProfile(ID2D1ColorContext1 *iface, BYTE *profile, UINT32 size)
++{
++    struct d2d_color_context *context = impl_from_ID2D1ColorContext1(iface);
++
++    TRACE("iface %p, profile %p, size %u.\n", iface, profile, size);
++
++    if (size < context->profile_size)
++        return D2DERR_INSUFFICIENT_BUFFER;
++    if (context->profile_size)
++        memcpy(profile, context->profile, context->profile_size);
++    return S_OK;
++}
++
++static D2D1_COLOR_CONTEXT_TYPE STDMETHODCALLTYPE d2d_color_context_GetColorContextType(ID2D1ColorContext1 *iface)
++{
++    TRACE("iface %p.\n", iface);
++
++    return impl_from_ID2D1ColorContext1(iface)->type;
++}
++
++static DXGI_COLOR_SPACE_TYPE STDMETHODCALLTYPE d2d_color_context_GetDXGIColorSpace(ID2D1ColorContext1 *iface)
++{
++    TRACE("iface %p.\n", iface);
++
++    return impl_from_ID2D1ColorContext1(iface)->dxgi_color_space;
++}
++
++static HRESULT STDMETHODCALLTYPE d2d_color_context_GetSimpleColorProfile(ID2D1ColorContext1 *iface,
++        D2D1_SIMPLE_COLOR_PROFILE *simple_profile)
++{
++    struct d2d_color_context *context = impl_from_ID2D1ColorContext1(iface);
++
++    TRACE("iface %p, simple_profile %p.\n", iface, simple_profile);
++
++    if (context->type != D2D1_COLOR_CONTEXT_TYPE_SIMPLE)
++        return D2DERR_INVALID_PROPERTY;
++    *simple_profile = context->simple_profile;
++    return S_OK;
++}
++
++static const ID2D1ColorContext1Vtbl d2d_color_context_vtbl =
++{
++    d2d_color_context_QueryInterface,
++    d2d_color_context_AddRef,
++    d2d_color_context_Release,
++    d2d_color_context_GetFactory,
++    d2d_color_context_GetColorSpace,
++    d2d_color_context_GetProfileSize,
++    d2d_color_context_GetProfile,
++    d2d_color_context_GetColorContextType,
++    d2d_color_context_GetDXGIColorSpace,
++    d2d_color_context_GetSimpleColorProfile,
++};
++
++/* Takes ownership of `profile` (malloc'd), also on failure. */
++static HRESULT d2d_color_context_create(struct d2d_device_context *device_context, D2D1_COLOR_CONTEXT_TYPE type,
++        D2D1_COLOR_SPACE space, DXGI_COLOR_SPACE_TYPE dxgi_color_space, BYTE *profile, UINT32 profile_size,
++        const D2D1_SIMPLE_COLOR_PROFILE *simple_profile, ID2D1ColorContext1 **color_context)
++{
++    struct d2d_color_context *object;
++
++    if (!(object = calloc(1, sizeof(*object))))
++    {
++        free(profile);
++        return E_OUTOFMEMORY;
++    }
++
++    object->ID2D1ColorContext1_iface.lpVtbl = &d2d_color_context_vtbl;
++    object->refcount = 1;
++    ID2D1Factory_AddRef(object->factory = device_context->factory);
++    object->type = type;
++    object->space = space;
++    object->dxgi_color_space = dxgi_color_space;
++    object->profile = profile;
++    object->profile_size = profile_size;
++    if (simple_profile)
++        object->simple_profile = *simple_profile;
++
++    TRACE("Created color context %p, type %u, space %u, dxgi color space %u, profile size %u.\n",
++            object, type, space, dxgi_color_space, profile_size);
++    *color_context = &object->ID2D1ColorContext1_iface;
++    return S_OK;
++}
++
++/* The DXGI color space a D2D1_COLOR_SPACE context reports: sRGB and scRGB have one, an ICC
++ * profile does not. */
++static DXGI_COLOR_SPACE_TYPE d2d_color_space_to_dxgi(D2D1_COLOR_SPACE space)
++{
++    switch (space)
++    {
++        case D2D1_COLOR_SPACE_SRGB: return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
++        case D2D1_COLOR_SPACE_SCRGB: return DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
++        default: return DXGI_COLOR_SPACE_CUSTOM;
++    }
++}
++
++static HRESULT d2d_color_context_create_icc(struct d2d_device_context *device_context, D2D1_COLOR_SPACE space,
++        BYTE *profile, UINT32 profile_size, ID2D1ColorContext **color_context)
++{
++    return d2d_color_context_create(device_context, D2D1_COLOR_CONTEXT_TYPE_ICC, space,
++            d2d_color_space_to_dxgi(space), profile, profile_size, NULL, (ID2D1ColorContext1 **)color_context);
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContext(ID2D1DeviceContext6 *iface,
+         D2D1_COLOR_SPACE space, const BYTE *profile, UINT32 profile_size, ID2D1ColorContext **color_context)
+ {
+     NEUTRON_API_TIME();
+-    FIXME("iface %p, space %#x, profile %p, profile_size %u, color_context %p stub!\n",
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    BYTE *copy = NULL;
++
++    if (!neutron_d2d_color_management())
++    {
++        FIXME("iface %p, space %#x, profile %p, profile_size %u, color_context %p stub!\n",
++                iface, space, profile, profile_size, color_context);
++        return E_NOTIMPL;
++    }
++
++    TRACE("iface %p, space %#x, profile %p, profile_size %u, color_context %p.\n",
+             iface, space, profile, profile_size, color_context);
+ 
+-    return E_NOTIMPL;
++    if (!color_context)
++        return E_POINTER;
++    *color_context = NULL;
++
++    switch (space)
++    {
++        case D2D1_COLOR_SPACE_CUSTOM:
++            if (!profile || !profile_size)
++                return E_INVALIDARG;
++            if (!(copy = malloc(profile_size)))
++                return E_OUTOFMEMORY;
++            memcpy(copy, profile, profile_size);
++            break;
++        case D2D1_COLOR_SPACE_SRGB:
++        case D2D1_COLOR_SPACE_SCRGB:
++            /* The space defines the colors; a profile passed along with it is not used. */
++            profile_size = 0;
++            break;
++        default:
++            WARN("Invalid color space %#x.\n", space);
++            return E_INVALIDARG;
++    }
++
++    return d2d_color_context_create_icc(context, space, copy, profile_size, color_context);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromFilename(ID2D1DeviceContext6 *iface,
+         const WCHAR *filename, ID2D1ColorContext **color_context)
+ {
+     NEUTRON_API_TIME();
+-    FIXME("iface %p, filename %s, color_context %p stub!\n", iface, debugstr_w(filename), color_context);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    DWORD size, read;
++    BYTE *profile;
++    HANDLE file;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_d2d_color_management())
++    {
++        FIXME("iface %p, filename %s, color_context %p stub!\n", iface, debugstr_w(filename), color_context);
++        return E_NOTIMPL;
++    }
++
++    TRACE("iface %p, filename %s, color_context %p.\n", iface, debugstr_w(filename), color_context);
++
++    if (!color_context)
++        return E_POINTER;
++    *color_context = NULL;
++    if (!filename)
++        return E_INVALIDARG;
++
++    file = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE)
++        return HRESULT_FROM_WIN32(GetLastError());
++    if ((size = GetFileSize(file, NULL)) == INVALID_FILE_SIZE || !size)
++    {
++        CloseHandle(file);
++        return E_INVALIDARG;
++    }
++    if (!(profile = malloc(size)))
++    {
++        CloseHandle(file);
++        return E_OUTOFMEMORY;
++    }
++    if (!ReadFile(file, profile, size, &read, NULL) || read != size)
++    {
++        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
++
++        CloseHandle(file);
++        free(profile);
++        return FAILED(hr) ? hr : E_FAIL;
++    }
++    CloseHandle(file);
++
++    return d2d_color_context_create_icc(context, D2D1_COLOR_SPACE_CUSTOM, profile, size, color_context);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromWicColorContext(ID2D1DeviceContext6 *iface,
+         IWICColorContext *wic_color_context, ID2D1ColorContext **color_context)
+ {
+     NEUTRON_API_TIME();
+-    FIXME("iface %p, wic_color_context %p, color_context %p stub!\n", iface, wic_color_context, color_context);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    WICColorContextType type;
++    UINT size = 0, exif;
++    BYTE *profile;
++    HRESULT hr;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_d2d_color_management())
++    {
++        FIXME("iface %p, wic_color_context %p, color_context %p stub!\n", iface, wic_color_context, color_context);
++        return E_NOTIMPL;
++    }
++
++    TRACE("iface %p, wic_color_context %p, color_context %p.\n", iface, wic_color_context, color_context);
++
++    if (!color_context)
++        return E_POINTER;
++    *color_context = NULL;
++    if (!wic_color_context)
++        return E_INVALIDARG;
++
++    if (FAILED(hr = IWICColorContext_GetType(wic_color_context, &type)))
++        return hr;
++
++    if (type == WICColorContextExifColorSpace)
++    {
++        if (FAILED(hr = IWICColorContext_GetExifColorSpace(wic_color_context, &exif)))
++            return hr;
++        /* EXIF color space 1 is sRGB. Anything else is described only by a number. */
++        return d2d_color_context_create_icc(context, exif == 1 ? D2D1_COLOR_SPACE_SRGB : D2D1_COLOR_SPACE_CUSTOM,
++                NULL, 0, color_context);
++    }
++
++    if (FAILED(hr = IWICColorContext_GetProfileBytes(wic_color_context, 0, NULL, &size)))
++        return hr;
++    if (!size)
++        return E_INVALIDARG;
++    if (!(profile = malloc(size)))
++        return E_OUTOFMEMORY;
++    if (FAILED(hr = IWICColorContext_GetProfileBytes(wic_color_context, size, profile, &size)))
++    {
++        free(profile);
++        return hr;
++    }
++
++    return d2d_color_context_create_icc(context, D2D1_COLOR_SPACE_CUSTOM, profile, size, color_context);
+ }
+ 
+ static BOOL d2d_bitmap_check_options_with_surface(unsigned int options, unsigned int surface_options)
+@@ -5045,18 +5370,56 @@
+         ID2D1DeviceContext6 *iface, DXGI_COLOR_SPACE_TYPE color_space, ID2D1ColorContext1 **color_context)
+ {
+     NEUTRON_API_TIME();
+-    FIXME("iface %p, color_space %u, color_context %p stub!\n", iface, color_space, color_context);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
++    D2D1_COLOR_SPACE space;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_d2d_color_management())
++    {
++        FIXME("iface %p, color_space %u, color_context %p stub!\n", iface, color_space, color_context);
++        return E_NOTIMPL;
++    }
++
++    TRACE("iface %p, color_space %u, color_context %p.\n", iface, color_space, color_context);
++
++    if (!color_context)
++        return E_POINTER;
++    *color_context = NULL;
++    if (color_space == DXGI_COLOR_SPACE_CUSTOM)
++        return E_INVALIDARG;
++
++    switch (color_space)
++    {
++        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: space = D2D1_COLOR_SPACE_SRGB; break;
++        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: space = D2D1_COLOR_SPACE_SCRGB; break;
++        default: space = D2D1_COLOR_SPACE_CUSTOM; break;
++    }
++
++    return d2d_color_context_create(context, D2D1_COLOR_CONTEXT_TYPE_DXGI, space, color_space,
++            NULL, 0, NULL, color_context);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateColorContextFromSimpleColorProfile(
+         ID2D1DeviceContext6 *iface, const D2D1_SIMPLE_COLOR_PROFILE *simple_profile, ID2D1ColorContext1 **color_context)
+ {
+     NEUTRON_API_TIME();
+-    FIXME("iface %p, simple_profile %p, color_context %p stub!\n", iface, simple_profile, color_context);
++    struct d2d_device_context *context = impl_from_ID2D1DeviceContext(iface);
+ 
+-    return E_NOTIMPL;
++    if (!neutron_d2d_color_management())
++    {
++        FIXME("iface %p, simple_profile %p, color_context %p stub!\n", iface, simple_profile, color_context);
++        return E_NOTIMPL;
++    }
++
++    TRACE("iface %p, simple_profile %p, color_context %p.\n", iface, simple_profile, color_context);
++
++    if (!color_context)
++        return E_POINTER;
++    *color_context = NULL;
++    if (!simple_profile)
++        return E_INVALIDARG;
++
++    return d2d_color_context_create(context, D2D1_COLOR_CONTEXT_TYPE_SIMPLE, D2D1_COLOR_SPACE_CUSTOM,
++            DXGI_COLOR_SPACE_CUSTOM, NULL, 0, simple_profile, color_context);
+ }
+ 
+ static void STDMETHODCALLTYPE d2d_device_context_BlendImage(ID2D1DeviceContext6 *iface, ID2D1Image *image,
+--- a/dlls/d2d1/effect.c
++++ b/dlls/d2d1/effect.c
+@@ -987,6 +987,8 @@
+ {
+     ID2D1EffectImpl ID2D1EffectImpl_iface;
+     LONG refcount;
++    /* NEUTRON: releases references held in the properties block (Color Management's contexts). */
++    void (*cleanup)(struct d2d_effect_impl *effect);
+ 
+     /* Followed by properties block, its size and format depends on particular effect. */
+ };
+@@ -1028,7 +1030,11 @@
+     LONG refcount = InterlockedDecrement(&effect->refcount);
+ 
+     if (!refcount)
++    {
++        if (effect->cleanup)
++            effect->cleanup(effect);
+         free(effect);
++    }
+ 
+     return refcount;
+ }
+@@ -1891,6 +1897,131 @@
+     return d2d_effect_create_impl(effect, NULL, 0);
+ }
+ 
++/* NEUTRON: Color Management, registered only with NEUTRON_D2D_COLOR_MANAGEMENT=1 (see
++ * neutron_d2d_color_management() in device.c for why it is off by default).
++ * Lightroom (the cloud app) creates this effect while it sets up its
++ * drawing and quits with "CreateD2DDeviceResources failed. HResult: 0x88990028"
++ * (D2DERR_EFFECT_IS_NOT_REGISTERED) when it is missing. Like Unpremultiply it is a registration
++ * stub: it carries the real properties, in Windows' order, so the app can set and read them, and
++ * DrawImage() draws its input unchanged (see neutron_passthrough). No color conversion is done
++ * yet. The enum properties hold Windows' values: rendering intents PERCEPTUAL 0 ..
++ * ABSOLUTE_COLORIMETRIC 3, alpha mode PREMULTIPLIED 1 / STRAIGHT 2, quality PROPER 0 / BEST 1. */
++static const WCHAR color_management_description[] =
++L"<?xml version='1.0'?>                                                          \
++  <Effect>                                                                       \
++    <Property name='DisplayName' type='string' value='Color Management'/>        \
++    <Property name='Author'      type='string' value='The Wine Project'/>        \
++    <Property name='Category'    type='string' value='Stub'/>                    \
++    <Property name='Description' type='string' value='Color Management'/>        \
++    <Inputs >                                                                    \
++      <Input name='Source'/>                                                     \
++    </Inputs>                                                                    \
++    <Property name='SourceColorContext' type='colorcontext' />                   \
++    <Property name='SourceRenderingIntent' type='enum' />                        \
++    <Property name='DestinationColorContext' type='colorcontext' />              \
++    <Property name='DestinationRenderingIntent' type='enum' />                   \
++    <Property name='AlphaMode' type='enum' />                                    \
++    <Property name='Quality' type='enum' />                                      \
++  </Effect>";
++
++struct color_management_properties
++{
++    ID2D1ColorContext *source_color_context;
++    UINT32 source_rendering_intent;
++    ID2D1ColorContext *destination_color_context;
++    UINT32 destination_rendering_intent;
++    UINT32 alpha_mode;
++    UINT32 quality;
++};
++
++EFFECT_PROPERTY_RW(color_management, source_rendering_intent, ENUM)
++EFFECT_PROPERTY_RW(color_management, destination_rendering_intent, ENUM)
++EFFECT_PROPERTY_RW(color_management, alpha_mode, ENUM)
++EFFECT_PROPERTY_RW(color_management, quality, ENUM)
++
++/* The generic helpers copy bytes and know no size for color contexts, so the two context
++ * properties hold a reference of their own: set takes one, get hands one out. */
++static HRESULT color_management_set_context(ID2D1ColorContext **slot, const BYTE *data, UINT32 data_size)
++{
++    ID2D1ColorContext *context;
++
++    if (data_size != sizeof(context))
++        return E_INVALIDARG;
++    memcpy(&context, data, sizeof(context));
++    if (context)
++        ID2D1ColorContext_AddRef(context);
++    if (*slot)
++        ID2D1ColorContext_Release(*slot);
++    *slot = context;
++    return S_OK;
++}
++
++static HRESULT color_management_get_context(ID2D1ColorContext *context, BYTE *data, UINT32 data_size,
++        UINT32 *actual_size)
++{
++    if (actual_size)
++        *actual_size = sizeof(context);
++    if (!data || !data_size)
++        return S_OK;
++    if (data_size < sizeof(context))
++        return E_NOT_SUFFICIENT_BUFFER;
++    if (context)
++        ID2D1ColorContext_AddRef(context);
++    memcpy(data, &context, sizeof(context));
++    return S_OK;
++}
++
++#define COLOR_MANAGEMENT_CONTEXT_PROPERTY(prop) \
++    static HRESULT __stdcall color_management_##prop##_set(IUnknown *iface, const BYTE *data, UINT32 data_size) \
++    { \
++        struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface); \
++        struct color_management_properties *props = (struct color_management_properties *)(effect + 1); \
++        return color_management_set_context(&props->prop, data, data_size); \
++    } \
++    static HRESULT __stdcall color_management_##prop##_get(const IUnknown *iface, BYTE *data, \
++            UINT32 data_size, UINT32 *actual_size) \
++    { \
++        struct d2d_effect_impl *effect = impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)iface); \
++        struct color_management_properties *props = (struct color_management_properties *)(effect + 1); \
++        return color_management_get_context(props->prop, data, data_size, actual_size); \
++    }
++
++COLOR_MANAGEMENT_CONTEXT_PROPERTY(source_color_context)
++COLOR_MANAGEMENT_CONTEXT_PROPERTY(destination_color_context)
++
++static const D2D1_PROPERTY_BINDING color_management_bindings[] =
++{
++    { L"SourceColorContext", BINDING_RW(color_management, source_color_context) },
++    { L"SourceRenderingIntent", BINDING_RW(color_management, source_rendering_intent) },
++    { L"DestinationColorContext", BINDING_RW(color_management, destination_color_context) },
++    { L"DestinationRenderingIntent", BINDING_RW(color_management, destination_rendering_intent) },
++    { L"AlphaMode", BINDING_RW(color_management, alpha_mode) },
++    { L"Quality", BINDING_RW(color_management, quality) },
++};
++
++static void color_management_cleanup(struct d2d_effect_impl *effect)
++{
++    struct color_management_properties *props = (struct color_management_properties *)(effect + 1);
++
++    if (props->source_color_context)
++        ID2D1ColorContext_Release(props->source_color_context);
++    if (props->destination_color_context)
++        ID2D1ColorContext_Release(props->destination_color_context);
++}
++
++static HRESULT __stdcall color_management_factory(IUnknown **effect)
++{
++    static const struct color_management_properties properties =
++    {
++        .alpha_mode = 1, /* D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED */
++    };
++    HRESULT hr;
++
++    if (SUCCEEDED(hr = d2d_effect_create_impl(effect, &properties, sizeof(properties))))
++        impl_from_ID2D1EffectImpl((ID2D1EffectImpl *)*effect)->cleanup = color_management_cleanup;
++    return hr;
++}
++
+ void d2d_effects_init_builtins(struct d2d_factory *factory)
+ {
+     static const struct builtin_description
+@@ -1924,6 +2055,7 @@
+         { &CLSID_D2D1Scale, X2(scale) },
+         { &CLSID_D2D1UnPremultiply, X(unpremultiply) },
+         { &CLSID_D2D1Premultiply, X(premultiply) },
++        { &CLSID_D2D1ColorManagement, X2(color_management) },
+ #undef X2
+ #undef X
+     };
+@@ -1934,6 +2066,9 @@
+     {
+         const struct builtin_description *desc = &builtin_effects[i];
+ 
++        if (desc->clsid == &CLSID_D2D1ColorManagement && !neutron_d2d_color_management())
++            continue;
++
+         if (FAILED(hr = d2d_factory_register_builtin_effect(factory, desc->clsid, desc->description,
+                 desc->bindings, desc->binding_count, desc->factory)))
+         {
+@@ -3642,12 +3777,14 @@
+     object->ID2D1Image_iface.lpVtbl = &d2d_effect_image_vtbl;
+     object->refcount = 1;
+     object->effect_context = effect_context;
+-    /* NEUTRON: mark ONLY our two registration stubs as passthrough. Whitelisting the exact
++    /* NEUTRON: mark ONLY our registration stubs as passthrough. Whitelisting the exact
+      * CLSIDs, rather than inferring "is a stub" from having no properties, keeps every real
+      * effect on its normal path -- an inference here is what regressed Premiere's Program
+-     * Monitor. If another stub is ever added, add it here deliberately. */
++     * Monitor. If another stub is ever added, add it here deliberately (Color Management,
++     * 2026-10-09, for Lightroom). */
+     object->neutron_passthrough = IsEqualGUID(effect_id, &CLSID_D2D1UnPremultiply)
+-            || IsEqualGUID(effect_id, &CLSID_D2D1Premultiply);
++            || IsEqualGUID(effect_id, &CLSID_D2D1Premultiply)
++            || IsEqualGUID(effect_id, &CLSID_D2D1ColorManagement);
+ 
+     /* Create properties */
+     d2d_effect_duplicate_properties(object, &object->properties, reg->properties);
