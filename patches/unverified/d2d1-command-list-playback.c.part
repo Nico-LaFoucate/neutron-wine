@@ -28,7 +28,7 @@
  * NOT handled (deliberate, and each degrades rather than fails):
  *   - ID2D1CommandSink1/4 (SetPrimitiveBlend1/2). Stream() already falls back to
  *     SOURCE_OVER for the blends those cover, which is the pre-existing
- *     behaviour, so QI'ing E_NOINTERFACE loses nothing.
+ *     behavior, so QI'ing E_NOINTERFACE loses nothing.
  *   - A Clear inside a list with no image_rect clips to the whole target rather
  *     than the list's extent. D2D command lists have infinite extent, so there
  *     is no bound to clip to; callers that pass image_rect get the right thing.

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # build.sh — build the Neutron wine (patch set + pinned config on upstream wine-tkg).
 #
-# Produces a complete Wine tree; point Neutron at it with NEUTRON_WINE=<…>/wine.
-# This is the Proton-GE-style recipe: fetch wine-tkg, drop in our patches + pinned
-# config, build. Phase 2/3 will turn the output into a versioned, bundled runtime.
+# Produces a complete Wine tree; `build/package.sh` turns it into the versioned runtime
+# (see RELEASING.md). This is the Proton-GE-style recipe: fetch wine-tkg, drop in our
+# patches + pinned config, build.
 #
 # Prereqs: the usual Wine build toolchain + wine-tkg-git's deps (see that project).
 # Env:
@@ -43,9 +43,10 @@ cp "$REPO/build/customization.cfg" "$TKGDIR/customization.cfg"
 
 # 2a. NEUTRON: build on DISK, not tmpfs.
 # Upstream wine-tkg hardcodes _build_in_tmpfs="true" and symlinks src -> /tmp/wine-tkg/src.
-# That makes builds fast but the tree evaporates on reboot: a full ~1h rebuild is then needed
-# for any change, and an incremental relink is impossible. It cost an hour on 2026-09-06 and
-# again on 09-07. Disk has terabytes; RAM does not. Idempotent (the pattern stops matching).
+# That makes builds fast but the tree evaporates on reboot: a full rebuild (~12 min) is then
+# needed for any change, and an incremental relink is impossible. It cost a full rebuild on
+# 2026-09-06 and again on 09-07. Disk has terabytes; RAM does not. Idempotent (the pattern
+# stops matching).
 if [ -L "$TKGDIR/src" ]; then
     echo "neutron: removing the tmpfs src symlink ($(readlink "$TKGDIR/src"))"
     rm -f "$TKGDIR/src"
@@ -158,8 +159,7 @@ cd "$TKGDIR"
 ./non-makepkg-build.sh
 
 echo
-echo "Built. The Neutron wine is under: $TKGDIR/src/*-build/wine"
-echo "Use it:  NEUTRON_WINE=\"$TKGDIR/src/<flavor>-build/wine\" neutron launch premiere"
+echo "Built neutron-wine $(cat "$REPO/build/VERSION")."
 # NEUTRON: record that THIS version built successfully. package.sh refuses without it.
 # 2026-08-31: a build failed on a rejected patch and package.sh cheerfully packaged the STALE tree
 # from the previous version, producing a complete, correctly-checksummed "11.10-69" tarball that
@@ -168,5 +168,7 @@ echo "Use it:  NEUTRON_WINE=\"$TKGDIR/src/<flavor>-build/wine\" neutron launch p
 printf '%s\n' "$(cat "$REPO/build/VERSION")" > "$WORK/.build-ok"
 
 echo
-echo "To cut a release, package the tree into a versioned tarball + manifest:"
-echo "  build/package.sh          # -> dist/  (see RELEASING.md)"
+echo "To run it, package the tree into a versioned runtime (tarball + manifest):"
+echo "  build/package.sh          # -> dist/  (adds DXVK, vkd3d-proton, the NVIDIA wrappers)"
+echo "then publish it as a release (see RELEASING.md) and install it with:"
+echo "  neutron runtime install --version $(cat "$REPO/build/VERSION")"

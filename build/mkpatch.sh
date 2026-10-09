@@ -5,7 +5,7 @@
 # ---------------
 # Four builds were lost to generating patches against the wrong tree. The failure is silent:
 # the patch looks fine, build.sh applies it with fuzz or rejects hunks, and you only find out
-# an hour later. The traps, all of which actually happened:
+# at the end of a build. The traps, all of which actually happened:
 #
 #   1. THERE ARE SEVERAL wine-git TREES ON THIS MACHINE and they are not interchangeable:
 #        <repo>/_work/wine-tkg-git/wine-tkg-git/src/wine-git   <- the ONLY correct base
@@ -34,7 +34,7 @@
 #   mkpatch.sh reset                      discard edits, restore the snapshot
 #   mkpatch.sh clean                      drop the snapshot without touching the tree
 #
-# Env: NEUTRON_WINE_WORK — same override build.sh honours.
+# Env: NEUTRON_WINE_WORK — same override build.sh honors.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,7 +47,7 @@ die() { echo "mkpatch: $*" >&2; exit 1; }
 
 # --- base tree resolution -----------------------------------------------------------------
 # Any other wine-git tree on this box is a trap, not an alternative. Name them so a wrong
-# base is caught here rather than an hour into a build.
+# base is caught here rather than at the end of a build.
 DECOYS=(
     "$HOME/wine-tkg-git/wine-tkg-git/src/wine-git"
     "/tmp/wine-tkg/src/wine-git"
@@ -96,7 +96,7 @@ cmd_snapshot() {
     local rel
     for rel in "$@"; do
         rel="${rel#./}"
-        # Accept an absolute path inside the base tree and normalise it.
+        # Accept an absolute path inside the base tree and normalize it.
         case "$rel" in "$BASE"/*) rel="${rel#"$BASE"/}" ;; esac
         if [ ! -f "$BASE/$rel" ]; then
             # NEW FILE: nothing to copy. Record it so emit diffs it against /dev/null, which

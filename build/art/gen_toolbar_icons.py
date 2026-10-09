@@ -7,9 +7,9 @@ dated thing in that window.
 
 EIGHT outputs: {hist,view} x {large 24px, small 16px} x {light-glyph, dark-glyph}.
 
-⭐ Why two palettes rather than one compromise grey: these strips are SHARED by every Wine toolbar,
+⭐ Why two palettes rather than one compromise gray: these strips are SHARED by every Wine toolbar,
 and Wine draws them on COLOR_BTNFACE — dark in the Neutron theme, light elsewhere. A single mid
-grey is mediocre on both. comctl32 picks the strip by the luminance of COLOR_BTNFACE instead
+gray is mediocre on both. comctl32 picks the strip by the luminance of COLOR_BTNFACE instead
 (TOOLBAR_AddBitmap), so each ground gets artwork drawn for it.
 
 ⛔ Glyphs must survive 16px. The first draft drew the sort-by-name mark as the letters A and Z; at
@@ -28,7 +28,7 @@ LIGHT_GLYPH = dict(fg="#C3CAD3", warn="#D07A6A", good="#8FBF7A")   # on DARK chr
 DARK_GLYPH  = dict(fg="#414A55", warn="#B4442E", good="#3F7A33")   # on LIGHT chrome
 
 # ---- glyphs, drawn in a 24x24 box with the frame's own origin at 0,0 --------------------
-# Each entry is a list of (path_d, colour_key). Stroke only; no fills, no gradients.
+# Each entry is a list of (path_d, color_key). Stroke only; no fills, no gradients.
 HIST = [
     [("M17 12H7", "fg"), ("M12 7l-5 5 5 5", "fg")],                         # 0 HIST_BACK
     [("M7 12h10", "fg"), ("M12 7l5 5-5 5", "fg")],                          # 1 HIST_FORWARD

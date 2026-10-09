@@ -11,4 +11,4 @@ synthetic CLR repro pass — **but the real aescripts manager still crashed at t
 premise came from a repro that used `Socket.Receive()` and was unrepresentative of the app.
 
 ⛔ No fd-type gate can work: Premiere's branch-C traffic and the manager's are the SAME type.
-✅ Superseded by `neutron-iocp-branchc-nopost.mypatch`.
+✅ Superseded by `neutron-iocp-zz-branchc-nopost.mypatch`.

@@ -27,7 +27,7 @@ Exact commits are in [`sources.conf`](sources.conf).
   screen under Wayland. Also exports textures for CUDA interop and adds bounded-wait acquire.
 - **dxgi** (`patches/dxvk-dxgi/`): only the two hooks that hand swapchains to Wine's
   DirectComposition bridge, exactly what the validated dxgi carried. `patches/dxvk` also changes
-  dxgi (forwarding the bounded-wait handshake, storing the background colour, tracing), but those
+  dxgi (forwarding the bounded-wait handshake, storing the background color, tracing), but those
   changes never ran in daily use, so dxgi is built without them and the build checks that.
 - **vkd3d-proton** (`patches/vkd3d-proton/`): the blit-to-window present path
   (`libs/vkd3d/blit_to_window.h`) and `NEUTRON_DISABLE_BTW`, which apps that draw better without

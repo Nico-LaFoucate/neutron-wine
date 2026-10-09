@@ -29,7 +29,7 @@ Applied on top of the upstream base by [`build/build.sh`](build/build.sh).
 | Path | What it holds | Built? |
 | --- | --- | --- |
 | `patches/*.mypatch` | The production patch set. | Yes |
-| `patches/diagnostic/` | Diagnostic probes, off unless their environment variable is set. | Only with `INCLUDE_DIAGNOSTIC=1` |
+| `patches/diagnostic/` | Diagnostic probes, most of them off unless their environment variable is set. | Only with `INCLUDE_DIAGNOSTIC=1` |
 | `patches/unverified/` | Work kept for later that hasn't been reviewed and tested yet. | No |
 | `patches/disproven/`, `patches/retired/` | Patches kept for the record. | No |
 | `external/patches/` | Our DXVK, vkd3d-proton and nvcuda patches, and SveSop's dxvk-nvapi commits. See [`external/README.md`](external/README.md). | Yes, by `build/package.sh` |
@@ -57,7 +57,8 @@ build/package.sh          # build external/ (DXVK, vkd3d-proton, NVIDIA wrappers
 
 On Arch-based systems `build/build.sh` checks its build dependencies first and says what to
 install; elsewhere you need Wine's usual build dependencies plus wine-tkg-git's, `meson`, `ninja`,
-`glslang` and `mingw-w64-gcc`. A from-scratch build (downloads included) takes about **11.5
+`glslang`, `mingw-w64-gcc`, and `rsvg-convert` (librsvg), `magick` (ImageMagick), `icotool` (icoutils)
+and `python3` for the generated toolbar and shell icons. A from-scratch build (downloads included) takes about **11.5
 minutes** on a 24-thread desktop CPU (i9-12900KF); `package.sh` adds a few more for `external/` and
 compression. The result is `dist/neutron-wine-<ver>.tar.xz` with its checksum, manifest and source
 archive.
@@ -66,12 +67,12 @@ archive.
 
 Users don't build Wine: `neutron setup` downloads the release GitHub marks **Latest** and checks it
 against its manifest. Each release carries four files: `neutron-wine-<ver>.tar.xz`, its `.sha256`,
-`manifest.json`, and `neutron-wine-<ver>-source.tar.xz` (the complete source). The release version
+`neutron-wine-<ver>.manifest.json`, and `neutron-wine-<ver>-source.tar.xz` (the complete source). The release version
 is pinned in [`build/VERSION`](build/VERSION).
 
 **Full packaging & release runbook:** [`RELEASING.md`](RELEASING.md) — how to cut a release, how the
-engine consumes the manifest, and the patch-set/LGPL provenance notes. Per-patch descriptions live in
-[`patches/MANIFEST.md`](patches/MANIFEST.md).
+engine consumes the manifest, and the patch-set/LGPL provenance notes. Notes on some of the patches are in
+[`patches/MANIFEST.md`](patches/MANIFEST.md); most patch files also open with their own description.
 
 ## License
 

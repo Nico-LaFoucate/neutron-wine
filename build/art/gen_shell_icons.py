@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-# A flat two-tone language: one body colour, one shade, one accent. Readable at 16px, which is
+# A flat two-tone language: one body color, one shade, one accent. Readable at 16px, which is
 # where these live most of the time.
 C = dict(
     amber="#D9A441", amber_d="#B8862C",

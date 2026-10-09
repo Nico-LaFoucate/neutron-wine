@@ -1,8 +1,8 @@
-# d2d1 command-list playback — UNVERIFIED, not yet a .mypatch
+# d2d1 command-list playback — UNVERIFIED, not built
 
-**Status 2026-07-31: the `E_NOTIMPL` half is PROVEN AND VALUABLE. The playback half is
-correct-looking code that After Effects never executes. Do not ship either as-is —
-this directory is not read by `build.sh`.**
+**The `EndDraw` half shipped as `patches/neutron-zzz9-d2d1-cmdlist-enddraw.mypatch` (11.10-20).
+The playback half below is correct-looking code that After Effects never executes; it stays here,
+unbuilt — this directory is not read by `build.sh`.**
 
 ## What the change is
 
@@ -45,27 +45,27 @@ full session (`NEUTRON_D2D_OPTRACE=1`, counters at `neutron-cl:`):
   out too.
 
 ⇒ **AE records healthy command lists and never consumes them by any d2d path.** Whatever it
-does with them, it is not drawing them. The remaining blank-composition bug is therefore
-somewhere else, and further work on playback will not move it.
+does with them, it is not drawing them. (Its blank composition had another cause, fixed
+2026-08-03: see `patches/MANIFEST.md`.)
 
 Keep the code anyway: it is a genuine Wine gap (upstream-quality, and the `EndDraw` half is
 required), but do NOT claim it fixes AE.
 
 ## Deliberate limitations
 * No `ID2D1CommandSink1/4` (`SetPrimitiveBlend1/2`). `Stream()` already falls back to
-  `SOURCE_OVER` for those, which is the pre-existing behaviour, so declining the QI loses nothing.
+  `SOURCE_OVER` for those, which is the pre-existing behavior, so declining the QI loses nothing.
 * A `Clear` inside a list with no `image_rect` clips to the whole target rather than the list's
   extent — D2D command lists have infinite extent, so there is nothing to clip to.
 
 ## Why this is not a .mypatch yet
-The patch-built baseline tree (`~/neutron-wine/_work/.../wine-git`) **no longer exists**, and the
-rule earned at real cost is: *generate a patch against the PATCH-BUILT baseline, never by
-filtering a dev-tree diff* — the dev tree holds every neutron change as one blob, so a keyword
-filter emits neighbouring patches' lines and duplicates code (cost: 3 builds). `git diff` of the
+The patch-built baseline tree (`~/neutron-wine/_work/.../wine-git`) **did not exist** when this was
+written (2026-07-31), and the rule earned at real cost is: *generate a patch against the
+PATCH-BUILT baseline, never by filtering a dev-tree diff* — the dev tree holds every neutron change as one blob, so a keyword
+filter emits neighboring patches' lines and duplicates code (cost: 3 builds). `git diff` of the
 three touched files here is **3947 lines**, almost all of it other people's work, which is
 exactly that trap.
 
-To productionise: rebuild the baseline via `build.sh`, apply the block in
+To productionize: rebuild the baseline via `build.sh`, apply the block in
 `d2d1-command-list-playback.c.part` plus the three small edits above, then generate the
 `.mypatch` against that baseline and prove it by re-apply + `cmp`.
 
@@ -75,6 +75,3 @@ runtime's `d2d1.dll`, refuses while any Adobe app is live, `--revert` restores).
 staging that all five 11.10-19 d2d1 fix markers matched the shipped dll and the only string
 difference was the removed `E_NOTIMPL` one — strong evidence, not proof, that the staged dll was
 11.10-19 + this change.
-
-⚠️ **The staged dll must be reverted** (`~/stage-d2d1-cmdlist.sh --revert`) — the runtime is
-shared with Premiere, Photoshop and Lightroom.

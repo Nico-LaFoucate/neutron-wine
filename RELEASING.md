@@ -60,12 +60,12 @@ picks the release marked **Latest**. Promote a build only after the clean-room t
 
 ## How the engine consumes a release
 
-The Neutron CLI pins a runtime version and resolves it from the manifest — download URL +
-`sha256` are both in the manifest, so the client can fetch and verify without guessing:
+`neutron setup` installs the release GitHub marks **Latest** and resolves it from its manifest —
+download URL + `sha256` are both in the manifest, so the client can fetch and verify without guessing:
 
 ```
 neutron setup                      # fetch the Latest neutron-wine, verify sha256,
-                                    # unpack to ~/.local/share/neutron/runtimes/<ver>/
+                                    # unpack to ~/.local/share/neutron/runtimes/neutron-wine-<ver>/
 neutron launch premiere            # launch against the resolved runtime
 ```
 
@@ -80,16 +80,19 @@ each prefix and writes their DLL overrides, as listed in `share/neutron/natives.
 
 - `external/sources.conf` pins each upstream repository to an exact commit.
 - `external/patches/<project>/` holds our changes (DXVK `d3d11`/`dxgi`, vkd3d-proton `d3d12core`,
-  nvcuda). Everything else is built unmodified.
+  nvcuda) and Sveinar Søpler's 11 dxvk-nvapi commits, which turn the v0.9.2 release into the exact
+  build the runtime was validated with. Everything else is built unmodified.
 - `external/build-external.sh <wine-tree>` clones, patches, builds and checks them. The build fails
   if a patched DLL lacks its Neutron markers, an unmodified one contains any, a file has the wrong
   architecture, or any file contains the builder's home path.
 
 Microsoft's files (VC++ runtime, UCRT, d3dcompiler_47, GDI+, core fonts) are **not** in the
-tarball: `neutron setup` downloads them from Microsoft on the user's machine.
+tarball: `neutron setup` downloads them on the user's machine (from Microsoft, or for
+`d3dcompiler_47` and the core fonts from pinned GitHub copies of Microsoft's files) and checks each
+against a pinned checksum.
 
 ## Licensing
 
-Wine, vkd3d-proton, nvcuda, nvenc and wine-nvoptix are **LGPL-2.1**; DXVK is zlib and dxvk-nvapi
-is MIT. Every release carries its own complete source as `neutron-wine-<ver>-source.tar.xz`, next
+Wine, vkd3d-proton, nvcuda and nvenc are **LGPL-2.1**; wine-nvoptix is LGPL-2.1 and MIT; DXVK is
+zlib and dxvk-nvapi is MIT. Every release carries its own complete source as `neutron-wine-<ver>-source.tar.xz`, next
 to the binaries, and `licenses/` inside the tarball holds every component's license text.

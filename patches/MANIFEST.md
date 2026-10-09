@@ -3,18 +3,20 @@
 Patches are applied on top of the upstream Wine base (see `../build/WINE_BASE`) by `../build/build.sh`,
 which drops them into `wine-tkg-git/wine-tkg-userpatches/` (wine-tkg applies every `*.mypatch` there).
 
-⚠️ **Order is NOT insignificant for the `neutron-d2d1-*` set** (2026-07-29): those patches touch the
+⚠️ **Order matters for the `neutron-d2d1-*` set** (2026-07-29): those patches touch the
 same regions of `geometry.c`/`device.c` and build on each other — e.g.
 `neutron-d2d1-stroke-join-bound-miter-limit` edits the join code introduced by
-`neutron-d2d1-outline-join-collinear-spur`. wine-tkg applies `*.mypatch` **alphabetically**, and the names are
-chosen so that order is correct (hence the `zz-` prefix). **Verify the d2d1 set in ALPHABETICAL order, not the
+`neutron-d2d1-outline-join-collinear-spur`. wine-tkg applies `*.mypatch` **in C (byte) order**, and the names are
+chosen so that order is correct (hence the `zz-` prefix). **Verify the d2d1 set in C (byte) order, not the
 order you generated them in** — a `g`-named stencil patch failed 6 of 8 hunks before being renamed.
 
-For the rest of the set, order is insignificant — those patches touch distinct files/regions, and each is generated against the
-**staging-applied base** (not plain upstream), so every patch applies cleanly on the wine-tkg staging
-tree in any order (verified: the full set reproduces the working source byte-for-byte). wine-tkg applies
-`*.mypatch` alphabetically. The build requires `_user_patches_no_confirm="true"` in `customization.cfg`
-(else userpatches are silently skipped on a non-interactive build).
+Order matters across the rest of the set too: later `zz…` patches build on code that earlier ones
+introduce, and the `zz…` prefixes encode the apply order. `build.sh` pins `LC_COLLATE=C` so wine-tkg
+applies them in byte order (another locale's collation reverses pairs that differ only by a separator),
+and `build/check-patch-order.py` fails the build when a patch does not sort after a patch its header
+says it applies after. Each patch is generated against the **staging-applied base** plus every earlier
+patch, not plain upstream. `build.sh` also forces `_user_patches_no_confirm="true"`, without which
+userpatches are silently skipped on a non-interactive build.
 
 ## Production (`patches/`)
 
@@ -53,8 +55,8 @@ would swallow their hunks. Leave it alone; add to `zzzzz` instead.
 Verified: full-set apply reproduces `effect.c` and `d2d1_private.h` byte-for-byte.
 
 ### Regenerating a patch
-Rebuild the true base (HEAD + every earlier patch in **system collation order**, seeding every file
-they touch) and diff your working tree against it. **Only valid when no later patch touches the same
+Rebuild the true base (HEAD + every earlier patch in **C collation order**, the `LC_COLLATE=C` that
+`build.sh` pins, seeding every file they touch) and diff your working tree against it. **Only valid when no later patch touches the same
 files** — otherwise you capture theirs too. Don't do it for a file wine-staging modifies, since HEAD
 is then the wrong base. For a new patch, use [`../build/mkpatch.sh`](../build/mkpatch.sh).
 
@@ -114,9 +116,7 @@ per the *actual* output — so a window is presented at the correct **physical**
 the surface is on (a 4K@1.7× app window dragged to a 1080p@1.0× renders correctly-sized, not 1.7× too
 large). The compositor's exact fractional scale is preferred only when it agrees with win32u's monitor
 dpi (within ~1 dpi). Named to sort **after** `neutron-winewayland` in any locale (same file, disjoint
-`conf->scale` region). Note: this fixes *floating*-window sizing across monitors; crisp native re-render
-and correct *maximize* target on the non-primary monitor need the driver-authoritative override (a
-separate, deferred effort). Touches: `dlls/winewayland.drv/window.c`.
+`conf->scale` region). Touches: `dlls/winewayland.drv/window.c`.
 
 ### `neutron-wintab.mypatch`
 Native pen/graphics-tablet (**WinTab**) support for winewayland — pressure-sensitive pen input from a
@@ -137,13 +137,10 @@ Touches: `dlls/winewayland.drv/` (`Makefile.in`, `waylanddrv.h`, `wayland.c`, `w
 `context.c`, `wintab_internal.h`).
 **Tilt + eraser** are implemented: tilt→`pkOrientation` (azimuth/altitude); the eraser end is a second
 cursor (`CSR_TYPE_ERASER`, slot 2) so flipping the stylus switches Photoshop to the Eraser tool.
-**First-stroke stray-line fix:** Photoshop latches a cursor's stroke origin from the position packet that
-`wintab32`'s `WT_PROXIMITY(enter)` handler queues (`AddPacketToContextQueue`) and never updates it from
-hover — so the first stroke of each tool drew a line from the entry point to the contact point. The enter
-is now made *origin-neutral* (`TABLET_WindowProc` forwards the enter via new `TABLET_FindContextByOwner`
-without queuing an authoritative packet), so the origin latches at actual contact like every later stroke.
-The angular/laggy *live* stroke that remains is the known winewayland canvas present-path lag, not the pen
-pipeline.
+**First-stroke stray fix:** the WinTab system context declared `lcOutExt` in tablet units where a real
+Wacom driver declares screen pixels, so Photoshop mapped the first stroke of a session from the wrong
+origin; `lcOutExt` now equals `lcSysExt` (screen pixels). The proximity-enter packet is also kept
+origin-neutral (`pkChanged=0`), so it cannot set the stroke anchor.
 
 ### `neutron-caption-buttons.mypatch`
 Flat, dark caption buttons for the client-side decorations, so the `_ [] X` buttons match modern
@@ -158,13 +155,14 @@ grayed, hot)` into a new `draw_caption_button` and the flat renderer lives in `u
 `HKCU\Software\Neutron\Caption` `Enabled`=1, `user_draw_caption_button` draws `IconDir\{close,min,max,
 restore}.ico` (optional `_hover`/`_press` variants) over the themed background via `LoadImageW` +
 `NtUserDrawIconEx` (`.ico` only — no WIC/COM in NC paint), falling back to the Marlett glyph when a
-file is missing. Collider writes the keys and ships/normalizes the `.ico` sets. Adds `CAPTION_*` to
+file is missing. `neutron theme icons` writes the keys and copies the `.ico` set into the prefix;
+Collider ships the sets and calls it. Adds `CAPTION_*` to
 `enum NONCLIENT_BUTTON_TYPE` and a trailing `hot` to the
 `pNonClientButtonDraw` hook + `draw_non_client_button_params`. Hover via a `(hwnd, hittest)` hot-button
 pair driven by `handle_nc_mouse_move` (arming `NtUserTrackMouseEvent` `TME_NONCLIENT|TME_LEAVE`) and
 cleared by `handle_nc_mouse_leave`; `set_nc_hot_button()`/`redraw_nc_button()` repaint only the affected
 button. `uxtheme` routes `CAPTION_*` to the default (user32) drawer so the flat buttons survive an active
-visual style. Pairs with `neutron-winewayland-decoration` + the prefix's dark Control Panel colors.
+visual style. Pairs with the CSD decoration in `neutron-winewayland` + the prefix's dark Control Panel colors.
 Touches: `include/winuser.h`, `include/ntuser.h`, `dlls/win32u/defwnd.c`,
 `dlls/user32/{nonclient.c,user_main.c,user_private.h}`, `dlls/uxtheme/{window.c,uxthemedll.h}`.
 
@@ -216,8 +214,9 @@ GPU-process main thread hung ≥120 s holding the lock, Chromium killed it (`exi
 the multi-second Vulkan re-init was the visible stall. Fix: swap the new swapchain in under the lock, then
 hand the retired swapchain to a **one-shot reaper thread** off the Present thread / outside `presentations_cs`
 (`release_swapchain_async` / `swapchain_reaper_proc`); same hazard fixed in `unregister_presentations_for_hwnd`.
-Worst case = one parked ~0%-CPU thread + one leaked presenter per switch (DXVK `m_presentPending` follow-up)
-instead of GPU-process death. Emits `ERR "neutron-reap: queued/released … in N ms"` for A/B observability.
+Worst case on this side = one parked ~0%-CPU thread + one leaked presenter per switch instead of
+GPU-process death; the DXVK side of that wait is bounded by the presenter drain-cancel in
+`external/patches/dxvk`. Emits `ERR "neutron-reap: queued/released … in N ms"` for A/B observability.
 Touches: `dlls/dcomp/device.c`.
 
 ### `neutron-cep-child-surface.mypatch`
@@ -308,9 +307,9 @@ The WinRT/launch fixes genuine Photoshop 2026 (27.8) needs to reach its licensed
   only the window WIDTH matters; when `GetWindowRect` is degenerate (negative width — a maximized
   window can report a stale/garbage Win32 origin under winewayland, e.g. Photoshop 2026's main window
   reports `left`≈2.6e7) it falls back to the client width so the bounds stay on-window. NOTE: this is
-  a correctness fix for the reported bounds; it does **not** resolve PS 2026's black caption-button
-  box — that is a composition/WSI present-black region (same class as the doc-canvas P1 issue), not a
-  bounds problem (verified: with correct bounds the buttons still render black).
+  a correctness fix for the reported bounds. The black caption-button box itself was fixed separately
+  (Wine drew nothing in the area Photoshop reserves for the buttons): `neutron-caption-buttons` and
+  `neutron-zzzzzzzzzp-caption-buttons-use-caption-palette`.
 - **d2d1**: `DrawGeometryRealization` implemented (was a semi-stub) — Wine keeps the realization's
   source geometry, so it renders as Fill/DrawGeometry on that geometry.
 Touches: `dlls/d2d1/device.c`, `dlls/dwmapi/dwmapi_main.c`,
@@ -325,10 +324,10 @@ shell so it never finishes loading. Drains the paint after a threshold of unvali
 `dlls/win32u/dce.c`, `dlls/win32u/message.c`.
 
 ### `neutron-win32u-surface-init-dark.mypatch`
-Initialise a fresh `win32u` `window_surface` to a dark neutral (`0x20`) instead of white (`0xff`) in
+Initialize a fresh `win32u` `window_surface` to a dark neutral (`0x20`) instead of white (`0xff`) in
 `create_window_surface` (`dce.c`). The content is only visible transiently before a window first paints,
 but `window_surface` recreation during an interactive resize (every 128px bucket) exposes it as a
-full-window flash — white flashes hard against a dark (Adobe) UI, dark grey blends in. Single, isolated
+full-window flash — white flashes hard against a dark (Adobe) UI, dark gray blends in. Single, isolated
 one-line hunk (line ~573); disjoint from the wmpaint patch's regions so it applies cleanly in either order.
 Touches: `dlls/win32u/dce.c`.
 
@@ -406,20 +405,6 @@ the version-resource `FindResource`/`LoadResource` path returns byte-identical d
 121.7 ms → 0.42 ms (288×); the LrC submenu stall dropped ~10 s → ~100 ms. Touches:
 `dlls/kernelbase/version.c`. Upstreamable.
 
-## Diagnostic (`patches/diagnostic/`) — env-gated, safe in shipping builds
-
-### `neutron-present-timing.mypatch`
-Present-cadence + blit-duration timing probe behind `NEUTRON_PRESENT_DEBUG`. Used to measure judder /
-A-B pacing strategies.
-
-### `neutron-uxp-present-probe.mypatch`
-Reads UXP surface pixels before the present blit (diagnostic for the home-screen render investigation).
-
-### `neutron-winewayland-dl-instrument.mypatch`
-Temporary `ERR("NEUTRON-DL …")` markers in `winewayland.drv` (`window.c`, `wayland_surface.c`) tracing
-`WindowPosChanging`/`WindowPosChanged` for the Photoshop `win_data_mutex` deadlock investigation.
-Self-labeled **NOT for production** — re-apply only to re-instrument.
-
 ### ~~`neutron-adobe-libxml2-embedded-decl.mypatch`~~ (REMOVED — now in wine-staging v11.10)
 Wine's bundled libxml2 rejects `<?xml …?>` declarations embedded inside elements; Adobe's Creative
 Cloud / HyperDrive installer emits exactly that in its config XML, so the install aborts. The fix
@@ -435,7 +420,7 @@ aborts the build. Removed as redundant; the fix is still in every build via stag
 isn't the head — hit during the Adobe installer's C++ exception unwinding. One-line guard. Ported from
 PhialsBasement/wine-adobe-installers.
 
-**`neutron-d2d1-unpremultiply-effect.mypatch` (2026-08-02) — After Effects composition viewer:**
+### `neutron-d2d1-unpremultiply-effect.mypatch` (2026-08-02) — After Effects composition viewer
 Wine's `dlls/d2d1/effect.c` registered 17 built-in effects; `CLSID_D2D1UnPremultiply` was not one of
 them ("premultiply" appeared nowhere in d2d1). After Effects' hardware blit
 (in `aedisplay.dll`) calls
@@ -465,7 +450,7 @@ Fixed outside Wine, in nvcuda + DXVK — see `external/patches/nvcuda` and `exte
 ([`../external/README.md`](../external/README.md)). ✅ With both, the composition
 renders **and** the UI overlay draws (user-confirmed 2026-08-03).
 
-**`neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen:**
+### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
 all. AE shows its splash (an owned `#32770`, 1301x877) ~22,000 log lines before the main window
@@ -474,6 +459,22 @@ Promotes such a window to its own toplevel — but **only the outermost orphan**
 genuine root with no owner of its own. Without that test, a 503x764 dialog owned by the splash was
 promoted too and appeared as a **ghost window behind it** (the failure the surrounding code's own
 comment warns about). Ownership *depth* separates them; owner *visibility* does not, because both
-are seen while their owner is still unmapped. Env `NEUTRON_WL_ORPHAN_TOPLEVEL=0` disables.
+are seen while their owner is still unmapped. Opt-in and off by default: `NEUTRON_WL_ORPHAN_TOPLEVEL=1`
+turns it on, and only the After Effects launch profile sets it (on for every app, it ghosted Premiere's
+splash).
 ⚠️ Named `zzzz-` deliberately: it must collate AFTER the four other patches touching
 `dlls/winewayland.drv/window.c`, or both hunks fail.
+
+## Diagnostic (`patches/diagnostic/`) — built only with `INCLUDE_DIAGNOSTIC=1`
+
+### `neutron-present-timing.mypatch`
+Present-cadence + blit-duration timing probe behind `NEUTRON_PRESENT_DEBUG`. Used to measure judder /
+A-B pacing strategies.
+
+### `neutron-uxp-present-probe.mypatch`
+Reads UXP surface pixels before the present blit (diagnostic for the home-screen render investigation).
+
+### `neutron-winewayland-dl-instrument.mypatch`
+Temporary `ERR("NEUTRON-DL …")` markers in `winewayland.drv` (`window.c`, `wayland_surface.c`) tracing
+`WindowPosChanging`/`WindowPosChanged` for the Photoshop `win_data_mutex` deadlock investigation.
+Self-labeled **NOT for production** — re-apply only to re-instrument.

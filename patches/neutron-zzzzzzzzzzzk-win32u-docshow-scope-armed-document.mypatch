@@ -18,8 +18,8 @@
 #   25773  force-show -> revealed 1 window(s)      <- 0x311f8 again; our last write wins
 #
 # Doc 1's window ends WS_VISIBLE and stacked over the canvas region, so a canvas click resolves to
-# IT rather than the active document. AdobeOwl's wndproc throws .?AVException@Owl@@ on the
-# WM_MOUSEACTIVATE and its catch funclet swallows it, so the app stays healthy and the click simply
+# IT rather than the active document. That window's procedure throws a C++ exception on the
+# WM_MOUSEACTIVATE and handles it itself, so the app stays healthy and the click simply
 # evaporates. Every reported property follows: canvas-only (menus/panels/tabs are elsewhere), the
 # third document every time, blank-vs-file irrelevant, and clicking doc 1's tab recovers it -- that
 # is PS showing the window legitimately (cmd=4), reconciling the state our cmd=8 forced.
@@ -62,8 +62,8 @@
 + *   25773  force-show -> revealed 1 window(s)      <- 0x311f8 again; our last write wins
 + *
 + * Doc 1's window is then WS_VISIBLE and stacked over the canvas region, so a canvas click
-+ * resolves (via window_from_point) to IT, not the active document. AdobeOwl's wndproc throws
-+ * .?AVException@Owl@@ on the WM_MOUSEACTIVATE and its catch funclet swallows it -- which is why
++ * resolves (via window_from_point) to IT, not the active document. That window's procedure
++ * throws a C++ exception on the WM_MOUSEACTIVATE and handles it itself -- which is why
 + * the app stays healthy and the click merely evaporates. Every reported property follows:
 + * canvas-only, third document, blank-vs-file irrelevant, and clicking doc 1's tab recovers it
 + * (that is PS showing the window legitimately, reconciling the state we forced).

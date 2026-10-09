@@ -24,7 +24,7 @@ WHY RETURNING THE WINDOW IS THE RIGHT CALL, NOT A FUDGE:
   On Windows, document.open() on a live document does not fail this way -- there is no
   mTooDeepWriteRecursion in Trident. The E_FAIL is an artifact of OUR Gecko backend, so apps are
   not written against it, and LrC's missing check is invisible on Windows. Handing back the window
-  (exactly as the success path does) restores the behaviour the app is entitled to expect.
+  (exactly as the success path does) restores the behavior the app is entitled to expect.
 
 ⚠️ HONEST LIMITATION: this stops the CRASH, not the cause. The writes still fail, so the About box
 will render empty rather than showing its text. Fixing that means stopping mWriteLevel from

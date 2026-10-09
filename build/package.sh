@@ -44,7 +44,7 @@ fi
 _BUILT="$(cat "$_BUILD_OK")"
 if [ "$_BUILT" != "$VERSION" ]; then
     echo "package.sh: the last successful build was $_BUILT, but build/VERSION says $VERSION." >&2
-    echo "  Packaging now would ship the $_BUILT tree labelled $VERSION. Re-run build/build.sh." >&2
+    echo "  Packaging now would ship the $_BUILT tree labeled $VERSION. Re-run build/build.sh." >&2
     exit 1
 fi
 SLUG="${NEUTRON_REPO_SLUG:-Nico-LaFoucate/neutron-wine}"
@@ -160,7 +160,7 @@ echo "wine-mono:           $MONO_VER (required by this build)"
 echo "wine-gecko:          $GECKO_VER (required by this build)"
 
 # Source trees, in priority order. These are runtime artifacts, NOT in git — keep them
-# staged under ~/neutron/{mono,gecko} (same trees `neutron runtime capture` uses).
+# staged under ~/neutron/{mono,gecko}.
 find_tree() {  # find_tree <subdir> <leafname>
     local d
     for d in "${NEUTRON_MONO_GECKO_SRC:-}" "$HOME/neutron/dist/$1" "$HOME/neutron/$1" \
