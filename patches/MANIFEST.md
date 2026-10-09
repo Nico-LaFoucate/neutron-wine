@@ -450,6 +450,16 @@ Fixed outside Wine, in nvcuda + DXVK — see `external/patches/nvcuda` and `exte
 ([`../external/README.md`](../external/README.md)). ✅ With both, the composition
 renders **and** the UI overlay draws (user-confirmed 2026-08-03).
 
+### `neutron-zzzzzzzzzzzzze-d2d1-color-management.mypatch` (2026-10-09) — Lightroom (cloud) startup
+Lightroom quit during startup with "CreateD2DDeviceResources failed. HResult: 0x88990028"
+(`D2DERR_EFFECT_IS_NOT_REGISTERED`): Wine has no `CLSID_D2D1ColorManagement`. Registers it as a
+pass-through stub like Unpremultiply (its six real properties, so the app can set and read them; no
+color conversion yet), and implements color contexts, where all five `CreateColorContext*` methods
+returned `E_NOTIMPL`. **Off unless `NEUTRON_D2D_COLOR_MANAGEMENT=1`**, which only the Lightroom
+launch profile sets: Premiere, After Effects, Media Encoder, Photoshop and Illustrator reference the
+effect too, and they keep their own fallback until the effect really converts colors. With the
+switch off, d2d1 behaves exactly as before.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
