@@ -1,0 +1,42 @@
+winewayland: a non-topmost click-through owned window stacks with its owner
+
+Lightroom Classic dims its main window behind the Adobe sign-in (and behind What's New) with a
+popup sized to its client area: WS_POPUP, WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW, owned
+by AgWinMainFrame, unmanaged. neutron_is_clickthrough_overlay() also required WS_EX_NOACTIVATE,
+so this window missed it and became an xdg_popup, which KWin keeps above everything: the sign-in
+window and every other application on that screen were dimmed until sign-in (GitHub issue
+Neutron#5). On Windows an owned window that is not topmost sits directly above its owner and
+below anything raised over the owner, which is exactly a subsurface. NOACTIVATE is now required
+only for topmost windows; menus and tooltips are topmost and keep the popup path.
+
+Verified in the clean room with NEUTRON_POPUP_TRACE=1, Lightroom Classic 15.6.0, same prefix and
+runtime: before, the overlay is XDG_POPUP and the sign-in card measures 66/255; after, it is a
+SUBSURFACE, the sign-in card is 255 (white), and Lightroom's own window is still dimmed exactly
+as before (the same pixel values).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -930,11 +930,19 @@
+  * user clicks another application (verified with a foreground probe), the handler logs
+  * DEACTIVATING, and the bezel still does not sink -- because on Windows WS_EX_TOPMOST really is
+  * absolute in the z-order, so the application is right to keep it up. Wayland has no such
+- * concept, so the only honest mapping is to stack it with its parent. */
++ * concept, so the only honest mapping is to stack it with its parent.
++ *
++ * WS_EX_NOACTIVATE is not required when the window is NOT topmost (2026-10-10, GitHub issue
++ * Neutron#5): Lightroom Classic dims its main window behind the Adobe sign-in with a 2194x1177
++ * popup, layered+transparent+toolwindow, owned by AgWinMainFrame, without NOACTIVATE. As an
++ * xdg_popup it dimmed the sign-in window and every other application. On Windows an owned window
++ * that is not topmost sits directly above its owner and below anything raised over the owner --
++ * exactly a subsurface. Menus and tooltips are topmost, so they keep the popup path. */
+ static BOOL neutron_is_clickthrough_overlay(HWND hwnd)
+ {
+     DWORD ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+-    return (ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT) && (ex & WS_EX_NOACTIVATE);
++    return (ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT) &&
++           ((ex & WS_EX_NOACTIVATE) || !(ex & WS_EX_TOPMOST));
+ }
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
