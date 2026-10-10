@@ -1,0 +1,209 @@
+winewayland: owned overlays stack in Win32 order (Lightroom first-run help froze the app)
+
+Lightroom Classic's first-run help (Import, Develop) stacks four windows owned by its main
+window; on Windows, top first: the help bubble (layered, topmost, activated), a highlight box and
+a dim layer (both layered + click-through toolwindows), and an opaque, DISABLED, layered toolwindow
+that blocks input (GitHub issue Neutron#5). Under Wine the bubble ended up underneath: the app
+then waited for a click on a bubble nobody could see, and had to be killed. Three causes:
+
+- The input blocker (disabled, so it takes no input and is never a menu) became an xdg_popup,
+  which is drawn above every subsurface of its owner. It now counts as an overlay, like the
+  click-through windows: a subsurface of its owner.
+- neutron_restack_apply() appended the owned subsurfaces in the driver tree's order, which is
+  sorted by HWND value. Phase A now records their Win32 z-order (one NtUserBuildHwndList, only
+  when an owner has two or more) and phase B sorts by it.
+- That restack only ran when the owner presented a GPU frame, so a GDI-only window was never
+  ordered and the newest owned subsurface simply covered the older ones. WindowPosChanged now
+  restacks the owner when an owned subsurface is shown, hidden, re-z-ordered or recreated
+  (wayland_restack_owned_now; plain moves and resizes do not trigger it).
+
+Verified with a test program that recreates the stack (same styles, same creation order, bubble
+shown first): before, 0 px of the bubble visible; after, the bubble
+and the highlight box are drawn on top and the restack applies blocker < dim < highlighter <
+bubble, the Win32 order.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -573,6 +573,8 @@
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+ UINT wayland_owned_subsurfaces_of(HWND toplevel, HWND *out, UINT max);
++UINT wayland_owned_subsurfaces_zorder(HWND toplevel, HWND *out, UINT max);
++void wayland_restack_owned_now(HWND toplevel);
+ void wayland_win_data_release(struct wayland_win_data *data);
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2226,6 +2226,8 @@
+     BOOL cef_host[NEUTRON_ZMAX]; /* __wine_dcomp_present: cross-proc CEF/CEP panel host */
+     RECT rect[NEUTRON_ZMAX];     /* window rect in toplevel window-rect space (for damage tests) */
+     UINT count;
++    HWND owned_z[NEUTRON_ZMAX];  /* owned subsurfaces in Win32 z-order, bottom to top */
++    UINT owned_z_count;
+ };
+ 
+ 
+@@ -2708,6 +2710,8 @@
+     NtUserGetWindowRect(toplevel, &tr, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
+     origin.x = tr.left; origin.y = tr.top;
+     neutron_zorder_collect_rec(toplevel, zl, &origin);
++    zl->owned_z_count = neutron_owned_zorder() ?
++        wayland_owned_subsurfaces_zorder(toplevel, zl->owned_z, NEUTRON_ZMAX) : 0;
+ }
+ 
+ /* order cache: skip wl traffic when the applied order is unchanged.
+@@ -2808,6 +2812,27 @@
+     {
+         HWND owned[NEUTRON_ZMAX];
+         UINT no = wayland_owned_subsurfaces_of(toplevel, owned, NEUTRON_ZMAX), k;
++
++        /* Win32 order, not HWND order (the tree is keyed by HWND): sort by the z-order phase A
++         * recorded. A window phase A did not see keeps its place at the bottom of the owned
++         * group, in the order it had before. Insertion sort: there are only a few. */
++        if (zl->owned_z_count >= 2)
++        {
++            int rank[NEUTRON_ZMAX];
++            for (k = 0; k < no; k++)
++            {
++                UINT z;
++                rank[k] = -1;
++                for (z = 0; z < zl->owned_z_count; z++)
++                    if (zl->owned_z[z] == owned[k]) { rank[k] = (int)z; break; }
++            }
++            for (k = 1; k < no; k++)
++            {
++                HWND h = owned[k]; int r = rank[k]; UINT m = k;
++                while (m > 0 && rank[m - 1] > r) { owned[m] = owned[m - 1]; rank[m] = rank[m - 1]; m--; }
++                owned[m] = h; rank[m] = r;
++            }
++        }
+         for (k = 0; k < no && n < NEUTRON_ZMAX; k++)
+         {
+             struct wayland_win_data *od = wayland_win_data_get_nolock(owned[k]);
+@@ -2886,6 +2911,21 @@
+         }
+     }
+ }
++/* NEUTRON (GitHub issue Neutron#5): restack `toplevel`'s subsurfaces in Win32 order outside a
++ * GPU present -- called from WAYLAND_WindowPosChanged when an owned subsurface is shown, hidden,
++ * re-z-ordered or recreated. Phase A then phase B, exactly as wayland_client_surface_update does;
++ * the order cache keeps it free when nothing changed. Must be called WITHOUT win_data_mutex. */
++void wayland_restack_owned_now(HWND toplevel)
++{
++    struct neutron_zlist zl;
++    struct wayland_win_data *data;
++
++    if (!neutron_owned_zorder()) return;
++    neutron_zorder_collect(toplevel, &zl);
++    if (!(data = wayland_win_data_get(toplevel))) return;
++    neutron_restack_apply(toplevel, &zl);
++    wayland_win_data_release(data);
++}
+ /* =================== end NEUTRON native stacking =================== */
+ 
+ /* NEUTRON: do NOT destroy a client subsurface for a TRANSIENTLY invisible window
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -804,6 +804,31 @@
+     }
+ }
+ 
++/* NEUTRON: the Win32 z-order of `toplevel`'s owned subsurfaces, BOTTOM to top, for
++ * neutron_restack_apply(). wayland_owned_subsurfaces_of() walks the driver's tree, which is
++ * sorted by HWND value, so restacking in its order put Lightroom's first-run help bubble (the
++ * lowest HWND, topmost on Windows) underneath the dim layer and the input blocker.
++ * Phase A only: must be called WITHOUT win_data_mutex held. The mutex is taken just to read the
++ * tree (no user-lock call inside it); then ONE NtUserBuildHwndList, and only when there are at
++ * least two owned subsurfaces -- one has no order to get wrong, and restacks run per present. */
++UINT wayland_owned_subsurfaces_zorder(HWND toplevel, HWND *out, UINT max)
++{
++    HWND owned[64], *list;
++    UINT n, i, j, k = 0;
++
++    pthread_mutex_lock(&win_data_mutex);
++    n = wayland_owned_subsurfaces_of(toplevel, owned, ARRAY_SIZE(owned));
++    pthread_mutex_unlock(&win_data_mutex);
++    if (n < 2 || !(list = build_hwnd_list())) return 0;
++
++    for (i = 0; list[i] != HWND_BOTTOM; i++) ;
++    while (i-- > 0 && k < max)                  /* the list runs top to bottom */
++        for (j = 0; j < n; j++)
++            if (list[i] == owned[j]) { out[k++] = owned[j]; break; }
++    free(list);
++    return k;
++}
++
+ static BOOL has_owned_popups(HWND hwnd)
+ {
+     HWND *list;
+@@ -937,11 +962,18 @@
+  * popup, layered+transparent+toolwindow, owned by AgWinMainFrame, without NOACTIVATE. As an
+  * xdg_popup it dimmed the sign-in window and every other application. On Windows an owned window
+  * that is not topmost sits directly above its owner and below anything raised over the owner --
+- * exactly a subsurface. Menus and tooltips are topmost, so they keep the popup path. */
++ * exactly a subsurface. Menus and tooltips are topmost, so they keep the popup path.
++ *
++ * A DISABLED layered window is the same kind of chrome (same issue): Lightroom's first-run help
++ * covers its main window with an opaque, disabled, layered toolwindow (an input blocker) under
++ * the dim layer, the highlight box and the help bubble. Disabled, it takes no input, so it is
++ * never a menu. As an xdg_popup it sat above all three -- the help could not be seen or
++ * dismissed, and Lightroom waited for it forever. */
+ static BOOL neutron_is_clickthrough_overlay(HWND hwnd)
+ {
+     DWORD ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+-    return (ex & WS_EX_LAYERED) && (ex & WS_EX_TRANSPARENT) &&
++    DWORD st = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++    return (ex & WS_EX_LAYERED) && ((ex & WS_EX_TRANSPARENT) || (st & WS_DISABLED)) &&
+            ((ex & WS_EX_NOACTIVATE) || !(ex & WS_EX_TOPMOST));
+ }
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+@@ -949,6 +981,8 @@
+ {
+     BOOL needs_expose = FALSE;
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL;
++    HWND root = toplevel, restack_owner = NULL;   /* NEUTRON #5, see the end of this function */
++    struct wl_subsurface *old_subsurface = NULL;
+     struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
+     struct wayland_client_surface *client;
+     struct wayland_win_data *data, *toplevel_data, *owner_data;
+@@ -1162,6 +1196,10 @@
+     data->is_fullscreen = fullscreen;
+     data->managed = managed;
+ 
++    /* union safety: wl_subsurface aliases the toplevel role's pointers on other roles */
++    if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
++        old_subsurface = data->wayland_surface->wl_subsurface;
++
+     if (!surface)
+     {
+         if ((client = data->client_surface))
+@@ -1184,10 +1222,26 @@
+         wayland_win_data_update_wayland_state(data);
+     }
+ 
++    /* An owned top-level window that is a subsurface of its owner: restack below if its place
++     * in the owner's stack can have changed (shown, hidden, raised/lowered) or its wl_subsurface
++     * is new -- a fresh wl_subsurface starts on top of its siblings. */
++    if (root == hwnd && toplevel && toplevel != hwnd && data->wayland_surface &&
++        data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++        (!(swp_flags & SWP_NOZORDER) || (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ||
++         data->wayland_surface->wl_subsurface != old_subsurface))
++        restack_owner = toplevel;
++
+     wayland_win_data_release(data);
+ 
+     /* Outside the win_data lock, matching xdg_surface_handle_configure(). */
+     if (needs_expose) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
++
++    /* NEUTRON (GitHub issue Neutron#5): put the owner's subsurfaces in Win32 order NOW. Before,
++     * that only happened when the owner presented a GPU frame (wayland_client_surface_update),
++     * so a GDI-only window never got ordered and the newest owned subsurface covered the rest:
++     * Lightroom's first-run input blocker, shown after the help bubble, hid it, and Lightroom
++     * waited for a click that could not happen. Needs win_data_mutex released (phase A). */
++    if (restack_owner) wayland_restack_owned_now(restack_owner);
+ }
+ 
+ /* NEUTRON POPUP SLIDE: adopt the position the compositor actually gave this popup.
