@@ -460,6 +460,21 @@ launch profile sets: Premiere, After Effects, Media Encoder, Photoshop and Illus
 effect too, and they keep their own fallback until the effect really converts colors. With the
 switch off, d2d1 behaves exactly as before.
 
+### `neutron-zzzzzzzzzzzzzf-winewayland-clickthrough-overlay-not-topmost.mypatch` (2026-10-10) — Lightroom dimming
+Lightroom Classic dims its main window behind the Adobe sign-in and What's New with a click-through
+layered popup that lacks `WS_EX_NOACTIVATE`, so it missed the click-through-overlay rule and became an
+`xdg_popup`, which KWin keeps above everything: the sign-in window and every other application were
+dimmed. `WS_EX_NOACTIVATE` is now required only for topmost windows; an owned window that is not
+topmost stacks with its owner (a subsurface), as on Windows. Menus and tooltips are topmost.
+
+### `neutron-zzzzzzzzzzzzzg-winewayland-owned-overlay-zorder.mypatch` (2026-10-10) — Lightroom first-run help froze the app
+Lightroom Classic's first-run help stacks a help bubble, a highlight box, a dim layer and an opaque,
+disabled input blocker over its main window. The bubble ended up underneath and the app waited for a
+click nobody could make. The disabled blocker now counts as an overlay (subsurface, not popup); owned
+subsurfaces are restacked in Win32 z-order rather than HWND order; and that restack now also runs when
+an owned subsurface is shown, hidden, re-z-ordered or recreated, not only on GPU presents. Verified
+with a test program that recreates the four windows (same styles, same creation order).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
