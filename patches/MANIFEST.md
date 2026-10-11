@@ -488,6 +488,17 @@ records which device delivered it, both are created when both managers exist (so
 on compositors that announce data-control before the seat, such as sway), and every listener slot
 has a handler. Verified on a nested Hyprland 0.56.2 with a drag driven by a virtual pointer.
 
+### `neutron-zzzzzzzzzzzzzi-winewayland-restack-all-client-subsurfaces.mypatch` (2026-10-11) — Lightroom Develop tips covered by the photo
+In Lightroom Classic's Develop module, after "Next" on the first help tip, the photo drew over the
+tip and the tip could not be closed; Alt put it back until the next "Next". The photo is a GPU child
+deep in the main frame's 240+ windows, and the restack's Win32 tree walk stops at 64, so the photo's
+subsurface was never placed -- and an unplaced sibling ends up above the chain the restack builds
+from the parent up. Every "Next" recreates the highlighter, restacks, and lifted the photo over the
+tip. The restack now also takes every client subsurface attached to the toplevel from the driver's
+own tree and places the ones the walk missed above the ordered client surfaces and below the owned
+windows. Verified with a test program (100 children, a still D3D11 child, the tip stack, a recreated
+highlighter) and in Lightroom Classic.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
