@@ -1,0 +1,111 @@
+winewayland: restack every client subsurface, not just the first 64 windows' (Lightroom Develop tips)
+
+In Lightroom Classic's Develop module, after "Next" on the first help tip, the photo drew over the
+tip, undimmed, and the tip could not be seen or closed; pressing Alt put it back until the next
+"Next" (GitHub issue Neutron#5, follow-up). Measured in the clean room: the photo is a GPU child
+deep in the main frame's tree of 240+ windows, and on every "Next" Lightroom destroys the
+"Highlighter" window and creates a new one, which restacks the owner.
+
+neutron_restack_apply orders the subsurfaces phase A collected from the Win32 tree, and that walk
+stops at NEUTRON_ZMAX (64) windows. The photo's client subsurface was never in the list
+(NT-EV restack ... zlist=64, photo absent), and a sibling the restack does not place ends up above
+the whole chain it builds from the parent upward. So every restack lifted the photo over the dim
+layer and the bubble; Alt only helped because a relayout re-placed the photo's subsurface just
+above the parent.
+
+Phase B now also asks the driver's own tree for every client subsurface attached to the toplevel
+(wayland_client_subsurfaces_of, no user-lock calls) and places the ones phase A missed after the
+client surfaces it ordered and before the owned windows, which float above every child in Win32.
+
+Verified with a test program (100 child windows, a D3D11 child that presents and then stops, as a
+still photo does, then dim + highlighter + bubble and a recreated highlighter): before, 0 px of
+the bubble and 1.58M px of the photo on top; after, the bubble on top and the photo under the dim.
+The first-run help stack test is unchanged. In Lightroom Classic (clean room, signed in, tips
+reset), the photo no longer covers any tip; every restack lists the photo first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -570,6 +570,7 @@
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+ struct wayland_win_data *wayland_win_data_get_nolock(HWND hwnd);
+ UINT wayland_owned_subsurfaces_of(HWND toplevel, HWND *out, UINT max);
++UINT wayland_client_subsurfaces_of(struct wl_surface *parent, HWND *out, UINT max);
+ UINT wayland_owned_subsurfaces_zorder(HWND toplevel, HWND *out, UINT max);
+ void wayland_restack_owned_now(HWND toplevel);
+ void wayland_win_data_release(struct wayland_win_data *data);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -2804,6 +2804,33 @@
+         if (zl->hwnd[i] == toplevel) top_idx = (int)n; else child_clients++;
+         n++;
+     }
++    /* NEUTRON (GitHub issue Neutron#5): the client surfaces phase A did not reach. Its tree walk
++     * stops at NEUTRON_ZMAX windows, and a sibling left out of this list is pushed ABOVE the whole
++     * chain below (place_above from the parent up) -- Lightroom Classic's Develop photo covered the
++     * help tips after every "Next" that way. They go after the client surfaces phase A ordered (the
++     * walk runs bottom of the z-order first, so the ones it misses are its upper end) and before
++     * the owned windows, which float above every child in Win32. */
++    {
++        HWND extra[NEUTRON_ZMAX];
++        UINT ne = wayland_client_subsurfaces_of(tsurf->wl_surface, extra, NEUTRON_ZMAX), e, j;
++
++        for (e = 0; e < ne && n < NEUTRON_ZMAX; e++)
++        {
++            struct wayland_win_data *d;
++            struct wayland_client_surface *cs;
++            BOOL listed = FALSE;
++
++            for (j = 0; j < n; j++) if (applied[j] == extra[e]) { listed = TRUE; break; }
++            if (listed) continue;
++            if (!(d = wayland_win_data_get_nolock(extra[e])) || !(cs = d->client_surface) ||
++                !cs->wl_surface) continue;
++            cs_of[n] = cs;
++            applied[n] = extra[e];
++            below[n] = cs->place_below;
++            if (extra[e] == toplevel) top_idx = (int)n; else child_clients++;
++            n++;
++        }
++    }
+     /* NEUTRON: append the promoted OWNED windows LAST = top of the bottom-to-top order, which is
+      * the Win32 rule (an owned window floats above its owner and the owner's children). Sourced
+      * from the driver's tree because GW_OWNER is NULL for them -- see
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -161,6 +161,35 @@
+ }
+ 
+ /***********************************************************************
++ *           wayland_client_subsurfaces_of
++ *
++ * NEUTRON (GitHub issue Neutron#5): every window whose client (GPU) subsurface is currently
++ * attached to `parent`, from the driver's own tree. Caller MUST hold win_data_mutex; this makes no
++ * user-lock calls, so it is safe in the restack phase-B context.
++ *
++ * The restack learns a toplevel's windows from a Win32 tree walk that stops at NEUTRON_ZMAX (64).
++ * Lightroom Classic's main frame has 240+, so its Develop photo -- a GPU child deep in that tree --
++ * was never in the list, and a sibling the restack does not place ends up ABOVE everything it
++ * does place: the chain is built from the parent upward. The photo then covered the help tips
++ * after every "Next" until something re-placed it. The driver knows every attached client
++ * subsurface regardless, so ask it.
++ */
++UINT wayland_client_subsurfaces_of(struct wl_surface *parent, HWND *out, UINT max)
++{
++    struct wayland_win_data *d;
++    UINT n = 0;
++
++    RB_FOR_EACH_ENTRY(d, &win_data_rb, struct wayland_win_data, entry)
++    {
++        if (n >= max) break;
++        if (!d->client_surface || !d->client_surface->wl_subsurface) continue;
++        if (d->client_surface->toplevel_wl_surface != parent) continue;
++        out[n++] = d->hwnd;
++    }
++    return n;
++}
++
++/***********************************************************************
+  *           wayland_win_data_create
+  *
+  * Create a data window structure for an existing window.
