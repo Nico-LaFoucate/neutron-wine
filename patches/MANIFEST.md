@@ -475,6 +475,19 @@ subsurfaces are restacked in Win32 z-order rather than HWND order; and that rest
 an owned subsurface is shown, hidden, re-z-ordered or recreated, not only on GPU presents. Verified
 with a test program that recreates the four windows (same styles, same creation order).
 
+### `neutron-zzzzzzzzzzzzzh-winewayland-dnd-with-data-control.mypatch` (2026-10-10) — drag-and-drop crash on Hyprland
+Dragging a file from the file manager onto Photoshop or Premiere on Hyprland closed the app as the
+file entered its window. Hyprland also offers `zwlr_data_control_manager_v1` for the clipboard (KDE
+does not), and the driver kept either a data-control device or a `wl_data_device` in one union,
+deciding an offer's type by whether data-control was bound. Our drag-and-drop patch creates a
+`wl_data_device` in every process when `wl_data_device_manager` is announced, which Hyprland does
+long before data-control, so drag requests went out on the wrong object and Hyprland disconnected
+the app; in the clipboard process the event thread also aborted on an unhandled `primary_selection`,
+breaking copy and paste with Linux apps. Both devices now coexist (separate fields), each offer
+records which device delivered it, both are created when both managers exist (so drops also arrive
+on compositors that announce data-control before the seat, such as sway), and every listener slot
+has a handler. Verified on a nested Hyprland 0.56.2 with a drag driven by a virtual pointer.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
