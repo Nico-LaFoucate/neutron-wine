@@ -499,6 +499,12 @@ own tree and places the ones the walk missed above the ordered client surfaces a
 windows. Verified with a test program (100 children, a still D3D11 child, the tip stack, a recreated
 highlighter) and in Lightroom Classic.
 
+### `neutron-zzzzzzzzzzzzzj-kernel32-unregister-app-recovery-callback.mypatch` (2026-10-11) — crash dialog on Lightroom's relaunch
+Lightroom Classic's "Reset all preferences and relaunch" showed Adobe's crash dialog: before
+relaunching it calls `UnregisterApplicationRecoveryCallback`, which kernel32 did not export (only
+the Register half, as a stub faking success), so the call aborted ("unimplemented function").
+Adds the counterpart, faking success the same way.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
