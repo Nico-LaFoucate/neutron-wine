@@ -1,0 +1,203 @@
+winewayland: drag-and-drop and the clipboard on compositors with data-control (Hyprland crash)
+
+Dragging a file from the file manager onto Photoshop or Premiere on Hyprland closed the app the
+moment the file entered its window (GitHub issue Neutron#6). Hyprland offers
+zwlr_data_control_manager_v1 for the clipboard; KDE does not, so it never showed up there.
+
+The driver keeps either a data-control device or a wl_data_device, never both: the two share a
+union, and offers decide their type from "is data-control bound". Our drag-and-drop patch creates
+a wl_data_device in every process as soon as wl_data_device_manager is announced, and Hyprland
+announces it long before data-control. So:
+
+- In every app process the drag offer was treated as a data-control offer, the read request went
+  out on the wrong object, and Hyprland disconnected the app ("Failed to read events from the
+  compositor, terminating process").
+- In the clipboard process, the data-control device was created over the wl_data_device (the old
+  one "destroyed" as the wrong type), and Hyprland then sends primary_selection, which we had no
+  handler for, so libwayland aborted that process's event thread. The clipboard stopped working
+  in both directions between Linux and Windows apps.
+
+Fix: the device keeps both sets of fields; each offer records which device delivered it; both
+devices are created when both managers exist (drag-and-drop only exists on wl_data_device, so on
+a compositor that announces data-control before the seat, such as sway, drops never arrived at
+all); a wl_data_device selection is ignored while data-control carries the clipboard; and every
+listener slot has a handler.
+
+Verified on Hyprland 0.56.2 (nested): before, Wine Notepad was disconnected on drag enter every
+time and the clipboard was empty in both directions; after, the dropped file opens in Notepad,
+Photoshop accepts the drop, and copy and paste work both ways. KDE takes the same path as before
+(no data-control there).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -64,6 +64,10 @@
+         struct zwlr_data_control_offer_v1 *zwlr_data_control_offer_v1;
+         struct wl_data_offer *wl_data_offer;
+     };
++    /* NEUTRON: which of the two the union holds. It must come from the device that delivered the
++     * offer, never from "is zwlr_data_control_manager_v1 bound": drag-and-drop offers always arrive
++     * on the wl_data_device, even when the compositor also offers data-control for the clipboard. */
++    BOOL data_control;
+     struct wl_array types;
+ };
+ 
+@@ -571,12 +575,26 @@
+     data_control_offer_offer(data, NULL, type);
+ }
+ 
++/* NEUTRON: every listener slot must be filled -- libwayland aborts the whole process on an event
++ * whose slot is NULL ("listener function for opcode N ... is NULL"). These two are drag-and-drop
++ * events we do not need, but a compositor may send them. */
++static void data_offer_source_actions(void *data, struct wl_data_offer *wl_data_offer,
++                                      uint32_t source_actions)
++{
++}
++
++static void data_offer_action(void *data, struct wl_data_offer *wl_data_offer, uint32_t dnd_action)
++{
++}
++
+ static const struct wl_data_offer_listener data_offer_listener =
+ {
+     data_offer_offer,
++    data_offer_source_actions,
++    data_offer_action,
+ };
+ 
+-static void wayland_data_offer_create(void *offer_proxy)
++static void wayland_data_offer_create(void *offer_proxy, BOOL data_control)
+ {
+     struct wayland_data_offer *data_offer;
+ 
+@@ -587,7 +605,8 @@
+     }
+ 
+     wl_array_init(&data_offer->types);
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    data_offer->data_control = data_control;
++    if (data_control)
+     {
+         data_offer->zwlr_data_control_offer_v1 = offer_proxy;
+         zwlr_data_control_offer_v1_add_listener(data_offer->zwlr_data_control_offer_v1,
+@@ -606,7 +625,7 @@
+ {
+     char **p;
+ 
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    if (data_offer->data_control)
+         zwlr_data_control_offer_v1_destroy(data_offer->zwlr_data_control_offer_v1);
+     else
+         wl_data_offer_destroy(data_offer->wl_data_offer);
+@@ -634,7 +653,7 @@
+         fcntl(data_pipe[1], F_SETFD, FD_CLOEXEC);
+     }
+ 
+-    if (process_wayland.zwlr_data_control_manager_v1)
++    if (data_offer->data_control)
+     {
+         zwlr_data_control_offer_v1_receive(data_offer->zwlr_data_control_offer_v1,
+                                            mime_type, data_pipe[1]);
+@@ -692,7 +711,7 @@
+     struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1,
+     struct zwlr_data_control_offer_v1 *zwlr_data_control_offer_v1)
+ {
+-    wayland_data_offer_create(zwlr_data_control_offer_v1);
++    wayland_data_offer_create(zwlr_data_control_offer_v1, TRUE);
+ }
+ 
+ static void handle_selection(struct wayland_data_device *data_device,
+@@ -782,11 +801,22 @@
+ {
+ }
+ 
++/* NEUTRON: Hyprland sends primary_selection even though we bind version 1, where the event does
++ * not exist. With no handler libwayland aborted the clipboard process's event thread at startup,
++ * so the Linux-to-Windows clipboard stopped updating. The primary selection is not used. */
++static void data_control_device_primary_selection(
++    void *data,
++    struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1,
++    struct zwlr_data_control_offer_v1 *zwlr_data_control_offer_v1)
++{
++}
++
+ static const struct zwlr_data_control_device_v1_listener data_control_device_listener =
+ {
+     data_control_device_data_offer,
+     data_control_device_selection,
+     data_control_device_finished,
++    data_control_device_primary_selection,
+ };
+ 
+ /**********************************************************************
+@@ -854,7 +884,7 @@
+ static void data_device_data_offer(void *data, struct wl_data_device *wl_data_device,
+                                    struct wl_data_offer *wl_data_offer)
+ {
+-    wayland_data_offer_create(wl_data_offer);
++    wayland_data_offer_create(wl_data_offer, FALSE);
+ }
+ 
+ /* NEUTRON: DRAG AND DROP FROM THE DESKTOP (wl_data_device DnD).
+@@ -1368,8 +1398,9 @@
+      * surfaces (see wayland_data_device_init). Clipboard ownership stays where it was: only the
+      * process hosting the clipboard window may touch the clipboard. Without this guard, each app
+      * process would answer selection events with clipboard_hwnd == NULL and they would fight over
+-     * (and empty) the clipboard. */
+-    if (!clipboard_hwnd) return;
++     * (and empty) the clipboard. Nor when data-control carries the clipboard: then the selection
++     * arrives on that device, and this wl_data_device exists only for drag-and-drop. */
++    if (!clipboard_hwnd || process_wayland.zwlr_data_control_manager_v1) return;
+     handle_selection(data, wl_data_offer ? wl_data_offer_get_user_data(wl_data_offer) : NULL);
+ }
+ 
+@@ -1406,7 +1437,11 @@
+                 data_device);
+         }
+     }
+-    else if (process_wayland.wl_data_device_manager)
++    /* NEUTRON: not "else". Data-control only carries the clipboard; drag-and-drop exists only on
++     * the wl_data_device, so a compositor that offers both (Hyprland, sway, other wlroots ones)
++     * needs both. With "else", whether an app could take a dropped file at all depended on the
++     * order the compositor announced its globals in. */
++    if (process_wayland.wl_data_device_manager)
+     {
+         if (data_device->wl_data_device)
+             wl_data_device_release(data_device->wl_data_device);
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -221,21 +221,18 @@
+ 
+ struct wayland_data_device
+ {
+-    union
+-    {
+-        struct
+-        {
+-            struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1;
+-            struct zwlr_data_control_source_v1 *zwlr_data_control_source_v1;
+-            struct zwlr_data_control_offer_v1 *clipboard_zwlr_data_control_offer_v1;
+-        };
+-        struct
+-        {
+-            struct wl_data_device *wl_data_device;
+-            struct wl_data_source *wl_data_source;
+-            struct wl_data_offer *clipboard_wl_data_offer;
+-        };
+-    };
++    /* NEUTRON: two sets of fields, not a union. Data-control carries only the clipboard, and
++     * drag-and-drop exists only on the wl_data_device, so a process can need both at once (any
++     * compositor that offers data-control: Hyprland, sway, other wlroots ones). As a union, the
++     * second device was created over the first: the clipboard process "destroyed" its
++     * wl_data_device as a data-control device, and drag-and-drop requests went out on the wrong
++     * object, which the compositor answers by disconnecting the app. */
++    struct zwlr_data_control_device_v1 *zwlr_data_control_device_v1;
++    struct zwlr_data_control_source_v1 *zwlr_data_control_source_v1;
++    struct zwlr_data_control_offer_v1 *clipboard_zwlr_data_control_offer_v1;
++    struct wl_data_device *wl_data_device;
++    struct wl_data_source *wl_data_source;
++    struct wl_data_offer *clipboard_wl_data_offer;
+     pthread_mutex_t mutex;
+ };
+ 
