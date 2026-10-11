@@ -1,0 +1,54 @@
+kernel32: add UnregisterApplicationRecoveryCallback (Lightroom's relaunch showed a crash dialog)
+
+Lightroom Classic's "Reset all preferences and relaunch" showed Adobe's crash dialog over the
+relaunched app; the app kept working until the dialog was closed (GitHub issue Neutron#5, reported
+by the user and reproduced in the clean room). The log had one line:
+
+    wine: Call from 00006FFFFFFA0CEA to unimplemented function
+    KERNEL32.dll.UnregisterApplicationRecoveryCallback, aborting
+
+Lightroom calls it before relaunching itself. kernel32 exported RegisterApplicationRecoveryCallback
+(a stub that fakes success) but not its counterpart, so the call aborted and the crash handler
+caught it. This adds the counterpart, faking success the same way. Normal quits never call it (none
+of the user's daily Lightroom logs has the line).
+
+Verified with a test program that registers and unregisters a recovery callback: before, the same
+abort (exception 80000100); after, S_OK. In Lightroom Classic (clean room), reset-and-relaunch no
+longer shows the dialog and the relaunched app works.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/kernel32/kernel32.spec
++++ b/dlls/kernel32/kernel32.spec
+@@ -1586,7 +1586,7 @@
+ @ stdcall -import UnlockFileEx(long long long long ptr)
+ @ stdcall -import UnmapViewOfFile(ptr)
+ @ stdcall -import UnmapViewOfFileEx(ptr long)
+-# @ stub UnregisterApplicationRecoveryCallback
++@ stdcall UnregisterApplicationRecoveryCallback()
+ @ stdcall UnregisterApplicationRestart()
+ # @ stub UnregisterConsoleIME
+ @ stdcall UnregisterWait(long)
+--- a/dlls/kernel32/process.c
++++ b/dlls/kernel32/process.c
+@@ -598,6 +598,20 @@
+     return S_OK;
+ }
+ 
++/**********************************************************************
++ *           UnregisterApplicationRecoveryCallback     (KERNEL32.@)
++ *
++ * NEUTRON (GitHub issue Neutron#5): Lightroom Classic calls this before it relaunches itself
++ * ("Reset all preferences and relaunch"). It was not exported at all, so the call aborted and
++ * Adobe's crash dialog appeared over the relaunched app. Pairs with the registration above,
++ * which already fakes success.
++ */
++HRESULT WINAPI UnregisterApplicationRecoveryCallback(void)
++{
++    FIXME(": stub, faking success\n");
++    return S_OK;
++}
++
+ static SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *get_logical_processor_info(void)
+ {
+     DWORD size = 0;
