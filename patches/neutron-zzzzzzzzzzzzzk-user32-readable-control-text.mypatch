@@ -1,0 +1,108 @@
+user32: readable text in standard controls under a dark palette (Lightroom About box)
+
+Lightroom Classic's About box drew its labels and its Legal Notices / Credits buttons as black text
+on a dark box (GitHub issue Neutron#10). Both go through MFC: the parent answers WM_CTLCOLORSTATIC
+with black text and a COLOR_BTNFACE brush, and the buttons are painted into an off-screen memory
+DC with black text and a BTNFACE background. On Windows COLOR_BTNFACE is light gray (240), so it
+reads; with Neutron's dark palette it is 43. The palette cannot simply be lightened: MFC caches it
+at startup and Lightroom's menus are drawn from the same table, so they turned light gray too (the
+2026-08 attempt, reverted).
+
+So fix the text, not the palette. DrawTextExW now draws in the palette's matching text color
+(COLOR_BTNTEXT / COLOR_WINDOWTEXT) when all of these hold:
+  - the DC's background color IS the palette's button face (or window color),
+  - the app's text color has under 2:1 contrast against it, and the palette's has more,
+  - the DC belongs to a Button or Static window -- or is a memory DC on the button face,
+    which is how MFC paints its buttons.
+Text that already reads is never touched, and with Windows' default palette dark text on the
+light face always reads, so the rule only ever acts where the result was unreadable.
+
+Verified with a test program (six cases: black-on-BTNFACE in a Static and in a memory DC change;
+black-on-white, palette-text-on-BTNFACE, a custom window and a white memory DC do not): before,
+the two black-on-dark cases fail; after, all six pass. In Lightroom Classic the labels and buttons
+are readable and the File/Edit/Develop menus look the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/user32/text.c
++++ b/dlls/user32/text.c
+@@ -862,8 +862,8 @@
+  * the allowance in DrawTextExA.
+  */
+ #define MAX_BUFFER 1024
+-INT WINAPI DrawTextExW( HDC hdc, LPWSTR str, INT i_count,
+-                        LPRECT rect, UINT flags, LPDRAWTEXTPARAMS dtp )
++static INT draw_text_ex_w( HDC hdc, LPWSTR str, INT i_count,
++                           LPRECT rect, UINT flags, LPDRAWTEXTPARAMS dtp )
+ {
+     SIZE size;
+     const WCHAR *strPtr;
+@@ -1072,6 +1072,68 @@
+     return ret;
+ }
+ 
++/* NEUTRON (GitHub issue Neutron#10): unreadable text in standard controls under a dark palette.
++ *
++ * Lightroom Classic's About box draws its labels (Static) and buttons through MFC, which sets the
++ * text to black and the background to COLOR_BTNFACE. On Windows that face is light gray (240), so
++ * the text reads; with Neutron's dark palette it is 43, and the text was black on dark gray. MFC
++ * reads the palette once at startup and Lightroom's menus are drawn from the same table, so making
++ * COLOR_BTNFACE light again would turn the menus light too (the 2026-08 global attempt did).
++ *
++ * So fix the text, not the palette: when text is drawn into a Button or Static window (or MFC's
++ * off-screen buffer for one), on a
++ * background that IS the palette's button face or window color, in a color with almost no contrast
++ * against it, draw it in the palette's matching text color instead. Text that already reads is
++ * never touched, and on Windows' default palette dark text on a light face always reads, so this
++ * only ever acts where the result was unreadable. */
++static int neutron_luma1000( COLORREF c )
++{
++    /* sRGB relative luminance x1000, gamma approximated as 2 (good enough for a threshold) */
++    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
++    return (2126 * r * r + 7152 * g * g + 722 * b * b) / (255 * 255 * 10);
++}
++
++static BOOL neutron_contrast_poor( COLORREF a, COLORREF b )
++{
++    int la = neutron_luma1000( a ), lb = neutron_luma1000( b );
++    int hi = max( la, lb ), lo = min( la, lb );
++    return (hi + 50) * 10 < (lo + 50) * 20;   /* contrast ratio below 2:1 */
++}
++
++static COLORREF neutron_readable_control_text( HDC hdc )
++{
++    static const WCHAR buttonW[] = {'B','u','t','t','o','n',0}, staticW[] = {'S','t','a','t','i','c',0};
++    COLORREF text = GetTextColor( hdc ), bk = GetBkColor( hdc ), fix;
++    WCHAR cls[16];
++    HWND hwnd;
++
++    if (text == CLR_INVALID || bk == CLR_INVALID) return CLR_INVALID;
++    if (bk == GetSysColor( COLOR_BTNFACE )) fix = GetSysColor( COLOR_BTNTEXT );
++    else if (bk == GetSysColor( COLOR_WINDOW )) fix = GetSysColor( COLOR_WINDOWTEXT );
++    else return CLR_INVALID;
++    if (!neutron_contrast_poor( text, bk ) || neutron_contrast_poor( fix, bk )) return CLR_INVALID;
++    /* MFC paints its buttons into an off-screen memory DC and copies it in, so that DC has no
++     * window. Accept it only on the button face itself, the exact color MFC sets for a button. */
++    if (!(hwnd = NtUserWindowFromDC( hdc )))
++        return (GetObjectType( hdc ) == OBJ_MEMDC && bk == GetSysColor( COLOR_BTNFACE )) ? fix : CLR_INVALID;
++    if (!GetClassNameW( hwnd, cls, ARRAY_SIZE(cls) )) return CLR_INVALID;
++    if (wcsicmp( cls, buttonW ) && wcsicmp( cls, staticW )) return CLR_INVALID;
++    return fix;
++}
++
++INT WINAPI DrawTextExW( HDC hdc, LPWSTR str, INT i_count,
++                        LPRECT rect, UINT flags, LPDRAWTEXTPARAMS dtp )
++{
++    COLORREF fix = CLR_INVALID, old = CLR_INVALID;
++    INT ret;
++
++    if (str && !(flags & DT_CALCRECT) && (fix = neutron_readable_control_text( hdc )) != CLR_INVALID)
++        old = SetTextColor( hdc, fix );
++    ret = draw_text_ex_w( hdc, str, i_count, rect, flags, dtp );
++    if (old != CLR_INVALID) SetTextColor( hdc, old );
++    return ret;
++}
++
+ /***********************************************************************
+  *           DrawTextExA    (USER32.@)
+  *
