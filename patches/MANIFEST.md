@@ -534,6 +534,17 @@ people remap (Escape, Caps Lock, BackSpace, Tab, Return, Shift, Control, Alt, Su
 now decides its VK, as in winex11. Character keys keep the layout tables. Verified with a test
 program in a nested Hyprland (caps:swapescape, no option, ctrl:nocaps).
 
+### `neutron-zzzzzzzzzzzzzn-winrt-mediasource-mediaplayer.mypatch` (2026-10-12) — Lightroom help videos (WinRT media)
+The Assisted Culling help video in Lightroom Classic's Import dialog did not play: its video toolkit
+opens clips with `Windows.Media.Core.MediaSource`, which Wine lacked (0x80040154 from
+CreateMediaSource; the codec was fine). Adds `MediaSource` (CreateFromUri), the
+`AdaptiveMediaSource` statics (Lightroom calls CreateFromUriAsync unchecked; it now completes with
+UnsupportedManifestContentType, as on Windows for a plain file, and Lightroom falls back to
+MediaSource and plays through IMFMediaEngine), and `MediaPlaybackItem`, `MediaPlaybackSession` and a
+real `MediaPlayer` (IMFMediaEngine, frame server) in place of stubs, with the IDL they need. Paired
+with `external/patches/dxvk/0002` (d3d11's WinRT interop exports). Verified with a test program that
+plays the clip through the MediaPlayer frame server into a D3D11 surface, and in Lightroom Classic.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
