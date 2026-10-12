@@ -1,0 +1,193 @@
+winewayland.drv: present a popup larger than the screen where the app put it, unstretched (Animate first launch)
+
+Animate 2024's first launch showed a black window covering the screen; Escape was the only way out.
+The window is Animate's first-launch overlay with the "New to Animate?" card: an owned WS_POPUP that
+Animate sizes to its main window's area times its UI scale (6714x3557 px at 175% on a 3840x2160
+screen; every input to that arithmetic matches what Windows returns). Two things in the Wayland
+driver hid it:
+
+1. Popups are xdg_popups whose positioner asks the compositor to SLIDE them on-screen. A popup
+   larger than every output cannot fit, so the slide only moved it: KWin slid it up and left until
+   its bottom-right corner met the screen's, showing empty backdrop while the card sat off-screen.
+   Windows leaves a window where the app put it and clips it at the screen edge. The positioner now
+   slides only along an axis where the popup fits on an output; menus and dropdowns still slide.
+
+2. win32u clips a window surface to the desktop, so such a window's buffer is smaller than the
+   window. The viewport source is clamped to the buffer but the destination was the full window, so
+   the compositor stretched the buffer (1.17x by 1.74x here): the card was drawn down and to the
+   right of where Animate hit-tests it, and its buttons did not respond. A buffer smaller than its
+   window is now presented 1:1, both where the buffer is attached and where the surface is
+   reconfigured. Windows that extend past the left or top of the desktop are not handled here.
+
+Harness: preserved-fixes/harnesses/popup-oversize.c + popup-oversize-check.py. On 11.10-108 `big`
+FAILS (both squares off-screen) and `edge` passes; patched, both pass (square aspect 1.01, spacing
+4.04/2.04, want 1/4/2). Animate first launch: the card is centered and its buttons respond
+(operator). Regression pass in the clean room (operator): Premiere 2025 dropdowns, context menu,
+Export dialog, Captioneer panel; Lightroom Classic Import dialog, dropdowns, filmstrip menu;
+Audition menus and New Audio File; InDesign menus and New Document.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -429,6 +429,10 @@
+     BOOL resizing;
+     struct wayland_window_config window;
+     int content_width, content_height;
++    /* NEUTRON: size of the shm buffer last attached, in window px (0 before the first attach).
++     * win32u clips a window surface to the desktop, so a window larger than the desktop has a
++     * buffer SMALLER than its window; see wayland_surface_viewport_destination(). */
++    int buffer_width, buffer_height;
+     /* NEUTRON: has this surface EVER held content? content_width is zeroed by
+      * wayland_surface_clear_role() on every hide, so it cannot distinguish "was drawn, hidden,
+      * re-shown" from "brand new, never painted". This one is never cleared. */
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -715,6 +715,22 @@
+     ERR("Failed to assign subsurface role to wayland surface\n");
+ }
+ 
++/* The largest logical width and height of any known output (0 when none is known yet). */
++static void wayland_outputs_max_logical_size(int *width, int *height)
++{
++    struct wayland_output *output;
++
++    *width = *height = 0;
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        if (!output->current.current_mode) continue;
++        *width = max(*width, output->current.logical_w);
++        *height = max(*height, output->current.logical_h);
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++}
++
+ /* Build an xdg_positioner that places the popup at (config->x, config->y)
+  * relative to the owner window's top-left, in surface-local coords. */
+ static struct xdg_positioner *popup_create_positioner(struct wayland_surface *owner,
+@@ -755,10 +771,30 @@
+     xdg_positioner_set_size(xdg_positioner, width, height);
+     /* Let the compositor slide the popup to keep it on-screen. Slide-only keeps
+      * the size constant so it stays consistent with our fixed menu buffer and
+-     * window geometry (flip/resize would change size/orientation). */
+-    xdg_positioner_set_constraint_adjustment(xdg_positioner,
+-        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+-        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
++     * window geometry (flip/resize would change size/orientation).
++     *
++     * NEUTRON: but only along an axis where the popup fits on an output. A popup larger than every
++     * output cannot be brought on-screen by sliding; the slide only changes which part of it is
++     * visible, while Windows leaves a window exactly where the app put it and clips it at the
++     * screen edge. Animate's first-launch overlay (owned by the main window, sized to its area
++     * times the UI scale: 6714x3557 at 175%) was slid up and left until its bottom-right corner
++     * met the screen's, so only empty backdrop showed and the "New to Animate?" card sat
++     * off-screen. Menus and dropdowns, which fit, still slide. */
++    {
++        uint32_t adjust = 0;
++        int out_width, out_height;
++
++        wayland_outputs_max_logical_size(&out_width, &out_height);
++        if (!out_width || width <= out_width) adjust |= XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X;
++        if (!out_height || height <= out_height) adjust |= XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
++        if (adjust != (XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++                       XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y))
++            TRACE("popup %dx%d is larger than every output (%dx%d); slide %s%s only\n",
++                  width, height, out_width, out_height,
++                  (adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X) ? "x" : "",
++                  (adjust & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y) ? "y" : "");
++        xdg_positioner_set_constraint_adjustment(xdg_positioner, adjust);
++    }
+ 
+     return xdg_positioner;
+ }
+@@ -943,6 +979,8 @@
+ 
+     surface->content_width = 0;
+     surface->content_height = 0;
++    surface->buffer_width = 0;
++    surface->buffer_height = 0;
+ 
+     wl_display_flush(process_wayland.wl_display);
+ }
+@@ -957,6 +995,8 @@
+  */
+ static BOOL wayland_surface_get_frame_spill_rect(struct wayland_surface *surface,
+                                                  RECT *rect);
++static BOOL wayland_surface_viewport_destination(struct wayland_surface *surface,
++                                                 int *width, int *height);
+ 
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+@@ -1039,6 +1079,16 @@
+                                wl_fixed_from_int(win_height));
+     }
+ 
++    surface->buffer_width = shm_buffer->width;
++    surface->buffer_height = shm_buffer->height;
++    if (!wayland_surface_get_frame_spill_rect(surface, &spill))
++    {
++        int dest_width, dest_height;
++
++        if (wayland_surface_viewport_destination(surface, &dest_width, &dest_height))
++            wp_viewport_set_destination(surface->wp_viewport, dest_width, dest_height);
++    }
++
+     surface->content_width = win_width;
+     surface->content_height = win_height;
+     surface->ever_had_content = TRUE;
+@@ -1488,6 +1538,39 @@
+ }
+ 
+ /**********************************************************************
++ *          wayland_surface_viewport_destination
++ *
++ * NEUTRON: the viewport destination for a window whose buffer is smaller than the window.
++ *
++ * win32u clips a window surface to the desktop, so a window that extends past it gets a buffer
++ * covering only the part inside it (from the window's top-left). The viewport source is clamped to
++ * that buffer, but the destination was the FULL window size, so the compositor stretched the
++ * buffer over the whole window: Animate's first-launch overlay (6714x3557 px, buffer 5760x2048)
++ * was magnified 1.17x by 1.74x, its card drawn down and to the right of where Animate hit-tests
++ * it, so the buttons did not respond. Present the buffer 1:1 instead, as Windows shows such a
++ * window clipped at the screen edge. Returns FALSE when the buffer covers the whole window (the
++ * normal case: the destination stays the window size).
++ *
++ * Assumes the buffer starts at the window's top-left, which holds for a window that extends past
++ * the right or bottom of the desktop; one that starts left of or above it is not handled here.
++ */
++static BOOL wayland_surface_viewport_destination(struct wayland_surface *surface,
++                                                 int *width, int *height)
++{
++    int win_width = surface->window.rect.right - surface->window.rect.left;
++    int win_height = surface->window.rect.bottom - surface->window.rect.top;
++
++    if (!surface->buffer_width || !surface->buffer_height) return FALSE;
++    if (surface->buffer_width >= win_width && surface->buffer_height >= win_height) return FALSE;
++
++    wayland_surface_coords_from_window(surface, min(win_width, surface->buffer_width),
++                                       min(win_height, surface->buffer_height), width, height);
++    *width = max(1, *width);
++    *height = max(1, *height);
++    return TRUE;
++}
++
++/**********************************************************************
+  *          wayland_surface_reconfigure_size
+  *
+  * Sets the surface size with viewporter
+@@ -1826,6 +1909,16 @@
+         break;
+     }
+ 
++    if (!content)
++    {
++        int dest_width, dest_height;
++
++        if (wayland_surface_viewport_destination(surface, &dest_width, &dest_height))
++        {
++            width = dest_width;
++            height = dest_height;
++        }
++    }
+     wayland_surface_reconfigure_size(surface, width, height);
+ 
+     return TRUE;
