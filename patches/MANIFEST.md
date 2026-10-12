@@ -579,6 +579,20 @@ operate either synchronously or asynchronously" in async mode). Verified with
 `harnesses/winhttp-async-nocallback.c` (108-pre fails the no-callback status query, the patched build
 passes; the with-callback control passes on both) and in Lightroom Classic (Help reaches winebrowser).
 
+### `neutron-zzzzzzzzzzzzzr-winewayland-oversized-popup-as-placed.mypatch` (2026-10-12) — Animate's first launch: black window covering the screen
+Animate 2024's first-launch overlay ("New to Animate?") is an owned `WS_POPUP` Animate sizes to its main window's
+area times its UI scale: 6714x3557 px at 175%, larger than any monitor (Animate's own arithmetic; every input to it
+matches Windows). Two driver faults hid it. (1) The xdg_positioner asked KWin to SLIDE popups on-screen; a popup larger
+than every output cannot fit, so KWin slid it until its bottom-right met the screen's, leaving only black backdrop on
+screen and the card off it. Slide is now requested only along an axis where the popup fits an output (menus and
+dropdowns unchanged). (2) win32u clips a window surface to the desktop, so the buffer was smaller than the window but
+the viewport destination was the full window: the buffer was stretched 1.17x by 1.74x and the card was drawn away from
+where Animate hit-tests it (buttons dead). A buffer smaller than its window is now presented 1:1, at attach and at
+reconfigure (`wayland_surface_viewport_destination`). Not handled: a window extending past the desktop's left or top
+(its buffer does not start at the window origin). Verified with `harnesses/popup-oversize.c` +
+`popup-oversize-check.py` (108: `big` fails, `edge` passes; patched: both pass) and in Animate (card centered, buttons
+work); regression pass in Premiere 2025, Lightroom Classic, Audition, InDesign (operator).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
