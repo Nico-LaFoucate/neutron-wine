@@ -545,6 +545,40 @@ real `MediaPlayer` (IMFMediaEngine, frame server) in place of stubs, with the ID
 with `external/patches/dxvk/0002` (d3d11's WinRT interop exports). Verified with a test program that
 plays the clip through the MediaPlayer frame server into a D3D11 surface, and in Lightroom Classic.
 
+### `neutron-zzzzzzzzzzzzzo-cep-panel-host-container-shape.mypatch` (2026-10-12) — Audition Learn panel blank
+Audition 2026's Learn panel (a CEP extension) stayed white while DevTools showed the page fully
+rendered. Two gaps on the cross-process CEP present path. (1) dcomp found a panel's host window only
+by PlugPlug class name (`WC_PLUGPLUG_HTMLEXTENSION` in Premiere, `PLUGPLUG_UI_NATIVE` in Animate);
+Audition hosts CEP panels in its own DVA window (`{guid} <- DroverLord`), so no host was found and the
+frames went to CEF's own window. A structural fallback now picks the window directly above the
+`{guid}` container (CefBrowserWindow's parent, in the app's process) -- the position the PlugPlug
+hosts occupy too -- only when neither class matches. (2) winewayland's consumer drew through
+`GetDC(host)`, which honors `WS_CLIPCHILDREN`; Audition's host has it and its `{guid}` child covers it,
+so every blit was clipped to nothing. The consumer no longer clips children. Verified in Audition:
+clearing the style by hand made the panel appear, and the patched build renders it.
+
+### `neutron-zzzzzzzzzzzzzp-teb-version-1e00-fiber-flag.mypatch` (2026-10-12) — InDesign crash after the home screen
+InDesign 2026 crashed seconds after its home screen appeared (access violation in `PMRuntime.dll`,
+RAX=0, from its Font Manager thread). `K2Memory::IsUIThread()` reads `gs:[0x20]` (NT_TIB.Version /
+FiberData), returns early on 0x1e00 and otherwise dereferences it. Windows starts every thread at
+0x1e00 and tracks fibers with `TEB.HasFiberData`; Wine left the slot NULL. `init_teb` now sets
+0x1e00 (both TEBs), and kernelbase's fiber functions use `HasFiberData`, restoring 0x1e00 in
+`ConvertFiberToThread`. Verified with `harnesses/teb-fiber-version.c` (107 fails 4 of 18 checks,
+the patched build passes all) and in InDesign (new document, typing).
+
+### `neutron-zzzzzzzzzzzzzq-winhttp-async-without-callback-is-sync.mypatch` (2026-10-12) — "Cannot display help." (Neutron#13)
+Every Help menu page in Lightroom Classic failed with "Cannot display help." Adobe's Help client
+(`ahclient.dll`, also in Premiere, Audition, InDesign, Animate, Media Encoder) checks it is online with a
+WinHTTP session opened `WINHTTP_FLAG_ASYNC`, no status callback, and `WinHttpSendRequest` /
+`WinHttpReceiveResponse` / `WinHttpQueryHeaders(STATUS_CODE)` back to back. Wine queued them, the status
+query failed with `ERROR_WINHTTP_INCORRECT_HANDLE_STATE`, and the client took its offline path (ARH.exe,
+not shipped) and gave up. A request with no status callback now runs send, receive, query-data-available,
+read and write synchronously; requests with a callback are unchanged. That Windows completes these calls
+is inferred from Adobe's Help working there (Microsoft documents only that `WinHttpReceiveResponse` "can
+operate either synchronously or asynchronously" in async mode). Verified with
+`harnesses/winhttp-async-nocallback.c` (108-pre fails the no-callback status query, the patched build
+passes; the with-callback control passes on both) and in Lightroom Classic (Help reaches winebrowser).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
