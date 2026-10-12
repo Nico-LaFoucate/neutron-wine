@@ -1,0 +1,96 @@
+D2d1: unwrite a layer's stencil mask where it was written (Lightroom Navigator cut-off)
+
+Lightroom Classic's Develop Navigator thumbnail was whole when Develop opened, then a few seconds
+later lost a strip on the right and one at the bottom (GitHub issue Neutron#9).
+
+The Navigator is a 398x318 DC render target. Each frame Lightroom saves its drawing state,
+translates by (10,31), pushes a layer masked to a 378x252 path rectangle, draws the thumbnail,
+pushes a second layer with the same mask, RESTORES the drawing state, and only then pops both
+layers. Our path-mask stencil wrote each mask under the world transform at PushLayer but unwrote
+it under the world transform at PopLayer -- by then identity -- so the unwrite landed at
+(0,0)-(378,252) instead of (10,31)-(388,283). A 10px strip on the right and a 31px strip at the
+bottom stayed promoted. The stencil is not cleared between frames, so on the next frame those
+strips failed the mask test and the thumbnail was clipped by exactly its offset. The first frame
+after the target is created is always whole, which is why it starts out right.
+
+The layer mask is placed by the world transform in force at PushLayer (as on Windows), so store
+the composed maskTransform x world matrix at push and unwrite with that.
+
+Verified with a test program that replays Lightroom's sequence: on 11.10-104 frames 2 and 3 lose
+both strips and a masked fill after the pops misses them in the same frame; with the stencil
+switched off (NEUTRON_D2D_STENCIL=0) all pass, so the stencil was the cause; with this change all
+pass with the stencil on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -3313,8 +3313,11 @@
+     return geometry->fill.face_count || geometry->fill.bezier_vertex_count;
+ }
+ 
++/* `transform` is the COMPLETE mask-space -> target transform: the layer's maskTransform composed
++ * with the world transform that was in force at PushLayer. It is deliberately NOT recomputed from
++ * the current world transform -- see d2d_device_context_push_layer_stencil(). */
+ static void d2d_device_context_stencil_mask(struct d2d_device_context *context,
+-        ID2D1Geometry *mask, const D2D1_MATRIX_3X2_F *mask_transform, int dir)
++        ID2D1Geometry *mask, const D2D1_MATRIX_3X2_F *transform, int dir)
+ {
+     D2D1_MATRIX_3X2_F saved = context->drawing_state.transform;
+     struct d2d_geometry *geometry;
+@@ -3322,14 +3325,7 @@
+     if (!(geometry = unsafe_impl_from_ID2D1Geometry(mask)))
+         return;
+ 
+-    if (mask_transform)
+-    {
+-        D2D1_MATRIX_3X2_F m = *mask_transform;
+-
+-        d2d_matrix_multiply(&m, &saved);        /* mask space -> world space */
+-        context->drawing_state.transform = m;
+-    }
+-
++    context->drawing_state.transform = *transform;
+     context->stencil_pass = dir;
+     d2d_device_context_fill_geometry(context, geometry, NULL, NULL);
+     context->stencil_pass = 0;
+@@ -3361,6 +3357,7 @@
+             && d2d_device_context_ensure_stencil(context))
+     {
+         unsigned int slot = context->layer_depth;
++        D2D1_MATRIX_3X2_F m = layer_parameters->maskTransform;
+         static LONG announced;
+ 
+         /* One line, once per process: a smoke test where this path never runs and one where it
+@@ -3371,11 +3368,18 @@
+                 "masks now stencilled rather than clipped to their bounds\n",
+                 context->pixel_size.width, context->pixel_size.height);
+ 
+-        d2d_device_context_stencil_mask(context, layer_parameters->geometricMask,
+-                &layer_parameters->maskTransform, +1);
++        /* The mask is placed by the world transform AT PUSH, and PopLayer must unwrite it in that
++         * same place, so keep the composed matrix rather than the bare maskTransform. Composing
++         * again at PopLayer used whatever transform was current THEN: Lightroom restores its
++         * drawing state (identity) before popping, so the unwrite missed by the translation and
++         * left strips of the mask promoted. The stencil is not cleared between frames, so the
++         * next frame's draws failed the test there -- the Develop Navigator thumbnail clipped by
++         * exactly its (10,31) offset (GitHub Neutron#9). */
++        d2d_matrix_multiply(&m, &context->drawing_state.transform);   /* mask space -> target */
++        d2d_device_context_stencil_mask(context, layer_parameters->geometricMask, &m, +1);
+         context->stencil_mask[slot] = layer_parameters->geometricMask;
+         ID2D1Geometry_AddRef(context->stencil_mask[slot]);
+-        context->stencil_mask_transform[slot] = layer_parameters->maskTransform;
++        context->stencil_mask_transform[slot] = m;
+         context->layer_stencilled[slot] = 1;
+         ++context->stencil_depth;
+         stencilled = TRUE;
+@@ -3457,7 +3461,8 @@
+     if (context->layer_depth)
+         --context->layer_depth;
+ 
+-    /* NEUTRON PATH-MASK STENCIL: unwrite exactly the geometry this layer wrote. */
++    /* NEUTRON PATH-MASK STENCIL: unwrite exactly the geometry this layer wrote, where it wrote
++     * it -- under the transform stored at PushLayer, not the current one. */
+     if (context->layer_depth < ARRAY_SIZE(context->layer_stencilled)
+             && context->layer_stencilled[context->layer_depth])
+     {
