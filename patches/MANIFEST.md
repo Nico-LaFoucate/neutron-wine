@@ -505,6 +505,15 @@ relaunching it calls `UnregisterApplicationRecoveryCallback`, which kernel32 did
 the Register half, as a stub faking success), so the call aborted ("unimplemented function").
 Adds the counterpart, faking success the same way.
 
+### `neutron-zzzzzzzzzzzzzk-user32-readable-control-text.mypatch` (2026-10-11) — Lightroom About box labels
+Lightroom Classic's About box drew its labels and two buttons as black text on dark boxes: MFC sets
+black text on `COLOR_BTNFACE`, which is light on Windows and 43 in Neutron's dark palette, and the
+palette cannot be lightened without turning Lightroom's menus light (MFC caches it for both).
+`DrawTextExW` now uses the palette's text color when the background is the palette's button face
+(or window color), the app's text has under 2:1 contrast against it, and the DC belongs to a
+Button/Static window or is a memory DC on the button face (MFC's button buffer). Readable text is
+never touched; with Windows' default palette the rule never acts.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
