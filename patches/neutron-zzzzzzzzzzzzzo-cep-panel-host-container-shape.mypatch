@@ -1,0 +1,89 @@
+dcomp, winewayland.drv: show CEP panels hosted in a plain app window (Audition Learn panel)
+
+Audition 2026's Learn panel stayed white while DevTools showed the page fully rendered
+(Neutron discussion #8). Two gaps on the CEP panel present path:
+
+* dcomp found the panel host only by PlugPlug class name (WC_PLUGPLUG_HTMLEXTENSION in
+  Premiere, PLUGPLUG_UI_NATIVE in Animate). Audition hosts CEP panels in its own DVA
+  window (Chrome_WidgetWin_0 <- CefBrowserWindow <- {guid} <- DroverLord ...), so no host
+  was found and the frames were registered against CEF's own window, where nothing draws
+  them. Add a structural fallback with the shape all three apps share: the host is the
+  window directly above the {guid} container, which is CefBrowserWindow's parent in the
+  app's process. Used only when neither class matches.
+
+* winewayland's consumer drew through GetDC(host), which honors WS_CLIPCHILDREN. Audition's
+  host has it, and its {guid} child covers it completely, so every blit was clipped to
+  nothing. Draw without clipping children (they are the panel these pixels belong to);
+  siblings are still honored.
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -205,7 +205,7 @@
+     HWND a;
+     int depth;
+ 
+-    HWND native_host = NULL;
++    HWND native_host = NULL, container_host = NULL;
+ 
+     /* NEUTRON 2026-08-04: Adobe uses TWO different CEP host window classes, and matching only the
+      * first one meant a whole app never got this present path:
+@@ -221,7 +221,17 @@
+      * ⚠️ Deliberately ADDITIVE: HTMLEXTENSION still wins outright, and the native host is only used
+      * when the chain contains no HTMLEXTENSION at all. Returning whichever matched FIRST while
+      * walking up would have changed which ancestor Premiere selects, and Premiere's panel works
+-     * today -- this must not disturb it. */
++     * today -- this must not disturb it.
++     *
++     * NEUTRON 2026-10-12: a THIRD host, with no PlugPlug class at all. Audition 2026 hosts its CEP
++     * panels in its own DVA windows: Chrome_WidgetWin_0 <- CefBrowserWindow <- {guid} <-
++     * DroverLord - Window Class <- ... (Neutron discussion #8: the Audition Learn panel stayed
++     * WHITE while DevTools showed the page fully rendered). What all three apps share is the
++     * SHAPE: the {guid} container is CefBrowserWindow's parent, lives in the Adobe app's process,
++     * and the host is the window directly above it -- HTMLEXTENSION in Premiere,
++     * PLUGPLUG_UI_NATIVE in Animate, a DroverLord in Audition (measured: the same 505x346 rect as
++     * the panel content; the DroverLord above that adds the tab header). Used only when neither
++     * class matched, so Premiere and Animate select exactly what they did before. */
+     for (a = hwnd, depth = 0; a && depth < 16; a = GetAncestor(a, GA_PARENT), depth++)
+     {
+         if (GetClassNameW(a, cls, 128) <= 0) continue;
+@@ -229,8 +239,19 @@
+             return a;
+         if (!native_host && wcsstr(cls, L"PLUGPLUG_UI_NATIVE"))
+             native_host = a;
++        if (!container_host && !wcscmp(cls, L"CefBrowserWindow"))
++        {
++            HWND container = GetAncestor(a, GA_PARENT), above;
++            DWORD cef_pid = 0, container_pid = 0;
++
++            GetWindowThreadProcessId(a, &cef_pid);
++            if (container && GetWindowThreadProcessId(container, &container_pid)
++                    && container_pid != cef_pid
++                    && (above = GetAncestor(container, GA_PARENT)) && above != GetDesktopWindow())
++                container_host = above;
++        }
+     }
+-    return native_host;
++    return native_host ? native_host : container_host;
+ }
+ 
+ static struct list presentations = LIST_INIT(presentations);
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -168,7 +168,16 @@
+     bmi.bmiHeader.biBitCount = 32;
+     bmi.bmiHeader.biCompression = BI_RGB;
+ 
+-    if ((hdc = GetDC(hwnd)))
++    /* NEUTRON 2026-10-12: never clip the host's CHILDREN. Those children are the panel itself --
++     * the {guid} container and CEF's windows, which cover the host completely -- and these pixels
++     * are what they would show. GetDC() honors WS_CLIPCHILDREN, so on a host that has it the
++     * visible region was EMPTY and every blit was discarded: Audition 2026 hosts its CEP panels in
++     * a DVA DroverLord window (style 0x52000000) and its Learn panel stayed white while frames were
++     * delivered. Clearing the style on that window by hand made the panel appear at once.
++     * Premiere's and Animate's PlugPlug hosts render through this path today, which they could not
++     * do if they clipped children, so their clipping is unchanged. Siblings are still honored. */
++    if ((hdc = GetDCEx(hwnd, 0, DCX_CACHE |
++                       ((GetWindowLongW(hwnd, GWL_STYLE) & WS_CLIPSIBLINGS) ? DCX_CLIPSIBLINGS : 0))))
+     {
+         static int (WINAPI *p_SetStretchBltMode)(HDC, int);
+         static int (WINAPI *p_StretchDIBits)(HDC, int, int, int, int, int, int, int, int,
