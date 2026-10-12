@@ -525,6 +525,15 @@ composed maskTransform x world matrix is now stored at push and used for the unw
 a test program that replays Lightroom's sequence (fails on 104, passes with the stencil off and with
 this change).
 
+### `neutron-zzzzzzzzzzzzzm-winewayland-remapped-control-key-vkey.mypatch` (2026-10-11) — remapped Escape/Caps Lock (Hyprland)
+With Caps Lock and Escape swapped (xkb `caps:swapescape`), the key that types Escape did not close
+Photoshop's menus but did leave a text box. winewayland took a key's character from the keymap
+but its VK only from its physical position, so the physical Caps Lock key arrived as VK_CAPITAL
+with an Escape character; menus close on VK_ESCAPE. When a key's base keysym is a control key
+people remap (Escape, Caps Lock, BackSpace, Tab, Return, Shift, Control, Alt, Super), the keysym
+now decides its VK, as in winex11. Character keys keep the layout tables. Verified with a test
+program in a nested Hyprland (caps:swapescape, no option, ctrl:nocaps).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
