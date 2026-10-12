@@ -1,0 +1,98 @@
+Winewayland: take a remapped control key's VK from its keysym (Hyprland caps:swapescape)
+
+With Caps Lock and Escape swapped in Hyprland (xkb option caps:swapescape), the key that types
+Escape did not close Photoshop's menus, though it did leave a text box (GitHub issue Neutron#7).
+
+winewayland took a key's character from the keymap but its VK only from the key's physical
+position (scan2vk[scan]). The physical Caps Lock key therefore arrived as VK_CAPITAL carrying an
+Escape character: a text box that acts on WM_CHAR 0x1b worked, menus, which close on WM_KEYDOWN
+VK_ESCAPE, did not. On Windows such a remap changes the key itself, so apps see VK_ESCAPE;
+winex11.drv has always taken the VK of non-character keys from their keysym.
+
+When a key's base keysym is a control key people remap (Escape, Caps Lock, BackSpace, Tab, Return,
+Shift, Control, Alt, Super) and differs from the positional VK, the keysym now decides the VK, in
+both the scancode-to-VK table and the VK-to-character table. Character keys keep the existing
+layout tables, so azerty/qwertz/dvorak are untouched.
+
+Verified with a test program in a nested Hyprland 0.56.2 with caps:swapescape, keys injected
+with hyprctl sendshortcut: on 11.10-105 the physical Caps Lock key gives VK_CAPITAL + an Escape
+character and leaves a popup menu open; with this change it gives VK_ESCAPE and closes the menu,
+and the physical Escape key gives VK_CAPITAL. Without the option nothing changes (Caps Lock is
+VK_CAPITAL, Escape is VK_ESCAPE); with ctrl:nocaps Caps Lock gives VK_CONTROL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -394,6 +394,53 @@
+     else return (HKL)(UINT_PTR)MAKELONG(locale, 0xf000 | layout->layout_id);
+ }
+ 
++/* NEUTRON: the VK of a remapped control key.
++ *
++ * A key's VK came only from its PHYSICAL position (scan2vk[scan]), while its character came from
++ * the keymap. With Caps Lock and Escape swapped (xkb caps:swapescape, as Hyprland users set it) the
++ * physical Caps Lock key therefore arrived as VK_CAPITAL carrying an Escape character: a text box
++ * that acts on WM_CHAR 0x1b worked, but menus, which close on WM_KEYDOWN VK_ESCAPE, did not
++ * (GitHub Neutron#7, Photoshop). On Windows such a remap changes the key itself, so apps see
++ * VK_ESCAPE. winex11.drv has always taken the VK of non-character keys from their keysym; do the
++ * same for the keys people remap: when the key's base keysym is one of these, it decides the VK.
++ * Character keys keep the layout tables above, so this does not touch azerty/qwertz/dvorak. */
++static WORD keysym_control_vkey(xkb_keysym_t keysym)
++{
++    switch (keysym)
++    {
++    case XKB_KEY_Escape:    return VK_ESCAPE;
++    case XKB_KEY_Caps_Lock: return VK_CAPITAL;
++    case XKB_KEY_BackSpace: return VK_BACK;
++    case XKB_KEY_Tab:       return VK_TAB;
++    case XKB_KEY_Return:    return VK_RETURN;
++    case XKB_KEY_Shift_L:   return VK_LSHIFT;
++    case XKB_KEY_Shift_R:   return VK_RSHIFT;
++    case XKB_KEY_Control_L: return VK_LCONTROL;
++    case XKB_KEY_Control_R: return VK_RCONTROL;
++    case XKB_KEY_Alt_L:     return VK_LMENU;
++    case XKB_KEY_Alt_R:     return VK_RMENU;
++    case XKB_KEY_Super_L:   return VK_LWIN;
++    case XKB_KEY_Super_R:   return VK_RWIN;
++    }
++    return 0;
++}
++
++static WORD key_vkey(struct xkb_keymap *xkb_keymap, xkb_keycode_t keyc, xkb_layout_index_t xkb_group,
++                     const USHORT *scan2vk, WORD scan)
++{
++    const xkb_keysym_t *keysym;
++    WORD vkey = scan2vk[scan], remapped;
++
++    if (xkb_keymap_key_get_syms_by_level(xkb_keymap, keyc, xkb_group, 0, &keysym) >= 1
++            && (remapped = keysym_control_vkey(keysym[0])) && remapped != (vkey & 0xff))
++    {
++        TRACE("keyc %#04x, scan %#05x: keysym %#x remaps vkey %#06x -> %#06x\n",
++              keyc, scan, keysym[0], vkey, remapped);
++        return remapped;
++    }
++    return vkey;
++}
++
+ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap,
+                             xkb_layout_index_t xkb_group, LANGID lang)
+ {
+@@ -515,7 +562,7 @@
+ 
+     for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+     {
+-        WORD scan = key2scan(keyc - 8), vkey = scan2vk[scan];
++        WORD scan = key2scan(keyc - 8), vkey = key_vkey(xkb_keymap, keyc, xkb_group, scan2vk, scan);
+         VSC_VK *entry = NULL;
+ 
+         if (!(scan & 0xff) || !vkey) continue;
+@@ -540,7 +587,7 @@
+ 
+     for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+     {
+-        WORD scan = key2scan(keyc - 8), vkey = scan2vk[scan];
++        WORD scan = key2scan(keyc - 8), vkey = key_vkey(xkb_keymap, keyc, xkb_group, scan2vk, scan);
+         VK_TO_WCHARS8 vkey2wch = {.VirtualKey = vkey}, caps_vkey2wch = vkey2wch;
+         BOOL found = FALSE, caps_found = FALSE;
+         uint32_t caps_ret, shift_ret;
