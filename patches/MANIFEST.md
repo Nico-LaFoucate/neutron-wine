@@ -514,6 +514,17 @@ palette cannot be lightened without turning Lightroom's menus light (MFC caches 
 Button/Static window or is a memory DC on the button face (MFC's button buffer). Readable text is
 never touched; with Windows' default palette the rule never acts.
 
+### `neutron-zzzzzzzzzzzzzl-d2d1-layer-unwrite-at-push-transform.mypatch` (2026-10-11) — Lightroom Navigator thumbnail cut off
+Lightroom Classic's Develop Navigator thumbnail lost a strip on the right and at the bottom a few
+seconds after entering Develop. Lightroom translates the thumbnail by (10,31), pushes two layers
+masked to its rectangle, then restores its drawing state (identity) BEFORE popping them. The
+path-mask stencil wrote each mask under the transform at PushLayer but unwrote it under the
+transform at PopLayer, so the unwrite missed by (10,31) and left those strips promoted; the stencil
+is not cleared between frames, so the next frame's thumbnail failed the mask test there. The
+composed maskTransform x world matrix is now stored at push and used for the unwrite. Verified with
+a test program that replays Lightroom's sequence (fails on 104, passes with the stencil off and with
+this change).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
