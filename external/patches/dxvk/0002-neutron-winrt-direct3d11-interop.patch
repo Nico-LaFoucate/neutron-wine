@@ -1,0 +1,273 @@
+From: Neutron
+Subject: [PATCH] d3d11: add the Windows.Graphics.DirectX.Direct3D11 interop exports
+
+CreateDirect3D11SurfaceFromDXGISurface and CreateDirect3D11DeviceFromDXGIDevice wrap a DXGI surface
+or device as the WinRT IDirect3DSurface / IDirect3DDevice that WinRT media and capture APIs take
+(MediaPlayer.CopyFrameToVideoSurface, for one); IDirect3DDxgiInterfaceAccess unwraps them.
+Windows' d3d11.dll exports both. Lightroom Classic's video toolkit imports the surface one, so
+under DXVK it resolved to a Wine stub. Only adds the two exports; nothing that exists changes.
+
+--- a/src/d3d11/d3d11.def
++++ b/src/d3d11/d3d11.def
+@@ -1,5 +1,7 @@
+ LIBRARY D3D11.DLL
+ EXPORTS  
++    CreateDirect3D11DeviceFromDXGIDevice @1
++    CreateDirect3D11SurfaceFromDXGISurface @2
+     D3D11CoreCreateDevice @18
+     D3D11CreateDevice @22
+     D3D11CreateDeviceAndSwapChain @23
+--- a/src/d3d11/d3d11.sym
++++ b/src/d3d11/d3d11.sym
+@@ -1,5 +1,7 @@
+ {
+   global:
++    CreateDirect3D11DeviceFromDXGIDevice;
++    CreateDirect3D11SurfaceFromDXGISurface;
+     D3D11CoreCreateDevice;
+     D3D11CreateDevice;
+     D3D11CreateDeviceAndSwapChain;
+--- a/src/d3d11/meson.build
++++ b/src/d3d11/meson.build
+@@ -42,6 +42,7 @@
+   'd3d11_input_layout.cpp',
+   'd3d11_interop.cpp',
+   'd3d11_main.cpp',
++  'd3d11_winrt.cpp',
+   'd3d11_on_12.cpp',
+   'd3d11_options.cpp',
+   'd3d11_query.cpp',
+--- /dev/null
++++ b/src/d3d11/d3d11_winrt.cpp
+@@ -0,0 +1,231 @@
++// Neutron: the two Windows.Graphics.DirectX.Direct3D11 interop exports of d3d11.dll.
++//
++// CreateDirect3D11SurfaceFromDXGISurface and CreateDirect3D11DeviceFromDXGIDevice wrap a DXGI
++// object as the WinRT IDirect3DSurface / IDirect3DDevice that WinRT media and capture APIs take,
++// and IDirect3DDxgiInterfaceAccess unwraps it again. Lightroom Classic's video toolkit imports
++// CreateDirect3D11SurfaceFromDXGISurface to hand its texture to MediaPlayer's frame server
++// (CopyFrameToVideoSurface); without the export the import resolves to a Wine stub and the
++// in-app help videos never play.
++//
++// The interfaces are declared here rather than taken from the WinRT headers so that this file
++// builds with nothing beyond what the rest of d3d11 already uses.
++
++#include <atomic>
++
++#include "d3d11_include.h"
++
++namespace dxvk {
++
++  using WinRTString = void*;  // HSTRING
++
++  // IIDs (Windows.Foundation / Windows.Graphics.DirectX.Direct3D11 metadata)
++  static const GUID IID_WinRTInspectable  = { 0xaf86e2e0, 0xb12d, 0x4c6a, { 0x9c, 0x5a, 0xd7, 0xaa, 0x65, 0x10, 0x1e, 0x90 } };
++  static const GUID IID_WinRTClosable     = { 0x30d5a829, 0x7fa4, 0x4026, { 0x83, 0xbb, 0xd7, 0x5b, 0xae, 0x4e, 0xa9, 0x9e } };
++  static const GUID IID_WinRTD3DSurface   = { 0x0bf4a146, 0x13c1, 0x4694, { 0xbe, 0xe3, 0x7a, 0xbf, 0x15, 0xea, 0xf5, 0x86 } };
++  static const GUID IID_WinRTD3DDevice    = { 0xa37624ab, 0x8d5f, 0x4650, { 0x9d, 0x3e, 0x9e, 0xae, 0x3d, 0x9b, 0xc6, 0x70 } };
++  static const GUID IID_DxgiInterfaceAccess = { 0xa9b3d012, 0x3df2, 0x4ee3, { 0xb8, 0xd1, 0x86, 0x95, 0xf4, 0x57, 0xd3, 0xc1 } };
++  static const GUID IID_AgileObject       = { 0x94ea2b94, 0xe9cc, 0x49e0, { 0xc0, 0xff, 0xee, 0x64, 0xca, 0x8f, 0x5b, 0x90 } };
++
++  struct WinRTSurfaceDescription {
++    INT32 Width;
++    INT32 Height;
++    INT32 Format;   // DirectXPixelFormat, numerically a DXGI_FORMAT
++    INT32 SampleCount;
++    INT32 SampleQuality;
++  };
++
++  struct IWinRTInspectable : public IUnknown {
++    virtual HRESULT STDMETHODCALLTYPE GetIids(ULONG* count, IID** iids) = 0;
++    virtual HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WinRTString* name) = 0;
++    virtual HRESULT STDMETHODCALLTYPE GetTrustLevel(INT32* level) = 0;
++  };
++
++  struct IWinRTClosable : public IWinRTInspectable {
++    virtual HRESULT STDMETHODCALLTYPE Close() = 0;
++  };
++
++  struct IWinRTD3DSurface : public IWinRTInspectable {
++    virtual HRESULT STDMETHODCALLTYPE get_Description(WinRTSurfaceDescription* desc) = 0;
++  };
++
++  struct IWinRTD3DDevice : public IWinRTInspectable {
++    virtual HRESULT STDMETHODCALLTYPE Trim() = 0;
++  };
++
++  struct IDxgiInterfaceAccess : public IUnknown {
++    virtual HRESULT STDMETHODCALLTYPE GetInterface(REFIID riid, void** ppv) = 0;
++  };
++
++
++  // One wrapper type for both: Primary is IWinRTD3DSurface or IWinRTD3DDevice.
++  template<typename Primary>
++  class WinRTDxgiWrapper : public Primary, public IWinRTClosable, public IDxgiInterfaceAccess {
++
++  public:
++
++    WinRTDxgiWrapper(IUnknown* object, const GUID& primaryIid)
++    : m_object(object), m_primaryIid(primaryIid) {
++      m_object->AddRef();
++    }
++
++    virtual ~WinRTDxgiWrapper() {
++      if (m_object)
++        m_object->Release();
++    }
++
++    // IUnknown, shared by all three bases through the Primary one
++    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) {
++      if (!ppv)
++        return E_POINTER;
++
++      *ppv = nullptr;
++
++      if (riid == __uuidof(IUnknown) || riid == IID_WinRTInspectable
++       || riid == m_primaryIid || riid == IID_AgileObject)
++        *ppv = static_cast<Primary*>(this);
++      else if (riid == IID_WinRTClosable)
++        *ppv = static_cast<IWinRTClosable*>(this);
++      else if (riid == IID_DxgiInterfaceAccess)
++        *ppv = static_cast<IDxgiInterfaceAccess*>(this);
++      else
++        return E_NOINTERFACE;
++
++      AddRef();
++      return S_OK;
++    }
++
++    ULONG STDMETHODCALLTYPE AddRef() {
++      return ++m_refs;
++    }
++
++    ULONG STDMETHODCALLTYPE Release() {
++      ULONG refs = --m_refs;
++
++      if (!refs)
++        delete this;
++
++      return refs;
++    }
++
++    // IInspectable
++    HRESULT STDMETHODCALLTYPE GetIids(ULONG* count, IID** iids) {
++      if (count) *count = 0;
++      if (iids) *iids = nullptr;
++      return E_NOTIMPL;
++    }
++
++    HRESULT STDMETHODCALLTYPE GetRuntimeClassName(WinRTString* name) {
++      if (name) *name = nullptr;
++      return E_NOTIMPL;
++    }
++
++    HRESULT STDMETHODCALLTYPE GetTrustLevel(INT32* level) {
++      if (!level)
++        return E_POINTER;
++      *level = 0;  // BaseTrust
++      return S_OK;
++    }
++
++    // IClosable
++    HRESULT STDMETHODCALLTYPE Close() {
++      return S_OK;
++    }
++
++    // IDirect3DDxgiInterfaceAccess
++    HRESULT STDMETHODCALLTYPE GetInterface(REFIID riid, void** ppv) {
++      if (!ppv)
++        return E_POINTER;
++      return m_object->QueryInterface(riid, ppv);
++    }
++
++  protected:
++
++    IUnknown*         m_object;
++
++  private:
++
++    GUID              m_primaryIid;
++    std::atomic<ULONG> m_refs = { 1u };
++
++  };
++
++
++  class WinRTD3DSurface : public WinRTDxgiWrapper<IWinRTD3DSurface> {
++
++  public:
++
++    WinRTD3DSurface(IDXGISurface* surface)
++    : WinRTDxgiWrapper<IWinRTD3DSurface>(surface, IID_WinRTD3DSurface) { }
++
++    HRESULT STDMETHODCALLTYPE get_Description(WinRTSurfaceDescription* desc) {
++      DXGI_SURFACE_DESC dxgi;
++
++      if (!desc)
++        return E_POINTER;
++
++      HRESULT hr = static_cast<IDXGISurface*>(m_object)->GetDesc(&dxgi);
++
++      if (FAILED(hr))
++        return hr;
++
++      desc->Width = INT32(dxgi.Width);
++      desc->Height = INT32(dxgi.Height);
++      desc->Format = INT32(dxgi.Format);
++      desc->SampleCount = INT32(dxgi.SampleDesc.Count);
++      desc->SampleQuality = INT32(dxgi.SampleDesc.Quality);
++      return S_OK;
++    }
++
++  };
++
++
++  class WinRTD3DDevice : public WinRTDxgiWrapper<IWinRTD3DDevice> {
++
++  public:
++
++    WinRTD3DDevice(IDXGIDevice* device)
++    : WinRTDxgiWrapper<IWinRTD3DDevice>(device, IID_WinRTD3DDevice) { }
++
++    HRESULT STDMETHODCALLTYPE Trim() {
++      Com<IDXGIDevice3> device3;
++
++      if (SUCCEEDED(m_object->QueryInterface(__uuidof(IDXGIDevice3), reinterpret_cast<void**>(&device3))))
++        device3->Trim();
++
++      return S_OK;
++    }
++
++  };
++
++}
++
++
++extern "C" {
++  using namespace dxvk;
++
++  DLLEXPORT HRESULT __stdcall CreateDirect3D11SurfaceFromDXGISurface(
++          IDXGISurface*         dgxiSurface,
++          IUnknown**            graphicsSurface) {
++    InitReturnPtr(graphicsSurface);
++
++    if (!dgxiSurface || !graphicsSurface)
++      return E_INVALIDARG;
++
++    *graphicsSurface = static_cast<IWinRTD3DSurface*>(new WinRTD3DSurface(dgxiSurface));
++    return S_OK;
++  }
++
++
++  DLLEXPORT HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice(
++          IDXGIDevice*          dxgiDevice,
++          IUnknown**            graphicsDevice) {
++    InitReturnPtr(graphicsDevice);
++
++    if (!dxgiDevice || !graphicsDevice)
++      return E_INVALIDARG;
++
++    *graphicsDevice = static_cast<IWinRTD3DDevice*>(new WinRTD3DDevice(dxgiDevice));
++    return S_OK;
++  }
++
++}

@@ -25,6 +25,9 @@ Exact commits are in [`sources.conf`](sources.conf).
 - **DXVK** (`patches/dxvk/`): presents the app's swapchain through GDI into the window
   (`NEUTRON_GDI_PRESENT`), which is what makes Premiere Pro's GPU-drawn interface reach the
   screen under Wayland. Also exports textures for CUDA interop and adds bounded-wait acquire.
+  `0002` adds d3d11's two WinRT interop exports, `CreateDirect3D11SurfaceFromDXGISurface` and
+  `CreateDirect3D11DeviceFromDXGIDevice`, which WinRT media and capture APIs take their surfaces
+  from (Lightroom Classic's video toolkit imports the first).
 - **dxgi** (`patches/dxvk-dxgi/`): only the two hooks that hand swapchains to Wine's
   DirectComposition bridge, exactly what the validated dxgi carried. `patches/dxvk` also changes
   dxgi (forwarding the bounded-wait handshake, storing the background color, tracing), but those
