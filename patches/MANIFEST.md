@@ -593,6 +593,18 @@ reconfigure (`wayland_surface_viewport_destination`). Not handled: a window exte
 `popup-oversize-check.py` (108: `big` fails, `edge` passes; patched: both pass) and in Animate (card centered, buttons
 work); regression pass in Premiere 2025, Lightroom Classic, Audition, InDesign (operator).
 
+### `neutron-zzzzzzzzzzzzzs-win32u-owner-drawn-menu-readable-text.mypatch` (2026-10-12) — InDesign font menu unreadable
+InDesign 2026's Type > Font menu drew the font names and "Sample" previews black on Neutron's dark menu (COLOR_MENU
+43). InDesign owner-draws those rows by copying each row into its own bitmap, rasterizing black text there and copying
+it back, so the text reaches Wine as pixels and cannot be recolored where it is drawn (as `DrawTextExW` does for
+controls, patch `…zzzzzzzzzzzzzk`). After `WM_DRAWITEM`, the row is now corrected when the palette's menu color is dark
+and neutral, at least half the row is still exactly that color, and the row holds near-black pixels: each neutral pixel
+darker than the menu color is remapped from black-over-menu to menu-text-over-menu with the same coverage. Colored
+pixels and anything lighter than the background are untouched; with Windows' default light palette it never acts.
+Verified with `preserved-fixes/harnesses/odmenu-text.c` (three rows drawn InDesign's way: black, COLOR_MENUTEXT, red;
+dark palette fails on 109 and passes patched, light palette passes both) and in InDesign. The highlighted font row
+still draws another row's text over its own (parked, OPEN-ISSUES).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at

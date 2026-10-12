@@ -1,0 +1,112 @@
+win32u: readable text in owner-drawn menu items under a dark palette (InDesign font menu)
+
+InDesign 2026's Type > Font menu showed the font names and "Sample" previews as black text on a dark
+gray menu. InDesign owner-draws those rows: for each one it copies the row out of the menu DC into
+its own bitmap, rasterizes the name and preview into it in black, and copies it back. Black reads on
+Windows' light menus; Neutron's palette makes COLOR_MENU 43. The text reaches Wine as pixels, so its
+color cannot be corrected where it is drawn, as DrawTextExW does for controls.
+
+After WM_DRAWITEM, the row's pixels are now corrected when all of these hold:
+  - the palette's menu color is dark and neutral and its menu text color is light,
+  - at least half the row is still exactly the menu color (the app drew on what it was given),
+  - the row contains near-black pixels (black text, not a light-on-dark design).
+Each neutral pixel darker than the menu color is then mapped from black-over-menu to
+menu-text-over-menu with the same coverage, so antialiasing is kept. Colored pixels (color fonts,
+emoji) and anything lighter than the background are untouched. With Windows' default light palette
+the rule never acts. Black artwork in such a row (an icon) becomes light as well.
+
+Harness: preserved-fixes/harnesses/odmenu-text.c draws three owner-drawn rows the way InDesign does
+(black, COLOR_MENUTEXT, red). Dark palette on 11.10-109: row 1 FAILS (black on 43); patched: all
+pass. Light palette: all pass before and after (black text kept). InDesign: the font names and
+previews are light and readable (operator, prototype of this rule). Not fixed: the highlighted row
+draws another row's text over its own and a bar 1/1.75 of the row size (parked, OPEN-ISSUES).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -2229,6 +2229,76 @@
+     return menu->Height;
+ }
+ 
++/* NEUTRON: readable text in owner-drawn menu items under a dark palette (InDesign's Type > Font menu).
++ *
++ * InDesign owner-draws its font menu: for each row it copies the row out of the menu DC into its own
++ * bitmap, rasterizes the font name and a "Sample" preview into it in black, and copies it back. Black
++ * reads on Windows' light menus; on Neutron's dark palette the row is COLOR_MENU (43) and the text was
++ * black on dark gray. Wine never sees the text (it arrives as pixels), so the text color cannot be
++ * corrected where it is drawn, as it is for controls in DrawTextExW.
++ *
++ * So correct the pixels the app left in the row. Act only when all of these hold:
++ *   - the palette's menu color is dark and neutral, and the palette's menu text reads on it while
++ *     black does not (with Windows' default light palette black always reads, so this never acts),
++ *   - most of the row is still exactly the menu color (the app drew on the background it was given),
++ *   - the row contains near-black pixels (the app drew black text, not a light-on-dark design).
++ * Then every neutral pixel darker than the menu color is mapped from "black text over the menu color"
++ * to "menu text over the menu color" with the same coverage, so antialiasing is kept. Colored pixels
++ * (color previews, emoji) and anything lighter than the background are left alone. */
++static void neutron_readable_owner_drawn_menu_item( HDC hdc, const RECT *rect )
++{
++    COLORREF menu = get_sys_color( COLOR_MENU ), text = get_sys_color( COLOR_MENUTEXT );
++    int w = rect->right - rect->left, h = rect->bottom - rect->top, bg = GetGValue( menu ), fg = GetGValue( text );
++    BITMAPINFO info = {{ sizeof(BITMAPINFOHEADER) }};
++    unsigned int i, n, at_bg = 0, near_black = 0, *px;
++    void *bits = NULL;
++    HBITMAP dib;
++    HGDIOBJ old;
++    HDC mem;
++
++    if (w <= 0 || h <= 0) return;
++    if (GetRValue( menu ) != bg || GetBValue( menu ) != bg || bg >= 96 || fg < 2 * bg + 64) return;
++
++    if (!(mem = NtGdiCreateCompatibleDC( hdc ))) return;
++    info.bmiHeader.biWidth = w;
++    info.bmiHeader.biHeight = -h;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    info.bmiHeader.biCompression = BI_RGB;
++    if (!(dib = NtGdiCreateDIBSection( mem, NULL, 0, &info, DIB_RGB_COLORS, 0, 0, 0, &bits )) || !bits)
++    {
++        if (dib) NtGdiDeleteObjectApp( dib );
++        NtGdiDeleteObjectApp( mem );
++        return;
++    }
++    old = NtGdiSelectBitmap( mem, dib );
++    NtGdiBitBlt( mem, 0, 0, w, h, hdc, rect->left, rect->top, SRCCOPY, 0, 0 );
++
++    px = bits;
++    n = w * h;
++    for (i = 0; i < n; i++)
++    {
++        unsigned int c = px[i] & 0xffffff;
++        if (c == (bg << 16 | bg << 8 | bg)) at_bg++;
++        else if (((c >> 16) & 0xff) < 24 && ((c >> 8) & 0xff) < 24 && (c & 0xff) < 24) near_black++;
++    }
++    if (at_bg * 2 >= n && near_black)
++    {
++        for (i = 0; i < n; i++)
++        {
++            int r = (px[i] >> 16) & 0xff, g = (px[i] >> 8) & 0xff, b = px[i] & 0xff, v;
++            if (max( r, max( g, b )) - min( r, min( g, b )) > 8) continue;
++            if ((v = (r + g + b) / 3) >= bg) continue;
++            v = bg + (bg - v) * (fg - bg) / bg;
++            px[i] = (px[i] & 0xff000000) | v << 16 | v << 8 | v;
++        }
++        NtGdiBitBlt( hdc, rect->left, rect->top, w, h, mem, 0, 0, SRCCOPY, 0, 0 );
++    }
++    NtGdiSelectBitmap( mem, old );
++    NtGdiDeleteObjectApp( dib );
++    NtGdiDeleteObjectApp( mem );
++}
++
+ static void draw_popup_arrow( HDC hdc, RECT rect, UINT arrow_width, UINT arrow_height )
+ {
+     HDC mem_hdc = NtGdiCreateCompatibleDC( hdc );
+@@ -2485,6 +2555,7 @@
+         NtGdiGetDCDword( hdc, NtGdiGetBkColor, &old_bk );
+         NtGdiGetDCDword( hdc, NtGdiGetTextColor, &old_text );
+         send_message( owner, WM_DRAWITEM, 0, (LPARAM)&dis );
++        neutron_readable_owner_drawn_menu_item( hdc, &rect );
+         /* Draw the popup-menu arrow */
+         NtGdiGetAndSetDCDword( hdc, NtGdiGetBkColor, old_bk, NULL );
+         NtGdiGetAndSetDCDword( hdc, NtGdiGetTextColor, old_text, NULL );
