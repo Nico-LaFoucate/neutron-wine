@@ -1,0 +1,94 @@
+ntdll, kernelbase: start threads with NT_TIB.Version = 0x1e00; track fibers by HasFiberData
+
+Windows initializes NT_TIB.Version -- the slot FiberData shares, gs:[0x20] on x64 -- to 0x1e00 for
+every new thread and tracks fiber state with TEB.HasFiberData. Wine left the slot NULL and used
+"FiberData != NULL" as the fiber test.
+
+InDesign 2026's K2Memory::IsUIThread() reads gs:[0x20], returns early on 0x1e00, and otherwise
+dereferences it as fiber data. On Wine that read NULL, and InDesign crashed on its font manager
+thread seconds after the home screen appeared (Neutron discussion #8; Adobe's crash report:
+EXCEPTION_ACCESS_VIOLATION in PMRuntime.dll, RAX=0, called from Font Manager).
+
+* ntdll: init_teb() sets the slot to 0x1e00 in the native TEB and in the other-bitness TEB.
+* kernelbase: ConvertThreadToFiberEx, ConvertFiberToThread and IsThreadAFiber use HasFiberData;
+  ConvertThreadToFiberEx sets it, ConvertFiberToThread clears it and restores 0x1e00.
+
+Harness: preserved-fixes/harnesses/teb-fiber-version.c -- 18 checks; 107 fails 4 (the slot is 0
+on the main thread, a new thread and after ConvertFiberToThread; InDesign's check would fault),
+the patched runtime passes all 18. InDesign 2026 runs, creates a document and takes text.
+
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -1151,10 +1151,13 @@
+ {
+     struct fiber_data *fiber = NtCurrentTeb()->Tib.FiberData;
+ 
+-    if (fiber)
++    /* NEUTRON: a thread that is not a fiber holds 0x1e00 here, not NULL (see init_teb in
++     * ntdll), so fiber state is the HasFiberData flag, as on Windows. */
++    if (NtCurrentTeb()->HasFiberData)
+     {
+         relocate_thread_actctx_stack( &NtCurrentTeb()->ActivationContextStack );
+-        NtCurrentTeb()->Tib.FiberData = NULL;
++        NtCurrentTeb()->Tib.FiberData = (void *)0x1e00;
++        NtCurrentTeb()->HasFiberData = 0;
+         HeapFree( GetProcessHeap(), 0, fiber );
+     }
+     return TRUE;
+@@ -1177,7 +1180,7 @@
+ {
+     struct fiber_data *fiber;
+ 
+-    if (NtCurrentTeb()->Tib.FiberData)
++    if (NtCurrentTeb()->HasFiberData)
+     {
+         SetLastError( ERROR_ALREADY_FIBER );
+         return NULL;
+@@ -1198,6 +1201,7 @@
+     fiber->fls_slots        = NtCurrentTeb()->FlsSlots;
+     relocate_thread_actctx_stack( &fiber->actctx.stack_space );
+     NtCurrentTeb()->Tib.FiberData = fiber;
++    NtCurrentTeb()->HasFiberData = 1;
+     return fiber;
+ }
+ 
+@@ -1228,7 +1232,7 @@
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH IsThreadAFiber(void)
+ {
+-    return NtCurrentTeb()->Tib.FiberData != NULL;
++    return NtCurrentTeb()->HasFiberData;
+ }
+ 
+ 
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4021,6 +4021,7 @@
+     teb32->StaticUnicodeString.MaximumLength = sizeof( teb32->StaticUnicodeBuffer );
+     teb32->GdiBatchCount = PtrToUlong( teb64 );
+     teb32->WowTebOffset  = -teb_offset;
++    teb32->Tib.FiberData = 0x1e00;
+     if (is_wow) teb64->WowTebOffset = teb_offset;
+ #else
+     teb = (TEB *)teb32;
+@@ -4035,6 +4036,7 @@
+     teb64->StaticUnicodeString.Buffer = PtrToUlong( teb64->StaticUnicodeBuffer );
+     teb64->StaticUnicodeString.MaximumLength = sizeof( teb64->StaticUnicodeBuffer );
+     teb64->WowTebOffset = teb_offset;
++    teb64->Tib.FiberData = 0x1e00;
+     if (is_wow)
+     {
+         teb32->GdiBatchCount = PtrToUlong( teb64 );
+@@ -4044,6 +4046,12 @@
+     teb->Peb = peb;
+     teb->Tib.Self = &teb->Tib;
+     teb->Tib.StackBase = (void *)~0ul;
++    /* NEUTRON: NT_TIB.Version, which shares its slot with FiberData. Windows starts every thread
++     * at 0x1e00 and tracks fibers with TEB.HasFiberData, so "not a fiber" is 0x1e00, not NULL.
++     * InDesign 2026's K2Memory::IsUIThread() reads gs:[0x20], treats anything but 0x1e00 as fiber
++     * data and dereferences it: NULL crashed its font manager thread seconds after the home
++     * screen appeared (Neutron discussion #8). The fiber functions in kernelbase use the flag. */
++    teb->Tib.FiberData = (void *)0x1e00;
+     teb->ActivationContextStackPointer = &teb->ActivationContextStack;
+     InitializeListHead( &teb->ActivationContextStack.FrameListCache );
+     teb->StaticUnicodeString.Buffer = teb->StaticUnicodeBuffer;
