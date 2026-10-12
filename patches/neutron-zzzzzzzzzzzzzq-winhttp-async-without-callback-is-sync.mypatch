@@ -1,0 +1,90 @@
+winhttp: run a request synchronously when no status callback is installed (Adobe Help, Neutron#13)
+
+Every Help menu page in Lightroom Classic ("Library Module Help..." and the rest) failed with
+"Cannot display help." Adobe's Help client (ahclient.dll, shipped with Lightroom Classic, Premiere
+Pro, Audition, InDesign, Animate and Media Encoder) checks it is online by opening a WinHTTP session
+with WINHTTP_FLAG_ASYNC, installing no status callback, and calling WinHttpSendRequest,
+WinHttpReceiveResponse and WinHttpQueryHeaders(STATUS_CODE) back to back. Wine queued the operations,
+so the status query failed with ERROR_WINHTTP_INCORRECT_HANDLE_STATE (or ReceiveResponse did, when the
+queued send had not started yet); the client concluded it was offline, took its local-help path
+(ARH.exe, which Adobe does not ship) and gave up without opening a browser.
+
+A request in an async session that has no status callback has nothing to report completion through,
+so send, receive, query-data-available, read and write now run synchronously for it. Requests with
+a callback keep the asynchronous path unchanged. That Windows completes these calls is inferred
+from Adobe's Help working there; Microsoft's documentation only says WinHttpReceiveResponse "can
+operate either synchronously or asynchronously" in async mode.
+
+Harness: preserved-fixes/harnesses/winhttp-async-nocallback.c (local HTTP server) -- 11.10-108 fails
+the no-callback status query (12019), the patched build passes; the with-callback control passes on
+both. Lightroom Classic: Library Module Help now launches winebrowser with Adobe's help page.
+
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -2429,6 +2429,21 @@
+     return ERROR_SUCCESS;
+ }
+ 
++/* NEUTRON: whether a request's operations run asynchronously. WINHTTP_FLAG_ASYNC alone is not
++ * enough: with no status callback installed there is nothing to report completion through, and an
++ * application treating such a session as synchronous gets its results only if the calls block.
++ * Adobe's Help client (ahclient.dll, shipped with Lightroom Classic, Premiere, Audition, InDesign ...)
++ * opens its online check with WINHTTP_FLAG_ASYNC and no callback, then calls WinHttpSendRequest,
++ * WinHttpReceiveResponse and WinHttpQueryHeaders(STATUS_CODE) back to back. Queued, the status
++ * query failed with ERROR_WINHTTP_INCORRECT_HANDLE_STATE, the client concluded it was offline, and
++ * every Help menu page failed with "Cannot display help." (Neutron#13). It works on Windows, so
++ * Windows completes these calls; that is inferred from Adobe's code, not documented. Requests
++ * with a callback keep the asynchronous path unchanged. */
++static BOOL request_is_async( struct request *request )
++{
++    return (request->connect->hdr.flags & WINHTTP_FLAG_ASYNC) && request->hdr.callback;
++}
++
+ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD headers_len, void *optional,
+                            DWORD optional_len, DWORD total_len, DWORD_PTR context, BOOL async )
+ {
+@@ -2598,7 +2613,7 @@
+ 
+     if (headers && !headers_len) headers_len = lstrlenW( headers );
+ 
+-    if (request->connect->hdr.flags & WINHTTP_FLAG_ASYNC)
++    if (request_is_async( request ))
+     {
+         struct send_request *s;
+ 
+@@ -3315,7 +3330,7 @@
+ 
+ static DWORD receive_response( struct request *request )
+ {
+-    BOOL async = request->connect->hdr.flags & WINHTTP_FLAG_ASYNC;
++    BOOL async = request_is_async( request );
+     DWORD ret, size, query, status;
+ 
+     TRACE( "request state %d\n", request->state );
+@@ -3529,7 +3544,7 @@
+         return FALSE;
+     }
+ 
+-    if (!(async = request->connect->hdr.flags & WINHTTP_FLAG_ASYNC) || skip_async_queue( request, &wont_block, 1 ))
++    if (!(async = request_is_async( request )) || skip_async_queue( request, &wont_block, 1 ))
+     {
+         ret = query_data_available( request, available, async );
+     }
+@@ -3650,7 +3665,7 @@
+         return FALSE;
+     }
+ 
+-    if (!(async = request->connect->hdr.flags & WINHTTP_FLAG_ASYNC) || skip_async_queue( request, &wont_block, to_read ))
++    if (!(async = request_is_async( request )) || skip_async_queue( request, &wont_block, to_read ))
+     {
+         ret = read_data( request, buffer, to_read, read, async );
+     }
+@@ -3763,7 +3778,7 @@
+         return FALSE;
+     }
+ 
+-    if (!(request->connect->hdr.flags & WINHTTP_FLAG_ASYNC))
++    if (!request_is_async( request ))
+     {
+         ret = write_data( request, buffer, to_write, written, FALSE );
+     }
