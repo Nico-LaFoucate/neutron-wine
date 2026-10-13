@@ -1,0 +1,54 @@
+winmm: give waveIn a 1 s capture buffer so short app stalls don't lose audio (Premiere voice-over)
+
+Premiere 2026's voice-over recordings came back as bursts of sound separated by silence (GitHub
+Neutron#17). Premiere records through MME (waveIn, CALLBACK_THREAD) with about ten small buffers,
+roughly 60 ms in total, and its audio thread sometimes hands them back late. WID_PullData only reads
+the device while the app has buffers queued, so during a stall the audio waits in the mmdevapi
+capture buffer, which winmm sized like playback: AC_BUFLEN, 100 ms. Anything past that was lost in
+the driver, and Premiere filled the missing time with whole 1024-sample blocks of silence.
+
+Capture now asks for 1 s. While the app keeps up only a few ms ever wait in it, so latency is
+unchanged; playback keeps 100 ms, where buffer length is latency.
+
+Harness: preserved-fixes/harnesses/capture-gaps.c records a continuous tone through waveIn with ten
+6 ms buffers and stalls 250 or 400 ms every 100 buffers. 11.10-110: 1181 / 2289 ms of 9.5 s
+missing; patched: 14 / 22 ms (startup). Premiere 2026 recording the same tone (clean room):
+11.10-110 had gaps in 2 of 2 recordings (7 gaps in 49 s, each a multiple of 1024 samples);
+patched: 0 gaps in 3 recordings (53 s).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winmm/waveform.c
++++ b/dlls/winmm/waveform.c
+@@ -63,6 +63,13 @@
+ 
+ /* buffer size = 10 * 100000 (100 ns) = 0.1 seconds */
+ #define AC_BUFLEN (10 * 100000)
++/* NEUTRON (GitHub Neutron#17): capture keeps 1 s instead of 100 ms. WID_PullData only reads the
++ * device while the app has buffers queued, so once they are all filled and the app is late handing
++ * them back, everything past this buffer is lost in the driver. Premiere queues ~60 ms of small
++ * buffers and its audio thread sometimes stalls for several hundred ms; its voice-over recordings
++ * came back with whole blocks of silence. A responsive app never has more than a few ms waiting here,
++ * so this adds no latency; playback keeps AC_BUFLEN, where buffer length is latency. */
++#define AC_CAPTURE_BUFLEN (10 * 1000000)
+ #define MAX_DEVICES 256
+ #define MAPPER_INDEX 0x3F
+ 
+@@ -866,7 +873,7 @@
+     hr = IAudioClient_Initialize(device->client, AUDCLNT_SHAREMODE_SHARED,
+             AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST
+             | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+-            AC_BUFLEN, 0, &target, &device->parent->session);
++            is_out ? AC_BUFLEN : AC_CAPTURE_BUFLEN, 0, &target, &device->parent->session);
+     if(hr != S_OK){
+         WARN("Initialize failed: %08lx\n", hr);
+         acmStreamClose(device->acm_handle, 0);
+@@ -980,7 +987,7 @@
+     hr = IAudioClient_Initialize(device->client, AUDCLNT_SHAREMODE_SHARED,
+             AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST
+             | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+-            AC_BUFLEN, 0, device->orig_fmt, &device->parent->session);
++            is_out ? AC_BUFLEN : AC_CAPTURE_BUFLEN, 0, device->orig_fmt, &device->parent->session);
+ 
+     if(FAILED(hr)){
+         if(hr == AUDCLNT_E_UNSUPPORTED_FORMAT && !(info->flags & WAVE_FORMAT_DIRECT)){

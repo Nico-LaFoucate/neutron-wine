@@ -616,6 +616,15 @@ file is also reported as the root configuration path. Verified with `preserved-f
 (110 fails with and without the .config; patched loads only with it) and in After Effects 2026: no warning, Mocha AE
 applies and its interface opens.
 
+### `neutron-zzzzzzzzzzzzzu-winmm-capture-buffer-1s.mypatch` (2026-10-12) — Premiere voice-over recordings full of silent gaps
+Premiere 2026's voice-over recordings came back as bursts separated by silence (GitHub Neutron#17). Premiere records through
+MME (waveIn, CALLBACK_THREAD) with ~60 ms of small buffers and sometimes hands them back late; `WID_PullData` only reads
+while buffers are queued, so the audio waits in the mmdevapi capture buffer — sized like playback, `AC_BUFLEN` = 100 ms —
+and everything past it was lost; Premiere padded the missing time with 1024-sample blocks of silence. Capture now asks for
+1 s (`AC_CAPTURE_BUFLEN`); no added latency while the app keeps up; playback unchanged. Verified with
+`preserved-fixes/harnesses/capture-gaps.c` (ten 6 ms buffers + 250/400 ms stalls: 110 loses 1181/2289 ms, patched 14/22) and
+Premiere 2026 recording a steady tone (110: gaps in 2/2 recordings; patched: 0 gaps in 3).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
