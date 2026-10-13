@@ -1,0 +1,155 @@
+ntdll: give an app started by another app its own environment (neutron-appenv.conf)
+
+Premiere's Dynamic Link started After Effects with Premiere's environment: a Wine child gets the parent's
+Windows block from the server and its Unix environ through fork() in spawn_process. The per-app settings
+`neutron launch` sets conflict (NEUTRON_D2D_COMPOSEREAD paints After Effects' canvas white; After Effects
+needs NEUTRON_DXVK_EXPORT_TEXTURES and NEUTRON_WL_ORPHAN_TOPLEVEL), so After Effects came up with no
+splash and a black Composition panel.
+
+init_startup_info now reads <prefix>/neutron-appenv.conf (written by `neutron launch`): when the image
+path names a section and the inherited NEUTRON_APP differs from the section's, KEY=VALUE / -KEY lines are
+applied to the Windows block and the Unix environ before anything reads them. A direct launch already
+carries its own NEUTRON_APP and is left alone. Kill switch NEUTRON_APPENV=0.
+
+--- a/dlls/ntdll/unix/env.c
++++ b/dlls/ntdll/unix/env.c
+@@ -1997,6 +1997,129 @@
+ }
+ 
+ 
++/* NEUTRON: give an app started BY ANOTHER APP its own environment.
++ *
++ * `neutron launch <app>` sets each Adobe app's settings (NEUTRON_* gates, DXVK_CONFIG_FILE,
++ * WINEDLLOVERRIDES, ...) on the process it starts, and nowhere else. A child inherits its parent's
++ * environment twice over: the Windows block arrives in the startup info below, and the Unix environ
++ * comes through fork() in spawn_process(). The app profiles conflict -- Premiere needs
++ * NEUTRON_D2D_COMPOSEREAD, which paints After Effects' canvas white, and After Effects needs
++ * NEUTRON_DXVK_EXPORT_TEXTURES, without which its composition stays black -- so After Effects started
++ * by Premiere's Dynamic Link came up with no splash and a black composition (2026-10-13, runtime 117).
++ *
++ * The launcher writes <prefix>/neutron-appenv.conf: one [section] per app, named by the app's Windows
++ * image path, listing what `neutron launch` would set (KEY=VALUE) or clear (-KEY) for it, including
++ * NEUTRON_APP=<profile>. When a process starts from an image path that names a section, and the
++ * NEUTRON_APP it inherited differs from the section's, apply the section to both environments here,
++ * before any module reads them. A direct launch already carries its own NEUTRON_APP and is left
++ * alone, so a variable set on the launcher's command line still wins for the app it launches.
++ * Kill switch: NEUTRON_APPENV=0. */
++static void neutron_apply_app_env( WCHAR **env, SIZE_T *pos, SIZE_T *size, const WCHAR *image, SIZE_T image_len )
++{
++    static const WCHAR gateW[] = {'N','E','U','T','R','O','N','_','A','P','P','E','N','V'};
++    static const WCHAR appW[] = {'N','E','U','T','R','O','N','_','A','P','P'};
++    static const char conf_name[] = "/neutron-appenv.conf";
++    char *path, *buf = NULL, *line, *next, *section = NULL, *app = NULL;
++    WCHAR *gate, *inherited = NULL, *valueW, headerW[1024], nameW[256];
++    int fd, sets = 0, clears = 0, off;
++    struct stat st;
++    ssize_t got = 0, ret;
++
++    if ((gate = get_env_var( *env, *pos, gateW, ARRAY_SIZE(gateW) )))
++    {
++        off = gate[0] == '0';
++        free( gate );
++        if (off) return;
++    }
++    if (image_len > 4 && image[0] == '\\' && image[1] == '?' && image[2] == '?' && image[3] == '\\')
++    {
++        image += 4;  /* \??\C:\... */
++        image_len -= 4;
++    }
++
++    if (!config_dir || !(path = malloc( strlen( config_dir ) + sizeof(conf_name) ))) return;
++    strcpy( path, config_dir );
++    strcat( path, conf_name );
++    fd = open( path, O_RDONLY );
++    free( path );
++    if (fd == -1) return;
++    if (!fstat( fd, &st ) && st.st_size > 0 && st.st_size < (1 << 20) && (buf = malloc( st.st_size + 1 )))
++    {
++        while (got < st.st_size && (ret = read( fd, buf + got, st.st_size - got )) > 0) got += ret;
++        buf[got] = 0;
++    }
++    close( fd );
++    if (!buf) return;
++
++    /* find this image's section and its NEUTRON_APP */
++    for (line = buf; line && *line; line = next)
++    {
++        size_t len;
++
++        if ((next = strchr( line, '\n' ))) *next++ = 0;
++        len = strlen( line );
++        if (len && line[len - 1] == '\r') line[--len] = 0;
++        if (line[0] == '[' && len > 2 && line[len - 1] == ']')
++        {
++            DWORD hlen;
++
++            if (section) break;  /* end of the matching section */
++            line[len - 1] = 0;
++            hlen = ntdll_umbstowcs( line + 1, len - 2, headerW, ARRAY_SIZE(headerW) );
++            if (hlen == image_len && !wcsnicmp( headerW, image, hlen )) section = next ? next : line + len;
++            continue;
++        }
++        if (section && !strncmp( line, "NEUTRON_APP=", 12 )) app = line + 12;
++    }
++    if (!section || !app) goto done;
++
++    /* a direct launch of this same app: its environment is already right */
++    inherited = get_env_var( *env, *pos, appW, ARRAY_SIZE(appW) );
++    if (inherited)
++    {
++        DWORD alen = ntdll_umbstowcs( app, strlen( app ) + 1, headerW, ARRAY_SIZE(headerW) );
++
++        if (alen && !wcscmp( headerW, inherited )) goto done;
++    }
++
++    /* the lines were split in place above; walk the section's NUL-separated lines */
++    for (line = section; line < buf + got; line += strlen( line ) + 1)
++    {
++        char *eq;
++        DWORD nlen;
++
++        if (line[0] == '[') break;
++        if (!line[0] || line[0] == '#') continue;
++        if (line[0] == '-')
++        {
++            if (!(nlen = ntdll_umbstowcs( line + 1, strlen( line + 1 ), nameW, ARRAY_SIZE(nameW) ))) continue;
++            unsetenv( line + 1 );
++            set_env_var( env, pos, size, nameW, nlen, NULL );
++            clears++;
++            continue;
++        }
++        if (!(eq = strchr( line, '=' )) || eq == line) continue;
++        *eq = 0;
++        if ((nlen = ntdll_umbstowcs( line, eq - line, nameW, ARRAY_SIZE(nameW) )) &&
++            (valueW = malloc( (strlen( eq + 1 ) + 1) * sizeof(WCHAR) )))
++        {
++            ntdll_umbstowcs( eq + 1, strlen( eq + 1 ) + 1, valueW, strlen( eq + 1 ) + 1 );
++            setenv( line, eq + 1, 1 );
++            set_env_var( env, pos, size, nameW, nlen, valueW );
++            free( valueW );
++            sets++;
++        }
++        *eq = '=';
++    }
++    ERR( "neutron-appenv: %s started from %s: applied its own environment (%d set, %d cleared)\n",
++         debugstr_wn( image, image_len ), inherited ? debugstr_w( inherited ) : "(no NEUTRON_APP)", sets, clears );
++
++done:
++    free( inherited );
++    free( buf );
++}
++
++
+ /*************************************************************************
+  *		init_startup_info
+  */
+@@ -2035,6 +2158,9 @@
+     memcpy( env, (char *)info + info_size, env_size * sizeof(WCHAR) );
+     env_pos = env_size - 1;
+     add_dynamic_environment( &env, &env_pos, &env_size );
++    neutron_apply_app_env( &env, &env_pos, &env_size,
++                           (const WCHAR *)(info + 1) + (info->curdir_len + info->dllpath_len) / sizeof(WCHAR),
++                           info->imagepath_len / sizeof(WCHAR) );
+     is_prefix_bootstrap = !!find_env_var( env, env_pos, bootstrapW, ARRAY_SIZE(bootstrapW) );
+     env[env_pos++] = 0;
+ 

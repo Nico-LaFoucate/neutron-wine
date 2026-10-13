@@ -704,6 +704,25 @@ Kill switch `NEUTRON_DSOUND_WAVE_ID=0`. Verified with `harnesses/dsound-wavedevi
 devices; patched 14/14; kill switch = 116) and Premiere 2025 in the clean room (Easy Effects output: no label, sound plays;
 Scarlett Input 1: voice-over enabled).
 
+### `neutron-zzzzzzzzzzzzzzzz-ntdll-appenv-per-app-environment.mypatch` (2026-10-13) — Dynamic Link: After Effects started by Premiere ran with Premiere's settings
+Operator, clean room AE2026 on 117, Premiere 2026 → File → Adobe Dynamic Link → New After Effects Composition with After
+Effects closed: *"AE opens, no splash screen, Composition panel is blank and black, UI appears fine."* AfterFX.exe carried
+exactly Premiere's environment: a Wine child gets its parent's Windows block from the server (`init_startup_info`) and its
+Unix environ through fork() (`spawn_process`), and `neutron launch` sets per-app settings only on the process it starts.
+The profiles conflict (Premiere's NEUTRON_D2D_COMPOSEREAD paints AE's canvas white; AE needs NEUTRON_DXVK_EXPORT_TEXTURES
+and NEUTRON_WL_ORPHAN_TOPLEVEL), so no single environment serves both. `init_startup_info` now calls
+`neutron_apply_app_env`: it reads `<prefix>/neutron-appenv.conf` (written by `neutron launch` on every launch: one
+section per installed app exe, named by its Windows image path, `KEY=VALUE` sets / `-KEY` clears, including
+`NEUTRON_APP=<profile>`); when the image path names a section (case-insensitive) and the inherited NEUTRON_APP differs,
+it applies the section to the Windows block (`set_env_var`) and the Unix environ (`setenv`/`unsetenv`) before any module
+reads them, and logs one ERR line `neutron-appenv: <image> started from <app>: applied its own environment (N set, M
+cleared)`. A direct launch already carries its own NEUTRON_APP and is left alone, so command-line overrides still win
+there. Kill switch `NEUTRON_APPENV=0`. Verified: `preserved-fixes/harnesses/appenv-spawn-test.sh` (stock 117 fails the
+apply / case / grandchild cases; patched 6/6: Windows block, getenv via WINEDLLOVERRIDES load order, and a grandchild's
+/proc environ); operator on the clean room with the patched ntdll: *"splash shows, comp draws, scrubbing is smooth"*.
+⚠️ `/proc/<pid>/environ` is an exec-time snapshot — the rewritten process itself still SHOWS the parent's values there;
+check its children or the ERR line.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
