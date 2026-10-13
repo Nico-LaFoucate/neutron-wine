@@ -625,6 +625,18 @@ and everything past it was lost; Premiere padded the missing time with 1024-samp
 `preserved-fixes/harnesses/capture-gaps.c` (ten 6 ms buffers + 250/400 ms stalls: 110 loses 1181/2289 ms, patched 14/22) and
 Premiere 2026 recording a steady tone (110: gaps in 2/2 recordings; patched: 0 gaps in 3).
 
+### `neutron-zzzzzzzzzzzzzv-dwrite-glyph-cache-rendering-mode.mypatch` (2026-10-12) — After Effects crashed while scrubbing
+After Effects 2026 crashed 10-30 s into scrubbing a reporter's project (GitHub Neutron#14), always inside glyph-run
+rendering (`glyphrunanalysis_render`) with a wild pointer. The glyph cache keyed rendered bitmaps by glyph, size and
+transform, not by rendering mode: an ALIASED bitmap is 1 bit per pixel and the other modes 8, so a glyph rendered
+antialiased and then aliased had the cached 8bpp bitmap copied into a 1bpp-sized buffer, overflowing the heap and
+crashing later in varying places. (Our earlier patch that put the transform into the key made this reachable at every
+HiDPI scale; upstream skipped the cache for any non-identity transform.) The rendering mode is now part of a bitmap's
+key, and a cached bitmap whose size differs from the one requested is rendered again instead of copied. Verified with
+`preserved-fixes/harnesses/dwrite-mode-cache.c` (110 corrupts the heap; patched stays valid and the aliased texture
+equals a fresh render) and in After Effects 2026 with the reporter's project: crashed 2 of 2 runs scrubbing before,
+0 of 2 patched.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at

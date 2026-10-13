@@ -1,0 +1,60 @@
+dwrite: key cached glyph bitmaps by rendering mode (After Effects crash while scrubbing)
+
+After Effects 2026 crashed 10-30 s into scrubbing a reporter's project (GitHub Neutron#14), always
+inside glyph-run rendering (glyphrunanalysis_render, the 1bpp and the 8bpp copy loops) with a wild
+destination pointer. The glyph cache keys rendered bitmaps by glyph, size and transform only. An ALIASED
+bitmap is 1 bit per pixel and the other modes 8, so a glyph rendered antialiased and later aliased got the
+cached 8bpp bitmap copied into a buffer sized for 1bpp: a heap overflow several times the buffer, which
+corrupted unrelated memory and crashed later, in varying places. After Effects draws some text aliased and
+renders on two threads, so the order and the crash varied from run to run. (Neutron's earlier patch that
+put the transform into the key made this reachable at every HiDPI scale; upstream skipped the cache for
+any non-identity transform.)
+
+The rendering mode is now part of a bitmap's key, and a cached bitmap whose size differs from the one
+requested is rendered again instead of copied.
+
+Harness: preserved-fixes/harnesses/dwrite-mode-cache.c renders one glyph antialiased, then aliased, and
+validates the heap: 11.10-110 CORRUPTED, patched valid and the aliased texture equals a fresh render.
+After Effects 2026 with the reporter's project (clean room): crashed 2 of 2 runs scrubbing without
+logging; patched, 0 of 2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -241,7 +241,12 @@
+ static HRESULT dwrite_fontface_get_glyph_bitmap(struct dwrite_fontface *fontface, DWRITE_RENDERING_MODE1 rendering_mode,
+         unsigned int *is_1bpp, struct dwrite_glyphbitmap *bitmap)
+ {
+-    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = DWRITE_MEASURING_MODE_NATURAL };
++    /* NEUTRON (GitHub Neutron#14): the bitmap depends on the rendering mode -- ALIASED is 1 bit per pixel,
++     * the others 8 -- so the mode belongs in the key. With only glyph, size and transform in it, a glyph
++     * rendered antialiased and later aliased got the cached 8bpp bitmap copied into a buffer sized for
++     * 1bpp, overflowing the heap; After Effects, which draws some text aliased, crashed at random later
++     * on. 0x100 keeps these keys apart from the bbox/advance entries, which use measuring modes. */
++    struct cache_key key = { .size = bitmap->emsize, .glyph = bitmap->glyph, .mode = 0x100 | rendering_mode };
+     struct get_glyph_bitmap_params params;
+     const RECT *bbox = &bitmap->bbox;
+     unsigned int bitmap_size, _1bpp;
+@@ -266,12 +271,20 @@
+     EnterCriticalSection(&fontface->cs);
+     if ((entry = fontface_get_cache_entry(fontface, bitmap_size, &key)))
+     {
+-        if (entry->has_bitmap)
++        if (entry->has_bitmap && entry->bitmap_size == bitmap_size)
+         {
+             memcpy(bitmap->buf, entry->bitmap, entry->bitmap_size);
+         }
+         else
+         {
++            /* never copy a cached bitmap of another size into a buffer sized for this one */
++            if (entry->has_bitmap)
++            {
++                fontface->cache.size += bitmap_size - entry->bitmap_size;
++                free(entry->bitmap);
++                entry->bitmap = NULL;
++                entry->has_bitmap = 0;
++            }
+             params.is_1bpp = &_1bpp;
+             UNIX_CALL(get_glyph_bitmap, &params);
+ 
