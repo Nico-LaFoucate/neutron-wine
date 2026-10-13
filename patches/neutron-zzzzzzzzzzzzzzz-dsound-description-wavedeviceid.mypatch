@@ -1,0 +1,116 @@
+dsound: report WaveDeviceId in DSPROPERTY_DIRECTSOUNDDEVICE_DESCRIPTION (Premiere's named audio devices "(Not working)")
+
+In Premiere's Audio Hardware preferences every named device (Scarlett, Easy Effects, built-in) showed
+"(Not working)" once selected, and Premiere fell back to "System Default"; with a named Default Input the
+voice-over button stayed greyed (operator, while testing Neutron#17). Wine's MME itself was fine: every
+device opens, plays and records (preserved-fixes/harnesses/mme-open-each.c).
+
+Premiere's audio backend (dvaaudiodevice "DirectSoundHelper"; Premiere 2025 dvaaudiodevice.dll 25.3 and
+the code built into Premiere 2026's exe) loads dsound.dll, creates CLSID_DirectSoundPrivate's
+IKsPropertySet and asks DSPROPSETID_DirectSoundDevice / DSPROPERTY_DIRECTSOUNDDEVICE_DESCRIPTION_W (id 6)
+for each DirectSound device, taking WaveDeviceId as the device's MME number and the DirectSound GUID as
+its ID. Wine's DSPROPERTY_DescriptionW never set WaveDeviceId (or DataFlow). Premiere's memory showed the
+result: only the defaults carried endpoint GUIDs, every named device the fallback ID "<MME name>-out" /
+"-in" ("Speakers (Easy Effects Sink)-out"), which matched no endpoint's PKEY_AudioEndpoint_GUID when
+selected -> "(Not working)".
+
+DSPROPERTY_DescriptionW now fills WaveDeviceId with the waveOut/waveIn device whose
+DRV_QUERYFUNCTIONINSTANCEID is the endpoint's ID, and DataFlow with the endpoint's direction, as Windows
+does. ENUMERATE_W already numbered devices this way. Kill switch: NEUTRON_DSOUND_WAVE_ID=0.
+
+Harness: preserved-fixes/harnesses/dsound-wavedeviceid.c (each DirectSound device's DESCRIPTION_W
+WaveDeviceId against the MME device with that endpoint GUID). On the operator's 5 outputs + 9 inputs:
+116 leaves the caller's 0xdeadbeef in all 14 (FAILED); patched 14/14 correct (PASSED); patched with
+NEUTRON_DSOUND_WAVE_ID=0 = 116. Premiere 2025 in the clean room (operator): Easy Effects as Default
+Output -> no "(Not working)", sound plays; the Scarlett's Input 1 as Default Input -> voice-over enabled.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/dsound/propset.c
++++ b/dlls/dsound/propset.c
+@@ -42,6 +42,18 @@
+ 
+ static WCHAR wInterface[] = L"Interface";
+ 
++/* Neutron kill switch for get_wave_device_id: NEUTRON_DSOUND_WAVE_ID=0 */
++static BOOL neutron_wave_device_id_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        WCHAR buf[8];
++        on = !(GetEnvironmentVariableW(L"NEUTRON_DSOUND_WAVE_ID", buf, ARRAY_SIZE(buf)) && buf[0] == '0');
++    }
++    return on;
++}
++
+ typedef struct IKsPrivatePropertySetImpl
+ {
+     IKsPropertySet IKsPropertySet_iface;
+@@ -187,11 +199,45 @@
+     return hr;
+ }
+ 
++/* Neutron: the waveOut/waveIn device number of the endpoint with ID endpoint_id, as Windows reports it in
++ * DSPROPERTY_DIRECTSOUNDDEVICE_DESCRIPTION's WaveDeviceId. Premiere's audio backend maps each MME device
++ * to its endpoint with exactly this query; left unset, every named device got a made-up "<name>-out" ID,
++ * matched no endpoint when selected and showed "(Not working)". */
++static BOOL get_wave_device_id(EDataFlow flow, const WCHAR *endpoint_id, ULONG *wave_id)
++{
++    UINT count = flow == eCapture ? waveInGetNumDevs() : waveOutGetNumDevs(), i;
++    WCHAR *id;
++    BOOL found = FALSE;
++
++    for (i = 0; i < count && !found; ++i)
++    {
++        DWORD_PTR size = 0; /* zero-extended whether winmm writes a ULONG or a DWORD_PTR */
++        MMRESULT mr = flow == eCapture
++                ? waveInMessage((HWAVEIN)(UINT_PTR)i, DRV_QUERYFUNCTIONINSTANCEIDSIZE, (DWORD_PTR)&size, 0)
++                : waveOutMessage((HWAVEOUT)(UINT_PTR)i, DRV_QUERYFUNCTIONINSTANCEIDSIZE, (DWORD_PTR)&size, 0);
++
++        if (mr || !size || !(id = malloc(size)))
++            continue;
++        mr = flow == eCapture
++                ? waveInMessage((HWAVEIN)(UINT_PTR)i, DRV_QUERYFUNCTIONINSTANCEID, (DWORD_PTR)id, size)
++                : waveOutMessage((HWAVEOUT)(UINT_PTR)i, DRV_QUERYFUNCTIONINSTANCEID, (DWORD_PTR)id, size);
++        if (!mr && !wcsicmp(id, endpoint_id))
++        {
++            *wave_id = i;
++            found = TRUE;
++        }
++        free(id);
++    }
++    return found;
++}
++
+ static HRESULT DSPROPERTY_DescriptionW(
+     LPVOID pPropData,
+     ULONG cbPropData,
+     PULONG pcbReturned )
+ {
++    EDataFlow flow = eRender;
++    ULONG wave_id;
+     PDSPROPERTY_DIRECTSOUNDDEVICE_DESCRIPTION_W_DATA ppd = pPropData;
+     GUID dev_guid;
+     IMMDevice *mmdevice;
+@@ -230,6 +276,7 @@
+         hr = get_mmdevice(eCapture, &dev_guid, &mmdevice);
+         if(FAILED(hr))
+             return hr;
++        flow = eCapture;
+     }
+ 
+     hr = IMMDevice_OpenPropertyStore(mmdevice, STGM_READ, &ps);
+@@ -251,6 +298,12 @@
+     ppd->Description = wcsdup(pv.pwszVal);
+     hr = IMMDevice_GetId(mmdevice, &id);
+     ppd->Module = wcsdup(id);
++    if (SUCCEEDED(hr) && neutron_wave_device_id_on() && get_wave_device_id(flow, id, &wave_id))
++    {
++        ppd->WaveDeviceId = wave_id;
++        ppd->DataFlow = flow == eCapture ? DIRECTSOUNDDEVICE_DATAFLOW_CAPTURE : DIRECTSOUNDDEVICE_DATAFLOW_RENDER;
++        TRACE("WaveDeviceId %lu\n", wave_id);
++    }
+     CoTaskMemFree(id);
+     ppd->Interface = wcsdup(wInterface);
+     ppd->Type = DIRECTSOUNDDEVICE_TYPE_WDM;

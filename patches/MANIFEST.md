@@ -691,6 +691,19 @@ Sol", "Analog Stereo (Built-in Audio)" whole, no collision; kill switch = 116 ex
 Out (Neutron Test Card)") and Premiere 2025 in the clean room (new names, no duplicates). Long names are still cut at 31,
 as on Windows. The Scarlett's "(Not working)" label in Premiere also appears with the kill switch: not this change.
 
+### `neutron-zzzzzzzzzzzzzzz-dsound-description-wavedeviceid.mypatch` (2026-10-13) — Premiere: every named audio device "(Not working)"
+Premiere's Audio Hardware showed "(Not working)" on every named device (Scarlett, Easy Effects, built-in) once selected and fell
+back to System Default; a named Default Input kept the voice-over button greyed (operator, testing Neutron#17). Wine's MME was
+fine (`harnesses/mme-open-each.c`). Premiere's audio backend ("DirectSoundHelper": Premiere 2025 dvaaudiodevice 25.3, and the
+code in Premiere 2026's exe) maps MME devices to endpoints through dsound's CLSID_DirectSoundPrivate IKsPropertySet,
+DSPROPERTY_DIRECTSOUNDDEVICE_DESCRIPTION_W (id 6): WaveDeviceId = the MME number, DeviceId = the ID it stores. Wine never set
+WaveDeviceId (or DataFlow), so named devices got the fallback ID "<MME name>-out" (seen in Premiere's memory), which matched no
+endpoint's PKEY_AudioEndpoint_GUID on selection. DescriptionW now returns the waveOut/waveIn device whose
+DRV_QUERYFUNCTIONINSTANCEID is the endpoint's ID, and its DataFlow, as Windows does (ENUMERATE_W already numbered this way).
+Kill switch `NEUTRON_DSOUND_WAVE_ID=0`. Verified with `harnesses/dsound-wavedeviceid.c` (116: WaveDeviceId untouched for all 14
+devices; patched 14/14; kill switch = 116) and Premiere 2025 in the clean room (Easy Effects output: no label, sound plays;
+Scarlett Input 1: voice-over enabled).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
