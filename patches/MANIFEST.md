@@ -664,6 +664,17 @@ stray glyphs; patched identical to a direct draw; no-growth control passes on bo
 failures of 17069 before and after; hand-built, tests are disabled in our configure) and After Effects 2026 with the
 reporter's project: 114 logged 8 oversized runs and drew the error text garbled in places; patched 0, no garbling, no crash.
 
+### `neutron-zzzzzzzzzzzzzy-winewayland-primary-monitor-origin.mypatch` (2026-10-13) — Premiere clicks landed above the pointer (multi-monitor GNOME)
+GitHub Neutron#16: on a reporter's GNOME desktop (4K @125% placed 443 logical px lower than the 1080p @100% beside it) the bottom
+of Premiere's maximized window could not be clicked; clicks landed above the pointer. No output was at logical (0,0), so the
+arrangement made the first output primary at (0,443) — Windows always has the primary at (0,0), and Premiere computes its
+maximized position as if work-area coordinates were primary-relative, so it maximized 443 px lower, past the bottom of the
+virtual screen, where every pointer position was clamped to the screen edge. After overlap resolution the layout is now
+translated so the primary sits at the origin (others may be negative, as on Windows); origin-anchored and single-monitor layouts
+are unchanged. Kill switch `NEUTRON_PRIMARY_ORIGIN=0`. Verified with `preserved-fixes/harnesses/monitors.c` and Premiere 2026 in
+nested mutter 51 with the reporter's layout: before, primary (0,354) and Premiere maximized at (0,882)-(2240,2282) on a monitor
+ending at 1843; patched, primary (0,0), Premiere maximized at exactly the monitor and the pointer reached the last row (y=1399).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at

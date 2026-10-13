@@ -1,0 +1,62 @@
+winewayland: put the primary monitor at (0,0) (Premiere clicks landed above the pointer on GNOME)
+
+Premiere 2026 on a two-monitor GNOME desktop could not be clicked in the bottom of its window: clicks
+landed above the pointer (GitHub Neutron#16). The reporter's 4K monitor at 125% sits 443 logical px
+lower than the 1080p monitor beside it, so no output is at logical (0,0). The arrangement then made
+the first output primary at (0,443). Windows always has the primary monitor at (0,0), and Premiere
+relies on it: it computes its maximized position from work-area coordinates as if they were relative
+to the primary, so it maximized 443 px further down, past the bottom of the virtual screen (reporter:
+window (-4,922)-(3762,3042) on a monitor ending at y=2603). Every pointer position in the lower part
+of the window mapped below the screen and was clamped to its edge (23527 of 35280 motion events in the
+reporter's trace).
+
+After overlap resolution, the whole layout is now translated so the primary output sits at the
+origin; other outputs may be at negative coordinates, as on Windows. Layouts that already have an
+output at (0,0), including every single-monitor setup, are unchanged. Kill switch:
+NEUTRON_PRIMARY_ORIGIN=0.
+
+Harness: preserved-fixes/harnesses/monitors.c prints the monitor layout. Nested mutter 51 with the
+reporter's arrangement (devkit monitor at 125%, primary, logical (0,443); a 1920x1080 at 100% at
+(1792,0)): before, the primary is at (0,354) and no monitor covers (0,0); patched, the primary is at
+(0,0) and the other at (2240,-284). Premiere 2026 there with fresh preferences: before, maximized at
+(0,882)-(2240,2282) with the monitor ending at y=1843, and the window's bottom edge mapped to y=2281;
+patched, maximized at exactly the monitor, (0,0)-(2240,1400), and 821 pointer events down to the
+bottom edge all mapped inside the screen (lowest y=1399).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -183,6 +183,32 @@
+      * to right, but ensure the primary output is first. */
+     qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
+           output_info_cmp_primary_x_y);
++
++    /* NEUTRON (GitHub Neutron#16): Windows always has the primary monitor at (0,0), and apps rely on
++     * it. With no output at logical (0,0) -- a 125% 4K monitor placed 443 px lower than the 1080p one
++     * beside it -- the first output became primary at (0,443). Premiere computes its maximized
++     * position from work-area coordinates as if they were relative to the primary, so it maximized
++     * a further 443 px down, past the bottom of the virtual screen; every pointer position in the
++     * lower part of the window was clamped to the screen edge and clicks there landed above the
++     * pointer. Translate the whole layout so the primary sits at the origin (others may then be at
++     * negative coordinates, as on Windows). Layouts with an output at (0,0) are unchanged.
++     * Kill switch: NEUTRON_PRIMARY_ORIGIN=0. */
++    if (num_outputs)
++    {
++        static int on = -1;
++        struct output_info *primary = output_info_array->data;
++        int dx = primary->x, dy = primary->y;
++
++        if (on < 0) on = neutron_gate("NEUTRON_PRIMARY_ORIGIN", TRUE);
++        if (on && (dx || dy))
++        {
++            wl_array_for_each(info, output_info_array)
++            {
++                info->x -= dx;
++                info->y -= dy;
++            }
++        }
++    }
+ }
+ 
+ /* NEUTRON: (re)compute each output's arranged physical position into output->current.x/y, running the
