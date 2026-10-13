@@ -675,6 +675,22 @@ are unchanged. Kill switch `NEUTRON_PRIMARY_ORIGIN=0`. Verified with `preserved-
 nested mutter 51 with the reporter's layout: before, primary (0,354) and Premiere maximized at (0,882)-(2240,2282) on a monitor
 ending at 1843; patched, primary (0,0), Premiere maximized at exactly the monitor and the pointer reached the last row (y=1399).
 
+### `neutron-zzzzzzzzzzzzzz-winepulse-endpoint-names-like-windows.mypatch` (2026-10-13) — Premiere's audio device names cut alike
+Premiere's Audio Hardware list (MME only; Premiere has no WASAPI choice) showed every device cut to 31 characters and both
+Scarlett Solo inputs as "Microphone (Scarlett Solo (3rd " (operator, while testing Neutron#17). MME's szPname is
+MAXPNAMELEN WCHARs and winmm fills it with the endpoint's friendly name cut to fit — Windows cuts too, but its friendly
+name is "<endpoint> (<adapter>)", so what tells a card's endpoints apart comes first; mmdevapi named every endpoint
+"Microphone (<PulseAudio description>)" / "Speakers (…)", and that description is "<card> <endpoint>". winepulse now splits
+the description into card (PipeWire `device.description`, or for PulseAudio the part before `device.profile.description`)
+and endpoint and returns them for DEVPKEY_Device_DeviceDesc / DEVPKEY_DeviceInterface_FriendlyName (monitors keep
+"Monitor of " on the endpoint part); mmdevapi builds "<endpoint> (<card>)" from them. Unsplittable descriptions (virtual
+devices, the default "PulseAudio Input/Output") keep their names; endpoint GUIDs (keyed by node name) do not change. Kill
+switch `NEUTRON_ENDPOINT_NAMES=0`. Verified with `preserved-fixes/harnesses/mme-device-names.c` on the operator's devices
+(116: 12 of 14 cut, Scarlett inputs collide; patched: "Input 1 Mic (Scarlett Solo (3rd" / "Input 2 Inst/Line (Scarlett
+Sol", "Analog Stereo (Built-in Audio)" whole, no collision; kill switch = 116 exactly), a PulseAudio-form null sink ("Line
+Out (Neutron Test Card)") and Premiere 2025 in the clean room (new names, no duplicates). Long names are still cut at 31,
+as on Windows. The Scarlett's "(Not working)" label in Premiere also appears with the kill switch: not this change.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at

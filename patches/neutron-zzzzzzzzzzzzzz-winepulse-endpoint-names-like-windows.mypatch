@@ -1,0 +1,255 @@
+winepulse/mmdevapi: name endpoints "<endpoint> (<card>)" like Windows (no two MME names alike)
+
+Premiere's Audio Hardware list showed every device cut to 31 characters, and both inputs of a
+Scarlett Solo as the same "Microphone (Scarlett Solo (3rd " (found by the operator while testing
+Neutron#17). That list uses only MME: WAVEINCAPS/WAVEOUTCAPS szPname, MAXPNAMELEN (32) WCHARs,
+which winmm fills with the endpoint's DEVPKEY_Device_FriendlyName cut to fit. Windows cuts there
+too, but its friendly name is "<endpoint> (<adapter>)" ("Microphone (Realtek(R) Audio)"), so what
+tells a card's endpoints apart comes first. mmdevapi named every endpoint "Microphone (<x>)" or
+"Speakers (<x>)", with <x> PulseAudio's whole description, "<card> <endpoint>"
+("Scarlett Solo (3rd Gen.) Input 1 Mic"); the cut kept only the card.
+
+winepulse now splits the description into the card (PipeWire's device.description, or for
+PulseAudio the part before device.profile.description) and the endpoint, and returns them for
+DEVPKEY_Device_DeviceDesc and DEVPKEY_DeviceInterface_FriendlyName; a monitor keeps "Monitor of "
+in front of its endpoint part. mmdevapi builds the friendly name from the two when the driver
+supplies them: "Input 1 Mic (Scarlett Solo (3rd Gen.))". Descriptions that do not split (virtual
+devices, the default "PulseAudio Input/Output") keep their names. Endpoint GUIDs are keyed by the
+PulseAudio node name and do not change. Kill switch: NEUTRON_ENDPOINT_NAMES=0.
+
+Harness: preserved-fixes/harnesses/mme-device-names.c lists each MME name next to its endpoint's
+names and fails on a collision. On the operator's machine, 116: 12 of 14 names cut, the two
+Scarlett inputs identical (FAILED); patched: "Input 1 Mic (Scarlett Solo (3rd" and
+"Input 2 Inst/Line (Scarlett Sol", "Analog Stereo (Built-in Audio)" whole, no collision (PASSED);
+patched with NEUTRON_ENDPOINT_NAMES=0: the 116 names exactly. A null sink described
+"Neutron Test Card Line Out" with profile "Line Out" (the PulseAudio form) gives
+"Line Out (Neutron Test Card)". Premiere 2025 (clean room, operator): the Audio Hardware lists
+show the new names with no duplicates; the Scarlett output's "(Not working)" label appears with
+the kill switch too, so it is not this change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/mmdevapi/devenum.c
++++ b/dlls/mmdevapi/devenum.c
+@@ -497,12 +497,29 @@
+         if (!RegCreateKeyExW(key, L"Properties", 0, NULL, 0, KEY_WRITE|KEY_READ|KEY_WOW64_64KEY, NULL, &keyprop, NULL))
+         {
+             PROPVARIANT pv;
+-            WCHAR *type;
++            WCHAR *type, *adapter = cur->drv_id;
++            PROPVARIANT desc_pv = { VT_EMPTY }, adapter_pv = { VT_EMPTY };
+             DWORD len;
+ 
+             pv.vt = VT_LPWSTR;
+             pv.pwszVal = cur->drv_id;
+ 
++            /* Neutron: a driver that names the endpoint and its adapter separately (winepulse's
++             * get_endpoint_names) gets Windows' "<endpoint> (<adapter>)" friendly name, so the
++             * part that tells endpoints apart survives MME's 31-character cut. */
++            if (!(SUCCEEDED(set_driver_prop_value(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_DeviceDesc))
++                    && SUCCEEDED(MMDevice_GetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_DeviceDesc, &desc_pv))
++                    && desc_pv.vt == VT_LPWSTR
++                    && SUCCEEDED(set_driver_prop_value(id, flow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName))
++                    && SUCCEEDED(MMDevice_GetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName, &adapter_pv))
++                    && adapter_pv.vt == VT_LPWSTR))
++            {
++                PropVariantClear(&desc_pv);
++                PropVariantClear(&adapter_pv);
++            }
++            else
++                pv.pwszVal = adapter = adapter_pv.pwszVal;
++
+             if (SUCCEEDED(set_driver_prop_value(id, flow, &devicepath_key))) {
+                 PROPVARIANT pv2;
+ 
+@@ -519,15 +536,21 @@
+ 
+             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_DeviceInterface_FriendlyName, &pv);
+ 
+-            pv.pwszVal = type = (WCHAR *)(flow == eCapture ? L"Microphone" : L"Speakers");
++            if (desc_pv.vt == VT_LPWSTR)
++                type = desc_pv.pwszVal;
++            else
++                type = (WCHAR *)(flow == eCapture ? L"Microphone" : L"Speakers");
++            pv.pwszVal = type;
+             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_DeviceDesc, &pv);
+ 
+-            len = (wcslen(type) + wcslen(cur->drv_id) + wcslen(L" ()") + 1);
++            len = (wcslen(type) + wcslen(adapter) + wcslen(L" ()") + 1);
+             pv.vt = VT_LPWSTR;
+             pv.pwszVal = CoTaskMemAlloc(len * sizeof(WCHAR));
+-            swprintf(pv.pwszVal, len, L"%ls (%ls)", type, cur->drv_id);
++            swprintf(pv.pwszVal, len, L"%ls (%ls)", type, adapter);
+             MMDevice_SetPropValue(id, flow, (const PROPERTYKEY*)&DEVPKEY_Device_FriendlyName, &pv);
+             CoTaskMemFree(pv.pwszVal);
++            PropVariantClear(&desc_pv);
++            PropVariantClear(&adapter_pv);
+ 
+             pv.pwszVal = guidstr;
+             MMDevice_SetPropValue(id, flow, &deviceinterface_key, &pv);
+--- a/dlls/winepulse.drv/pulse.c
++++ b/dlls/winepulse.drv/pulse.c
+@@ -98,6 +98,7 @@
+ typedef struct _PhysDevice {
+     struct list entry;
+     WCHAR *name;
++    WCHAR *endpoint_name, *adapter_name; /* Neutron: see get_endpoint_names */
+     enum phys_device_bus_type bus_type;
+     USHORT vendor_id, product_id;
+     EndpointFormFactor form;
+@@ -167,6 +168,8 @@
+     do {
+         LIST_FOR_EACH_ENTRY_SAFE(dev, dev_next, *list, PhysDevice, entry) {
+             free(dev->name);
++            free(dev->endpoint_name);
++            free(dev->adapter_name);
+             free(dev);
+         }
+     } while (*(++list));
+@@ -573,6 +576,90 @@
+     return name;
+ }
+ 
++static WCHAR *utf8_to_wstr(const char *str, size_t len)
++{
++    WCHAR *ret = malloc((len + 1) * sizeof(WCHAR));
++
++    if (!ret)
++        return NULL;
++    len = ntdll_umbstowcs(str, len, ret, len);
++    ret[len] = 0;
++    return ret;
++}
++
++/* Neutron: Windows names an endpoint "<endpoint> (<adapter>)" -- "Microphone (Realtek(R) Audio)",
++ * "DELL P2715Q (NVIDIA High Definition Audio)" -- and MME apps (Premiere's Audio Hardware list) get
++ * that name cut to MAXPNAMELEN - 1 = 31 characters, so what tells a card's endpoints apart survives
++ * the cut. mmdevapi named every endpoint "Microphone (<description>)" / "Speakers (<description>)",
++ * and PulseAudio's description is "<card> <endpoint>" ("Scarlett Solo (3rd Gen.) Input 1 Mic"): the
++ * cut kept only the card, and both Scarlett inputs became "Microphone (Scarlett Solo (3rd ".
++ * When the description splits into the card and the rest, mmdevapi gets the two parts as DeviceDesc
++ * and DeviceInterface_FriendlyName: "Input 1 Mic (Scarlett Solo (3rd Gen.))". A monitor keeps
++ * "Monitor of " in front of its endpoint part. Anything else (virtual devices, the default
++ * "PulseAudio Input/Output") keeps its name. Kill switch: NEUTRON_ENDPOINT_NAMES=0. */
++static void get_endpoint_names(PhysDevice *dev, const char *desc, pa_proplist *proplist)
++{
++    static const char monitor_of[] = "Monitor of ";
++    const size_t monitor_len = sizeof(monitor_of) - 1;
++    const char *card, *profile, *class, *endpoint = NULL, *env;
++    size_t card_len = 0, desc_len, profile_len = 0, endpoint_len;
++    BOOL monitor;
++    char *buf;
++
++    dev->endpoint_name = dev->adapter_name = NULL;
++    if (!proplist || !desc || ((env = getenv("NEUTRON_ENDPOINT_NAMES")) && *env == '0'))
++        return;
++
++    class = pa_proplist_gets(proplist, PA_PROP_DEVICE_CLASS);
++    monitor = class && !strcmp(class, "monitor");
++    if (monitor && !strncmp(desc, monitor_of, monitor_len))
++        desc += monitor_len;
++    desc_len = strlen(desc);
++    profile = pa_proplist_gets(proplist, PA_PROP_DEVICE_PROFILE_DESCRIPTION);
++    if (profile)
++        profile_len = strlen(profile);
++
++    /* PipeWire: device.description is the card's name ("Built-in Audio") */
++    card = pa_proplist_gets(proplist, PA_PROP_DEVICE_DESCRIPTION);
++    if (card && (card_len = strlen(card)) && card_len + 1 < desc_len
++            && !strncmp(desc, card, card_len) && desc[card_len] == ' ')
++        endpoint = desc + card_len + 1;
++    /* PulseAudio: the description ends with the profile's ("Analog Stereo") */
++    else if (profile_len && profile_len + 1 < desc_len && desc[desc_len - profile_len - 1] == ' '
++            && !strcmp(desc + desc_len - profile_len, profile))
++    {
++        card = desc;
++        card_len = desc_len - profile_len - 1;
++        endpoint = profile;
++    }
++    if (!endpoint)
++        return;
++
++    /* stay within get_device_name's limit; an HDMI node's rest carries the monitor's name too
++       ("Digital Stereo (HDMI) [DELL P2715Q]"), its profile alone is shorter */
++    endpoint_len = strlen(endpoint);
++    if (card_len + endpoint_len > MAX_DEVICE_NAME_LEN && profile_len && endpoint != profile)
++    {
++        endpoint = profile;
++        endpoint_len = profile_len;
++    }
++    if ((monitor ? monitor_len : 0) + endpoint_len + card_len > MAX_DEVICE_NAME_LEN)
++        return;
++
++    if (!(buf = malloc(monitor_len + endpoint_len + 1)))
++        return;
++    sprintf(buf, "%s%s", monitor ? monitor_of : "", endpoint);
++    dev->endpoint_name = utf8_to_wstr(buf, strlen(buf));
++    dev->adapter_name = utf8_to_wstr(card, card_len);
++    free(buf);
++    if (!dev->endpoint_name || !dev->adapter_name)
++    {
++        free(dev->endpoint_name);
++        free(dev->adapter_name);
++        dev->endpoint_name = dev->adapter_name = NULL;
++    }
++}
++
+ static void fill_device_info(PhysDevice *dev, pa_proplist *p)
+ {
+     const char *buffer;
+@@ -611,6 +698,7 @@
+         free(dev);
+         return;
+     }
++    get_endpoint_names(dev, desc, proplist);
+     dev->form = form;
+     dev->index = index;
+     dev->channel_mask = channel_mask;
+@@ -2476,6 +2564,21 @@
+     return TRUE;
+ }
+ 
++static void get_string_prop(const WCHAR *str, struct get_prop_value_params *params)
++{
++    unsigned int size = (wcslen(str) + 1) * sizeof(WCHAR);
++
++    if (*params->buffer_size < size) {
++        params->result = E_NOT_SUFFICIENT_BUFFER;
++        *params->buffer_size = size;
++        return;
++    }
++    params->value->vt = VT_LPWSTR;
++    params->value->pwszVal = params->buffer;
++    memcpy(params->buffer, str, size);
++    params->result = S_OK;
++}
++
+ static NTSTATUS pulse_get_prop_value(void *args)
+ {
+     static const GUID PKEY_AudioEndpoint_GUID = {
+@@ -2484,6 +2587,12 @@
+     static const PROPERTYKEY devicepath_key = { /* undocumented? - {b3f8fa53-0004-438e-9003-51a46e139bfc},2 */
+         {0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2
+     };
++    static const PROPERTYKEY devicedesc_key = { /* DEVPKEY_Device_DeviceDesc */
++        {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 2
++    };
++    static const PROPERTYKEY interfacename_key = { /* DEVPKEY_DeviceInterface_FriendlyName */
++        {0x026e516e, 0xb814, 0x414b, {0x83, 0xcd, 0x85, 0x6d, 0x6f, 0xef, 0x48, 0x22}}, 2
++    };
+     struct get_prop_value_params *params = args;
+     struct list *list = (params->flow == eRender) ? &g_phys_speakers : &g_phys_sources;
+     PhysDevice *dev;
+@@ -2494,6 +2603,12 @@
+         if (IsEqualPropertyKey(*params->prop, devicepath_key)) {
+             get_device_path(dev, params);
+             return STATUS_SUCCESS;
++        } else if (dev->endpoint_name && IsEqualPropertyKey(*params->prop, devicedesc_key)) {
++            get_string_prop(dev->endpoint_name, params);
++            return STATUS_SUCCESS;
++        } else if (dev->adapter_name && IsEqualPropertyKey(*params->prop, interfacename_key)) {
++            get_string_prop(dev->adapter_name, params);
++            return STATUS_SUCCESS;
+         } else if (IsEqualGUID(&params->prop->fmtid, &PKEY_AudioEndpoint_GUID)) {
+             switch (params->prop->pid) {
+             case 0:   /* FormFactor */
