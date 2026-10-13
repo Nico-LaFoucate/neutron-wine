@@ -1,0 +1,182 @@
+d2d1: recorded commands keep offsets, not pointers, into the command buffer (After Effects garbled text)
+
+After Effects' expression-error text was sometimes drawn garbled, and the glyph runs behind it reached
+d2d1 with advances of 1e36 and NaN (GitHub Neutron#14; 11.10-114 stopped those runs from crashing it).
+They are replayed from a command list. d2d_command_list_draw_glyph_run copies a run's indices,
+advances and offsets, and its description's locale, string and cluster map, into the command buffer
+right after the command and kept POINTERS to the copies; DrawBitmap, FillOpacityMask and DrawImage keep
+their rectangles the same way. The buffer is realloc'd as later commands are recorded, so a list that
+grew after the command was recorded replayed it from freed memory.
+
+The fields now hold the copy's offset from the command, which survives the buffer moving, and
+d2d_command_list_Stream turns them back into pointers. A description without a locale name no longer
+calls wcslen(NULL) while recording.
+
+Harness: preserved-fixes/harnesses/d2d-cmdlist-glyphrun.c records a glyph run, then 4000 rectangles,
+and replays the list: 11.10-114 draws nothing (3725 of 3725 pixels wrong; 118 stray pixels when freed
+memory is left alone); patched, identical to drawing the run directly; without growth both pass. Wine's
+d2d1 conformance tests: 17069 tests, the same 46 failures before and after. After Effects 2026 with the
+reporter's project (clean room), stepping through the expression errors: 114 logged 8 oversized runs
+(the log cap) and the text was garbled in places; patched, 0, no garbled text, no crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/d2d1/command_list.c
++++ b/dlls/d2d1/command_list.c
+@@ -276,6 +276,17 @@
+     ID2D1Factory_AddRef(*factory = command_list->factory);
+ }
+ 
++/* NEUTRON (GitHub Neutron#14): a recorded command's variable data (a glyph run's indices, advances and
++ * offsets, its description's strings, DrawBitmap's, FillOpacityMask's and DrawImage's rectangles) is
++ * copied into the command buffer right after the command, and the command used to keep POINTERS to it.
++ * The buffer is realloc'd as later commands are recorded, so replay read those fields from freed memory:
++ * After Effects' text came back with advances of 1e36 and NaN. The fields now hold the data's offset from
++ * the command, which survives the buffer moving; this turns one back into a pointer. */
++static inline const void *d2d_command_field(const void *command, const void *field)
++{
++    return field ? (const BYTE *)command + (ULONG_PTR)field : NULL;
++}
++
+ static HRESULT STDMETHODCALLTYPE d2d_command_list_Stream(ID2D1CommandList *iface, ID2D1CommandSink *sink)
+ {
+     NEUTRON_API_TIME();
+@@ -394,7 +405,21 @@
+             case D2D_COMMAND_DRAW_GLYPH_RUN:
+             {
+                 const struct d2d_command_draw_glyph_run *c = data;
+-                hr = ID2D1CommandSink_DrawGlyphRun(sink, c->origin, &c->run, c->run_desc, c->brush, c->measuring_mode);
++                DWRITE_GLYPH_RUN_DESCRIPTION desc, *run_desc = NULL;
++                DWRITE_GLYPH_RUN run = c->run;
++
++                run.glyphIndices = d2d_command_field(c, c->run.glyphIndices);
++                run.glyphAdvances = d2d_command_field(c, c->run.glyphAdvances);
++                run.glyphOffsets = d2d_command_field(c, c->run.glyphOffsets);
++                if (c->run_desc)
++                {
++                    desc = *(const DWRITE_GLYPH_RUN_DESCRIPTION *)d2d_command_field(c, c->run_desc);
++                    desc.localeName = d2d_command_field(c, desc.localeName);
++                    desc.string = d2d_command_field(c, desc.string);
++                    desc.clusterMap = d2d_command_field(c, desc.clusterMap);
++                    run_desc = &desc;
++                }
++                hr = ID2D1CommandSink_DrawGlyphRun(sink, c->origin, &run, run_desc, c->brush, c->measuring_mode);
+                 break;
+             }
+             case D2D_COMMAND_DRAW_LINE:
+@@ -421,15 +446,16 @@
+             case D2D_COMMAND_DRAW_BITMAP:
+             {
+                 const struct d2d_command_draw_bitmap *c = data;
+-                hr = ID2D1CommandSink_DrawBitmap(sink, c->bitmap, c->dst_rect, c->opacity,
+-                        c->interpolation_mode, c->src_rect, c->perspective_transform);
++                hr = ID2D1CommandSink_DrawBitmap(sink, c->bitmap, d2d_command_field(c, c->dst_rect), c->opacity,
++                        c->interpolation_mode, d2d_command_field(c, c->src_rect),
++                        d2d_command_field(c, c->perspective_transform));
+                 break;
+             }
+             case D2D_COMMAND_DRAW_IMAGE:
+             {
+                 const struct d2d_command_draw_image *c = data;
+-                hr = ID2D1CommandSink_DrawImage(sink, c->image, c->target_offset, c->image_rect,
+-                        c->interpolation_mode, c->composite_mode);
++                hr = ID2D1CommandSink_DrawImage(sink, c->image, d2d_command_field(c, c->target_offset),
++                        d2d_command_field(c, c->image_rect), c->interpolation_mode, c->composite_mode);
+                 break;
+             }
+             case D2D_COMMAND_FILL_MESH:
+@@ -441,7 +467,8 @@
+             case D2D_COMMAND_FILL_OPACITY_MASK:
+             {
+                 const struct d2d_command_fill_opacity_mask *c = data;
+-                hr = ID2D1CommandSink_FillOpacityMask(sink, c->bitmap, c->brush, c->dst_rect, c->src_rect);
++                hr = ID2D1CommandSink_FillOpacityMask(sink, c->bitmap, c->brush, d2d_command_field(c, c->dst_rect),
++                        d2d_command_field(c, c->src_rect));
+                 break;
+             }
+             case D2D_COMMAND_FILL_GEOMETRY:
+@@ -933,7 +960,8 @@
+     d2d_command_list_set_text_rendering_params_internal(command_list, FALSE, params);
+ }
+ 
+-static inline void d2d_command_list_write_field(BYTE **data, void *dst, const void *src, size_t size)
++/* See d2d_command_field(). */
++static inline void d2d_command_list_write_field(const void *command, BYTE **data, void *dst, const void *src, size_t size)
+ {
+     void **ptr = dst;
+ 
+@@ -943,7 +971,7 @@
+         return;
+     }
+ 
+-    *ptr = *data;
++    *ptr = (void *)(ULONG_PTR)(*data - (const BYTE *)command);
+     memcpy(*data, src, size);
+     *data = *data + size;
+ }
+@@ -1005,21 +1033,23 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &r->glyphIndices, run->glyphIndices, glyph_count * sizeof(*r->glyphIndices));
+-    d2d_command_list_write_field(&data, &r->glyphAdvances, run->glyphAdvances, glyph_count * sizeof(*r->glyphAdvances));
+-    d2d_command_list_write_field(&data, &r->glyphOffsets, run->glyphOffsets, glyph_count * sizeof(*r->glyphOffsets));
++    d2d_command_list_write_field(command, &data, &r->glyphIndices, run->glyphIndices, glyph_count * sizeof(*r->glyphIndices));
++    d2d_command_list_write_field(command, &data, &r->glyphAdvances, run->glyphAdvances, glyph_count * sizeof(*r->glyphAdvances));
++    d2d_command_list_write_field(command, &data, &r->glyphOffsets, run->glyphOffsets, glyph_count * sizeof(*r->glyphOffsets));
+ 
+     command->run_desc = NULL;
+     if (run_desc)
+     {
+-        d = command->run_desc = (DWRITE_GLYPH_RUN_DESCRIPTION *)data;
++        d = (DWRITE_GLYPH_RUN_DESCRIPTION *)data;
++        command->run_desc = (DWRITE_GLYPH_RUN_DESCRIPTION *)(ULONG_PTR)(data - (BYTE *)command);
+         memset(d, 0, sizeof(*d));
+         data += sizeof(*d);
+ 
+-        d2d_command_list_write_field(&data, &d->localeName, run_desc->localeName, (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName));
+-        d2d_command_list_write_field(&data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
++        d2d_command_list_write_field(command, &data, &d->localeName, run_desc->localeName,
++                run_desc->localeName ? (wcslen(run_desc->localeName) + 1) * sizeof(*run_desc->localeName) : 0);
++        d2d_command_list_write_field(command, &data, &d->string, run_desc->string, run_desc->stringLength * sizeof(*run_desc->string));
+         d->stringLength = run_desc->stringLength;
+-        d2d_command_list_write_field(&data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
++        d2d_command_list_write_field(command, &data, &d->clusterMap, run_desc->clusterMap, run_desc->stringLength * sizeof(*run_desc->clusterMap));
+         d->textPosition = run_desc->textPosition;
+     }
+ 
+@@ -1051,9 +1081,9 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+-    d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
+-    d2d_command_list_write_field(&data, &command->perspective_transform, perspective_transform, sizeof(*perspective_transform));
++    d2d_command_list_write_field(command, &data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
++    d2d_command_list_write_field(command, &data, &command->src_rect, src_rect, sizeof(*src_rect));
++    d2d_command_list_write_field(command, &data, &command->perspective_transform, perspective_transform, sizeof(*perspective_transform));
+ }
+ 
+ void d2d_command_list_draw_image(struct d2d_command_list *command_list, ID2D1Image *image,
+@@ -1078,8 +1108,8 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &command->target_offset, target_offset, sizeof(*target_offset));
+-    d2d_command_list_write_field(&data, &command->image_rect, image_rect, sizeof(*image_rect));
++    d2d_command_list_write_field(command, &data, &command->target_offset, target_offset, sizeof(*target_offset));
++    d2d_command_list_write_field(command, &data, &command->image_rect, image_rect, sizeof(*image_rect));
+ }
+ 
+ void d2d_command_list_fill_mesh(struct d2d_command_list *command_list, const struct d2d_device_context *context,
+@@ -1129,8 +1159,8 @@
+ 
+     data = (BYTE *)(command + 1);
+ 
+-    d2d_command_list_write_field(&data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
+-    d2d_command_list_write_field(&data, &command->src_rect, src_rect, sizeof(*src_rect));
++    d2d_command_list_write_field(command, &data, &command->dst_rect, dst_rect, sizeof(*dst_rect));
++    d2d_command_list_write_field(command, &data, &command->src_rect, src_rect, sizeof(*src_rect));
+ }
+ 
+ /* ---------------------------------------------------------------------------

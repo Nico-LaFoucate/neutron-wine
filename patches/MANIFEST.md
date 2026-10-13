@@ -652,6 +652,18 @@ grayscale, ClearType and aliased) and in After Effects 2026 with the reporter's 
 and a crash in 1 of 2 runs; fix on, 0 failed draws, no crash. ⚠️ Where the garbage advances come from is still open
 (OPEN-ISSUES #14).
 
+### `neutron-zzzzzzzzzzzzzx-d2d1-command-list-field-offsets.mypatch` (2026-10-13) — After Effects text garbled in places (expression-error bar)
+The garbage glyph advances behind GitHub Neutron#14's second crash (1e36, NaN; 114 stopped them from crashing) came from
+d2d1's command lists: `d2d_command_list_draw_glyph_run` copied a run's indices/advances/offsets and its description's
+locale/string/cluster map into the command buffer and kept POINTERS to the copies (DrawBitmap, FillOpacityMask and
+DrawImage kept their rectangles the same way), and the buffer is realloc'd as later commands are recorded — so a list that
+grew afterwards replayed them from freed memory. Upstream Wine bug. The fields now hold offsets from the command;
+`d2d_command_list_Stream` resolves them (`d2d_command_field`). A description without a locale name no longer calls
+`wcslen(NULL)`. Verified with `preserved-fixes/harnesses/d2d-cmdlist-glyphrun.c` (114: replay after growth draws nothing /
+stray glyphs; patched identical to a direct draw; no-growth control passes on both), Wine's d2d1 conformance tests (same 46
+failures of 17069 before and after; hand-built, tests are disabled in our configure) and After Effects 2026 with the
+reporter's project: 114 logged 8 oversized runs and drew the error text garbled in places; patched 0, no garbling, no crash.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
