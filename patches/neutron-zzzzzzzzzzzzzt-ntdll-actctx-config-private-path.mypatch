@@ -1,0 +1,217 @@
+ntdll: honor <probing privatePath> in a module's application configuration file (After Effects' Mocha plug-in)
+
+After Effects 2026 reported at every start that mochashape4ae_adobe.aex (Boris FX Mocha AE) failed to
+load (GitHub Neutron#14). The plug-in's embedded manifest (resource 2) depends on the private assembly
+BorisFX.qt.shared-dlls 6.5.4.0, whose manifest and DLLs (Qt 6, OpenSSL, zlib, png, jpeg) are in
+Resources\mochaui\bin. Windows finds it through mochashape4ae_adobe.aex.2.config beside the plug-in:
+
+  <configuration><windows><assemblyBinding xmlns="urn:schemas-microsoft-com:asm.v1">
+    <probing privatePath=".\Resources\mochaui\bin"/></assemblyBinding></windows></configuration>
+
+Wine never read such a file, so the dependent assembly was not found and every Qt import failed.
+
+When an activation context is created from resource N of a module, read "<module>.N.config"
+("<exe>.config" for resource 1), take the privatePath of
+configuration/windows/assemblyBinding/probing, and after the usual probing fails, look in each of its
+';'-separated directories (relative to the module's directory, at most 9, absolute paths ignored) for
+<name>.dll, <name>.manifest and <name>\<name>.{dll,manifest}. The configuration file is also reported
+as the context's root configuration path, as on Windows.
+
+Harness: preserved-fixes/harnesses/sxs-config-probing/run.sh builds a plug-in laid out like Mocha's.
+11.10-110: it fails to load with and without the .config (error 126); patched: it loads with the
+.config and still fails without it. After Effects 2026 (clean room): no startup warning, Mocha AE
+applies and its interface opens (operator).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/ntdll/actctx.c
++++ b/dlls/ntdll/actctx.c
+@@ -589,6 +589,7 @@
+     struct assembly_identity *dependencies;
+     unsigned int              num_dependencies;
+     unsigned int              allocated_dependencies;
++    WCHAR                    *private_paths;  /* <probing privatePath> of the configuration file */
+ };
+ 
+ static const xmlstr_t empty_xmlstr;
+@@ -3368,6 +3369,148 @@
+     return status;
+ }
+ 
++/* NEUTRON (GitHub Neutron#14): application configuration files with <probing privatePath>.
++ *
++ * A module whose manifest is resource N can ship "<module>.N.config" beside it ("<exe>.config" for
++ * an executable's resource 1). Its <configuration><windows><assemblyBinding><probing privatePath>
++ * lists up to 9 ';'-separated directories, relative to the module's directory, in which Windows
++ * also looks for the private assemblies the manifest depends on. After Effects' Mocha plug-in
++ * (mochashape4ae_adobe.aex) depends on BorisFX.qt.shared-dlls, which lives in
++ * Resources\mochaui\bin and is only found through mochashape4ae_adobe.aex.2.config; without it the
++ * plug-in's Qt imports were not found and After Effects reported it as failed to load. */
++static void parse_config_elem( xmlbuf_t *xmlbuf, const struct xml_elem *elem, unsigned int level,
++                               WCHAR **paths )
++{
++    struct xml_elem child;
++    struct xml_attr attr;
++    BOOL end = FALSE, match;
++
++    switch (level)
++    {
++    case 0: match = xmlstr_cmp( &elem->name, L"configuration" ); break;
++    case 1: match = xmlstr_cmp( &elem->name, L"windows" ); break;
++    case 2: match = xml_elem_cmp( elem, L"assemblyBinding", asmv1W ); break;
++    case 3: match = xml_elem_cmp( elem, L"probing", asmv1W ); break;
++    default: match = FALSE; break;
++    }
++
++    while (next_xml_attr( xmlbuf, &attr, &end ))
++    {
++        if (match && level == 3 && !*paths && xml_attr_cmp( &attr, L"privatePath" ))
++            *paths = xmlstrdupW( &attr.value );
++    }
++    if (end) return;
++
++    while (next_xml_elem( xmlbuf, &child, elem ))
++        parse_config_elem( xmlbuf, &child, match ? level + 1 : 4, paths );
++}
++
++static WCHAR *read_config_private_paths( const WCHAR *config )
++{
++    FILE_END_OF_FILE_INFORMATION info;
++    UNICODE_STRING nameW;
++    IO_STATUS_BLOCK io;
++    struct xml_elem elem, parent = {0};
++    xmlbuf_t xmlbuf = {0};
++    WCHAR *paths = NULL, *text = NULL;
++    void *data = NULL;
++    HANDLE file;
++    ULONG size, len;
++    INT unicode_tests = IS_TEXT_UNICODE_SIGNATURE | IS_TEXT_UNICODE_REVERSE_SIGNATURE;
++
++    if (!RtlDosPathNameToNtPathName_U( config, &nameW, NULL, NULL )) return NULL;
++    if (open_nt_file( &file, &nameW ))
++    {
++        RtlFreeUnicodeString( &nameW );
++        return NULL;
++    }
++    RtlFreeUnicodeString( &nameW );
++
++    if (NtQueryInformationFile( file, &io, &info, sizeof(info), FileEndOfFileInformation ) ||
++        !info.EndOfFile.QuadPart || info.EndOfFile.QuadPart > 0x10000) goto done;
++    size = info.EndOfFile.LowPart;
++    if (!(data = RtlAllocateHeap( GetProcessHeap(), 0, size ))) goto done;
++    if (NtReadFile( file, 0, NULL, NULL, &io, data, size, NULL, NULL ) || io.Information != size) goto done;
++
++    if (RtlIsTextUnicode( data, size, &unicode_tests ))
++    {
++        xmlbuf.ptr = data;
++        xmlbuf.end = xmlbuf.ptr + size / sizeof(WCHAR);
++    }
++    else
++    {
++        RtlUTF8ToUnicodeN( NULL, 0, &len, data, size );
++        if (!(text = RtlAllocateHeap( GetProcessHeap(), 0, len ))) goto done;
++        RtlUTF8ToUnicodeN( text, len, &len, data, size );
++        xmlbuf.ptr = text;
++        xmlbuf.end = xmlbuf.ptr + len / sizeof(WCHAR);
++    }
++
++    if (!next_xml_elem( &xmlbuf, &elem, &parent )) goto done;
++    if (xmlstr_cmp( &elem.name, L"?xml" ) &&
++        (!parse_xml_header( &xmlbuf ) || !next_xml_elem( &xmlbuf, &elem, &parent ))) goto done;
++    parse_config_elem( &xmlbuf, &elem, 0, &paths );
++
++done:
++    RtlFreeHeap( GetProcessHeap(), 0, text );
++    RtlFreeHeap( GetProcessHeap(), 0, data );
++    NtClose( file );
++    return paths;
++}
++
++static void load_module_config( struct actctx_loader *acl, HMODULE module, unsigned int resid )
++{
++    UNICODE_STRING name;
++    WCHAR suffix[24];
++
++    if (resid == 1) wcscpy( suffix, L".config" );
++    else swprintf( suffix, ARRAY_SIZE(suffix), L".%u.config", resid );
++    if (get_module_filename( module, &name, wcslen( suffix ) * sizeof(WCHAR) )) return;
++    wcscat( name.Buffer, suffix );
++
++    if ((acl->private_paths = read_config_private_paths( name.Buffer )))
++    {
++        TRACE( "%s: privatePath %s\n", debugstr_w(name.Buffer), debugstr_w(acl->private_paths) );
++        acl->actctx->config.type = ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE;
++        RtlFreeHeap( GetProcessHeap(), 0, acl->actctx->config.info );
++        acl->actctx->config.info = name.Buffer;
++    }
++    else RtlFreeUnicodeString( &name );
++}
++
++/* <dir>\name.dll, <dir>\name.manifest, <dir>\name\name.dll and <dir>\name\name.manifest for each
++ * privatePath directory, relative to the module's directory. Absolute paths are not allowed. */
++static NTSTATUS lookup_assembly_private_paths( struct actctx_loader *acl, struct assembly_identity *ai,
++                                               const WCHAR *lang, const WCHAR *directory )
++{
++    const WCHAR *path, *end, *appdir = acl->actctx->appdir.info;
++    NTSTATUS status = STATUS_SXS_ASSEMBLY_NOT_FOUND;
++    unsigned int count = 0;
++    WCHAR *buffer;
++    DWORD len, total;
++
++    for (path = acl->private_paths; *path && count < 9; path = *end ? end + 1 : end)
++    {
++        if (!(end = wcschr( path, ';' ))) end = path + wcslen( path );
++        if (!(len = end - path)) continue;
++        count++;
++        if (path[0] == '\\' || path[0] == '/' || (len > 1 && path[1] == ':')) continue;
++
++        total = wcslen( appdir ) + len + 2 * wcslen( ai->name ) + wcslen( lang ) + 16;
++        if (!(buffer = RtlAllocateHeap( GetProcessHeap(), 0, total * sizeof(WCHAR) ))) return STATUS_NO_MEMORY;
++        swprintf( buffer, total, L"%s%.*s\\", appdir, (int)len, path );
++        status = open_manifest_file( acl, ai, lang, directory, buffer, total );
++        if (status == STATUS_SXS_ASSEMBLY_NOT_FOUND)
++        {
++            swprintf( buffer, total, L"%s%.*s\\%s\\", appdir, (int)len, path, ai->name );
++            status = open_manifest_file( acl, ai, lang, directory, buffer, total );
++        }
++        RtlFreeHeap( GetProcessHeap(), 0, buffer );
++        if (status != STATUS_SXS_ASSEMBLY_NOT_FOUND) break;
++    }
++    return status;
++}
++
+ static NTSTATUS lookup_assembly(struct actctx_loader* acl,
+                                 struct assembly_identity* ai)
+ {
+@@ -3424,6 +3567,9 @@
+         status = open_manifest_file( acl, ai, lang, directory, buffer, total );
+     }
+ 
++    if (status == STATUS_SXS_ASSEMBLY_NOT_FOUND && acl->private_paths)
++        status = lookup_assembly_private_paths( acl, ai, lang, directory );
++
+ done:
+     RtlFreeHeap( GetProcessHeap(), 0, directory );
+     RtlFreeHeap( GetProcessHeap(), 0, buffer );
+@@ -5384,6 +5530,7 @@
+     }
+ 
+     acl.actctx = actctx;
++    acl.private_paths = NULL;
+     acl.dependencies = NULL;
+     acl.num_dependencies = 0;
+     acl.allocated_dependencies = 0;
+@@ -5420,8 +5567,13 @@
+     if (file) NtClose( file );
+     RtlFreeUnicodeString( &nameW );
+ 
++    if (status == STATUS_SUCCESS && (pActCtx->dwFlags & ACTCTX_FLAG_RESOURCE_NAME_VALID) &&
++        (pActCtx->dwFlags & ACTCTX_FLAG_HMODULE_VALID) && !((ULONG_PTR)pActCtx->lpResourceName >> 16))
++        load_module_config( &acl, pActCtx->hModule, LOWORD(pActCtx->lpResourceName) );
++
+     if (status == STATUS_SUCCESS) status = parse_depend_manifests(&acl);
+     free_depend_manifests( &acl );
++    RtlFreeHeap( GetProcessHeap(), 0, acl.private_paths );
+ 
+     if (status == STATUS_SUCCESS) *new_actctx = actctx;
+     else actctx_release( actctx );

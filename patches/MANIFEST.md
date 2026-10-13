@@ -605,6 +605,17 @@ Verified with `preserved-fixes/harnesses/odmenu-text.c` (three rows drawn InDesi
 dark palette fails on 109 and passes patched, light palette passes both) and in InDesign. The highlighted font row
 still draws another row's text over its own (parked, OPEN-ISSUES).
 
+### `neutron-zzzzzzzzzzzzzt-ntdll-actctx-config-private-path.mypatch` (2026-10-12) — After Effects: Mocha AE plug-in failed to load
+After Effects 2026 warned at every start that `mochashape4ae_adobe.aex` (Boris FX Mocha AE) failed to load (GitHub
+Neutron#14). Its embedded manifest depends on the private assembly `BorisFX.qt.shared-dlls`, which lives in
+`Resources\mochaui\bin` and which Windows finds through `mochashape4ae_adobe.aex.2.config`'s
+`<probing privatePath=".\Resources\mochaui\bin"/>`; Wine never read application configuration files. An activation
+context created from resource N of a module now reads `<module>.N.config` (`<exe>.config` for resource 1) and, after the
+usual probing fails, searches each privatePath directory (relative to the module, at most 9, absolute ones ignored); the
+file is also reported as the root configuration path. Verified with `preserved-fixes/harnesses/sxs-config-probing/`
+(110 fails with and without the .config; patched loads only with it) and in After Effects 2026: no warning, Mocha AE
+applies and its interface opens.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
