@@ -637,6 +637,21 @@ key, and a cached bitmap whose size differs from the one requested is rendered a
 equals a fresh render) and in After Effects 2026 with the reporter's project: crashed 2 of 2 runs scrubbing before,
 0 of 2 patched.
 
+### `neutron-zzzzzzzzzzzzzw-d2d1-dwrite-glyph-run-clip-to-target.mypatch` (2026-10-12) — After Effects crashed on its expression-error bar
+After Effects 2026 sometimes crashed while the comp panel's expression-error bar was shown (GitHub Neutron#14, second
+crash). Some draws of the bar's own text arrive with garbage advances (1e36, NaN) that put the rest of the run up to a
+billion pixels away; d2d1 rasterized every run into one bitmap covering the whole run, so a run wider than 16384 px was
+not drawn at all and wider ones overflowed the size arithmetic in d2d1 (32-bit, and float in `d2d_size_set`) and in
+dwrite (the run bitmap could be far smaller than the glyphs copied into it). Windows draws only what is visible. d2d1 now
+clips a run's bitmap to the target; dwrite renders a run whose whole bitmap would exceed 16 MiB straight into the
+caller's texture (only the requested part), sizes textures without 32-bit overflow and clamps glyph origins to ±1e9 px.
+Runs that fit are unchanged; `NEUTRON_GLYPH_CLIP=0` turns it off; the first 8 oversized runs are logged
+(`neutron-glyphclip`). Verified with `preserved-fixes/harnesses/d2d-huge-glyphrun.c` (110 draws nothing for a
+3000-glyph line or runs with a glyph 2e7/2e9 DIPs away; patched, the visible part is pixel-identical to a short run, in
+grayscale, ClearType and aliased) and in After Effects 2026 with the reporter's project: fix off, 179 failed glyph draws
+and a crash in 1 of 2 runs; fix on, 0 failed draws, no crash. ⚠️ Where the garbage advances come from is still open
+(OPEN-ISSUES #14).
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at

@@ -1,0 +1,295 @@
+d2d1, dwrite: rasterize glyph runs only where they can be seen (After Effects crash on expression errors)
+
+After Effects 2026 sometimes crashed while the comp panel's expression-error bar was shown (GitHub
+Neutron#14). Some draws of the bar's own text arrive with garbage advances (1e36, NaN), which put the
+rest of the run up to a billion pixels away. d2d1 rasterized each glyph run into one bitmap covering
+the whole run: a run wider than 16384 px exceeded the D3D texture limit and was not drawn at all, and
+wider ones overflowed the size arithmetic (32-bit, and float in d2d_size_set) in d2d1 and in dwrite,
+whose run bitmap could come out far smaller than the glyphs copied into it. Windows draws only what
+is visible.
+
+d2d1 now clips a run's bitmap to the target before rasterizing. dwrite renders a run whose whole
+bitmap would exceed 16 MiB straight into the caller's texture, only the requested part; computes
+texture sizes and offsets without 32-bit overflow; and clamps glyph origins to +-1e9 px instead of
+converting out-of-range floats to int. Runs that fit are unchanged. NEUTRON_GLYPH_CLIP=0 turns the
+clipping off in both. The first 8 oversized runs are logged ("neutron-glyphclip").
+
+Harness: preserved-fixes/harnesses/d2d-huge-glyphrun.c draws a 3000-glyph line and two runs with a
+glyph 2e7 and 2e9 DIPs away onto an 800x200 target: 11.10-110 draws nothing (the three errors from
+After Effects' log); patched, the visible part is pixel-identical to the same glyphs drawn as a short
+run, in grayscale, ClearType and aliased. After Effects 2026 with the reporter's project (clean
+room), stepping through the expression errors: fix off, 179 failed glyph draws per run and a crash
+in 1 of 2 runs; fix on, 0 failed draws and no crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2916,6 +2916,15 @@
+     return S_OK;
+ }
+ 
++/* NEUTRON (GitHub Neutron#14): glyph runs are rasterized only where they can be seen.
++ * NEUTRON_GLYPH_CLIP=0 turns that off (d2d1 and dwrite read the same switch). */
++static int neutron_glyph_clip(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_GLYPH_CLIP"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++
+ static void d2d_device_context_draw_glyph_run_bitmap(struct d2d_device_context *context,
+         D2D1_POINT_2F baseline_origin, const DWRITE_GLYPH_RUN *glyph_run, ID2D1Brush *brush,
+         DWRITE_RENDERING_MODE rendering_mode, DWRITE_MEASURING_MODE measuring_mode,
+@@ -2951,6 +2960,43 @@
+         goto done;
+     }
+ 
++    if (neutron_glyph_clip() && context->pixel_size.width && context->pixel_size.height)
++    {
++        /* NEUTRON (GitHub Neutron#14): rasterize only the part of the run that lies on the target,
++         * as Windows does. The whole run used to become one bitmap however much of it was off the
++         * target: a line longer than 16384 px exceeded the D3D texture limit and was not drawn at
++         * all, and runs millions of pixels wide overflowed the size arithmetic here (32-bit, and
++         * float in d2d_size_set) and in dwrite. After Effects' expression-error bar draws such runs,
++         * and it crashed there. */
++        RECT target_rect = { 0, 0, context->pixel_size.width, context->pixel_size.height };
++        RECT run_bounds = bounds;
++
++        if (!IntersectRect(&bounds, &run_bounds, &target_rect))
++            goto done;
++        if ((LONG64)run_bounds.right - run_bounds.left > 16384 || (LONG64)run_bounds.bottom - run_bounds.top > 16384)
++        {
++            static LONG logged;
++
++            if (InterlockedIncrement(&logged) <= 8)
++            {
++                const D2D1_MATRIX_3X2_F *t = &context->drawing_state.transform;
++                float sum = 0.0f, most = 0.0f;
++                UINT32 i;
++
++                for (i = 0; glyph_run->glyphAdvances && i < glyph_run->glyphCount; ++i)
++                {
++                    sum += glyph_run->glyphAdvances[i];
++                    if (fabsf(glyph_run->glyphAdvances[i]) > fabsf(most)) most = glyph_run->glyphAdvances[i];
++                }
++                ERR("neutron-glyphclip: run %s clipped to target %ux%u: %u glyphs, em %.2f, origin (%.1f,%.1f), "
++                        "advances sum %.1f max %.1f, transform [%.3g %.3g %.3g %.3g %.6g %.6g], dpi %.0f\n",
++                        wine_dbgstr_rect(&run_bounds), context->pixel_size.width, context->pixel_size.height,
++                        glyph_run->glyphCount, glyph_run->fontEmSize, baseline_origin.x, baseline_origin.y, sum, most,
++                        t->_11, t->_12, t->_21, t->_22, t->_31, t->_32, context->desc.dpiX);
++            }
++        }
++    }
++
+     d2d_size_set(&bitmap_size, bounds.right - bounds.left, bounds.bottom - bounds.top);
+     if (!bitmap_size.width || !bitmap_size.height)
+     {
+@@ -2965,7 +3011,7 @@
+         ERR("Failed to allocate opacity values.\n");
+         goto done;
+     }
+-    opacity_values_size = bitmap_size.height * bitmap_size.width;
++    opacity_values_size = (size_t)bitmap_size.height * bitmap_size.width;
+ 
+     if (FAILED(hr = IDWriteGlyphRunAnalysis_CreateAlphaTexture(analysis,
+             texture_type, &bounds, opacity_values, opacity_values_size)))
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -6018,6 +6018,35 @@
+     return refcount;
+ }
+ 
++/* NEUTRON (GitHub Neutron#14): glyph runs are rasterized only where they can be seen.
++ * NEUTRON_GLYPH_CLIP=0 turns that off (d2d1 and dwrite read the same switch). */
++static int neutron_glyph_clip(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_GLYPH_CLIP"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++
++/* NEUTRON (GitHub Neutron#14): glyph origins are floats. Converting one outside the int range is
++ * undefined (x86 gives INT_MIN), which turned a far-away glyph's box into garbage and the run's
++ * bounds into widths that overflow. Anything past 1e9 px is off every surface, so clamp there. */
++static inline int glyph_origin_coord(float v)
++{
++    if (v > 1e9f) return 1000000000;
++    if (!(v >= -1e9f)) return -1000000000;
++    return v;
++}
++
++/* Size in bytes of a texture of this run covering r, computed without overflow. */
++static UINT64 glyphrunanalysis_texture_size(const struct dwrite_glyphrunanalysis *analysis, const RECT *r)
++{
++    LONG64 w = (LONG64)r->right - r->left, h = (LONG64)r->bottom - r->top;
++
++    if (w <= 0 || h <= 0)
++        return 0;
++    return (UINT64)w * h * (analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1 ? 3 : 1);
++}
++
+ static void glyphrunanalysis_get_texturebounds(struct dwrite_glyphrunanalysis *analysis, RECT *bounds)
+ {
+     struct dwrite_glyphbitmap glyph_bitmap;
+@@ -6049,7 +6078,7 @@
+         if (bitmap_size > analysis->max_glyph_bitmap_size)
+             analysis->max_glyph_bitmap_size = bitmap_size;
+ 
+-        OffsetRect(bbox, analysis->origins[i].x, analysis->origins[i].y);
++        OffsetRect(bbox, glyph_origin_coord(analysis->origins[i].x), glyph_origin_coord(analysis->origins[i].y));
+         UnionRect(&analysis->bounds, &analysis->bounds, bbox);
+     }
+ 
+@@ -6082,10 +6111,10 @@
+ static inline BYTE *get_pixel_ptr(BYTE *ptr, DWRITE_TEXTURE_TYPE type, const RECT *runbounds, const RECT *bounds)
+ {
+     if (type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+-        return ptr + (runbounds->top - bounds->top) * (bounds->right - bounds->left) * 3 +
+-            (runbounds->left - bounds->left) * 3;
++        return ptr + (ptrdiff_t)(runbounds->top - bounds->top) * (bounds->right - bounds->left) * 3 +
++            (ptrdiff_t)(runbounds->left - bounds->left) * 3;
+     else
+-        return ptr + (runbounds->top - bounds->top) * (bounds->right - bounds->left) +
++        return ptr + (ptrdiff_t)(runbounds->top - bounds->top) * (bounds->right - bounds->left) +
+             runbounds->left - bounds->left;
+ }
+ 
+@@ -6098,9 +6127,14 @@
+     UINT32 i, size;
+     RECT *bbox;
+ 
+-    size = (analysis->bounds.right - analysis->bounds.left)*(analysis->bounds.bottom - analysis->bounds.top);
+-    if (analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+-        size *= 3;
++    /* NEUTRON (GitHub Neutron#14): this was computed in 32 bits and wrapped for huge runs, so the
++     * bitmap came out far smaller than the glyphs then copied into it. */
++    if (glyphrunanalysis_texture_size(analysis, &analysis->bounds) > 0x7fffffff)
++    {
++        WARN("Run bitmap too large, %s.\n", wine_dbgstr_rect(&analysis->bounds));
++        return E_OUTOFMEMORY;
++    }
++    size = glyphrunanalysis_texture_size(analysis, &analysis->bounds);
+     if (!(analysis->bitmap = calloc(1, size)))
+     {
+         WARN("Failed to allocate run bitmap, %s, type %s.\n", wine_dbgstr_rect(&analysis->bounds),
+@@ -6144,7 +6178,7 @@
+             continue;
+         }
+ 
+-        OffsetRect(bbox, analysis->origins[i].x, analysis->origins[i].y);
++        OffsetRect(bbox, glyph_origin_coord(analysis->origins[i].x), glyph_origin_coord(analysis->origins[i].y));
+ 
+         /* blit to analysis bitmap */
+         dst = get_pixel_ptr(analysis->bitmap, analysis->texture_type, bbox, &analysis->bounds);
+@@ -6206,11 +6240,79 @@
+     return S_OK;
+ }
+ 
++/* NEUTRON (GitHub Neutron#14): renders the glyphs that fall inside 'bounds' straight into 'bitmap', a zeroed
++ * texture laid out like CreateAlphaTexture's, without building the whole run's bitmap first. */
++static HRESULT glyphrunanalysis_render_rect(struct dwrite_glyphrunanalysis *analysis, BYTE *bitmap, const RECT *bounds)
++{
++    static const BYTE masks[8] = {0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01};
++    struct dwrite_fontface *fontface = unsafe_impl_from_IDWriteFontFace(analysis->run.fontFace);
++    unsigned int pixel_size = analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1 ? 3 : 1;
++    size_t dst_pitch = (size_t)(bounds->right - bounds->left) * pixel_size;
++    struct dwrite_glyphbitmap glyph_bitmap;
++    RECT *bbox = &glyph_bitmap.bbox;
++    UINT32 i;
++
++    if (!analysis->max_glyph_bitmap_size)
++        return S_OK;
++
++    memset(&glyph_bitmap, 0, sizeof(glyph_bitmap));
++    glyph_bitmap.simulations = fontface->simulations;
++    glyph_bitmap.emsize = analysis->run.fontEmSize;
++    if (analysis->flags & RUNANALYSIS_USE_TRANSFORM)
++        glyph_bitmap.m = &analysis->m;
++    if (!(glyph_bitmap.buf = malloc(analysis->max_glyph_bitmap_size)))
++        return E_OUTOFMEMORY;
++
++    for (i = 0; i < analysis->run.glyphCount; ++i)
++    {
++        RECT glyph_rect, part;
++        unsigned int is_1bpp;
++        int x, y;
++
++        glyph_bitmap.glyph = analysis->run.glyphIndices[i];
++        dwrite_fontface_get_glyph_bbox(analysis->run.fontFace, &glyph_bitmap);
++        if (IsRectEmpty(bbox))
++            continue;
++
++        glyph_rect = *bbox;
++        OffsetRect(&glyph_rect, glyph_origin_coord(analysis->origins[i].x), glyph_origin_coord(analysis->origins[i].y));
++        if (!IntersectRect(&part, &glyph_rect, bounds))
++            continue;
++
++        glyph_bitmap.pitch = get_glyph_bitmap_pitch(analysis->rendering_mode, bbox->right - bbox->left);
++        memset(glyph_bitmap.buf, 0, (bbox->bottom - bbox->top) * glyph_bitmap.pitch);
++        if (FAILED(dwrite_fontface_get_glyph_bitmap(fontface, analysis->rendering_mode, &is_1bpp, &glyph_bitmap)))
++        {
++            WARN("Failed to render glyph[%u] = %#x.\n", i, glyph_bitmap.glyph);
++            continue;
++        }
++
++        for (y = part.top; y < part.bottom; ++y)
++        {
++            const BYTE *src = glyph_bitmap.buf + (size_t)(y - glyph_rect.top) * glyph_bitmap.pitch;
++            BYTE *dst = bitmap + (size_t)(y - bounds->top) * dst_pitch;
++
++            for (x = part.left; x < part.right; ++x)
++            {
++                int sx = x - glyph_rect.left;
++                BYTE value = is_1bpp ? ((src[sx / 8] & masks[sx % 8]) ? DWRITE_ALPHA_MAX : 0) : src[sx];
++                BYTE *p = dst + (size_t)(x - bounds->left) * pixel_size;
++                unsigned int c;
++
++                for (c = 0; c < pixel_size; ++c)
++                    p[c] |= value;
++            }
++        }
++    }
++    free(glyph_bitmap.buf);
++    return S_OK;
++}
++
+ static HRESULT WINAPI glyphrunanalysis_CreateAlphaTexture(IDWriteGlyphRunAnalysis *iface, DWRITE_TEXTURE_TYPE type,
+     RECT const *bounds, BYTE *bitmap, UINT32 size)
+ {
+     struct dwrite_glyphrunanalysis *analysis = impl_from_IDWriteGlyphRunAnalysis(iface);
+-    UINT32 required;
++    UINT64 required;
+     RECT runbounds;
+ 
+     TRACE("%p, %d, %s, %p, %u.\n", iface, type, wine_dbgstr_rect(bounds), bitmap, size);
+@@ -6219,9 +6321,7 @@
+         return E_INVALIDARG;
+ 
+     /* make sure buffer is large enough for requested texture type */
+-    required = (bounds->right - bounds->left) * (bounds->bottom - bounds->top);
+-    if (analysis->texture_type == DWRITE_TEXTURE_CLEARTYPE_3x1)
+-        required *= 3;
++    required = glyphrunanalysis_texture_size(analysis, bounds);
+ 
+     if (size < required)
+         return E_NOT_SUFFICIENT_BUFFER;
+@@ -6232,6 +6332,18 @@
+ 
+     memset(bitmap, 0, size);
+     glyphrunanalysis_get_texturebounds(analysis, &runbounds);
++
++    /* NEUTRON (GitHub Neutron#14): a run whose whole bitmap would be large (one millions of pixels
++     * wide, mostly off the caller's texture) is rendered only where the caller asked, straight into
++     * its texture. Normal-sized runs still build and keep the whole bitmap. */
++    if (!(analysis->flags & RUNANALYSIS_BITMAP_READY) && neutron_glyph_clip()
++            && glyphrunanalysis_texture_size(analysis, &analysis->bounds) > (16 << 20))
++    {
++        if (IntersectRect(&runbounds, &runbounds, bounds))
++            return glyphrunanalysis_render_rect(analysis, bitmap, bounds);
++        return S_OK;
++    }
++
+     if (IntersectRect(&runbounds, &runbounds, bounds))
+     {
+         int pixel_size = type == DWRITE_TEXTURE_CLEARTYPE_3x1 ? 3 : 1;
