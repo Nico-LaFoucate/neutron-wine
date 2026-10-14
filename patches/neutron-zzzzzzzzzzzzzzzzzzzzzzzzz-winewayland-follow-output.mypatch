@@ -1,0 +1,254 @@
+winewayland: put a maximized window on the monitor of the output the compositor shows it on (GitHub Neutron#20)
+
+Reporter (portrait 1080x1920 at the layout origin, landscape 2560x1440 beside it, KDE primary = the landscape one),
+after the rotation fix: "even though the splash screen appears on the main screen (2560x1440) it takes the 1080x1920
+size for the maximized window. If I move it to the secondary monitor it looks/fit well."
+
+On Wayland the compositor decides which output a toplevel is on. Illustrator maximized itself on the monitor win32u
+believed it was on (Wine's primary: the output at the layout's origin, the portrait one); KWin mapped the window on
+the landscape output and configured it 2560x1440. The configure kept win32u's position, the app clamped the window
+back to the portrait work area, and the window stayed portrait-sized on the landscape screen (or white: the surface
+never matched the configure). Nothing told win32u where the window really was: wl_surface.enter was trace-only
+(acting on it flip-flopped DPI for windows straddling two outputs), and the DPI-based follow (NEUTRON_DPI_34, off)
+cannot tell two 96-dpi monitors apart.
+
+wl_surface.enter/leave now keep the set of outputs a surface is on. When a toplevel is on exactly one output, and
+after every maximized/fullscreen configure, the window thread compares that output's monitor with win32u's and, if
+they differ for a maximized or fullscreen window, moves the Win32 window there: keeping the frame overhang the
+maximized rect had around its old work area, or, if it was sized for the other output, the compositor's size at the
+work area's origin (as for a compositor-initiated maximize). SWP_FRAMECHANGED so an application that computes its own
+client area (Illustrator) recomputes it for the new monitor. A raw move: WS_MAXIMIZE and the restore rect are kept.
+A maximized window fills one output, so there is no straddle. Kill switch NEUTRON_FOLLOW_OUTPUT=0.
+
+Verified on a nested KWin (portrait Virtual-0 at (0,0), landscape Virtual-1 priority 1), clean-room Illustrator 2026
+saved maximized on the portrait monitor: shipped 122 -> window 1440 px wide on the landscape output (=0 reproduces it
+again); with this -> neutron-follow moves it (0,32)-(2560,1472) -> (1440,581)-(4000,2021), client 2560x1440, full
+width on screen. Restore then maximize again in session: back to full width on the landscape output.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -82,6 +82,10 @@
+      * re-derives conf->scale and re-commits the viewport so the window is sized with the
+      * exact compositor scale. */
+     WM_WAYLAND_SCALE_REFRESH,
++    /* NEUTRON (Neutron#20): a maximized or fullscreen toplevel is on exactly one wl_output (or was just
++     * configured); the window thread moves the Win32 window onto that output's monitor if win32u thinks it is
++     * on another one. */
++    WM_WAYLAND_FOLLOW_OUTPUT,
+     /* NEUTRON drag-and-drop: the wl_data_device events arrive on the dedicated wayland event
+      * thread (wayland_read_events_thread), but the OLE delivery underneath NtUserDragDropCall
+      * ends in user32's get_droptarget_pointer(), which unmarshals the target's IDropTarget with
+@@ -386,6 +390,9 @@
+     struct wp_fractional_scale_v1 *wp_fractional_scale;
+     /* compositor's preferred fractional scale (0 if none received yet) */
+     double preferred_scale;
++    /* NEUTRON (Neutron#20): global ids of the wl_outputs this surface is on (wl_surface.enter/leave). */
++    uint32_t entered_outputs[8];
++    int entered_output_count;
+     struct wayland_shm_buffer *small_icon_buffer;
+     struct wayland_shm_buffer *big_icon_buffer;
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -327,28 +327,49 @@
+     fractional_scale_handle_preferred,
+ };
+ 
+-/* NEUTRON: trace which wl_output a toplevel surface overlaps. NOTE: this does NOT drive per-monitor
+- * DPI — wl_surface.enter fires once per overlapping output, so a window straddling two monitors is
+- * "entered" on both, which produced a 163<->96 DPI flip-flop when we acted on it. The authoritative,
+- * compositor-debounced monitor signal is wp_fractional_scale_v1.preferred_scale instead (see
+- * fractional_scale_handle_preferred), so this handler is trace-only. */
+-static void wl_surface_handle_enter(void *data, struct wl_surface *wl_surface,
+-                                    struct wl_output *wl_output)
++/* NEUTRON (Neutron#20): keep the set of wl_outputs a surface is on. When a toplevel is on exactly one, the
++ * window thread checks whether a maximized/fullscreen window is on that output's monitor in win32u
++ * (WM_WAYLAND_FOLLOW_OUTPUT). This does NOT drive per-monitor DPI: wl_surface.enter fires once per overlapping
++ * output, so a window straddling two monitors is "entered" on both, which produced a 163<->96 DPI flip-flop
++ * when we acted on it; the debounced DPI signal is wp_fractional_scale_v1.preferred_scale (see
++ * fractional_scale_handle_preferred). A maximized or fullscreen window fills one output, so it never straddles. */
++static void neutron_surface_output(HWND hwnd, struct wl_surface *wl_surface, struct wl_output *wl_output,
++                                   BOOL entered)
+ {
+-    HWND hwnd = data;
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
+     struct wayland_output *output;
+     uint32_t id = 0;
++    BOOL post = FALSE;
++    int i;
++
++    if (wl_output && (output = wl_output_get_user_data(wl_output))) id = output->global_id;
++    TRACE("hwnd=%p wl_output=%p output_id=%u %s\n", hwnd, wl_output, id, entered ? "enter" : "leave");
++    if (!id || !(data = wayland_win_data_get(hwnd))) return;
++    if ((surface = data->wayland_surface) && surface->wl_surface == wl_surface)
++    {
++        for (i = 0; i < surface->entered_output_count; i++)
++            if (surface->entered_outputs[i] == id) break;
++        if (entered && i == surface->entered_output_count && i < ARRAY_SIZE(surface->entered_outputs))
++            surface->entered_outputs[surface->entered_output_count++] = id;
++        else if (!entered && i < surface->entered_output_count)
++            surface->entered_outputs[i] = surface->entered_outputs[--surface->entered_output_count];
++        post = surface->entered_output_count == 1 && wayland_surface_is_toplevel(surface);
++    }
++    wayland_win_data_release(data);
++    if (post) NtUserPostMessage(hwnd, WM_WAYLAND_FOLLOW_OUTPUT, 0, 0);
++}
+ 
+-    if (wl_output && (output = wl_output_get_user_data(wl_output)))
+-        id = output->global_id;
+-    TRACE("hwnd=%p wl_output=%p output_id=%u\n", hwnd, wl_output, id);
++static void wl_surface_handle_enter(void *data, struct wl_surface *wl_surface,
++                                    struct wl_output *wl_output)
++{
++    neutron_surface_output(data, wl_surface, wl_output, TRUE);
+ }
+ 
+ static void wl_surface_handle_leave(void *data, struct wl_surface *wl_surface,
+                                     struct wl_output *wl_output)
+ {
+-    /* A leave alone doesn't say where the window went; the enter for the destination
+-     * output drives the reposition, so nothing to do here. */
++    neutron_surface_output(data, wl_surface, wl_output, FALSE);
+ }
+ 
+ static const struct wl_surface_listener wl_surface_listener =
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1674,6 +1674,126 @@
+         (flags & SWP_NOSIZE) ? "NOSIZE" : "RESIZE", maxkeep ? " (maxkeep)" : "");
+ 
+     NtUserSetRawWindowPos(hwnd, rect, flags, FALSE);
++
++    /* NEUTRON (Neutron#20): a maximize or fullscreen is placed for win32u's idea of the window's monitor;
++     * check it against the output the compositor actually shows the window on. */
++    if (state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED | WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++        NtUserPostMessage(hwnd, WM_WAYLAND_FOLLOW_OUTPUT, 0, 0);
++}
++
++/* NEUTRON (Neutron#20): kill switch NEUTRON_FOLLOW_OUTPUT=0. */
++static BOOL neutron_follow_output(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_FOLLOW_OUTPUT", TRUE);
++    return on;
++}
++
++/**********************************************************************
++ *           wayland_window_follow_output
++ *
++ * NEUTRON (Neutron#20): on Wayland the compositor, not the application, decides which output a toplevel is on,
++ * and a maximized or fullscreen window fills exactly that output. Illustrator 2026 maximized itself on the
++ * monitor win32u believed it was on (the primary: a portrait screen at the layout's origin) while KWin showed it
++ * on the landscape screen; the window kept the portrait size there ("it takes the 1080x1920 size for the
++ * maximized window"), or stayed white when its size could never match the configure.
++ *
++ * When the surface is on exactly one output and win32u places the window on a different monitor, move the
++ * Win32 window onto that output's monitor, as Windows does when a maximized window changes monitor: the
++ * maximized rect keeps the frame overhang it had around its old work area (what win32u's maximize computes)
++ * or, if it is not a maximized rect of its monitor (it was sized for the other output), the compositor's
++ * maximized size at the work area's origin, as for a compositor-initiated maximize. A raw move: the WS_MAXIMIZE
++ * state and win32u's saved restore rect are untouched. */
++static void wayland_window_follow_output(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++    struct wayland_output *output;
++    uint32_t id = 0, state = 0;
++    INT win_w = 0, win_h = 0;
++    int out_x = 0, out_y = 0;
++    BOOL found = FALSE, moved = FALSE;
++    RECT win = {0}, probe, cur_area, out_area, new_rect;
++    HMONITOR win_mon, out_mon;
++    MONITORINFO win_mi = {.cbSize = sizeof(win_mi)}, out_mi = {.cbSize = sizeof(out_mi)};
++    UINT context;
++
++    if (!neutron_follow_output()) return;
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
++        surface->entered_output_count == 1)
++    {
++        const struct wayland_surface_config *cfg = surface->processing.serial ? &surface->processing
++                                                                              : &surface->current;
++        id = surface->entered_outputs[0];
++        state = cfg->state;
++        win = data->rects.window;
++        if (cfg->width && cfg->height)
++        {
++            wayland_surface_coords_to_window(surface, cfg->width, cfg->height, &win_w, &win_h);
++            if (cfg->decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
++            {
++                win_w += (surface->window.rect.left - surface->window.window_rect.left) +
++                         (surface->window.window_rect.right - surface->window.rect.right);
++                win_h += (surface->window.rect.top - surface->window.window_rect.top) +
++                         (surface->window.window_rect.bottom - surface->window.rect.bottom);
++            }
++        }
++    }
++    wayland_win_data_release(data);
++    if (!id || !(state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED | WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)))
++        return;
++
++    /* The output's origin in the Win32 desktop (physical px), the same arrangement the monitor list is built
++     * from (UpdateDisplayDevices runs in the desktop process, so compute it here). */
++    wayland_output_arrange_positions();
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        if (output->global_id != id || !output->current.current_mode) continue;
++        out_x = output->current.x;
++        out_y = output->current.y;
++        found = TRUE;
++        break;
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    if (!found) return;
++
++    /* Raw rects throughout: see neutron_window_work_area_part. */
++    context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
++    SetRect(&probe, out_x, out_y, out_x + 1, out_y + 1);
++    if ((out_mon = NtUserMonitorFromRect(&probe, MONITOR_DEFAULTTONULL)) &&
++        (win_mon = NtUserMonitorFromRect(&win, MONITOR_DEFAULTTONEAREST)) && win_mon != out_mon &&
++        NtUserGetMonitorInfo(out_mon, &out_mi) && NtUserGetMonitorInfo(win_mon, &win_mi))
++    {
++        BOOL full = !!(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
++        INT left, top, right, bottom;
++
++        cur_area = full ? win_mi.rcMonitor : win_mi.rcWork;
++        out_area = full ? out_mi.rcMonitor : out_mi.rcWork;
++        left = cur_area.left - win.left;
++        top = cur_area.top - win.top;
++        right = win.right - cur_area.right;
++        bottom = win.bottom - cur_area.bottom;
++        if (left >= 0 && top >= 0 && right >= 0 && bottom >= 0 &&
++            left <= 64 && top <= 64 && right <= 64 && bottom <= 64)
++            SetRect(&new_rect, out_area.left - left, out_area.top - top,
++                    out_area.right + right, out_area.bottom + bottom);
++        else if (win_w > 0 && win_h > 0)
++            SetRect(&new_rect, out_area.left, out_area.top, out_area.left + win_w, out_area.top + win_h);
++        else
++            new_rect = out_area;
++        moved = TRUE;
++    }
++    NtUserSetThreadDpiAwarenessContext(context);
++    if (!moved) return;
++
++    ERR("neutron-follow: hwnd=%p is on output %u but win32u had it on another monitor: %s -> %s\n",
++        hwnd, id, wine_dbgstr_rect(&win), wine_dbgstr_rect(&new_rect));
++    /* SWP_FRAMECHANGED: the move may keep the size, and an application that computes its own client area
++     * (Illustrator answers WM_NCCALCSIZE from its monitor's work area) must recompute it for the new monitor --
++     * without it Illustrator kept a 1440x2528 client inside the 2560x1440 window. */
++    NtUserSetRawWindowPos(hwnd, new_rect, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED, FALSE);
+ }
+ 
+ /* NEUTRON: gate for the driver-authoritative per-monitor-DPI path (#2). OFF by default while it's
+@@ -1796,6 +1916,9 @@
+     case WM_WAYLAND_SCALE_REFRESH:
+         wayland_window_scale_refresh(hwnd);
+         return 0;
++    case WM_WAYLAND_FOLLOW_OUTPUT:
++        wayland_window_follow_output(hwnd);
++        return 0;
+     case WM_WAYLAND_SET_FOREGROUND:
+         ERR( "neutron-wlsetfg: winewayland foregrounding hwnd=%p\n", hwnd );
+         NtUserSetForegroundWindowInternal(hwnd);
