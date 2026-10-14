@@ -1,0 +1,230 @@
+winewayland: do not draw a maximized window's frame on the next monitor
+
+Operator, 2026-10-12: "I'm seeing a sliver of app on my right monitor again." Audition, Lightroom and Premiere
+maximized on the 175% 4K monitor left a few-pixel strip on the 1080p monitor to its right; InDesign on some launches.
+Also "a left screen sliver" from apps maximized on the right-hand monitor.
+
+A maximized window's rect is its work area grown by the frame on every side (win32u's maximize, as on Windows):
+Audition (-5,51)-(3845,2165) on a 3840-wide monitor. The surface carried all 3850 px and the xdg geometry named the
+work-area part, but xdg geometry does not clip: the compositor drew the rest past the output's edges, so the right
+frame landed on the next monitor. The frame-spill crop (for self-maximized toplevels) ran only until the maximized
+configure was acked; a window that painted again after that, i.e. every live app, got the full surface back. A
+window that paints once and stops never showed it, which is why it came and went.
+
+Windows keeps that rect (GetWindowRect still reports it), but DWM does not draw the overhanging border (Vista and
+later). Do the same: a maximized toplevel shows only the part inside its work area, grown to cover the client area
+(DWM hides the system border, not an app's own pixels drawn into the frame region). The crop is skipped when it
+would leave the surface short of the configure, which the compositor would never ack.
+
+Premiere still left a 4 px strip the height of the next monitor: its main UI is an owned window ("DroverLord - Window
+Class", WS_POPUP|WS_CAPTION|WS_THICKFRAME) sized so its client fills the monitor, and owned windows are subsurfaces,
+which the crop skipped. A subsurface larger than its monitor (hanging past two opposite edges; a window dragged
+partly off-screen hangs past one) gets the same crop, positioned from the crop's origin. Popups are not touched.
+
+Popups of a cropped window are placed relative to its surface-local origin (wayland_surface_content_origin), as GPU
+children and pointer input already were: Audition's File menu now opens flush under its menu-bar item (before: 4
+logical px right and below it on a maximized window).
+
+Kill switch NEUTRON_MAX_CROP=0 (both crops).
+
+Verified on a nested KWin laid out like the operator's desk (4K at 175% with a 32 px top panel, a second output at
+(2195,94)), runtime 11.10-123, clean-room prefixes; strip = non-black pixels in the second output's first columns:
+- test window maximized and repainting (harnesses/maxsliver.c), left output: =0 -> 5 image px on the right output;
+  with this -> none. Maximized on the right output: =0 -> 3 px on the left output; with this -> none.
+- Audition 2026: 123 -> 5 px; with this -> none. Lightroom Classic: =0 -> 5 px; with this -> none.
+  Premiere Pro 2025: main-window crop only -> 4 px (DroverLord); with the owned-window crop -> none.
+  InDesign 2026: none. Captures inside the 4K output identical to the pixel with and without the owned-window crop
+  (Premiere); Audition's content moved 0.5 logical px, to where Win32 places it.
+- pointer (harnesses/ptrcheck.c maximized, KWin fake input): crosshair within 1 image px (0.5 logical) of the pointer
+  at four points with the crop on.
+- restore after maximize: a normal framed window at its exact Win32 client size (no crop left behind).
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -832,9 +832,13 @@
+ {
+     struct wayland_surface_config config = {0};
+     struct xdg_positioner *xdg_positioner = NULL;
++    int origin_x, origin_y;
+ 
+-    config.x = rect->left - owner->window.rect.left;
+-    config.y = rect->top - owner->window.rect.top;
++    /* NEUTRON: relative to the owner's surface-local (0,0), which the frame-spill crop moves inside the window
++     * (wayland_surface_content_origin); without it a cropped window's popups open offset by the crop origin. */
++    wayland_surface_content_origin(owner, &origin_x, &origin_y);
++    config.x = rect->left - owner->window.rect.left - origin_x;
++    config.y = rect->top - owner->window.rect.top - origin_y;
+     config.width = rect->right - rect->left;
+     config.height = rect->bottom - rect->top;
+ 
+@@ -1273,6 +1277,93 @@
+     return v;
+ }
+ 
++static BOOL neutron_crop_would_break_maximized(struct wayland_surface *surface, int cw, int ch);
++
++/* NEUTRON maxcrop: kill switch for both crops below. */
++static BOOL neutron_max_crop(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_MAX_CROP", TRUE);
++    return on;
++}
++
++/* NEUTRON maxcrop: grow a window-local crop rect to cover the window's client area. DWM hides the system border
++ * only, so an app whose client area reaches into the frame region (WM_NCCALCSIZE) keeps those pixels on the next
++ * monitor, as on Windows. TRUE if the crop still cuts anything off the window. */
++static BOOL neutron_crop_keep_client(struct wayland_surface *surface, RECT *rect)
++{
++    int win_w = surface->window.rect.right - surface->window.rect.left;
++    int win_h = surface->window.rect.bottom - surface->window.rect.top;
++    RECT client = surface->window.client_rect;
++
++    OffsetRect(&client, -surface->window.rect.left, -surface->window.rect.top);
++    if (!IsRectEmpty(&client))
++    {
++        rect->left = max(0, min(rect->left, client.left));
++        rect->top = max(0, min(rect->top, client.top));
++        rect->right = min(win_w, max(rect->right, client.right));
++        rect->bottom = min(win_h, max(rect->bottom, client.bottom));
++    }
++    return rect->left > 0 || rect->top > 0 || rect->right < win_w || rect->bottom < win_h;
++}
++
++/**********************************************************************
++ *          neutron_maximized_crop_rect
++ *
++ * NEUTRON maxcrop (2026-10-14). His report: "I'm seeing a sliver of app on my right monitor again" (Audition,
++ * Lightroom, Premiere; InDesign on some launches). A maximized window's rect is its work area grown by the frame on
++ * every side (win32u's maximize, as on Windows): Audition (-5,51)-(3845,2165) on a 3840-wide monitor. The surface
++ * carried all 3850 px and the xdg geometry named the work-area part, but xdg geometry does not clip: the compositor
++ * drew the rest past the output's edges, and the right-hand frame landed on the next monitor. The frame-spill crop
++ * below only ran until the maximized config was acked, so a window that repainted after that (every live app) got
++ * the sliver back.
++ *
++ * Windows keeps that rect (GetWindowRect still reports it) but DWM does not draw the overhanging border (Vista and
++ * later). Do the same: present only the part of the window inside its work area, plus its client area.
++ *
++ * Returns TRUE with *rect in window-local coords when part of the window lies outside that region and the cropped
++ * surface still fills the maximized configure.
++ */
++static BOOL neutron_maximized_crop_rect(struct wayland_surface *surface, RECT *rect)
++{
++    if (!neutron_max_crop()) return FALSE;
++
++    /* the work-area part, the same rect the maximized geometry is built from */
++    wayland_surface_get_rect_in_monitor(surface, rect, TRUE);
++    if (IsRectEmpty(rect)) return FALSE;
++    if (!neutron_crop_keep_client(surface, rect)) return FALSE;
++    /* a crop short of the configure would never be acked (see neutron_crop_would_break_maximized) */
++    if (neutron_crop_would_break_maximized(surface, rect->right - rect->left, rect->bottom - rect->top))
++        return FALSE;
++    return TRUE;
++}
++
++/**********************************************************************
++ *          neutron_owned_crop_rect
++ *
++ * NEUTRON maxcrop, owned windows (2026-10-14). Premiere's main UI is an owned window ("DroverLord - Window Class",
++ * WS_POPUP|WS_CAPTION|WS_THICKFRAME) sized so its client fills the monitor, so its frame hangs past every edge: the
++ * self-maximized shape the toplevel crop below handles. Owned windows are subsurfaces, which that crop skipped, and
++ * the compositor draws a subsurface wherever it reaches: with the main window cropped, Premiere still left a 4 px
++ * strip, the height of the whole next monitor, from this window's right frame.
++ *
++ * Same rule as the toplevel crop -- only a window larger than its monitor, i.e. hanging past two opposite edges (one
++ * merely dragged partly off-screen hangs past one) -- and the same output as the maximized crop: the part inside
++ * the monitor, plus the client area. The subsurface is positioned from the crop's origin (reconfigure_subsurface).
++ */
++static BOOL neutron_owned_crop_rect(struct wayland_surface *surface, RECT *rect)
++{
++    int win_w = surface->window.rect.right - surface->window.rect.left;
++    int win_h = surface->window.rect.bottom - surface->window.rect.top;
++
++    if (!neutron_max_crop()) return FALSE;
++
++    wayland_surface_get_rect_in_monitor(surface, rect, FALSE);
++    if (IsRectEmpty(rect)) return FALSE;
++    if (!((rect->left > 0 && rect->right < win_w) || (rect->top > 0 && rect->bottom < win_h))) return FALSE;
++    return neutron_crop_keep_client(surface, rect);
++}
++
+ /**********************************************************************
+  *          wayland_surface_get_frame_spill_rect
+  *
+@@ -1287,9 +1378,10 @@
+  * genuinely EXCEEDS its monitor, returns TRUE and fills *rect with the in-monitor
+  * subregion in window-local (buffer-pixel) coordinates, so callers can crop the
+  * wp_viewport source (and shrink the destination/geometry) to just the visible
+- * content. Returns FALSE (leave untouched) for popups/subsurfaces, ordinary
+- * sub-monitor windows (and windows merely dragged partly off-screen), and real
+- * maximize/fullscreen (which already clip via wayland_surface_reconfigure_geometry).
++ * content. Returns FALSE (leave untouched) for popups, ordinary sub-monitor
++ * windows (and windows merely dragged partly off-screen), and fullscreen. A real
++ * maximize gets neutron_maximized_crop_rect() (the xdg geometry alone does not
++ * clip it), and an owned window (subsurface) neutron_owned_crop_rect().
+  */
+ static BOOL wayland_surface_get_frame_spill_rect(struct wayland_surface *surface,
+                                                  RECT *rect)
+@@ -1298,6 +1390,7 @@
+     MONITORINFO mi;
+     int win_w, win_h, mon_w, mon_h;
+ 
++    if (surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE) return neutron_owned_crop_rect(surface, rect);
+     if (surface->role != WAYLAND_SURFACE_ROLE_TOPLEVEL) return FALSE;
+     /* ⚠️ Do NOT widen this to surface->window.state, and do not assume the
+      * overhang case is un-maximized. Measured 2026-08-12: Premiere's overhang
+@@ -1306,9 +1399,10 @@
+      * (verified: WIN=3850x2116 cropped to 3840x2111 on 11.10-48, and gone when
+      * the guard was added). The real constraint is a SIZE one and lives at the
+      * call site in wayland_surface_reconfigure(). */
+-    if (surface->current.state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED |
+-                                  WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++    if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)
+         return FALSE;
++    if (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED)
++        return neutron_maximized_crop_rect(surface, rect);
+ 
+     mi.cbSize = sizeof(mi);
+     if (!(hmonitor = NtUserMonitorFromRect(&surface->window.rect, 0)) ||
+@@ -1949,7 +2043,7 @@
+  * Reconfigures the subsurface as needed to match the latest requested
+  * state.
+  */
+-static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface)
++static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface, const RECT *content)
+ {
+     struct wayland_win_data *toplevel_data;
+     struct wayland_surface *toplevel_surface;
+@@ -1965,6 +2059,13 @@
+         wayland_surface_content_origin(toplevel_surface, &origin_x, &origin_y);
+         local_x = surface->window.rect.left - toplevel_surface->window.rect.left - origin_x;
+         local_y = surface->window.rect.top - toplevel_surface->window.rect.top - origin_y;
++        /* NEUTRON maxcrop: and this window's own surface-local (0,0) is window `content` when it is cropped
++         * (neutron_owned_crop_rect) */
++        if (content)
++        {
++            local_x += content->left;
++            local_y += content->top;
++        }
+ 
+         wayland_surface_coords_from_window(surface, local_x, local_y, &x, &y);
+ 
+@@ -2005,7 +2106,8 @@
+      * applied to this pass, so wayland_surface_reconfigure_geometry() knows where
+      * surface-local (0,0) sits in window coords. It cannot re-derive this: the
+      * maximized config is acked in between, after which
+-     * wayland_surface_get_frame_spill_rect() returns FALSE. */
++     * wayland_surface_get_frame_spill_rect() answers for the maximized state
++     * (the work-area crop, or none). */
+     const RECT *content = NULL;
+ 
+     win_width = surface->window.rect.right - surface->window.rect.left;
+@@ -2055,7 +2157,7 @@
+         break;
+     case WAYLAND_SURFACE_ROLE_SUBSURFACE:
+         if (!surface->wl_subsurface) break; /* surface role has been cleared */
+-        wayland_surface_reconfigure_subsurface(surface);
++        wayland_surface_reconfigure_subsurface(surface, content);
+         break;
+     }
+ 

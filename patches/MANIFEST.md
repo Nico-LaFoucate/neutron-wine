@@ -770,6 +770,17 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-maximized-crop.mypatch` (2026-10-14) — a maximized window's frame on the next monitor
+Operator: *"I'm seeing a sliver of app on my right monitor again."* A maximized window's rect overhangs its work area
+by the frame (as on Windows); the surface carried the overhang and xdg geometry does not clip, so KWin drew the frame
+on the neighboring monitor (5 px from Audition and Lightroom, 3 px leftward from a window maximized on the right-hand
+monitor). The frame-spill crop stopped once the maximized configure was acked, so any app that repainted got it back.
+Windows (DWM) keeps the rect but does not draw the overhanging border: a maximized toplevel now shows only its
+work-area part plus its client area. Owned windows larger than their monitor (Premiere's "DroverLord" main UI, a
+subsurface, 4 px) get the same crop. Popups of a cropped window are placed from its surface-local origin (Audition's
+File menu was 4 px off its menu-bar item). Kill switch `NEUTRON_MAX_CROP=0`. Verified on a nested KWin laid out like
+the operator's desk with clean-room Audition, Lightroom Classic, Premiere, InDesign and harnesses/maxsliver.c.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-follow-output.mypatch` (2026-10-14) — a maximized window sized for the wrong monitor
 Reporter (Neutron#20, portrait screen at the layout origin, KDE primary = the landscape one): *"it takes the 1080x1920
 size for the maximized window"*. On Wayland the compositor picks the output; win32u kept its own idea (Wine's primary,
