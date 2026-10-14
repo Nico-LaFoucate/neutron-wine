@@ -1,0 +1,111 @@
+mountmgr: report a card reader or USB stick as a removable drive (Neutron#15 follow-up)
+
+udisks describes an SD card reader as Removable with MediaRemovable and MediaCompatibility "flash_sd" (a USB stick:
+"thumb"). Wine only mapped optical and floppy media to a device type, so these came out DEVICE_UNKNOWN, which
+GetDriveType reports as DRIVE_FIXED. Windows reports card readers and USB sticks as DRIVE_REMOVABLE (the
+removable-media bit). Lightroom Classic therefore listed an SD card under Files, as a folder, instead of under Devices,
+and did not select it when Import opened.
+
+A udisks drive that is Removable and has removable or flash/thumb media now becomes DEVICE_HARDDISK, which mountmgr
+reports as DRIVE_REMOVABLE: the mapping the macOS backend (diskarb.c) already uses for removable IOMedia. A USB hard
+disk (Removable because it is on USB, but no removable or flash media) stays DRIVE_FIXED, as on Windows.
+Kill switch NEUTRON_MOUNT_REMOVABLE_TYPE=0 (read in the unix part, where the udisks code runs).
+
+Verified with preserved-fixes/harnesses/udisks2-mock/ (MOCK_KIND=sd|hdd, devwatch.exe prints GetDriveType): SD reader
+FIXED -> REMOVABLE, USB disk FIXED -> FIXED, =0 -> FIXED. Lightroom Classic (clean-room LrcRelease, runtime 122 + both
+mountmgr patches, nested KWin): after the mount, Import opens with "FROM MOCKSD / DCIM", the card under Devices
+("D:\ MOCKSD") and its photos shown, in Copy mode -- before, "Please select a source" with the card under Files.
+
+--- a/dlls/mountmgr.sys/dbus.c
++++ b/dlls/mountmgr.sys/dbus.c
+@@ -335,9 +335,41 @@
+     return array;
+ }
+ 
++/* NEUTRON (Neutron#15): does udisks describe media the user takes out -- a card in a reader, a USB stick? Windows
++ * reports those drives as DRIVE_REMOVABLE (the removable-media bit), while an external hard disk stays DRIVE_FIXED. */
++static int udisks2_media_compatibility_is_flash( DBusMessageIter *iter )
++{
++    DBusMessageIter media;
++
++    p_dbus_message_iter_recurse( iter, &media );
++    while (p_dbus_message_iter_get_arg_type( &media ) == DBUS_TYPE_STRING)
++    {
++        const char *media_type;
++        p_dbus_message_iter_get_basic( &media, &media_type );
++        if (starts_with( media_type, "flash" ) || starts_with( media_type, "thumb" )) return TRUE;
++        p_dbus_message_iter_next( &media );
++    }
++    return FALSE;
++}
++
++/* NEUTRON (Neutron#15): kill switch NEUTRON_MOUNT_REMOVABLE_TYPE=0 -- report flash/removable media as Wine always
++ * did (DEVICE_UNKNOWN, so GetDriveType says DRIVE_FIXED). */
++static int neutron_removable_type(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_MOUNT_REMOVABLE_TYPE" );
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
+ /* find the drive entry in the dictionary and get its parameters */
+ static void udisks2_get_drive_info( const char *drive_name, DBusMessageIter *dict,
+-                                    enum device_type *drive_type, int *removable, const char **serial )
++                                    enum device_type *drive_type, int *removable, const char **serial,
++                                    int *removable_media )
+ {
+     DBusMessageIter iter, drive, variant;
+     const char *name;
+@@ -353,8 +385,17 @@
+             {
+                 if (!strcmp( name, "Removable" ))
+                     p_dbus_message_iter_get_basic( &variant, removable );
++                else if (!strcmp( name, "MediaRemovable" ))
++                {
++                    int media_removable = FALSE;
++                    p_dbus_message_iter_get_basic( &variant, &media_removable );
++                    if (media_removable) *removable_media = TRUE;
++                }
+                 else if (!strcmp( name, "MediaCompatibility" ))
++                {
+                     *drive_type = udisks_parse_media_compatibility( &variant );
++                    if (udisks2_media_compatibility_is_flash( &variant )) *removable_media = TRUE;
++                }
+                 else if (!strcmp( name, "Id" ))
+                     p_dbus_message_iter_get_basic( &variant, serial );
+             }
+@@ -373,7 +414,7 @@
+     const char *label = NULL;
+     GUID guid, *guid_ptr = NULL;
+     const char *iface, *name;
+-    int removable = FALSE;
++    int removable = FALSE, removable_media = FALSE;
+     enum device_type drive_type = DEVICE_UNKNOWN;
+ 
+     while ((iface = udisks_next_dict_entry( block, &iter )))
+@@ -406,7 +447,7 @@
+                 else if (!strcmp( name, "Drive" ))
+                 {
+                     p_dbus_message_iter_get_basic( &variant, &drive );
+-                    udisks2_get_drive_info( drive, dict, &drive_type, &removable, &id );
++                    udisks2_get_drive_info( drive, dict, &drive_type, &removable, &id, &removable_media );
+                 }
+                 else if (!strcmp( name, "IdUUID" ))
+                 {
+@@ -438,6 +479,11 @@
+             drive_type = DEVICE_DVD;
+         }
+     }
++    /* NEUTRON (Neutron#15): a card in a reader or a USB stick is DEVICE_HARDDISK, which mountmgr reports as
++     * DRIVE_REMOVABLE, the same mapping the macOS backend (diskarb.c) uses for removable IOMedia. As DEVICE_UNKNOWN it
++     * came out DRIVE_FIXED, and Lightroom Classic listed an SD card as a folder (Files) instead of a card (Devices). */
++    if (removable && removable_media && drive_type == DEVICE_UNKNOWN && neutron_removable_type())
++        drive_type = DEVICE_HARDDISK;
+     if (device)
+     {
+         if (removable) queue_device_op( ADD_DOS_DEVICE, udi, device, mount_point, drive_type, guid_ptr, id, label, NULL );
