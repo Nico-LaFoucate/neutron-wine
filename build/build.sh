@@ -61,6 +61,18 @@ echo "neutron: build tree on disk -> $TKGDIR/src"
 # or dropped) would still be applied and can fail/conflict against the current set.
 mkdir -p "$TKGDIR/wine-tkg-userpatches"
 rm -f "$TKGDIR"/wine-tkg-userpatches/*.mypatch "$TKGDIR"/*.mypatch
+# Untracked patches are copied too -- that is how a freshly emitted patch gets its first test build --
+# but a release must never carry one: 2026-10-14 a forgotten untracked d2d1 diagnostic (Sep 25) sat in
+# patches/ and would have gone into the next release from this checkout. Record them; package.sh refuses
+# to package a build that had any.
+_untracked_globs=(':(glob)patches/*.mypatch')
+[ "${INCLUDE_DIAGNOSTIC:-0}" = "1" ] && _untracked_globs+=(':(glob)patches/diagnostic/*.mypatch')
+_untracked="$(git -C "$REPO" ls-files --others --exclude-standard -- "${_untracked_globs[@]}" 2>/dev/null || true)"
+rm -f "$WORK/.build-untracked"
+if [ -n "$_untracked" ]; then
+    echo "neutron: ⚠️  this build includes UNTRACKED patches (fine for a test build; package.sh will refuse it):" >&2
+    printf '    %s\n' $_untracked >&2
+fi
 cp "$REPO"/patches/*.mypatch "$TKGDIR/wine-tkg-userpatches/"
 if [ "${INCLUDE_DIAGNOSTIC:-0}" = "1" ]; then
     cp "$REPO"/patches/diagnostic/*.mypatch "$TKGDIR/wine-tkg-userpatches/"
@@ -166,6 +178,7 @@ echo "Built neutron-wine $(cat "$REPO/build/VERSION")."
 # was actually 11.10-68. Nothing in its output said so. Only checking build.sh's exit code caught
 # it. A checksum proves a file arrived intact, never that it contains what its name claims.
 printf '%s\n' "$(cat "$REPO/build/VERSION")" > "$WORK/.build-ok"
+printf '%s\n' "$_untracked" > "$WORK/.build-untracked"   # one path per line; empty = none
 
 echo
 echo "To run it, package the tree into a versioned runtime (tarball + manifest):"

@@ -47,6 +47,15 @@ if [ "$_BUILT" != "$VERSION" ]; then
     echo "  Packaging now would ship the $_BUILT tree labeled $VERSION. Re-run build/build.sh." >&2
     exit 1
 fi
+# NEUTRON (2026-10-14): refuse a build that applied UNTRACKED patches (build.sh records them). The source
+# archive would still carry them, but nothing reviewed or committed them -- a forgotten diagnostic would ship.
+_UNTRACKED="${NEUTRON_WINE_WORK:-$REPO/_work}/.build-untracked"
+if [ -f "$_UNTRACKED" ] && grep -q . "$_UNTRACKED"; then
+    echo "package.sh: ⛔ the last build applied UNTRACKED patches:" >&2
+    sed 's/^/    /' "$_UNTRACKED" >&2
+    echo "  Commit them (or move them out of patches/), then re-run build/build.sh." >&2
+    exit 1
+fi
 SLUG="${NEUTRON_REPO_SLUG:-Nico-LaFoucate/neutron-wine}"
 NAME="neutron-wine-$VERSION"
 DIST="$REPO/dist"

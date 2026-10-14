@@ -1,0 +1,210 @@
+d2d1: NEUTRON_D2D_RECTLOG -- log where each distinct fill/stroke/clip/layer/bitmap lands
+
+Diagnostic, off by default (one branch per op when off). With NEUTRON_D2D_RECTLOG=1, one line per
+DISTINCT op: the rect the app asked for (DIPs), the world transform, the target's DPI and pixel
+size, whether the op is being recorded into a command list or drawn, and where it lands in device
+pixels computed the way the draw path does it (world transform first, then dpi/96). Clips also
+print the rect Wine actually stored. A 4096-entry hash cache drops repeats.
+
+For: Premiere's marked-range bar on both its rulers lands ~0.5% too far right, growing from each
+ruler's visible left edge, while ticks, playheads and render bars are right (OPEN-ISSUES, Premiere
+Pro, 2026-09-25). This answers whether Premiere asks for the stretched rect or d2d1 stretches it.
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1937,6 +1937,112 @@
+     return hr;
+ }
+ 
++/* NEUTRON RECTLOG (env NEUTRON_D2D_RECTLOG=1; off by default, one branch per op when off).
++ *
++ * One line per DISTINCT fill / stroke / clip / layer / bitmap op: what the app asked for (DIPs),
++ * the world transform, the target's DPI and pixel size, whether the op is being RECORDED into a
++ * command list (tgt=2) or drawn (tgt=1), and where it lands in device pixels computed the way
++ * the draw path does it -- world transform first, then dpi/96. For clips it also prints the rect
++ * Wine actually stored, so the two can be compared.
++ *
++ * Written for one question (2026-09-25): Premiere's marked-range bar on BOTH its rulers lands
++ * ~0.5% too far right, growing from each ruler's visible left edge, while ticks, playheads and
++ * render bars are right. Does Premiere ASK for the stretched rect, or does d2d1 stretch it?
++ * Repeats are dropped through a small hash cache, so an idle UI logs nothing. */
++static BOOL neutron_rectlog(void)
++{
++    static int v = -1;
++
++    if (v < 0)
++    {
++        char buf[8];
++
++        v = (GetEnvironmentVariableA("NEUTRON_D2D_RECTLOG", buf, sizeof(buf)) && buf[0] == '1') ? 1 : 0;
++        if (v)
++            ERR("neutron-gateresolved: NEUTRON_D2D_RECTLOG = 1 (environment)\n");
++    }
++    return v;
++}
++
++static void neutron_rectlog_xform(const D2D1_MATRIX_3X2_F *m, const D2D1_RECT_F *in, D2D1_RECT_F *out)
++{
++    D2D1_POINT_2F p;
++
++    d2d_point_transform(&p, m, in->left, in->top);
++    d2d_rect_set(out, p.x, p.y, p.x, p.y);
++    d2d_point_transform(&p, m, in->left, in->bottom);
++    d2d_rect_expand(out, &p);
++    d2d_point_transform(&p, m, in->right, in->top);
++    d2d_rect_expand(out, &p);
++    d2d_point_transform(&p, m, in->right, in->bottom);
++    d2d_rect_expand(out, &p);
++}
++
++/* world: the op's bounds after the world transform, in DIPs. wine_dev: what Wine itself used in
++ * device pixels, when that differs from the draw path (clips); NULL otherwise. */
++static void neutron_rectlog_op(struct d2d_device_context *context, const char *op, const D2D1_RECT_F *in,
++        const D2D1_RECT_F *world, const D2D1_RECT_F *wine_dev, const struct d2d_brush *brush, float extra)
++{
++    static unsigned int cache[4096];
++    const D2D1_MATRIX_3X2_F *m = &context->drawing_state.transform;
++    float xs = context->desc.dpiX / 96.0f, ys = context->desc.dpiY / 96.0f;
++    D2D1_COLOR_F c = {0.0f, 0.0f, 0.0f, 0.0f};
++    D2D1_RECT_F dev;
++    unsigned int h = 2166136261u, i;
++    int bt = -1;
++
++    dev.left = world->left * xs;
++    dev.right = world->right * xs;
++    dev.top = world->top * ys;
++    dev.bottom = world->bottom * ys;
++    if (brush)
++    {
++        bt = brush->type;
++        if (brush->type == D2D_BRUSH_TYPE_SOLID)
++            c = brush->u.solid.color;
++    }
++#define NEUTRON_MIX(x) (h = (h ^ (unsigned int)(x)) * 16777619u)
++    for (i = 0; op[i]; ++i) NEUTRON_MIX(op[i]);
++    NEUTRON_MIX((UINT_PTR)context);
++    NEUTRON_MIX(context->target.type);
++    NEUTRON_MIX((int)floorf(dev.left * 4.0f));
++    NEUTRON_MIX((int)floorf(dev.top * 4.0f));
++    NEUTRON_MIX((int)floorf(dev.right * 4.0f));
++    NEUTRON_MIX((int)floorf(dev.bottom * 4.0f));
++    NEUTRON_MIX((int)(c.r * 255.0f)); NEUTRON_MIX((int)(c.g * 255.0f));
++    NEUTRON_MIX((int)(c.b * 255.0f)); NEUTRON_MIX((int)(c.a * 255.0f));
++    NEUTRON_MIX(bt);
++    if (wine_dev)
++    {
++        NEUTRON_MIX((int)floorf(wine_dev->left * 4.0f));
++        NEUTRON_MIX((int)floorf(wine_dev->right * 4.0f));
++    }
++#undef NEUTRON_MIX
++    if (cache[h % ARRAY_SIZE(cache)] == h)
++        return;
++    cache[h % ARRAY_SIZE(cache)] = h;
++
++    ERR("neutron-rectlog: %s ctx=%p tgt=%d px=%ux%u dpi=%.3f,%.3f M=[%.6f %.6f %.6f %.6f %.4f %.4f] "
++            "in=(%.4f,%.4f)-(%.4f,%.4f) dev=(%.2f,%.2f)-(%.2f,%.2f)%s brush=%d rgba=(%.3f,%.3f,%.3f,%.3f) opac=%.3f x=%.4f\n",
++            op, context, context->target.type, context->pixel_size.width, context->pixel_size.height,
++            context->desc.dpiX, context->desc.dpiY, m->_11, m->_12, m->_21, m->_22, m->_31, m->_32,
++            in->left, in->top, in->right, in->bottom, dev.left, dev.top, dev.right, dev.bottom,
++            wine_dev ? wine_dbg_sprintf(" WINE_USED=(%.2f,%.2f)-(%.2f,%.2f)",
++                    wine_dev->left, wine_dev->top, wine_dev->right, wine_dev->bottom) : "",
++            bt, c.r, c.g, c.b, c.a, brush ? brush->opacity : 0.0f, extra);
++}
++
++static void neutron_rectlog_geometry(struct d2d_device_context *context, const char *op, ID2D1Geometry *geometry,
++        const struct d2d_brush *brush, float extra)
++{
++    D2D1_RECT_F in, world;
++
++    if (!geometry || FAILED(ID2D1Geometry_GetBounds(geometry, NULL, &in))
++            || FAILED(ID2D1Geometry_GetBounds(geometry, &context->drawing_state.transform, &world)))
++        return;
++    neutron_rectlog_op(context, op, &in, &world, NULL, brush, extra);
++}
++
+ static void STDMETHODCALLTYPE d2d_device_context_DrawLine(ID2D1DeviceContext6 *iface,
+         D2D1_POINT_2F p0, D2D1_POINT_2F p1, ID2D1Brush *brush, float stroke_width, ID2D1StrokeStyle *stroke_style)
+ {
+@@ -2388,6 +2494,9 @@
+     TRACE("iface %p, geometry %p, brush %p, stroke_width %.8e, stroke_style %p.\n",
+             iface, geometry, brush, stroke_width, stroke_style);
+ 
++    if (neutron_rectlog())
++        neutron_rectlog_geometry(context, "STROKE", geometry, brush_impl, stroke_width);
++
+     neutron_dr_add_clip(context); /* NEUTRON DIRTYRECTS: geometry extent unknown -> clip superset */
+ 
+     if (FAILED(context->error.code))
+@@ -2530,6 +2639,9 @@
+ 
+     TRACE("iface %p, geometry %p, brush %p, opacity_brush %p.\n", iface, geometry, brush, opacity_brush);
+ 
++    if (neutron_rectlog())
++        neutron_rectlog_geometry(context, "FILL", geometry, brush_impl, opacity_brush ? 1.0f : 0.0f);
++
+     neutron_dr_add_clip(context); /* NEUTRON DIRTYRECTS: geometry extent unknown -> clip superset */
+ 
+     if (FAILED(context->error.code))
+@@ -2692,6 +2804,22 @@
+ 
+     if (dst_rect) neutron_dr_add(context, dst_rect); else neutron_dr_add_clip(context); /* NEUTRON DIRTYRECTS */
+ 
++    if (neutron_rectlog() && bitmap)
++    {
++        D2D1_RECT_F in, world;
++        D2D1_SIZE_F sz;
++
++        if (dst_rect)
++            in = *dst_rect;
++        else
++        {
++            sz = ID2D1Bitmap_GetSize(bitmap);
++            d2d_rect_set(&in, 0.0f, 0.0f, sz.width, sz.height);
++        }
++        neutron_rectlog_xform(&context->drawing_state.transform, &in, &world);
++        neutron_rectlog_op(context, "BITMAP", &in, &world, NULL, NULL, opacity);
++    }
++
+     if (FAILED(context->error.code))
+         return;
+ 
+@@ -3428,6 +3556,24 @@
+      * vtbl and the two entry points disagreed. That census is the table that cracked the WIC
+      * retained-content bug -- an inflated count in it misleads exactly the same way. */
+     neutron_op(context, NEUTRON_OP_PUSHLAYER);
++    if (neutron_rectlog() && layer_parameters)
++    {
++        D2D1_RECT_F world;
++
++        neutron_rectlog_xform(&context->drawing_state.transform, &layer_parameters->contentBounds, &world);
++        neutron_rectlog_op(context, "LAYER", &layer_parameters->contentBounds, &world, NULL, NULL,
++                layer_parameters->opacity);
++        if (layer_parameters->geometricMask)
++        {
++            D2D1_MATRIX_3X2_F mw = layer_parameters->maskTransform;
++            D2D1_RECT_F in;
++
++            d2d_matrix_multiply(&mw, &context->drawing_state.transform);
++            if (SUCCEEDED(ID2D1Geometry_GetBounds(layer_parameters->geometricMask, NULL, &in))
++                    && SUCCEEDED(ID2D1Geometry_GetBounds(layer_parameters->geometricMask, &mw, &world)))
++                neutron_rectlog_op(context, "LAYERMASK", &in, &world, NULL, NULL, 0.0f);
++        }
++    }
+     if (layer_parameters)
+         d2d_device_context_push_layer_clip(context, &layer_parameters->contentBounds,
+                 layer_parameters->geometricMask, &layer_parameters->maskTransform);
+@@ -3576,6 +3722,14 @@
+             clip_rect->right * x_scale, clip_rect->bottom * y_scale);
+     d2d_rect_expand(&transformed_rect, &point);
+ 
++    if (neutron_rectlog())
++    {
++        D2D1_RECT_F world;
++
++        neutron_rectlog_xform(&context->drawing_state.transform, clip_rect, &world);
++        neutron_rectlog_op(context, "CLIP", clip_rect, &world, &transformed_rect, NULL, 0.0f);
++    }
++
+     if (!d2d_clip_stack_push(&context->clip_stack, &transformed_rect))
+         WARN("Failed to push clip rect.\n");
+ 
