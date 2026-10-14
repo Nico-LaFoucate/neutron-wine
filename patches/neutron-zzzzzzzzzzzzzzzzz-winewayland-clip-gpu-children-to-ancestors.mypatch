@@ -1,0 +1,402 @@
+winewayland/win32u: clip GPU child windows to their ancestors (Lightroom Classic What's New videos)
+
+A Wayland subsurface is not clipped by its parent, so a GPU child scrolled out of its container was still drawn:
+Lightroom Classic's What's New videos showed below the dialog. win32u records each Vulkan present's buffer size
+and brackets the present with client_surface.present_busy (the host WSI sends all its requests for the surface
+inside vkQueuePresentKHR: measured on NVIDIA, FIFO and MAILBOX). winewayland intersects every ancestor's client
+area: a window entirely outside is shrunk to 1x1 and placed below the toplevel (kept mapped, so present-wait never
+wedges); an edge an ancestor cuts rounds inward with a matching wp_viewport source crop; touching edges keep the
+outward rounding. A crop change made outside a present is committed at once, synchronized with the parent, so a
+scrolling or stopped video is never shown with a stale crop. OpenGL client surfaces keep the old behavior. Kill
+switch NEUTRON_CLIENT_CLIP=0. Harness: preserved-fixes/harnesses/clipped-gpu-child.c + -check.py.
+
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -1976,6 +1976,12 @@
+     {
+         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+         struct surface *surface = swapchain->surface;
++        /* NEUTRON: claim the surface for this present (see present_busy in gdi_driver.h); a driver holds it
++         * only for a few requests, never across a wait */
++        while (InterlockedCompareExchange( &surface->client->present_busy, 1, 0 )) NtYieldExecution();
++        /* NEUTRON: the size of the image this present shows, for drivers that crop it (see gdi_driver.h) */
++        surface->client->buffer_width = swapchain->extents.width;
++        surface->client->buffer_height = swapchain->extents.height;
+         client_surface_update( surface->client );
+     }
+ 
+@@ -1989,6 +1995,7 @@
+         RECT client_rect;
+ 
+         client_surface_present( surface->client );
++        InterlockedExchange( &surface->client->present_busy, 0 ); /* NEUTRON: see present_busy */
+ 
+         if (swapchain_res < VK_SUCCESS) continue;
+         if (!get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -350,6 +350,15 @@
+      * blitted UI. Replaces the round-17 attach(NULL) suppress that orphaned the surface
+      * (never mapped again -> no present feedback -> main thread deadlock mid-D2D). */
+     BOOL place_below;
++    /* NEUTRON: the window is entirely outside its ancestors' client areas (scrolled out of view), so it is
++     * shrunk to 1x1 inside the toplevel and placed below it -- kept MAPPED for the reason above. */
++    BOOL clipped_out;
++    /* NEUTRON: the viewport state last sent (to send only changes), and whether it changed since the surface was
++     * last committed -- viewport state is double-buffered on the CLIENT surface, so without a commit it waits
++     * for the app's next present (forever, for a paused video). */
++    wl_fixed_t vp_src[4];
++    int vp_dst_w, vp_dst_h;
++    LONG vp_dirty;
+ };
+ 
+ struct wayland_shm_buffer
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1589,6 +1589,31 @@
+ static int neutron_native_stack(void); /* round-35 native stacking (defined below) */
+ static int neutron_trace(void);        /* round-37 broad trace (defined below) */
+ 
++/* NEUTRON: send a viewport change only when it is one, and remember that the client surface needs a commit for it
++ * to show (see vp_dirty). */
++static void neutron_client_set_source(struct wayland_client_surface *client, wl_fixed_t x, wl_fixed_t y,
++                                      wl_fixed_t w, wl_fixed_t h)
++{
++    if (client->vp_src[0] == x && client->vp_src[1] == y && client->vp_src[2] == w && client->vp_src[3] == h) return;
++    client->vp_src[0] = x; client->vp_src[1] = y; client->vp_src[2] = w; client->vp_src[3] = h;
++    wp_viewport_set_source(client->wp_viewport, x, y, w, h);
++    InterlockedExchange(&client->vp_dirty, 1);
++}
++
++static void neutron_client_set_destination(struct wayland_client_surface *client, int w, int h)
++{
++    if (client->vp_dst_w == w && client->vp_dst_h == h) return;
++    client->vp_dst_w = w; client->vp_dst_h = h;
++    wp_viewport_set_destination(client->wp_viewport, w, h);
++    InterlockedExchange(&client->vp_dirty, 1);
++}
++
++static void neutron_client_unset_source(struct wayland_client_surface *client)
++{
++    neutron_client_set_source(client, wl_fixed_from_int(-1), wl_fixed_from_int(-1),
++                              wl_fixed_from_int(-1), wl_fixed_from_int(-1));
++}
++
+ /**********************************************************************
+  *          wayland_surface_reconfigure_client
+  *
+@@ -1596,7 +1621,7 @@
+  */
+ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+                                                struct wayland_client_surface *client,
+-                                               const RECT *client_rect)
++                                               const RECT *client_rect, const RECT *clip)
+ {
+     struct wayland_window_config *window = &surface->window;
+     int client_x, client_y, x, y;
+@@ -1658,6 +1683,99 @@
+                 x, y, width, height, old_x, old_y, old_w, old_h);
+     }
+ 
++    /* NEUTRON: show only the part of the client area its ancestors show (`clip`, the intersection of their client
++     * areas, same coordinates as client_rect; see neutron_ancestor_clip). Lightroom Classic's What's New videos are
++     * D3D11 swapchains on children of a scrolled ClipView: the ones scrolled out of it were drawn below the dialog,
++     * because a Wayland subsurface is not clipped by its parent. Kill switch NEUTRON_CLIENT_CLIP=0.
++     *   - entirely outside: 1x1 at the toplevel's client origin and placed BELOW the toplevel surface
++     *     (clipped_out). Not detached: a detached surface gets no frame callbacks and present-wait wedges.
++     *   - an edge an ancestor CUTS (the child extends past it) rounds INWARD, so nothing the container hides
++     *     shows past it; every other edge, including one that exactly touches an ancestor's edge, keeps the
++     *     outward rounding above. A subsurface edge can only land on the logical grid (1.75 device px at 175%),
++     *     on one side of the true edge or the other depending on where the window sits on screen. Inward at
++     *     touching edges too was tried and measured: Lightroom Classic's Develop view (which exactly fills its
++     *     ancestors) got 1-2 px of extra dark border on every side vs shipped, the mechanism of Premiere's
++     *     September black L; outward keeps shipped geometry at the cost of up to one device row of the child's
++     *     own edge over its container's (his call, 2026-10-13: "go with outward at touching edges").
++     *   - whenever an edge rounds inward the image is cropped with wp_viewport_set_source to match. The crop is in
++     *     BUFFER pixels and must stay inside the buffer (out_of_buffer is a fatal protocol error), so it is only
++     *     done when win32u told us the presented buffer's size (Vulkan); otherwise the window is shown whole. */
++    client->clipped_out = FALSE;
++    {
++        static int clip_on = -1;
++        RECT vis = *client_rect;
++        UINT bw = client->client.buffer_width, bh = client->client.buffer_height;
++        double scale = surface->window.scale;
++        BOOL own_l = TRUE, own_t = TRUE, own_r = TRUE, own_b = TRUE;
++
++        if (clip_on < 0) clip_on = neutron_gate("NEUTRON_CLIENT_CLIP", TRUE);
++        if (clip_on && clip)
++        {
++            if (!intersect_rect(&vis, client_rect, clip)) SetRectEmpty(&vis);
++            own_l = client_rect->left >= clip->left;     /* touching counts as the child's own edge */
++            own_t = client_rect->top >= clip->top;
++            own_r = client_rect->right <= clip->right;
++            own_b = client_rect->bottom <= clip->bottom;
++        }
++        /* only when the presented buffer's size is known (Vulkan, after its first present): OpenGL client
++         * surfaces keep the old behavior entirely -- there is no present bracket to commit them safely (see
++         * present_busy), and before the first present there is no buffer to show anyway */
++        if (!clip_on || !clip || !bw || !bh || (own_l && own_t && own_r && own_b) ||
++            client_width <= 0 || client_height <= 0)
++        {
++            neutron_client_unset_source(client);
++        }
++        else if (IsRectEmpty(&vis))
++        {
++            client->clipped_out = TRUE;
++            wayland_surface_coords_from_window(surface, window->client_rect.left - window->rect.left,
++                                               window->client_rect.top - window->rect.top, &x, &y);
++            width = height = 1;
++            neutron_client_set_source(client, wl_fixed_from_int(0), wl_fixed_from_int(0),
++                                      wl_fixed_from_int(1), wl_fixed_from_int(1));
++        }
++        else
++        {
++            /* the visible rect in window pixels, converted to surface coordinates edge by edge (see above), and
++             * the source taken from exactly those rounded edges so image and position stay aligned */
++            int vx = vis.left + window->client_rect.left - window->rect.left;
++            int vy = vis.top + window->client_rect.top - window->rect.top;
++            int vx2 = vx + vis.right - vis.left, vy2 = vy + vis.bottom - vis.top;
++            int nx = (int)(own_l ? floor(vx / scale) : ceil(vx / scale));
++            int ny = (int)(own_t ? floor(vy / scale) : ceil(vy / scale));
++            int nx2 = (int)(own_r ? ceil(vx2 / scale) : floor(vx2 / scale));
++            int ny2 = (int)(own_b ? ceil(vy2 / scale) : floor(vy2 / scale));
++            double sx = (nx * scale - client_x) * bw / client_width;
++            double sy = (ny * scale - client_y) * bh / client_height;
++            double sx2 = (nx2 * scale - client_x) * bw / client_width;
++            double sy2 = (ny2 * scale - client_y) * bh / client_height;
++
++            sx = max(0.0, min(sx, (double)bw)); sx2 = max(0.0, min(sx2, (double)bw));
++            sy = max(0.0, min(sy, (double)bh)); sy2 = max(0.0, min(sy2, (double)bh));
++            if (sx2 - sx >= 1.0 && sy2 - sy >= 1.0 && nx2 > nx && ny2 > ny)
++            {
++                x = nx; y = ny; width = nx2 - nx; height = ny2 - ny;
++                neutron_client_set_source(client, wl_fixed_from_double(sx), wl_fixed_from_double(sy),
++                                          wl_fixed_from_double(sx2 - sx), wl_fixed_from_double(sy2 - sy));
++            }
++            else
++            {
++                /* a sliver thinner than one logical pixel: treat as scrolled out */
++                client->clipped_out = TRUE;
++                wayland_surface_coords_from_window(surface, window->client_rect.left - window->rect.left,
++                                                   window->client_rect.top - window->rect.top, &x, &y);
++                width = height = 1;
++                neutron_client_set_source(client, wl_fixed_from_int(0), wl_fixed_from_int(0),
++                                          wl_fixed_from_int(1), wl_fixed_from_int(1));
++            }
++        }
++        if (neutron_wl_surf_diag() || (client->clipped_out && neutron_trace()))
++            ERR("neutron-clientclip: hwnd=%p client=%s clip=%s own=%d%d%d%d buffer=%ux%u -> %d,%d+%dx%d%s\n",
++                surface->hwnd, wine_dbgstr_rect(client_rect), clip ? wine_dbgstr_rect(clip) : "(none)",
++                own_l, own_t, own_r, own_b, bw, bh, x, y, width, height,
++                client->clipped_out ? " (clipped out)" : "");
++    }
++
+     TRACE("hwnd=%p subsurface=%d,%d+%dx%d\n", surface->hwnd, x, y, width, height);
+ 
+     /* NEUTRON round-37 broad trace: computed subsurface geometry per present --
+@@ -1728,7 +1846,7 @@
+             /* NEUTRON: dcomp-bridge-managed (suppressed) surfaces go BELOW the toplevel
+              * GDI content surface so their black swapchain can't occlude/flicker, while
+              * staying MAPPED so present-wait stays healthy. Everything else stays above. */
+-            else if (client->place_below)
++            else if (client->place_below || client->clipped_out)
+                 wl_subsurface_place_below(client->wl_subsurface, surface->wl_surface);
+             else
+                 wl_subsurface_place_above(client->wl_subsurface, surface->wl_surface);
+@@ -1739,9 +1857,9 @@
+     }
+ 
+     if (width != 0 && height != 0)
+-        wp_viewport_set_destination(client->wp_viewport, width, height);
++        neutron_client_set_destination(client, width, height);
+     else /* We can't have a 0x0 destination, use 1x1 instead. */
+-        wp_viewport_set_destination(client->wp_viewport, 1, 1);
++        neutron_client_set_destination(client, 1, 1);
+ }
+ 
+ /**********************************************************************
+@@ -2296,7 +2414,34 @@
+ 
+ static unsigned neutron_dbg_n;
+ 
+-static void wayland_client_surface_attach_rect(struct wayland_client_surface *client, HWND toplevel, const RECT *rect);
++static void wayland_client_surface_attach_rect(struct wayland_client_surface *client, HWND toplevel,
++                                               const RECT *rect, const RECT *clip);
++
++/* NEUTRON: the area `hwnd`'s ancestors let it show -- the intersection of every ancestor's client area up to and
++ * including the toplevel -- in toplevel client coordinates, as wayland_client_surface_update and attach compute
++ * the child's own rect. FALSE when hwnd is the toplevel itself (nothing clips it). Windows clips a child to the
++ * client area of every ancestor; a Wayland subsurface is not clipped by its parent at all, so a GPU child scrolled
++ * out of its container was still drawn (Lightroom Classic's What's New videos, 2026-10-13).
++ * Makes user-lock calls: only before win_data_mutex is taken (round-34 lock order). */
++static BOOL neutron_ancestor_clip(HWND hwnd, HWND toplevel, UINT dpi, RECT *clip)
++{
++    HWND p = hwnd;
++    BOOL any = FALSE;
++    int depth;
++
++    for (depth = 0; depth < 64 && p != toplevel; depth++)
++    {
++        RECT r;
++
++        if (!(p = NtUserGetAncestor(p, GA_PARENT))) break;
++        NtUserGetClientRect(p, &r, dpi);
++        NtUserMapWindowPoints(p, toplevel, (POINT *)&r, 2, dpi);
++        if (!any) *clip = r;
++        else if (!intersect_rect(clip, clip, &r)) SetRectEmpty(clip);
++        any = TRUE;
++    }
++    return any;
++}
+ 
+ /* ===================== NEUTRON round-35: NATIVE WIN32-Z-ORDER STACKING =====================
+  * The native-present pivot: every D2D-UI window's Vulkan client subsurface SHOWS its own
+@@ -2884,7 +3029,7 @@
+         cs_of[n] = cs;
+         applied[n] = zl->hwnd[i];
+         /* suppress rule (round-17-proven minimal set): CEF/CEP host containers... */
+-        below[n] = zl->cef_host[i];
++        below[n] = zl->cef_host[i] || cs->clipped_out;
+         /* NEUTRON round-36 TEMPORAL rule ("latest painter wins"): if this chain
+          * is IDLE and newer GDI damage (CEP shared-mem blits, GDI-hybrid paints)
+          * intersects its rect, its stale/black frame must not cover that GDI
+@@ -2919,7 +3064,7 @@
+                 !cs->wl_surface) continue;
+             cs_of[n] = cs;
+             applied[n] = extra[e];
+-            below[n] = cs->place_below;
++            below[n] = cs->place_below || cs->clipped_out;
+             if (extra[e] == toplevel) top_idx = (int)n; else child_clients++;
+             n++;
+         }
+@@ -3081,9 +3226,9 @@
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+     struct wayland_win_data *data;
+-    RECT client_rect = {0};
++    RECT client_rect = {0}, clip_rect = {0};
+     struct neutron_zlist zl = {0}; /* round-35 native stacking (phase A result) */
+-    BOOL visible, parent_visible;
++    BOOL visible, parent_visible, has_clip = FALSE;
+     HWND parent;
+ 
+     /* NEUTRON round-34 LOCK-ORDER FIX (ABBA deadlock, toy-repro'd + eu-stack-proven):
+@@ -3125,6 +3270,7 @@
+     {
+         NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+         NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++        has_clip = neutron_ancestor_clip(hwnd, toplevel, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI), &clip_rect);
+     }
+ 
+     /* NEUTRON round-35 native stacking, phase A (user-lock queries, PRE-lock):
+@@ -3223,7 +3369,7 @@
+ 
+     if (toplevel && visible)
+     {
+-        wayland_client_surface_attach_rect(surface, toplevel, &client_rect);
++        wayland_client_surface_attach_rect(surface, toplevel, &client_rect, has_clip ? &clip_rect : NULL);
+         /* NEUTRON round-35 native stacking, phase B (under win_data_mutex, NO
+          * user-lock calls): mirror the collected win32 z-order in the
+          * wl_subsurface stack (order cache no-ops when unchanged). */
+@@ -3243,7 +3389,7 @@
+         }
+     }
+     else
+-        wayland_client_surface_attach_rect(surface, NULL, NULL); /* detach: no user calls */
++        wayland_client_surface_attach_rect(surface, NULL, NULL, NULL); /* detach: no user calls */
+ 
+     wayland_win_data_release(data);
+ }
+@@ -3252,6 +3398,11 @@
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+     HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++
++    /* NEUTRON: viewport state changed while this present was in flight (see the end of attach_rect): the app's
++     * own commit has just happened, nothing else commits this surface until present_busy drops, so apply it now */
++    if (client->buffer_width && surface->wl_surface && InterlockedExchange(&surface->vp_dirty, 0))
++        wl_surface_commit(surface->wl_surface);
+     ensure_window_surface_contents(toplevel);
+     set_client_surface(hwnd, surface);
+ }
+@@ -3356,12 +3507,13 @@
+  * all user-lock queries BEFORE taking win_data_mutex. rect==NULL keeps the
+  * original behavior (query here) for the window-manager (window.c) callers,
+  * which already run on threads where the user-lock nesting is safe. */
+-static void wayland_client_surface_attach_rect(struct wayland_client_surface *client, HWND toplevel, const RECT *rect)
++static void wayland_client_surface_attach_rect(struct wayland_client_surface *client, HWND toplevel,
++                                               const RECT *rect, const RECT *clip)
+ {
+     struct wayland_win_data *toplevel_data;
+     struct wayland_surface *surface;
+     HWND hwnd = client->client.hwnd;
+-    RECT client_rect;
++    RECT client_rect, clip_rect;
+ 
+     if (!toplevel)
+     {
+@@ -3428,16 +3580,41 @@
+     {
+         NtUserGetClientRect(hwnd, &client_rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+         NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&client_rect, 2, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++        /* window.c callers run where user-lock calls are safe (see the comment above this function) */
++        if (neutron_ancestor_clip(hwnd, toplevel, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI), &clip_rect))
++            clip = &clip_rect;
++    }
++
++    wayland_surface_reconfigure_client(surface, client, &client_rect, clip);
++
++    /* NEUTRON: a viewport change (crop/size) is CLIENT-surface state and shows only when that surface commits; the
++     * position is parent state and shows with the commit below. Left to the app's next present, a container
++     * scrolling a video moved it at once but cropped it a frame late (flicker at the clip edge), and a paused
++     * video kept a stale crop for good (scrolled back into view, it stayed 1x1 = gone). Lightroom Classic's
++     * What's New, 2026-10-13. So when nothing is presenting to it (present_busy, gdi_driver.h; Vulkan only --
++     * buffer_width is set by its present path), commit it HERE, synchronized, so crop and position land in the
++     * same parent commit. If a present is in flight, it carries the change (or wayland_client_surface_present
++     * commits it right after). */
++    if (client->vp_dirty && client->client.buffer_width && client->wl_subsurface &&
++        client->toplevel_wl_surface == surface->wl_surface &&
++        !InterlockedCompareExchange(&client->client.present_busy, 1, 0))
++    {
++        wl_subsurface_set_sync(client->wl_subsurface);
++        wl_surface_commit(client->wl_surface);
++        /* Commit to apply subsurface positioning -- and, synchronized, the client state cached above. */
++        wl_surface_commit(surface->wl_surface);
++        wl_subsurface_set_desync(client->wl_subsurface);
++        InterlockedExchange(&client->vp_dirty, 0);
++        InterlockedExchange(&client->client.present_busy, 0);
++        return;
+     }
+-
+-    wayland_surface_reconfigure_client(surface, client, &client_rect);
+     /* Commit to apply subsurface positioning. */
+     wl_surface_commit(surface->wl_surface);
+ }
+ 
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel)
+ {
+-    wayland_client_surface_attach_rect(client, toplevel, NULL);
++    wayland_client_surface_attach_rect(client, toplevel, NULL, NULL);
+ }
+ 
+ static void dummy_buffer_release(void *data, struct wl_buffer *buffer)
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -266,6 +266,17 @@
+     HWND                               hwnd;           /* window the surface was created for */
+     LONG                               updated;        /* has been moved / resized / reparented */
+     LONG                               offscreen;      /* client window is offscreen */
++    /* NEUTRON: size of the buffers presented to this surface, set by win32u before each Vulkan present
++     * (0 = unknown, e.g. OpenGL). Lets a driver crop the presented image safely: a crop that reaches past
++     * the buffer is a fatal wp_viewport out_of_buffer error on Wayland. */
++    UINT                               buffer_width;
++    UINT                               buffer_height;
++    /* NEUTRON: 1 while win32u presents to this surface (from just before update() until after present()). The
++     * host Vulkan WSI sends ALL its requests for the surface inside vkQueuePresentKHR (measured on NVIDIA,
++     * FIFO and MAILBOX: acquire/release points, attach, damage, commit); a driver that commits the surface
++     * itself must first set this 0 -> 1 with InterlockedCompareExchange, so it never lands in that sequence
++     * (a commit between set_acquire_point and attach is a fatal wp_linux_drm_syncobj error). */
++    LONG                               present_busy;
+ };
+ 
+ W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );

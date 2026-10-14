@@ -1,0 +1,244 @@
+winewayland: position GPU child windows and map input from the cropped window's real origin (Premiere black line)
+
+A maximized Premiere keeps a window that hangs 5 px off the monitor, and the frame-spill crop shows it from an inner
+origin, so surface-local (0,0) is window (5,0). GPU child windows (the Program Monitor) were still placed from the
+window origin: 5 px right, leaving a black strip down their left edge, and pointer input landed 5 px left of the
+pointer. The applied crop origin is now recorded (wayland_surface_content_origin) and used for client and owned
+subsurface positions, pointer motion, confine and warp, tablet and Wintab positions, and drag-and-drop. Kill switch
+NEUTRON_CROP_ORIGIN=0. Harness: preserved-fixes/harnesses/ptrcheck.c (overhang0) and clipped-gpu-child.c (overhang).
+
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -1191,11 +1191,13 @@
+     if ((surface = data->wayland_surface))
+     {
+         RECT *window_rect = &surface->window.rect;
++        int ox, oy;   /* NEUTRON: frame-spill crop origin, see wayland_surface_content_origin */
++        wayland_surface_content_origin(surface, &ox, &oy);
+         wayland_surface_coords_to_window(surface, wl_fixed_to_double(x_w),
+                                          wl_fixed_to_double(y_w),
+                                          (int *)&pt->x, (int *)&pt->y);
+-        pt->x += window_rect->left;
+-        pt->y += window_rect->top;
++        pt->x += window_rect->left + ox;
++        pt->y += window_rect->top + oy;
+     }
+     wayland_win_data_release(data);
+ }
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -438,6 +438,10 @@
+     BOOL resizing;
+     struct wayland_window_config window;
+     int content_width, content_height;
++    /* NEUTRON: where surface-local (0,0) sits in window coordinates (window px). Non-zero only while the
++     * frame-spill crop shows the window from an inner origin (wayland_surface_attach_shm); every conversion
++     * between surface-local and window positions must go through it (wayland_surface_content_origin). */
++    int content_x, content_y;
+     /* NEUTRON: size of the shm buffer last attached, in window px (0 before the first attach).
+      * win32u clips a window surface to the desktop, so a window larger than the desktop has a
+      * buffer SMALLER than its window; see wayland_surface_viewport_destination(). */
+@@ -513,6 +517,7 @@
+ void wayland_surface_coords_from_window(struct wayland_surface *surface,
+                                         int window_x, int window_y,
+                                         int *surface_x, int *surface_y);
++void wayland_surface_content_origin(struct wayland_surface *surface, int *x, int *y);
+ void wayland_surface_coords_to_window(struct wayland_surface *surface,
+                                       double surface_x, double surface_y,
+                                       int *window_x, int *window_y);
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -204,8 +204,13 @@
+                                      wl_fixed_to_double(sx),
+                                      wl_fixed_to_double(sy),
+                                      (int *)&screen.x, (int *)&screen.y);
+-    screen.x += window_rect->left;
+-    screen.y += window_rect->top;
++    {
++        /* NEUTRON: surface-local (0,0) is not the window origin while the frame-spill crop is on */
++        int ox, oy;
++        wayland_surface_content_origin(surface, &ox, &oy);
++        screen.x += window_rect->left + ox;
++        screen.y += window_rect->top + oy;
++    }
+     wayland_clamp_rounding_overshoot(&screen, window_rect);
+ 
+     wayland_win_data_release(data);
+@@ -1197,9 +1202,13 @@
+         return;
+     }
+ 
+-    OffsetRect(&window_clip,
+-               -surface->window.rect.left,
+-               -surface->window.rect.top);
++    {
++        int ox, oy;   /* NEUTRON: frame-spill crop origin, see wayland_surface_content_origin */
++        wayland_surface_content_origin(surface, &ox, &oy);
++        OffsetRect(&window_clip,
++                   -surface->window.rect.left - ox,
++                   -surface->window.rect.top - oy);
++    }
+     wayland_surface_coords_from_window(surface,
+                                        window_clip.left, window_clip.top,
+                                        (int *)&confine->left, (int *)&confine->top);
+@@ -1425,10 +1434,14 @@
+         wl_surface = surface->wl_surface;
+         if (clip) wayland_surface_calc_confine(surface, clip, &confine_rect);
+         covers_vscreen = wayland_surface_client_covers_vscreen(surface);
+-        wayland_surface_coords_from_window(surface,
+-                cursor_pos.x - surface->window.rect.left,
+-                cursor_pos.y - surface->window.rect.top,
+-                &warp_x, &warp_y);
++        {
++            int ox, oy;   /* NEUTRON: frame-spill crop origin, see wayland_surface_content_origin */
++            wayland_surface_content_origin(surface, &ox, &oy);
++            wayland_surface_coords_from_window(surface,
++                    cursor_pos.x - surface->window.rect.left - ox,
++                    cursor_pos.y - surface->window.rect.top - oy,
++                    &warp_x, &warp_y);
++        }
+     }
+     wayland_win_data_release(data);
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1064,9 +1064,12 @@
+         wp_viewport_set_source(surface->wp_viewport,
+                                wl_fixed_from_int(sx), wl_fixed_from_int(sy),
+                                wl_fixed_from_int(sw), wl_fixed_from_int(sh));
++        surface->content_x = sx;   /* surface-local (0,0) is now window (sx,sy): see content_origin */
++        surface->content_y = sy;
+     }
+     else
+     {
++        surface->content_x = surface->content_y = 0;
+         /* It is an error to specify a wp_viewporter source rectangle that
+          * is partially or completely outside of the wl_buffe.
+          * 0 is also an invalid width / height value so use 1x1 instead.
+@@ -1627,9 +1630,13 @@
+     int client_x, client_y, x, y;
+     int client_width, client_height, width, height;
+ 
+-    /* The offset of the client area origin relatively to the window origin. */
+-    client_x = client_rect->left + window->client_rect.left - window->rect.left;
+-    client_y = client_rect->top + window->client_rect.top - window->rect.top;
++    int origin_x, origin_y;
++
++    /* The offset of the client area origin relatively to the window origin -- or, while the frame-spill crop
++     * is on, to the window position of surface-local (0,0) (NEUTRON, see wayland_surface_content_origin). */
++    wayland_surface_content_origin(surface, &origin_x, &origin_y);
++    client_x = client_rect->left + window->client_rect.left - window->rect.left - origin_x;
++    client_y = client_rect->top + window->client_rect.top - window->rect.top - origin_y;
+ 
+     client_width = client_rect->right - client_rect->left;
+     client_height = client_rect->bottom - client_rect->top;
+@@ -1728,8 +1735,8 @@
+         else if (IsRectEmpty(&vis))
+         {
+             client->clipped_out = TRUE;
+-            wayland_surface_coords_from_window(surface, window->client_rect.left - window->rect.left,
+-                                               window->client_rect.top - window->rect.top, &x, &y);
++            wayland_surface_coords_from_window(surface, window->client_rect.left - window->rect.left - origin_x,
++                                               window->client_rect.top - window->rect.top - origin_y, &x, &y);
+             width = height = 1;
+             neutron_client_set_source(client, wl_fixed_from_int(0), wl_fixed_from_int(0),
+                                       wl_fixed_from_int(1), wl_fixed_from_int(1));
+@@ -1738,8 +1745,8 @@
+         {
+             /* the visible rect in window pixels, converted to surface coordinates edge by edge (see above), and
+              * the source taken from exactly those rounded edges so image and position stay aligned */
+-            int vx = vis.left + window->client_rect.left - window->rect.left;
+-            int vy = vis.top + window->client_rect.top - window->rect.top;
++            int vx = vis.left + window->client_rect.left - window->rect.left - origin_x;
++            int vy = vis.top + window->client_rect.top - window->rect.top - origin_y;
+             int vx2 = vx + vis.right - vis.left, vy2 = vy + vis.bottom - vis.top;
+             int nx = (int)(own_l ? floor(vx / scale) : ceil(vx / scale));
+             int ny = (int)(own_t ? floor(vy / scale) : ceil(vy / scale));
+@@ -1762,8 +1769,8 @@
+             {
+                 /* a sliver thinner than one logical pixel: treat as scrolled out */
+                 client->clipped_out = TRUE;
+-                wayland_surface_coords_from_window(surface, window->client_rect.left - window->rect.left,
+-                                                   window->client_rect.top - window->rect.top, &x, &y);
++                wayland_surface_coords_from_window(surface, window->client_rect.left - window->rect.left - origin_x,
++                                                   window->client_rect.top - window->rect.top - origin_y, &x, &y);
+                 width = height = 1;
+                 neutron_client_set_source(client, wl_fixed_from_int(0), wl_fixed_from_int(0),
+                                           wl_fixed_from_int(1), wl_fixed_from_int(1));
+@@ -1931,8 +1938,12 @@
+         (toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) &&
+         (toplevel_surface = toplevel_data->wayland_surface))
+     {
+-        local_x = surface->window.rect.left - toplevel_surface->window.rect.left;
+-        local_y = surface->window.rect.top - toplevel_surface->window.rect.top;
++        int origin_x, origin_y;
++
++        /* NEUTRON: relative to the window position of the toplevel's surface-local (0,0) (frame-spill crop) */
++        wayland_surface_content_origin(toplevel_surface, &origin_x, &origin_y);
++        local_x = surface->window.rect.left - toplevel_surface->window.rect.left - origin_x;
++        local_y = surface->window.rect.top - toplevel_surface->window.rect.top - origin_y;
+ 
+         wayland_surface_coords_from_window(surface, local_x, local_y, &x, &y);
+ 
+@@ -2368,6 +2379,26 @@
+ }
+ 
+ /**********************************************************************
++ *          wayland_surface_content_origin
++ *
++ * NEUTRON: the window position of surface-local (0,0). The frame-spill crop (wayland_surface_attach_shm) shows a
++ * window that hangs off its monitor -- a maximized Premiere's 3850x2114 rect at (-5,51) -- from an inner origin, so
++ * surface-local (0,0) is window (5,0), not (0,0). Measured 2026-10-13: GPU child windows (Premiere's Program
++ * Monitor) were placed 5 device px right of where they belong, leaving their first 5 columns unpainted (a black
++ * line), and pointer input landed 5 px left of the pointer (ptrcheck "overhang0": crosshair left of the pointer at
++ * every position; the operator saw it too). Add this when converting a surface-local position to the window,
++ * subtract it the other way. Kill switch NEUTRON_CROP_ORIGIN=0.
++ */
++void wayland_surface_content_origin(struct wayland_surface *surface, int *x, int *y)
++{
++    static int on = -1;
++
++    if (on < 0) on = neutron_gate("NEUTRON_CROP_ORIGIN", TRUE);
++    *x = on ? surface->content_x : 0;
++    *y = on ? surface->content_y : 0;
++}
++
++/**********************************************************************
+  *          wayland_surface_coords_to_window
+  *
+  * Converts the surface-local coordinates to window (logical) coordinates.
+--- a/dlls/winewayland.drv/wayland_tablet.c
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -227,8 +227,12 @@
+         }
+         window_rect = &surface->window.rect;
+         wayland_surface_coords_to_window(surface, wl_fixed_to_double(x), wl_fixed_to_double(y), (int *)&screen.x, (int *)&screen.y);
+-        screen.x += window_rect->left;
+-        screen.y += window_rect->top;
++        {
++            int ox, oy;   /* NEUTRON: frame-spill crop origin, see wayland_surface_content_origin */
++            wayland_surface_content_origin(surface, &ox, &oy);
++            screen.x += window_rect->left + ox;
++            screen.y += window_rect->top + oy;
++        }
+         /* NEUTRON: was an UNCONDITIONAL copy of the pointer's clamp -- pinning pen motion to the
+          * focused window's edge however far outside it really was. The pen has the same implicit
+          * grab as the mouse: while the tip is down, focus stays on the surface that received the
+--- a/dlls/winewayland.drv/wintab.c
++++ b/dlls/winewayland.drv/wintab.c
+@@ -475,9 +475,12 @@
+          * velocity PS's cold predictor over-reacts to, WITHOUT a cold-start ramp (warm from
+          * hover) and WITHOUT desyncing channels (the ONE filtered position drives both pkX/pkY
+          * and the injected cursor via pending_pos). OFF (default) = exact prior raw behavior. */
+-        double raw_x = wl_fixed_to_double(x) * surface->window.scale + window_rect->left;
+-        double raw_y = wl_fixed_to_double(y) * surface->window.scale + window_rect->top;
+-        double fx = raw_x, fy = raw_y;
++        int ox, oy;   /* NEUTRON: frame-spill crop origin, see wayland_surface_content_origin */
++        double raw_x, raw_y, fx, fy;
++        wayland_surface_content_origin(surface, &ox, &oy);
++        raw_x = wl_fixed_to_double(x) * surface->window.scale + window_rect->left + ox;
++        raw_y = wl_fixed_to_double(y) * surface->window.scale + window_rect->top + oy;
++        fx = raw_x, fy = raw_y;
+         if (neutron_pen_on())
+         {
+             double jit = neutron_pen_jitter(), thr2 = (2.0*jit)*(2.0*jit);

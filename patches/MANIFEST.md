@@ -723,6 +723,42 @@ apply / case / grandchild cases; patched 6/6: Windows block, getenv via WINEDLLO
 ⚠️ `/proc/<pid>/environ` is an exec-time snapshot — the rewritten process itself still SHOWS the parent's values there;
 check its children or the ERR line.
 
+### `neutron-zzzzzzzzzzzzzzzzz-winewayland-clip-gpu-children-to-ancestors.mypatch` (2026-10-13) — Lightroom Classic What's New videos drawn outside the pop-up
+Operator, clean room LrC 15.4.1: *"All of the videos are on screen and not clipping in the pop up like they should."* The
+videos are D3D11 swapchains on children of a scrolled ClipView; winewayland shows each GPU child as a wl_subsurface at
+its full rect, and a Wayland subsurface is not clipped by its parent (upstream does not clip either; X11 gets it from X
+child windows). win32u now records each Vulkan present's buffer size on the client surface and brackets the present
+with `client_surface.present_busy` (measured with WAYLAND_DEBUG: NVIDIA's WSI sends every request for the surface —
+syncobj acquire/release points, attach, damage, commit — inside vkQueuePresentKHR, FIFO 462/462 and MAILBOX 458/458).
+winewayland intersects every ancestor's client area (`neutron_ancestor_clip`): entirely outside → 1x1 placed BELOW the
+toplevel (kept mapped: a detached surface wedges present-wait); an edge an ancestor cuts rounds inward with a matching
+`wp_viewport_set_source` crop (only with a known buffer size: out_of_buffer is fatal); touching edges keep the outward
+rounding (his call — inward measurably thickened LrC Develop's border, Premiere's old black-L mechanism). A crop change
+made outside a present is committed at once, synchronized with the parent (set_sync / commit / parent commit /
+set_desync), and one made during a present right after it — playing videos had flickered at the clip edge, a STOPPED
+video kept a stale 1x1 crop and vanished. OpenGL client surfaces keep the old behavior. Kill switch
+`NEUTRON_CLIENT_CLIP=0`. Verified: `preserved-fixes/harnesses/clipped-gpu-child.c` + `-check.py` (every pixel,
+native `spectacle -m`): stock 118 fails all 8 checks, patched passes all (render thread, scrolling container, stopped
+video, touching edges); 60 s MAILBOX stress scroll, ~61k presents, no protocol error; cost measured (diagnostic build):
+ancestor walk ~1-2.5 us per update, 0 busy waits in Premiere, 1 of ~65k in the stress run. Operator, clean room: What's
+New *"no flicker, videos stay inside, none disappear"*; LrC Develop pixel-identical to shipped at all four edges;
+Premiere unchanged (A/B: same playback jitter on shipped).
+
+### `neutron-zzzzzzzzzzzzzzzzzz-winewayland-crop-origin.mypatch` (2026-10-13) — Premiere Program Monitor black line; pointer 5 px off in maximized Premiere
+Operator: *"the black line is back on the left side of the program monitor"* (present on shipped 117 too). A maximized
+Premiere keeps the frame-inflated window rect (-5,51) 3850x2114 (since 11.10-78's maxkeep), so the frame-spill crop
+shows it from window x 5 (`neutron-overhang: full=3850x2114 clipped=3840x2109`). Client subsurfaces were positioned
+from the window origin: the Program Monitor's layer at logical 965 instead of 962, leaving its first 5 columns
+unpainted (screen cols 1684-1688 black) and covering 5 past its right edge. Same math for input: pointer motion landed 5
+px left of the pointer. The crop origin applied in `wayland_surface_attach_shm` is now stored (`content_x/y`) and
+`wayland_surface_content_origin()` is used by client and owned subsurface positions, pointer motion, confine and warp,
+tablet and Wintab positions, and drag-and-drop. xdg_popup anchoring already accounted for it (maxgeom fix #2) and is
+unchanged. Kill switch `NEUTRON_CROP_ORIGIN=0`. Verified: `preserved-fixes/harnesses/ptrcheck.c 180 overhang0`
+(sized like maximized Premiere, crop on) with pointer screenshots — pointer tip minus crosshair dx 8 → 3 (exactly the
+5-px crop; the rest is the arrow sprite); `clipped-gpu-child.c overhang` phase 6 spill past the container 6 px → within
+the touching allowance. Operator, clean room Premiere 2026: *"black line is gone, clicks and tooltips line up.
+playback is the same"*.
+
 ### `neutron-zzzz-winewayland-orphan-toplevel.mypatch` (2026-08-03) — After Effects splash screen
 A `wl_subsurface` only displays when its PARENT surface is mapped. An owned window whose owner has
 no `xdg_surface` yet became a subsurface of something not on screen, so it was never displayed at
