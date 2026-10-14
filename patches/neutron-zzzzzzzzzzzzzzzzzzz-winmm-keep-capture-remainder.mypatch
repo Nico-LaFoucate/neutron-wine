@@ -1,0 +1,190 @@
+winmm: keep the part of a capture packet that does not fit in the app's buffers (Premiere mic audio dropped)
+
+Premiere 2026 opens its MME input at startup (since 11.10-117 its default input is valid) and keeps it running,
+recording or not. Under Neutron every launch has PULSE_LATENCY_MSEC=90, which PipeWire applies to capture as
+well: the Scarlett Solo's Mic 1 got a 180 ms shared-mode period, so each capture packet was 8640 frames. Premiere
+queues about ten small waveIn buffers; whenever some were still out when a packet arrived, WID_PullData copied
+what fit and dropped the rest ("losing 7040-7936 frames", 7 times in 75 s with Premiere idle). Windows' MME does
+not lose audio because an app is late handing its buffers back.
+
+WID_PullData now keeps the frames that did not fit and gives them to the next buffers the app queues; while any
+are left, new audio waits in the device buffer (1 s since the capture-buffer patch). waveInReset discards them
+with the queue; closing the device frees them. The ACM conversion path still drops a converted packet's rest when
+the app has no buffers (unchanged; it only runs for non-PCM formats). Kill switch: NEUTRON_WINMM_KEEP_CAPTURE=0.
+
+Harness: preserved-fixes/harnesses/capture-gaps.exe mme NeutronToneSrc 20 10 20 (ten 20 ms buffers, 2 ms busy
+per buffer) recording a 997 Hz tone from a PipeWire null sink + remap source, PULSE_LATENCY_MSEC=180 (180 ms
+packets on that source), checked with tone-continuity.py (a dropped chunk is a phase jump): 11.10-119 lost audio
+in 6 of 7 runs (31-38 drops, 5-6 s of 21.5 s missing); patched 0 of 5 (0 drops, 0 phase jumps); patched with the
+kill switch 2 of 3. With Wine's normal 10 ms packets both behave the same. Premiere 2026 with the patched winmm:
+0 drops in a 30-minute session. (Premiere's playback jumps that led here are caused by the 180 ms chunks
+themselves, not by the drops; this fixes the lost audio only.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/winmm/waveform.c
++++ b/dlls/winmm/waveform.c
+@@ -102,6 +102,11 @@
+     ACMSTREAMHEADER acm_hdr;
+     UINT32 acm_offs;
+ 
++    /* NEUTRON: the part of the last capture packet that did not fit in the app's queued buffers,
++     * handed to the next buffers the app queues instead of being dropped */
++    BYTE *cap_keep;
++    UINT32 cap_keep_size, cap_keep_frames, cap_keep_ofs;
++
+     WAVEHDR *first, *last, *playing, *loop_start;
+ 
+     BOOL stopped;
+@@ -1263,6 +1268,10 @@
+         device->acm_handle = NULL;
+     }
+ 
++    free(device->cap_keep);
++    device->cap_keep = NULL;
++    device->cap_keep_size = device->cap_keep_frames = device->cap_keep_ofs = 0;
++
+     IMMDevice_Release(device->device);
+     device->device = NULL;
+ 
+@@ -1706,10 +1715,54 @@
+     device->acm_hdr.cbDstLengthUsed = 0;
+ }
+ 
++/* NEUTRON (Premiere 2026: playback audio cut out and the picture jumped while its MME input was open):
++ * NEUTRON_WINMM_KEEP_CAPTURE=0 restores dropping the part of a capture packet that does not fit in the
++ * app's queued buffers. */
++static BOOL neutron_keep_capture(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        WCHAR buf[8];
++        on = !(GetEnvironmentVariableW(L"NEUTRON_WINMM_KEEP_CAPTURE", buf, ARRAY_SIZE(buf)) && buf[0] == '0');
++    }
++    return on;
++}
++
++/* Copies up to `frames` frames into the app's queued buffers; returns how many did not fit. */
++static UINT32 WID_CopyToQueue(WINMM_Device *device, const BYTE *data, UINT32 frames, WAVEHDR **last)
++{
++    UINT32 left = frames;
++    WAVEHDR *queue = device->first;
++
++    while(queue && left > 0){
++        UINT32 to_copy_bytes;
++
++        to_copy_bytes = min(left * device->bytes_per_frame,
++                WINMM_FixedBufferLen(queue->dwBufferLength, device) - queue->dwBytesRecorded);
++
++        memcpy(queue->lpData + queue->dwBytesRecorded,
++                data + (frames - left) * device->bytes_per_frame,
++                to_copy_bytes);
++
++        queue->dwBytesRecorded += to_copy_bytes;
++
++        if(queue->dwBufferLength - queue->dwBytesRecorded <
++                device->bytes_per_frame){
++            *last = queue;
++            device->first = queue = queue->lpNext;
++        }
++
++        left -= to_copy_bytes / device->bytes_per_frame;
++    }
++
++    return left;
++}
++
+ static void WID_PullData(WINMM_Device *device)
+ {
+     WINMM_CBInfo cb_info;
+-    WAVEHDR *queue, *first = NULL, *last = NULL;
++    WAVEHDR *first = NULL, *last = NULL;
+     HRESULT hr;
+ 
+     TRACE("(%p)\n", device->handle);
+@@ -1730,6 +1783,22 @@
+         BYTE *data;
+         UINT32 packet_len, packet;
+         DWORD flags;
++        BOOL kept = FALSE;
++
++        /* NEUTRON: frames left over from the previous packet go first. Windows' MME does not lose
++         * audio just because the app was late handing its buffers back; while any are left over,
++         * new audio waits in the device buffer. */
++        if(device->cap_keep_frames){
++            UINT32 left = WID_CopyToQueue(device,
++                    device->cap_keep + device->cap_keep_ofs * device->bytes_per_frame,
++                    device->cap_keep_frames, &last);
++            device->played_frames += device->cap_keep_frames - left;
++            device->cap_keep_ofs += device->cap_keep_frames - left;
++            device->cap_keep_frames = left;
++            if(left)
++                break;
++            continue;
++        }
+ 
+         hr = IAudioCaptureClient_GetBuffer(device->capture, &data, &packet_len,
+                 &flags, NULL, NULL);
+@@ -1741,34 +1810,32 @@
+             goto exit;
+         }
+ 
+-        packet = packet_len;
+-        queue = device->first;
+-        while(queue && packet > 0){
+-            UINT32 to_copy_bytes;
+-
+-            to_copy_bytes = min(packet * device->bytes_per_frame,
+-                    WINMM_FixedBufferLen(queue->dwBufferLength, device) - queue->dwBytesRecorded);
+-
+-            memcpy(queue->lpData + queue->dwBytesRecorded,
+-                    data + (packet_len - packet) * device->bytes_per_frame,
+-                    to_copy_bytes);
+-
+-            queue->dwBytesRecorded += to_copy_bytes;
+-
+-            if(queue->dwBufferLength - queue->dwBytesRecorded <
+-                    device->bytes_per_frame){
+-                last = queue;
+-                device->first = queue = queue->lpNext;
+-            }
++        packet = WID_CopyToQueue(device, data, packet_len, &last);
+ 
+-            packet -= to_copy_bytes / device->bytes_per_frame;
++        if(packet > 0 && neutron_keep_capture()){
++            UINT32 bytes = packet * device->bytes_per_frame;
++            if(bytes > device->cap_keep_size){
++                BYTE *keep = realloc(device->cap_keep, bytes);
++                if(keep){
++                    device->cap_keep = keep;
++                    device->cap_keep_size = bytes;
++                }
++            }
++            if(bytes <= device->cap_keep_size){
++                memcpy(device->cap_keep, data + (packet_len - packet) * device->bytes_per_frame, bytes);
++                device->cap_keep_frames = packet;
++                device->cap_keep_ofs = 0;
++                kept = TRUE;
++            }
+         }
+ 
+         hr = IAudioCaptureClient_ReleaseBuffer(device->capture, packet_len);
+         if(FAILED(hr))
+             WARN("ReleaseBuffer failed: %08lx\n", hr);
+ 
+-        if(packet > 0)
++        if(kept)
++            TRACE("keeping %u frames for the next buffers\n", packet);
++        else if(packet > 0)
+             WARN("losing %u frames\n", packet);
+         device->played_frames += packet_len - packet;
+     }
+@@ -1854,6 +1921,7 @@
+     device->played_frames = 0;
+     device->loop_counter = 0;
+     device->last_clock_pos = 0;
++    device->cap_keep_frames = device->cap_keep_ofs = 0;
+     IAudioClient_Reset(device->client);
+ 
+     cb_info = device->cb_info;

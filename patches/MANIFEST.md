@@ -744,6 +744,19 @@ ancestor walk ~1-2.5 us per update, 0 busy waits in Premiere, 1 of ~65k in the s
 New *"no flicker, videos stay inside, none disappear"*; LrC Develop pixel-identical to shipped at all four edges;
 Premiere unchanged (A/B: same playback jitter on shipped).
 
+### `neutron-zzzzzzzzzzzzzzzzzzz-winmm-keep-capture-remainder.mypatch` (2026-10-13) — mic audio dropped when capture packets are large
+Found while chasing Premiere 2026's playback jumps (operator: *"the audio cuts out and jumps with the footage"*). Since
+11.10-117 Premiere opens its MME input at startup and keeps it running. With `PULSE_LATENCY_MSEC=90` (set by the CLI
+since 08-17) PipeWire gave the Scarlett's Mic 1 a 180 ms capture period; when Premiere's ~10 small waveIn buffers could
+not take a whole 8640-frame packet, `WID_PullData` dropped the rest ("losing 7040-7936 frames", 7 in 75 s with Premiere
+idle). It now keeps those frames for the next buffers the app queues (new audio waits in the 1 s device buffer);
+`waveInReset` discards them, close frees them. The ACM (non-PCM) path still drops a converted packet's rest (unchanged).
+Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses/capture-gaps.exe mme NeutronToneSrc 20
+10 20` + `PULSE_LATENCY_MSEC=180` + `tone-continuity.py WAV 997` — 11.10-119 lost audio in 6/7 runs (31-38 drops), patched
+0/5 (0 drops, 0 phase jumps), kill switch 2/3; 10 ms packets identical either way. Premiere 2026 with it: 0 drops in a
+33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
+with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
+
 ### `neutron-zzzzzzzzzzzzzzzzzz-winewayland-crop-origin.mypatch` (2026-10-13) — Premiere Program Monitor black line; pointer 5 px off in maximized Premiere
 Operator: *"the black line is back on the left side of the program monitor"* (present on shipped 117 too). A maximized
 Premiere keeps the frame-inflated window rect (-5,51) 3850x2114 (since 11.10-78's maxkeep), so the frame-spill crop
