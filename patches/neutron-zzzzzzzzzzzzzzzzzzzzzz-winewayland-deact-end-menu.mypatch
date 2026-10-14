@@ -1,0 +1,61 @@
+winewayland: end an open menu when the focus leaves the application
+
+Operator: "the dropdowns are also persisting on the top of everything when switching between apps" (Lightroom
+Classic, his prefix and the clean room). On Windows, switching apps closes an open menu. Our focus-leave handler
+(deactivate-on-focus-leave) sends WM_CANCELMODE to the foreground window, and DefWindowProc's end_menu() only ends a
+menu owned by that window. Lightroom Classic shows its panel dropdowns (Metadata view and preset, etc.) as popup
+menus owned by the ComboBox child control (+menu: TrackPopupMenuEx hwnd = a ComboBox, not the AgWinMainFrame), so
+they stayed open, drawn above the app the user switched to. Menu-bar menus (owned by the frame) already closed.
+
+When the keyboard focus has left the process and this thread is in menu mode (GetGUIThreadInfo GUI_INMENUMODE),
+the handler now calls NtUserEndMenu(), which ends the menu whatever owns it, as EndMenu does. It runs before the
+"still the foreground window?" check, so it also applies when the focus went to another Wine process.
+Kill switch NEUTRON_DEACT_ENDMENU=0.
+
+Verified on a nested KWin (clean-room LrcRelease, runtime 122 + this driver), switching to KCalc with each open:
+Library menu (closed before and after), Metadata view dropdown and Metadata preset dropdown (stayed open on 122;
+close with this). Known-bad: NEUTRON_DEACT_ENDMENU=0 leaves the view dropdown open. Harness:
+preserved-fixes/harnesses/kwin-nested/ (start.sh, place.sh, activate.sh) + menucmd.exe (click, info, postmsg).
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -458,6 +458,14 @@
+     return on;
+ }
+ 
++/* NEUTRON: kill switch for ending an open menu when focus leaves the process (see WM_WAYLAND_KILL_FOREGROUND). */
++static BOOL neutron_deact_endmenu(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_DEACT_ENDMENU", TRUE);
++    return on;
++}
++
+ static BOOL neutron_gate_deactivate_on_leave(void)
+ {
+     static int on = -1;
+@@ -1827,6 +1835,24 @@
+             return 0;
+         }
+ 
++        /* NEUTRON: an open menu ends when its application loses the focus, whatever window owns it,
++         * as on Windows. The WM_CANCELMODE below only ends a menu owned by the window it is sent to
++         * (end_menu), and Lightroom Classic shows its panel dropdowns as popup menus owned by the
++         * ComboBox child control (TrackPopupMenuEx hwnd = the ComboBox), not its main frame: switching
++         * apps left them open, drawn above every other window.
++         * Done before the foreground check, so it also runs when the focus went to another Wine
++         * process, whose window is already the foreground one. Kill switch NEUTRON_DEACT_ENDMENU=0. */
++        if (neutron_deact_endmenu())
++        {
++            GUITHREADINFO info = {.cbSize = sizeof(info)};
++
++            if (NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) && (info.flags & GUI_INMENUMODE))
++            {
++                ERR("neutron-wlkillfg: hwnd=%p ending the open menu (owner %p)\n", hwnd, info.hwndMenuOwner);
++                NtUserEndMenu();
++            }
++        }
++
+         /* Messages sent below may themselves change the foreground window, so re-check rather
+          * than trusting the state we saw when the leave arrived. */
+         if (hwnd != NtUserGetForegroundWindow()) return 0;
