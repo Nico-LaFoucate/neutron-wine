@@ -744,6 +744,19 @@ ancestor walk ~1-2.5 us per update, 0 busy waits in Premiere, 1 of ~65k in the s
 New *"no flicker, videos stay inside, none disappear"*; LrC Develop pixel-identical to shipped at all four edges;
 Premiere unchanged (A/B: same playback jitter on shipped).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzz-dxcore-real-adapter-identity.mypatch` (2026-10-14) — DXCore names the real GPU and answers its queries
+Found on GitHub Neutron#18 (AMD; Photoshop "DirectX unavailable"). DXCore took wined3d's identity: with the GL renderer a
+guess when the driver can't report PCI IDs or the card isn't in wined3d's table (RTX 5070 -> "GTX 470" 10de:06cd; RX 7900 XT
+0x744c -> an older Radeon), while DXGI/D3DKMT/Vulkan name the real card; IsValid/IsAttributeSupported/IsPropertySupported were
+FALSE stubs and CreateAdapterList ignored its filter. Users: Photoshop (LibXPUInfo, sniffer), Premiere (GPUSniffer, app), Media
+Encoder, onnxruntime. Now: PCI IDs + name from the display device whose DEVPROPKEY_GPU_LUID matches (as Wine's win32u tests
+map it); IsValid TRUE; D3D11/D3D12 graphics + D3D12 core compute supported for such a GPU (ML/media not); IsPropertySupported
+= what GetProperty implements; CreateAdapterList filters on the modelled attributes only (ML/media filters keep listing every
+adapter, so onnxruntime/DirectML see what they did before). Kill switch `NEUTRON_DXCORE_IDENTITY=0`. Verified on the RTX 5070:
+`preserved-fixes/harnesses/gpu-report.c` (DXCore = DXGI = D3DKMT = Vulkan: RTX 5070 10de:2f04, IsValid/D3D11/D3D12/compute 1;
+kill switch = old output); Photoshop 2026 still finds and uses the GPU (sniffer 2 displays + 1 device, D3D12 in sniffer and
+app), adapter-list counts unchanged; Premiere 2026 CUDA initializes. NOT yet shown to fix AMD (waiting on gpu-report data).
+
 ### `neutron-zzzzzzzzzzzzzzzzzzz-winmm-keep-capture-remainder.mypatch` (2026-10-13) — mic audio dropped when capture packets are large
 Found while chasing Premiere 2026's playback jumps (operator: *"the audio cuts out and jumps with the footage"*). Since
 11.10-117 Premiere opens its MME input at startup and keeps it running. With `PULSE_LATENCY_MSEC=90` (set by the CLI

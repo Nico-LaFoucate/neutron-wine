@@ -1,0 +1,227 @@
+dxcore: describe the real adapter (name, PCI IDs) and answer IsValid/IsAttributeSupported/IsPropertySupported
+
+DXCore reported wined3d's identity for an adapter. With wined3d's GL renderer that is a guess whenever the
+GL driver can't report PCI IDs or the card is missing from wined3d's table: an RTX 5070 came out as
+"NVIDIA GeForce GTX 470" 10de:06cd, and an RX 7900 XT (0x744c, not in the table) as an older Radeon
+(GitHub Neutron#18), while DXGI, D3DKMT and Vulkan all name the real card. IsValid, IsAttributeSupported and
+IsPropertySupported were stubs returning FALSE, and CreateAdapterList ignored its filter. Photoshop
+(LibXPUInfo, sniffer), Premiere (GPUSniffer, the app), Media Encoder and onnxruntime all query DXCore.
+
+Windows' DXCore describes the adapter the kernel driver exposes. The adapter now takes its PCI IDs and name
+from the display device whose DEVPROPKEY_GPU_LUID matches its LUID (win32u writes the HardwareID, DriverDesc
+and LUID of every GPU; Wine's own win32u tests map adapters the same way). IsValid is TRUE (it only turns
+FALSE when an adapter goes away). For such a GPU, D3D11 graphics, D3D12 graphics and D3D12 core compute are
+supported (DXVK and vkd3d-proton on its Vulkan device); the ML and media attributes stay unsupported.
+IsPropertySupported answers for the properties GetProperty implements. CreateAdapterList drops adapters that
+lack a requested D3D11/D3D12/compute attribute; filters on the ML/media attributes are not modelled and keep
+the old behaviour (every adapter listed), so onnxruntime/DirectML enumerate exactly what they did before.
+Kill switch: NEUTRON_DXCORE_IDENTITY=0.
+
+Verified (RTX 5070): preserved-fixes/harnesses/gpu-report.c -- DXCore "NVIDIA GeForce GTX 470" 10de:06cd,
+IsValid 0, D3D11/D3D12/compute 0 -> "NVIDIA GeForce RTX 5070" 10de:2f04, IsValid 1, D3D11/D3D12/compute 1,
+same LUID as DXGI/D3DKMT/Vulkan; kill switch = old output. Photoshop 2026: sniffer native 2 displays + 1
+device, sniffer.exe and Photoshop.exe create D3D12 devices; every CreateAdapterList returns the same adapter
+count as before. Premiere 2026: DXCore finds 10de:2f04, CUDA initializes (cuDeviceGetLuid -> display LUID).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/dxcore/dxcore.c
++++ b/dlls/dxcore/dxcore.c
+@@ -21,6 +21,12 @@
+ #define COBJMACROS
+ #include "initguid.h"
+ #include "dxcore.h"
++#include "windef.h"
++#include "winbase.h"
++#include "winnls.h"
++#include "setupapi.h"
++#include "devguid.h"
++#include "devpkey.h"
+ #include "wine/wined3d.h"
+ 
+ #include "wine/debug.h"
+@@ -34,8 +40,77 @@
+ 
+     struct wined3d_adapter_identifier identifier;
+     char driver_description[128];
++    BOOL is_gpu; /* NEUTRON: a real display adapter (found by LUID among the display devices) */
+ };
+ 
++/* NEUTRON (2026-10-14, GitHub Neutron#18): DXCore reported wined3d's identity for an adapter. With the GL
++ * renderer that is a guess whenever the GL driver can't report PCI IDs (NVIDIA: an RTX 5070 came out as
++ * "NVIDIA GeForce GTX 470" 10de:06cd) or the card is missing from wined3d's table (RX 7900 XT 0x744c), while
++ * DXGI, D3DKMT and Vulkan all name the real card. Windows' DXCore describes the adapter the kernel driver
++ * exposes, so take the name and PCI IDs from the display device whose GPU LUID matches, as Windows components
++ * do (DEVPROPKEY_GPU_LUID; win32u writes it with the HardwareID and DriverDesc of every GPU), and answer the
++ * validity and attribute queries Adobe's LibXPUInfo makes (IsValid, D3D11/D3D12 graphics, D3D12 core compute)
++ * instead of stubbing them to FALSE. Kill switch: NEUTRON_DXCORE_IDENTITY=0. */
++DEFINE_DEVPROPKEY(DEVPROPKEY_GPU_LUID, 0x60b193cb, 0x5276, 0x4d0f, 0x96, 0xfc, 0xf1, 0x73, 0xab, 0xad, 0x3e, 0xc6, 2);
++
++static BOOL neutron_dxcore_identity_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        WCHAR buf[8];
++        on = !(GetEnvironmentVariableW(L"NEUTRON_DXCORE_IDENTITY", buf, ARRAY_SIZE(buf)) && buf[0] == '0');
++    }
++    return on;
++}
++
++/* Fills the adapter's PCI IDs and name from the display device with this LUID; FALSE if there is none. */
++static BOOL neutron_dxcore_identity_from_luid(struct dxcore_adapter *adapter)
++{
++    const LUID *luid = &adapter->identifier.adapter_luid;
++    SP_DEVINFO_DATA device = {sizeof(device)};
++    BOOL found = FALSE;
++    HDEVINFO set;
++    DWORD i;
++
++    if ((set = SetupDiGetClassDevsW(&GUID_DEVCLASS_DISPLAY, NULL, NULL, 0)) == INVALID_HANDLE_VALUE)
++        return FALSE;
++
++    for (i = 0; !found && SetupDiEnumDeviceInfo(set, i, &device); ++i)
++    {
++        unsigned int vendor, device_id, subsys, rev;
++        WCHAR hardware_id[256], name[128];
++        DEVPROPTYPE type;
++        LUID device_luid;
++
++        if (!SetupDiGetDevicePropertyW(set, &device, &DEVPROPKEY_GPU_LUID, &type, (BYTE *)&device_luid,
++                sizeof(device_luid), NULL, 0))
++            continue;
++        if (device_luid.LowPart != luid->LowPart || device_luid.HighPart != luid->HighPart)
++            continue;
++        if (!SetupDiGetDeviceRegistryPropertyW(set, &device, SPDRP_HARDWAREID, NULL, (BYTE *)hardware_id,
++                sizeof(hardware_id), NULL)
++                || swscanf(hardware_id, L"PCI\\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X", &vendor, &device_id,
++                &subsys, &rev) != 4)
++            continue;
++
++        adapter->identifier.vendor_id = vendor;
++        adapter->identifier.device_id = device_id;
++        adapter->identifier.subsystem_id = subsys;
++        adapter->identifier.revision = rev;
++        if (SetupDiGetDevicePropertyW(set, &device, &DEVPKEY_Device_DriverDesc, &type, (BYTE *)name,
++                sizeof(name), NULL, 0) && type == DEVPROP_TYPE_STRING)
++            WideCharToMultiByte(CP_UTF8, 0, name, -1, adapter->driver_description,
++                    sizeof(adapter->driver_description), NULL, NULL);
++        found = TRUE;
++    }
++
++    SetupDiDestroyDeviceInfoList(set);
++    TRACE("LUID %08lx:%08lx -> %s %04lx:%04lx.\n", luid->HighPart, luid->LowPart, found ? "found" : "not found",
++            adapter->identifier.vendor_id, adapter->identifier.device_id);
++    return found;
++}
++
+ static inline struct dxcore_adapter *impl_from_IDXCoreAdapter(IDXCoreAdapter *iface)
+ {
+     return CONTAINING_RECORD(iface, struct dxcore_adapter, IDXCoreAdapter_iface);
+@@ -83,20 +158,57 @@
+     return refcount;
+ }
+ 
++static HRESULT dxcore_adapter_get_property_size(struct dxcore_adapter *adapter,
++        DXCoreAdapterProperty property, size_t *size);
++
++/* NEUTRON: the attributes modelled here; the ML and media ones are not (see CreateAdapterList). */
++static BOOL neutron_dxcore_modelled_attribute(REFGUID attribute)
++{
++    return IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS)
++            || IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS)
++            || IsEqualGUID(attribute, &DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE);
++}
++
+ static BOOL STDMETHODCALLTYPE dxcore_adapter_IsValid(IDXCoreAdapter *iface)
+ {
++    if (neutron_dxcore_identity_on())
++    {
++        /* NEUTRON: FALSE only means the adapter went away (removal, driver update); Wine has no such event. */
++        TRACE("iface %p.\n", iface);
++        return TRUE;
++    }
+     FIXME("iface %p stub!\n", iface);
+     return FALSE;
+ }
+ 
+ static BOOL STDMETHODCALLTYPE dxcore_adapter_IsAttributeSupported(IDXCoreAdapter *iface, REFGUID attribute)
+ {
++    struct dxcore_adapter *adapter = impl_from_IDXCoreAdapter(iface);
++
++    if (neutron_dxcore_identity_on())
++    {
++        /* NEUTRON: a GPU here runs D3D11 (DXVK) and D3D12 (vkd3d-proton) on its Vulkan device; ML and media
++         * attributes stay unsupported. */
++        BOOL ret = adapter->is_gpu && neutron_dxcore_modelled_attribute(attribute);
++        TRACE("iface %p, attribute %s -> %d.\n", iface, debugstr_guid(attribute), ret);
++        return ret;
++    }
+     FIXME("iface %p, attribute %s stub!\n", iface, debugstr_guid(attribute));
+     return FALSE;
+ }
+ 
+ static BOOL STDMETHODCALLTYPE dxcore_adapter_IsPropertySupported(IDXCoreAdapter *iface, DXCoreAdapterProperty property)
+ {
++    struct dxcore_adapter *adapter = impl_from_IDXCoreAdapter(iface);
++    size_t size;
++
++    if (neutron_dxcore_identity_on())
++    {
++        /* NEUTRON: supported = the properties GetProperty/GetPropertySize answer. */
++        BOOL ret = SUCCEEDED(dxcore_adapter_get_property_size(adapter, property, &size));
++        TRACE("iface %p, property %u -> %d.\n", iface, property, ret);
++        return ret;
++    }
+     FIXME("iface %p, property %u stub!\n", iface, property);
+     return FALSE;
+ }
+@@ -505,6 +617,8 @@
+         free(adapter);
+         return hr;
+     }
++    if (neutron_dxcore_identity_on())
++        adapter->is_gpu = neutron_dxcore_identity_from_luid(adapter);
+ 
+     TRACE("Created adapter %p.\n", adapter);
+     *ret_adapter = adapter;
+@@ -567,6 +681,30 @@
+         return hr;
+     }
+ 
++    /* NEUTRON: drop the adapters that lack a requested D3D11/D3D12/compute attribute, as on Windows. Filters
++     * on the ML and media attributes are not modelled and keep the old behaviour (every adapter is listed),
++     * so ML runtimes (onnxruntime/DirectML) enumerate exactly what they did before. */
++    if (neutron_dxcore_identity_on())
++    {
++        uint32_t kept = 0;
++
++        for (uint32_t i = 0; i < list->adapter_count; ++i)
++        {
++            struct dxcore_adapter *adapter = list->adapters[i];
++            BOOL match = TRUE;
++
++            for (uint32_t j = 0; match && j < num_attributes; ++j)
++                if (neutron_dxcore_modelled_attribute(&filter_attributes[j]))
++                    match = IDXCoreAdapter_IsAttributeSupported(&adapter->IDXCoreAdapter_iface, &filter_attributes[j]);
++            if (match)
++                list->adapters[kept++] = adapter;
++            else
++                IDXCoreAdapter_Release(&adapter->IDXCoreAdapter_iface);
++        }
++        TRACE("%u of %u adapters match the %u filter attribute(s).\n", kept, list->adapter_count, num_attributes);
++        list->adapter_count = kept;
++    }
++
+     hr = IDXCoreAdapterList_QueryInterface(&list->IDXCoreAdapterList_iface, riid, out);
+     IDXCoreAdapterList_Release(&list->IDXCoreAdapterList_iface);
+     TRACE("created IDXCoreAdapterList %p.\n", *out);
+--- a/dlls/dxcore/Makefile.in
++++ b/dlls/dxcore/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE  = dxcore.dll
+-IMPORTS = wined3d
++IMPORTS = wined3d setupapi
+ 
+ SOURCES = \
+ 	dxcore.c
