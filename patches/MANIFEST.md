@@ -770,6 +770,34 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-follow-output.mypatch` (2026-10-14) — a maximized window sized for the wrong monitor
+Reporter (Neutron#20, portrait screen at the layout origin, KDE primary = the landscape one): *"it takes the 1080x1920
+size for the maximized window"*. On Wayland the compositor picks the output; win32u kept its own idea (Wine's primary,
+the portrait screen), Illustrator maximized for it, and KWin showed the window on the landscape output at portrait size.
+`wl_surface.enter/leave` now track a surface's outputs. A maximized or fullscreen toplevel on exactly one output whose
+win32u monitor differs is moved onto that output's monitor (frame overhang kept, or the compositor's size at the work
+area origin), with SWP_FRAMECHANGED so an app that computes its own client area recomputes it. Kill switch
+`NEUTRON_FOLLOW_OUTPUT=0`. Verified on a nested KWin with clean-room Illustrator: 1440 px wide before, 2560x1440 after.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzz-mountmgr-removable-media-type.mypatch` (2026-10-14) — SD cards and USB sticks are removable drives
+udisks flash/thumb (or removable) media came out DEVICE_UNKNOWN, i.e. DRIVE_FIXED; Windows says DRIVE_REMOVABLE.
+Lightroom Classic listed a card under Files instead of Devices and did not select it in Import. Now DEVICE_HARDDISK
+(DRIVE_REMOVABLE), as the macOS backend maps removable media; a USB hard disk stays fixed. Kill switch
+`NEUTRON_MOUNT_REMOVABLE_TYPE=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzz-mountmgr-announce-on-mount.mypatch` (2026-10-14) — Lightroom Classic opened Import before the card was mounted
+Reporter (Neutron#15): *"Lightroom pops up the import dialog. However, the card hasn't actually been mounted yet"*. Every
+udisks add/PropertiesChanged was broadcast as DBT_DEVICEARRIVAL (6 arrivals for one card in the mock, one on UNMOUNT).
+Now arrival when the drive gets a mount point and removal when it loses one. Kill switch `NEUTRON_MOUNT_NOTIFY_MOUNTED=0`,
+read on the Unix side (services.exe gives winedevice a registry-built Windows environment). Harness
+`preserved-fixes/harnesses/udisks2-mock/`. Operator, real SD card: passed.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzz-winewayland-deact-end-menu.mypatch` (2026-10-14) — dropdowns stay open after switching apps
+Operator: *"the dropdowns are also persisting on the top of everything when switching between apps"*. The focus-leave
+handler's WM_CANCELMODE only ends a menu owned by the foreground window; Lightroom Classic's panel dropdowns are popup
+menus owned by a ComboBox child. Now NtUserEndMenu() when focus leaves the process and the thread is in menu mode.
+Kill switch `NEUTRON_DEACT_ENDMENU=0`. Operator check (clean-room Lightroom Classic): passed.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzz-winewayland-output-transform.mypatch` (2026-10-14) — rotated (portrait) monitors reported landscape at the wrong dpi
 Reporter (Neutron#20, AMD, KDE): Illustrator 2026's menus are drawn at about half size inside an oversized white pop-up;
 their second screen is a 1080x1920 portrait at (0,0). `wl_output.mode` is in the panel's hardware orientation, before the
