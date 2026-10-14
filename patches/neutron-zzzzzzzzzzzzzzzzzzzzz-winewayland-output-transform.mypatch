@@ -1,0 +1,271 @@
+winewayland: report rotated (portrait) monitors in the desktop's orientation (GitHub Neutron#20)
+
+A monitor turned to portrait was reported landscape. wl_output.mode gives the size in the panel's hardware
+orientation, before the output transform, and the driver never read the transform: a 1080x1920 portrait screen
+became a 1920x1080 monitor at 96 * 1920/1080 = 171 dpi, overlapped its neighbor and pushed it sideways. Illustrator
+2026 on the landscape screen beside it then drew its menus at 96/171 of their size inside an oversized white pop-up
+(at Wine 150% the pop-up also opened away from the menu bar), and Wine's own windows were scaled wrong.
+
+The transform from wl_output.geometry is now kept per output, and every mode size that reaches win32u goes through
+wayland_output_mode_width/height(): the arrangement, the monitor rect, the per-monitor dpi, the work-area inset and
+the mode list. Modes carry dmDisplayOrientation (DMDO_90/180/270, counter-clockwise like RandR, as winex11 maps
+them; flipped transforms report their rotation). Unrotated outputs are unchanged.
+
+ORDERING: applies AFTER neutron-zzzzzzzzzzzzzy-winewayland-primary-monitor-origin and
+neutron-zzzzzzzzzzi-winewayland-geom-trace, which edit the same display.c code.
+Kill switch NEUTRON_OUTPUT_TRANSFORM=0. Harness: preserved-fixes/harnesses/monitors.c (dpi column) under
+preserved-fixes/harnesses/kwin-nested/start.sh (two virtual outputs, one rotated).
+
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -57,12 +57,25 @@
+     return strcmp(a->output->name, b->output->name);
+ }
+ 
++/* NEUTRON (Neutron#20): an output's size in the desktop's orientation (its mode size after the output
++ * transform). A portrait monitor's raw mode is landscape; used raw, it overlapped its neighbor, pushed it
++ * sideways, and came out at 96 * 2560/1440 = 171 dpi. */
++static inline int output_info_width(const struct output_info *info)
++{
++    return wayland_output_mode_width(info->output, info->output->current_mode);
++}
++
++static inline int output_info_height(const struct output_info *info)
++{
++    return wayland_output_mode_height(info->output, info->output->current_mode);
++}
++
+ static inline BOOL output_info_overlap(struct output_info *a, struct output_info *b)
+ {
+-    return b->x < a->x + a->output->current_mode->width &&
+-           b->x + b->output->current_mode->width > a->x &&
+-           b->y < a->y + a->output->current_mode->height &&
+-           b->y + b->output->current_mode->height > a->y;
++    return b->x < a->x + output_info_width(a) &&
++           b->x + output_info_width(b) > a->x &&
++           b->y < a->y + output_info_height(a) &&
++           b->y + output_info_height(b) > a->y;
+ }
+ 
+ /* Map a point to one of the four quadrants of our 2d coordinate space:
+@@ -144,16 +157,16 @@
+             rel_x = (move->output->logical_x - anchor->output->logical_x +
+                      (x_use_end ? move->output->logical_w : 0)) /
+                     (double)anchor->output->logical_w;
+-            move->x = anchor->x + anchor->output->current_mode->width * rel_x -
+-                      (x_use_end ? move->output->current_mode->width : 0);
++            move->x = anchor->x + output_info_width(anchor) * rel_x -
++                      (x_use_end ? output_info_width(move) : 0);
+ 
+             /* Similarly for the Y axis. */
+             y_use_end = move->output->logical_y < anchor->output->logical_y;
+             rel_y = (move->output->logical_y - anchor->output->logical_y +
+                      (y_use_end ? move->output->logical_h : 0)) /
+                     (double)anchor->output->logical_h;
+-            move->y = anchor->y + anchor->output->current_mode->height * rel_y -
+-                      (y_use_end ? move->output->current_mode->height : 0);
++            move->y = anchor->y + output_info_height(anchor) * rel_y -
++                      (y_use_end ? output_info_height(move) : 0);
+         }
+     }
+ 
+@@ -265,7 +278,7 @@
+      * everywhere (which makes a per-monitor-aware app render 1.7x too large on the 1080p). Falls back
+      * to the system dpi until the compositor has advertised the output's logical size. */
+     UINT dpi = NtUserGetSystemDpiForProcess( NULL );
+-    int mode_w = output_info->output->current_mode ? output_info->output->current_mode->width : 0;
++    int mode_w = output_info->output->current_mode ? output_info_width(output_info) : 0;
+     int logical_w = output_info->output->logical_w;
+     if (mode_w > 0 && logical_w > 0)
+         dpi = (UINT)((96.0 * mode_w) / logical_w + 0.5);
+@@ -338,8 +351,8 @@
+     struct gdi_monitor monitor = {0};
+ 
+     SetRect(&monitor.rc_monitor, output_info->x, output_info->y,
+-            output_info->x + output_info->output->current_mode->width,
+-            output_info->y + output_info->output->current_mode->height);
++            output_info->x + output_info_width(output_info),
++            output_info->y + output_info_height(output_info));
+ 
+     /* NEUTRON GEOM TRACE (NEUTRON_GEOM_TRACE=1): dump every input to the monitor rect in one
+      * line per output. A probe showed Wine publishing DISPLAY1 as (0,0)-(2262,1272) but
+@@ -353,11 +366,12 @@
+          * silently never fires. */
+         const char *gt = getenv("NEUTRON_GEOM_TRACE");
+         if (gt && gt[0] == '1')
+-            ERR("neutron-geom: %s arranged=(%d,%d) mode=%dx%d logical=(%d,%d) %dx%d "
++            ERR("neutron-geom: %s arranged=(%d,%d) mode=%dx%d transform=%d logical=(%d,%d) %dx%d "
+                 "-> rc_monitor=(%d,%d)-(%d,%d)\n",
+                 output_info->output->name, output_info->x, output_info->y,
+                 output_info->output->current_mode ? output_info->output->current_mode->width : -1,
+                 output_info->output->current_mode ? output_info->output->current_mode->height : -1,
++                output_info->output->transform,
+                 output_info->output->logical_x, output_info->output->logical_y,
+                 output_info->output->logical_w, output_info->output->logical_h,
+                 (int)monitor.rc_monitor.left, (int)monitor.rc_monitor.top,
+@@ -380,8 +394,7 @@
+          * The in-memory value is 0 in a freshly started desktop process -- nothing has been
+          * maximized yet -- so on a cold wineserver rc_work was still built from the 32px guess
+          * and the first launch came up wrong even with workarea#1 in place. */
+-        int mode_h = output_info->output->current_mode ?
+-                     output_info->output->current_mode->height : 0;
++        int mode_h = output_info->output->current_mode ? output_info_height(output_info) : 0;
+         int logical_h = output_info->output->logical_h;
+         int logical_inset = 32; /* fallback: KWin/Breeze titlebar ~= this */
+         int inset;
+@@ -427,15 +440,35 @@
+     device_manager->add_monitor(&monitor, param);
+ }
+ 
+-static void populate_devmode(struct wayland_output_mode *output_mode, DEVMODEW *mode)
++/* NEUTRON (Neutron#20): Wayland transforms, like RandR rotations, are counter-clockwise; winex11 maps
++ * RR_Rotate_90 to DMDO_90, so do the same. Windows has no mirrored orientations: a flipped transform
++ * reports its rotation. */
++static DWORD wayland_output_orientation(int transform)
++{
++    switch (transform)
++    {
++    case WL_OUTPUT_TRANSFORM_90:
++    case WL_OUTPUT_TRANSFORM_FLIPPED_90: return DMDO_90;
++    case WL_OUTPUT_TRANSFORM_180:
++    case WL_OUTPUT_TRANSFORM_FLIPPED_180: return DMDO_180;
++    case WL_OUTPUT_TRANSFORM_270:
++    case WL_OUTPUT_TRANSFORM_FLIPPED_270: return DMDO_270;
++    default: return DMDO_DEFAULT;
++    }
++}
++
++/* NEUTRON (Neutron#20): every mode is reported in the output's current orientation (a Wayland client
++ * cannot rotate an output, so there are no other orientations to list). */
++static void populate_devmode(const struct wayland_output_state *output, struct wayland_output_mode *output_mode,
++                             DEVMODEW *mode)
+ {
+     mode->dmFields = DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT |
+                      DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
+-    mode->dmDisplayOrientation = DMDO_DEFAULT;
++    mode->dmDisplayOrientation = wayland_output_orientation(output->transform);
+     mode->dmDisplayFlags = 0;
+     mode->dmBitsPerPel = 32;
+-    mode->dmPelsWidth = output_mode->width;
+-    mode->dmPelsHeight = output_mode->height;
++    mode->dmPelsWidth = wayland_output_mode_width(output, output_mode);
++    mode->dmPelsHeight = wayland_output_mode_height(output, output_mode);
+     /* Round the refresh rate to calculate the win32 display frequency. */
+     mode->dmDisplayFrequency = (output_mode->refresh + 500) / 1000;
+ }
+@@ -450,7 +483,7 @@
+     if (!(modes = malloc(output_info->output->modes_count * sizeof(*modes))))
+         return;
+ 
+-    populate_devmode(output_info->output->current_mode, &current);
++    populate_devmode(output_info->output, output_info->output->current_mode, &current);
+     current.dmFields |= DM_POSITION;
+     current.dmPosition.x = output_info->x;
+     current.dmPosition.y = output_info->y;
+@@ -459,7 +492,7 @@
+                       struct wayland_output_mode, entry)
+     {
+         DEVMODEW mode = {.dmSize = sizeof(mode)};
+-        populate_devmode(output_mode, &mode);
++        populate_devmode(output_info->output, output_mode, &mode);
+         modes[modes_count++] = mode;
+     }
+ 
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -286,6 +286,9 @@
+     char *name;
+     int logical_x, logical_y;
+     int logical_w, logical_h;
++    /* NEUTRON (Neutron#20): wl_output.geometry transform (WL_OUTPUT_TRANSFORM_*). Mode sizes are in the
++     * output's hardware orientation; see wayland_output_mode_width(). */
++    int transform;
+     /* NEUTRON: the output's arranged position in the Win32 physical-pixel desktop space
+      * (device px, matching win32u's monitor rc_monitor origin). Filled by the display-device
+      * update after overlap resolution; used to reposition a window onto this output's monitor
+@@ -463,6 +466,30 @@
+  *          Wayland output
+  */
+ 
++/* NEUTRON (Neutron#20): wl_output.mode sizes are in the output's hardware orientation, BEFORE its transform:
++ * a 2560x1440 monitor turned to portrait still reports a 2560x1440 mode, with a 1440x2560 logical size.
++ * Windows describes a rotated display in the desktop's orientation (dmPelsWidth/Height swapped,
++ * dmDisplayOrientation DMDO_90/DMDO_270), as winex11 does for RandR rotations. Every mode size that
++ * reaches win32u -- monitor rects, the arrangement, the per-monitor dpi, the mode list -- goes
++ * through these. */
++static inline BOOL wayland_output_transform_swaps_wh(int transform)
++{
++    return transform == WL_OUTPUT_TRANSFORM_90 || transform == WL_OUTPUT_TRANSFORM_270 ||
++           transform == WL_OUTPUT_TRANSFORM_FLIPPED_90 || transform == WL_OUTPUT_TRANSFORM_FLIPPED_270;
++}
++
++static inline int wayland_output_mode_width(const struct wayland_output_state *state,
++                                            const struct wayland_output_mode *mode)
++{
++    return wayland_output_transform_swaps_wh(state->transform) ? mode->height : mode->width;
++}
++
++static inline int wayland_output_mode_height(const struct wayland_output_state *state,
++                                             const struct wayland_output_mode *mode)
++{
++    return wayland_output_transform_swaps_wh(state->transform) ? mode->width : mode->height;
++}
++
+ BOOL wayland_output_create(uint32_t id, uint32_t version);
+ void wayland_output_destroy(struct wayland_output *output);
+ void wayland_output_use_xdg_extension(struct wayland_output *output);
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -39,6 +39,7 @@
+ #define WAYLAND_OUTPUT_CHANGED_NAME       0x02
+ #define WAYLAND_OUTPUT_CHANGED_LOGICAL_XY 0x04
+ #define WAYLAND_OUTPUT_CHANGED_LOGICAL_WH 0x08
++#define WAYLAND_OUTPUT_CHANGED_TRANSFORM  0x10
+ 
+ /**********************************************************************
+  *          Output handling
+@@ -191,21 +192,24 @@
+         output->current.logical_h = output->pending.logical_h;
+     }
+ 
++    if (output->pending_flags & WAYLAND_OUTPUT_CHANGED_TRANSFORM)
++        output->current.transform = output->pending.transform;
++
+     output->pending_flags = 0;
+ 
+     /* Ensure the logical dimensions have sane values. */
+     if ((!output->current.logical_w || !output->current.logical_h) &&
+         output->current.current_mode)
+     {
+-        output->current.logical_w = output->current.current_mode->width;
+-        output->current.logical_h = output->current.current_mode->height;
++        output->current.logical_w = wayland_output_mode_width(&output->current, output->current.current_mode);
++        output->current.logical_h = wayland_output_mode_height(&output->current, output->current.current_mode);
+     }
+ 
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+-    TRACE("name=%s logical=%d,%d+%dx%d\n",
++    TRACE("name=%s logical=%d,%d+%dx%d transform=%d\n",
+           output->current.name, output->current.logical_x, output->current.logical_y,
+-          output->current.logical_w, output->current.logical_h);
++          output->current.logical_w, output->current.logical_h, output->current.transform);
+ 
+     RB_FOR_EACH_ENTRY(mode, &output->current.modes, struct wayland_output_mode, entry)
+     {
+@@ -224,6 +228,15 @@
+                                    const char *make, const char *model,
+                                    int32_t output_transform)
+ {
++    struct wayland_output *output = data;
++    static int on = -1;
++
++    /* NEUTRON (Neutron#20): the only geometry field we use. Modes stay in hardware orientation;
++     * wayland_output_mode_width/height() apply this. Kill switch: NEUTRON_OUTPUT_TRANSFORM=0
++     * (every output reported unrotated, as before). */
++    if (on < 0) on = neutron_gate("NEUTRON_OUTPUT_TRANSFORM", TRUE);
++    output->pending.transform = on ? output_transform : WL_OUTPUT_TRANSFORM_NORMAL;
++    output->pending_flags |= WAYLAND_OUTPUT_CHANGED_TRANSFORM;
+ }
+ 
+ static void output_handle_mode(void *data, struct wl_output *wl_output,
