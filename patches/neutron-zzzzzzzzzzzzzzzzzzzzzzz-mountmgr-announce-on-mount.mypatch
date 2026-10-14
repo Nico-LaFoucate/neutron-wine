@@ -1,0 +1,135 @@
+mountmgr: announce a removable drive when it is mounted, not on every udisks update (GitHub Neutron#15)
+
+Reporter (Lightroom Classic 15.6, KDE): "When I insert my SD card into the USB-attached reader, Lightroom pops up the
+import dialog. However, the card hasn't actually been mounted yet so the content isn't available." ... "Once I accept
+the mount prompt from KDE, then the Import dialog appears automatically again".
+
+udisks reports an inserted card before anything has mounted it, and sends PropertiesChanged for every later update
+(mount, unmount, size, ...). Each one re-ran add_dos_device(), which broadcast DBT_DEVICEARRIVAL (DBTF_MEDIA) every
+time: on insert (drive not readable), on mount, on every property change, and even on UNMOUNT. On Windows a card is
+announced once its volume is usable. add_dos_device() now broadcasts DBT_DEVICEARRIVAL when a udisks drive gets a
+mount point and DBT_DEVICEREMOVECOMPLETE when it loses one (remove_dos_device already announces removal only for a
+mounted drive), and nothing otherwise. Kill switch NEUTRON_MOUNT_NOTIFY_MOUNTED=0, read from the UNIX environment by a
+new unix call: services.exe starts winedevice.exe with a registry-built Windows environment, so
+GetEnvironmentVariableW never sees a launch variable there.
+
+Verified with preserved-fixes/harnesses/udisks2-mock/ (a fake UDisks2 on a private bus; devwatch.exe logs every
+WM_DEVICECHANGE): insert, update, mount, update, unmount, mount, remove went from 6 arrivals (3 for an unreadable
+drive) + 1 removal to arrival at each mount (drive readable) and removal at unmount/remove; =0 restores the 6.
+Lightroom Classic (clean-room LrcRelease, runtime 122) with the mock card: stock opens Import ("Please select a
+source") the moment the unmounted card appears; with this, nothing until the mount, then Import opens.
+Not changed: an SD card still reports DRIVE_FIXED (udisks "flash_*" media maps to DEVICE_UNKNOWN), so Lightroom lists
+it under Files, not Devices.
+
+--- a/dlls/mountmgr.sys/device.c
++++ b/dlls/mountmgr.sys/device.c
+@@ -119,6 +119,16 @@
+     return &guid;
+ }
+ 
++/* NEUTRON (Neutron#15): kill switch NEUTRON_MOUNT_NOTIFY_MOUNTED=0 -- announce every add of a removable drive,
++ * mounted or not, as stock Wine does. Read on the Unix side (see neutron_notify_on_mount in unixlib.c). */
++static BOOL neutron_notify_on_mount(void)
++{
++    static int on = -1;
++
++    if (on < 0) on = !MOUNTMGR_CALL( neutron_notify_on_mount, NULL );
++    return on;
++}
++
+ /* send notification about a change to a given drive */
+ static void send_notify( int drive, int code )
+ {
+@@ -1254,7 +1264,8 @@
+     NTSTATUS status = STATUS_SUCCESS;
+     struct dos_drive *drive, *next;
+     struct volume *volume;
+-    int notify = -1;
++    int notify = -1, notify_code = DBT_DEVICEARRIVAL;
++    BOOL was_mounted = FALSE;
+     char dosdev[] = "a::";
+ 
+     EnterCriticalSection( &device_section );
+@@ -1267,7 +1278,11 @@
+ 
+         LIST_FOR_EACH_ENTRY_SAFE( drive, next, &drives_list, struct dos_drive, entry )
+         {
+-            if (drive->volume->udi && !strcmp( udi, drive->volume->udi )) goto found;
++            if (drive->volume->udi && !strcmp( udi, drive->volume->udi ))
++            {
++                was_mounted = drive->volume->device->unix_mount != NULL;
++                goto found;
++            }
+             if (drive->drive == letter) delete_dos_device( drive );
+         }
+     }
+@@ -1327,13 +1342,30 @@
+         RegCloseKey( hkey );
+     }
+ 
+-    if (udi) notify = drive->drive;
++    /* NEUTRON (Neutron#15): announce a removable drive when its media becomes usable, as Windows does, not on
++     * every add. udisks reports an inserted card before anything has mounted it, then again on every property
++     * change, and each add was broadcast as DBT_DEVICEARRIVAL: Lightroom Classic opened Import for a card it
++     * could not read yet (over the desktop's mount prompt), and again once it was mounted. Now: arrival when the
++     * drive gets a mount point, removal when it loses it (remove_dos_device already sends removal only for a
++     * mounted drive), nothing otherwise. */
++    if (udi)
++    {
++        BOOL mounted = mount_point && mount_point[0];
++
++        if (!neutron_notify_on_mount()) notify = drive->drive;
++        else if (mounted && !was_mounted) notify = drive->drive;
++        else if (!mounted && was_mounted)
++        {
++            notify = drive->drive;
++            notify_code = DBT_DEVICEREMOVECOMPLETE;
++        }
++    }
+     if (scsi_info) create_scsi_entry( volume, scsi_info );
+ 
+ done:
+     if (volume) release_volume( volume );
+     LeaveCriticalSection( &device_section );
+-    if (notify != -1) send_notify( notify, DBT_DEVICEARRIVAL );
++    if (notify != -1) send_notify( notify, notify_code );
+     return status;
+ }
+ 
+--- a/dlls/mountmgr.sys/unixlib.c
++++ b/dlls/mountmgr.sys/unixlib.c
+@@ -633,6 +633,16 @@
+     return status;
+ }
+ 
++/* NEUTRON (Neutron#15): the kill switch NEUTRON_MOUNT_NOTIFY_MOUNTED=0, read from the UNIX environment. mountmgr runs
++ * in winedevice.exe, which services.exe starts with a Windows environment built from the registry
++ * (CreateEnvironmentBlock), so a variable set for the launch never reaches GetEnvironmentVariableW there; the Unix
++ * environment is inherited from the process that started the wineserver. */
++static NTSTATUS neutron_notify_on_mount( void *args )
++{
++    const char *e = getenv( "NEUTRON_MOUNT_NOTIFY_MOUNTED" );
++    return e && e[0] == '0' ? STATUS_NOT_SUPPORTED : STATUS_SUCCESS;
++}
++
+ const unixlib_entry_t __wine_unix_call_funcs[] =
+ {
+     run_loop,
+@@ -655,6 +665,7 @@
+     write_credential,
+     delete_credential,
+     enumerate_credentials,
++    neutron_notify_on_mount,
+ };
+ 
+ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
+--- a/dlls/mountmgr.sys/unixlib.h
++++ b/dlls/mountmgr.sys/unixlib.h
+@@ -174,6 +174,7 @@
+     unix_write_credential,
+     unix_delete_credential,
+     unix_enumerate_credentials,
++    unix_neutron_notify_on_mount,
+     unix_funcs_count
+ };
+ 
