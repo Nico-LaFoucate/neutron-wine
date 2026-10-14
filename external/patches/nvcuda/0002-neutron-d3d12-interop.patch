@@ -1,0 +1,202 @@
+# Neutron#21 follow-up (11.10-122): map D3D12_HEAP / D3D12_RESOURCE / D3D11_RESOURCE memory handles to Linux OPAQUE_FD
+# and D3D12/D3D11 fences to TIMELINE_SEMAPHORE_FD through the D3DKMT object (neutron_d3dkmt_object_fd), so Premiere
+# 2026 can import vkd3d-proton's shared buffers and fences into CUDA. Also adds the missing break after the
+# OPAQUE_WIN32_KMT memory case and clearer error logs. Kill switch NEUTRON_CUDA_D3D_INTEROP=0. Applies after
+# 0001-neutron.patch. Pairs with vkd3d-proton/0002-neutron-shared-committed-buffers.patch.
+diff --git a/dlls/nvcuda/internal.c b/dlls/nvcuda/internal.c
+index 762140c..e525e62 100644
+--- a/dlls/nvcuda/internal.c
++++ b/dlls/nvcuda/internal.c
+@@ -167,27 +167,40 @@ int get_shared_resource_fd(HANDLE win32_handle)
+  *
+  * Returns a host fd suitable for cuImportExternalMemory(OPAQUE_FD), or -1. */
+ int get_shared_resource_fd_d3dkmt(HANDLE shared)
++{
++    return neutron_d3dkmt_object_fd(shared, D3DKMT_RESOURCE);
++}
++
++/* NEUTRON 2026-10-14 (Neutron#21) -- the same route for any D3DKMT object type. winevulkan exports
++ * memory as D3DKMT_RESOURCE (a D3D12 heap or resource too) and timeline semaphores / D3D12 fences
++ * as D3DKMT_SYNC (dlls/win32u/vulkan.c: d3dkmt_create_resource / d3dkmt_create_sync). A resource
++ * carries runtime data (the DXGI descriptor) that the open needs a buffer for; a sync has none
++ * (win32u's d3dkmt_open_sync opens it with a zero-size runtime). */
++int neutron_d3dkmt_object_fd(HANDLE shared, unsigned int type)
+ {
+     unsigned int status, runtime_size = 0;
+     HANDLE object = NULL;
+     void *runtime = NULL;
+     int unix_fd = -1;
+ 
+-    SERVER_START_REQ( d3dkmt_object_query )
++    if (type == D3DKMT_RESOURCE)
+     {
+-        req->type   = D3DKMT_RESOURCE;
+-        req->global = 0;
+-        req->handle = wine_server_obj_handle( shared );
+-        status = wine_server_call( req );
+-        runtime_size = reply->runtime_size;
+-    }
+-    SERVER_END_REQ;
++        SERVER_START_REQ( d3dkmt_object_query )
++        {
++            req->type   = type;
++            req->global = 0;
++            req->handle = wine_server_obj_handle( shared );
++            status = wine_server_call( req );
++            runtime_size = reply->runtime_size;
++        }
++        SERVER_END_REQ;
+ 
+-    if (status)
+-    {
+-        ERR("neutron-d3dkmt: the server does not know shared handle %p as a resource (status %#x)\n",
+-             shared, status);
+-        return -1;
++        if (status)
++        {
++            ERR("neutron-d3dkmt: the server does not know shared handle %p as a resource (status %#x)\n",
++                 shared, status);
++            return -1;
++        }
+     }
+ 
+     /* mirror win32u's d3dkmt_open_resource(): query for the runtime-data size, then open with a
+@@ -197,7 +210,7 @@ int get_shared_resource_fd_d3dkmt(HANDLE shared)
+ 
+     SERVER_START_REQ( d3dkmt_object_open )
+     {
+-        req->type   = D3DKMT_RESOURCE;
++        req->type   = type;
+         req->global = 0;
+         req->handle = wine_server_obj_handle( shared );
+         if (runtime) wine_server_set_reply( req, runtime, runtime_size );
+@@ -209,7 +222,7 @@ int get_shared_resource_fd_d3dkmt(HANDLE shared)
+ 
+     if (status || !object)
+     {
+-        ERR("neutron-d3dkmt: failed to open resource %p (status %#x)\n", shared, status);
++        ERR("neutron-d3dkmt: failed to open shared handle %p as type %u (status %#x)\n", shared, type, status);
+         return -1;
+     }
+ 
+@@ -218,7 +231,7 @@ int get_shared_resource_fd_d3dkmt(HANDLE shared)
+ 
+     if (status || unix_fd < 0)
+     {
+-        ERR("neutron-d3dkmt: resource object has no fd (status %#x)\n", status);
++        ERR("neutron-d3dkmt: object of type %u has no fd (status %#x)\n", type, status);
+         return -1;
+     }
+ 
+diff --git a/dlls/nvcuda/nvcuda.c b/dlls/nvcuda/nvcuda.c
+index 5b9f23d..7f9e899 100644
+--- a/dlls/nvcuda/nvcuda.c
++++ b/dlls/nvcuda/nvcuda.c
+@@ -4520,6 +4520,43 @@ CUresult WINAPI wine_cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void *
+     return pcuLaunchHostFunc_ptsz(hStream, fn, userData);
+ }
+ 
++/* NEUTRON 2026-10-14 (Neutron#21) -- D3D11/D3D12 interop handles for Linux CUDA.
++ * Premiere 2026 with its DirectX display hands frames between CUDA and D3D12 through
++ * cuImportExternalMemory(D3D12_HEAP / D3D12_RESOURCE) and cuImportExternalSemaphore(D3D12_FENCE).
++ * Linux libcuda knows none of the Windows handle types, so they reached it as raw handle values and
++ * failed with CUDA_ERROR_INVALID_VALUE on every frame (300x in one session) -- Premiere then fell back
++ * to a host-memory path and playback crawled. Under this Wine a shared D3D11/D3D12 object is a D3DKMT
++ * object over the Vulkan memory / timeline semaphore that winevulkan exported as an opaque fd, so the
++ * fd is reachable the same way the D3D11 interop above reaches it. Kill switch:
++ * NEUTRON_CUDA_D3D_INTEROP=0 (pass the handle through untouched, the old behavior). */
++static BOOL neutron_d3d_interop_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv("NEUTRON_CUDA_D3D_INTEROP");
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
++static int neutron_d3d_handle_fd(HANDLE handle, const void *name, unsigned int type, const char *what)
++{
++    static LONG logged;
++    int fd = -1;
++
++    if (!handle && name)
++        ERR("neutron-d3dinterop: %s shared by NAME is not supported\n", what);
++    else if ((fd = neutron_d3dkmt_object_fd(handle, type)) < 0)
++    {
++        NTSTATUS status = wine_server_handle_to_fd(handle, GENERIC_ALL, &fd, NULL);
++        if (status || fd < 0) fd = -1;
++    }
++    if (fd < 0 || InterlockedIncrement(&logged) <= 16)
++        ERR("neutron-d3dinterop: %s handle %p -> fd %d\n", what, handle, fd);
++    return fd;
++}
++
+ CUresult WINAPI wine_cuImportExternalMemory(void *extMem_out, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC *memHandleDesc)
+ {
+     TRACE("(%p, %p)\n", extMem_out, memHandleDesc);
+@@ -4538,12 +4575,25 @@ CUresult WINAPI wine_cuImportExternalMemory(void *extMem_out, const CUDA_EXTERNA
+             handle = get_shared_resource_kmt_handle(linuxHandleDesc.handle.win32.handle);
+             linuxHandleDesc.handle.fd = get_shared_resource_fd(handle);
+             linuxHandleDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
++            break;
++        case CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP:
++        case CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE:
++        case CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_RESOURCE:
++            if (!neutron_d3d_interop_on()) break;
++            linuxHandleDesc.handle.fd = neutron_d3d_handle_fd(memHandleDesc->handle.win32.handle,
++                    memHandleDesc->handle.win32.name, D3DKMT_RESOURCE,
++                    memHandleDesc->type == CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP ? "D3D12 heap" :
++                    memHandleDesc->type == CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE ? "D3D12 resource" :
++                    "D3D11 resource");
++            linuxHandleDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
++            break;
+         default:
+             break;
+     }
+ 
+     CUresult ret = pcuImportExternalMemory(extMem_out, &linuxHandleDesc);
+-    if(ret) ERR("Returned error: %d\n", ret);
++    if(ret) ERR("Returned error: %d (type %d -> %d, size %llu, flags %#x)\n", ret, memHandleDesc->type,
++                linuxHandleDesc.type, (unsigned long long)memHandleDesc->size, memHandleDesc->flags);
+     return ret;
+ }
+ 
+@@ -4606,13 +4656,23 @@ CUresult WINAPI wine_cuImportExternalSemaphore(CUexternalSemaphore *extSem_out,
+             linuxHandleDesc.handle.fd = get_shared_resource_fd(linuxHandleDesc.handle.win32.handle);
+             linuxHandleDesc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD;
+             break;
++        case CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE:
++        case CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE:
++            /* a D3D12/D3D11 fence is a timeline semaphore under winevulkan (D3DKMT_SYNC) */
++            if (!neutron_d3d_interop_on()) break;
++            linuxHandleDesc.handle.fd = neutron_d3d_handle_fd(semHandleDesc->handle.win32.handle,
++                    semHandleDesc->handle.win32.name, D3DKMT_SYNC,
++                    semHandleDesc->type == CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE ? "D3D12 fence" : "D3D11 fence");
++            linuxHandleDesc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_TIMELINE_SEMAPHORE_FD;
++            break;
+         default:
+             break;
+     }
+ 
+     CUresult ret = pcuImportExternalSemaphore(extSem_out, &linuxHandleDesc);
+     if(!ret) semaphoreHandling(extSem_out);
+-    else ERR("Returned error: %d\n", ret);
++    else ERR("Returned error: %d (type %d -> %d, flags %#x)\n", ret, semHandleDesc->type,
++             linuxHandleDesc.type, semHandleDesc->flags);
+ 
+     return ret;
+ }
+diff --git a/dlls/nvcuda/nvcuda.h b/dlls/nvcuda/nvcuda.h
+index c1bdfeb..b3b7a35 100644
+--- a/dlls/nvcuda/nvcuda.h
++++ b/dlls/nvcuda/nvcuda.h
+@@ -28,6 +28,7 @@ void __attribute((visibility("hidden"))) cuda_process_tls_callbacks(DWORD reason
+ CUresult __attribute((visibility("hidden"))) cuda_get_table(const void **table, const CUuuid *uuid, const void *orig_table, CUresult orig_result);
+ int __attribute((visibility("hidden"))) get_shared_resource_fd(HANDLE win32_handle);
+ int __attribute((visibility("hidden"))) get_shared_resource_fd_d3dkmt(HANDLE shared);
++int __attribute((visibility("hidden"))) neutron_d3dkmt_object_fd(HANDLE shared, unsigned int type);
+ HANDLE __attribute((visibility("hidden"))) get_shared_resource_kmt_handle(HANDLE shared_resource);
+ 
+ #endif

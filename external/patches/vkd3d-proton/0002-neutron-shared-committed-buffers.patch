@@ -1,0 +1,149 @@
+# Neutron#21 follow-up (11.10-122): export SHARED committed BUFFERS like vkd3d-proton already exports shared committed
+# textures -- external-memory buffer create info, export allocate info on a dedicated allocation, and the D3DKMT open --
+# so ID3D12Device::CreateSharedHandle on a shared buffer returns a real NT handle. Premiere 2026's CUDA <-> D3D12 frame
+# sharing (cuImportExternalMemory of a shared buffer) failed on every frame without it (3102 failures in a session on
+# 121, 0 with this). Kill switch NEUTRON_VKD3D_SHARED_BUFFERS=0. Applies after 0001-neutron.patch. Pairs with
+# nvcuda/0002-neutron-d3d12-interop.patch.
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index e1d41d02..8ecb4109 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1281,6 +1281,7 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     VkMemoryPriorityAllocateInfoEXT priority_info;
++    VkMemoryDedicatedAllocateInfo dedicated_info;
+     VkMemoryRequirements memory_requirements;
+     VkMemoryAllocateFlagsInfo flags_info;
+     VkMemoryPropertyFlags type_flags;
+@@ -1389,6 +1390,19 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
+         flags_info.flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+     }
+ 
++    /* NEUTRON (Neutron#21): an exported allocation that owns a global buffer is a SHARED committed buffer.
++     * Make it a dedicated allocation of that buffer, as a D3D12 committed resource is: an importer such as
++     * CUDA (cuImportExternalMemory with CUDA_EXTERNAL_MEMORY_DEDICATED, which Premiere 2026 passes) expects
++     * exactly that. */
++    if (allocation->resource.vk_buffer && vk_find_pnext(info->pNext, VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO))
++    {
++        dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++        dedicated_info.pNext = flags_info.pNext;
++        dedicated_info.image = VK_NULL_HANDLE;
++        dedicated_info.buffer = allocation->resource.vk_buffer;
++        flags_info.pNext = &dedicated_info;
++    }
++
+     allocation->resource.size = info->memory_requirements.size;
+ 
+     if (info->heap_flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH)
+@@ -2151,6 +2165,7 @@ HRESULT vkd3d_allocate_heap_memory(struct d3d12_device *device, struct vkd3d_mem
+     alloc_info.heap_properties = info->heap_desc.Properties;
+     alloc_info.heap_flags = info->heap_desc.Flags;
+     alloc_info.host_ptr = info->host_ptr;
++    alloc_info.pNext = info->pNext; /* NEUTRON: a chain also means "never suballocate" (vkd3d_memory_info_allow_suballocate) */
+     alloc_info.vk_memory_priority = info->vk_memory_priority;
+     alloc_info.explicit_global_buffer_usage = info->explicit_global_buffer_usage;
+ 
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 93b76f36..196a1b7e 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -100,6 +100,23 @@ VkSampleCountFlagBits vk_samples_from_dxgi_sample_desc(const DXGI_SAMPLE_DESC *d
+     return VK_SAMPLE_COUNT_1_BIT;
+ }
+ 
++#ifdef _WIN32
++/* NEUTRON (Neutron#21): kill switch NEUTRON_VKD3D_SHARED_BUFFERS=0 -- shared committed buffers are created
++ * without exportable memory again (CreateSharedHandle returns no handle, as before 11.10-122). Read once. */
++static bool neutron_shared_buffers(void)
++{
++    static int v = -1;
++    char e[8];
++
++    if (v < 0)
++    {
++        v = !(vkd3d_get_env_var("NEUTRON_VKD3D_SHARED_BUFFERS", e, sizeof(e)) && e[0] == '0');
++        if (!v) ERR("NEUTRON_VKD3D_SHARED_BUFFERS=0: shared committed buffers are not exported.\n");
++    }
++    return v;
++}
++#endif
++
+ HRESULT vkd3d_create_buffer_explicit_usage(struct d3d12_device *device,
+         VkBufferUsageFlags2KHR vk_usage_flags, VkDeviceSize size, const char *tag, VkBuffer *vk_buffer)
+ {
+@@ -193,6 +210,18 @@ HRESULT vkd3d_create_buffer(struct d3d12_device *device,
+         external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+         buffer_info.pNext = &external_info;
+     }
++#ifdef _WIN32
++    /* NEUTRON (Neutron#21): a SHARED buffer's memory is exported as an NT handle (committed buffers, see
++     * d3d12_resource_create_committed), and Vulkan requires a buffer bound to exported memory to declare
++     * the handle type. Same convention as images (vkd3d_get_image_create_info). */
++    else if (heap_properties && (heap_flags & D3D12_HEAP_FLAG_SHARED) && neutron_shared_buffers())
++    {
++        external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
++        external_info.pNext = NULL;
++        external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++        buffer_info.pNext = &external_info;
++    }
++#endif
+ 
+     if (sparse_resource)
+     {
+@@ -4414,6 +4443,9 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+     else
+     {
+         struct vkd3d_allocate_heap_memory_info allocate_info;
++#ifdef _WIN32
++        VkExportMemoryAllocateInfo export_info;
++#endif
+ 
+         memset(&allocate_info, 0, sizeof(allocate_info));
+         allocate_info.heap_desc.Properties = *heap_properties;
+@@ -4422,6 +4454,21 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+         allocate_info.heap_desc.Flags = heap_flags | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+         allocate_info.vk_memory_priority = object->priority.residency_count ? vkd3d_convert_to_vk_prio(object->priority.d3d12priority) : 0.f;
+ 
++#ifdef _WIN32
++        /* NEUTRON (Neutron#21): export a SHARED committed buffer like a shared committed texture, so
++         * CreateSharedHandle returns a real NT handle. Without this the memory was never exportable:
++         * vkGetMemoryWin32HandleKHR handed back NULL and Premiere 2026's CUDA <-> D3D12 frame sharing
++         * (cuImportExternalMemory of a shared buffer) failed on every frame. A chained allocation is
++         * never suballocated, so the buffer gets its own VkDeviceMemory. */
++        if ((heap_flags & D3D12_HEAP_FLAG_SHARED) && neutron_shared_buffers())
++        {
++            memset(&export_info, 0, sizeof(export_info));
++            export_info.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++            export_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
++            allocate_info.pNext = &export_info;
++        }
++#endif
++
+         if (!VKD3D_CONFIG_FLAG_IS_SET(DAMAGE_NOT_ZEROED_ALLOCATIONS))
+         {
+             /* Unfortunately, we cannot trust CREATE_NOT_ZEROED to actually do anything.
+@@ -4435,6 +4482,11 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+                 &device->memory_allocator, &allocate_info, &object->mem)))
+             goto fail;
+ 
++#ifdef _WIN32
++        if ((heap_flags & D3D12_HEAP_FLAG_SHARED) && neutron_shared_buffers())
++            d3d12_resource_open_export_kmt(object, device, &object->mem);
++#endif
++
+         object->res.vk_buffer = object->mem.resource.vk_buffer;
+         object->res.va = object->mem.resource.va;
+     }
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 2918aba1..04a5898c 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -798,6 +798,7 @@ struct vkd3d_allocate_heap_memory_info
+ {
+     D3D12_HEAP_DESC heap_desc;
+     void *host_ptr;
++    const void *pNext; /* NEUTRON: extra VkMemoryAllocateInfo chain (export info for shared committed buffers) */
+     uint32_t extra_allocation_flags;
+     float vk_memory_priority;
+     VkBufferUsageFlags2KHR explicit_global_buffer_usage;

@@ -757,6 +757,19 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzz-winewayland-output-transform.mypatch` (2026-10-14) — rotated (portrait) monitors reported landscape at the wrong dpi
+Reporter (Neutron#20, AMD, KDE): Illustrator 2026's menus are drawn at about half size inside an oversized white pop-up;
+their second screen is a 1080x1920 portrait at (0,0). `wl_output.mode` is in the panel's hardware orientation, before the
+output transform, and winewayland never read the transform (upstream 11.10 doesn't either): the portrait screen became a
+1920x1080 monitor, our per-monitor dpi made it 96 x 1920/1080 = 171 dpi, and its rect pushed the other monitor sideways.
+The transform from `wl_output.geometry` is now kept per output and every mode size that reaches win32u goes through
+`wayland_output_mode_width/height()` (arrangement, monitor rect, dpi, work-area inset, mode list); modes carry
+dmDisplayOrientation DMDO_90/180/270 as winex11 maps RandR rotations. Unrotated outputs are unchanged. Kill switch
+`NEUTRON_OUTPUT_TRANSFORM=0`. Verified on a nested KWin with one rotated output
+(`preserved-fixes/harnesses/kwin-nested/start.sh`): `monitors.exe pm` went from DISPLAY1 (0,0)-(2560,1440) dpi 171 +
+DISPLAY2 at (2560,326) to (0,0)-(1440,2560) dpi 96 + (1440,581) dpi 96 (the compositor's layout); clean-room Illustrator
+2026's File and Edit menus went from tiny text in a white box to normal size under the menu bar, at Wine 100% and 150%.
+
 ### `neutron-zzzzzzzzzzzzzzzzzz-winewayland-crop-origin.mypatch` (2026-10-13) — Premiere Program Monitor black line; pointer 5 px off in maximized Premiere
 Operator: *"the black line is back on the left side of the program monitor"* (present on shipped 117 too). A maximized
 Premiere keeps the frame-inflated window rect (-5,51) 3850x2114 (since 11.10-78's maxkeep), so the frame-spill crop

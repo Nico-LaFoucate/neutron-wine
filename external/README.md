@@ -36,9 +36,15 @@ Exact commits are in [`sources.conf`](sources.conf).
   but those changes never ran in daily use, so dxgi is built without them and the build checks that.
 - **vkd3d-proton** (`patches/vkd3d-proton/`): the blit-to-window present path
   (`libs/vkd3d/blit_to_window.h`) and `NEUTRON_DISABLE_BTW`, which apps that draw better without
-  it (Photoshop, Lightroom Classic, After Effects) set in their launch profiles.
+  it (Photoshop, Lightroom Classic, After Effects) set in their launch profiles. `0002`
+  (11.10-122) exports shared committed buffers the way vkd3d-proton already exports shared
+  committed textures, so CreateSharedHandle returns a real handle for them (kill switch
+  `NEUTRON_VKD3D_SHARED_BUFFERS=0`).
 - **nvcuda** (`patches/nvcuda/`): `cuGraphicsD3D11RegisterResource` and the D3D11/CUDA interop
-  that After Effects needs to render compositions.
+  that After Effects needs to render compositions. `0002` (11.10-122) imports D3D12 heaps,
+  resources and fences (and D3D11 resources and fences) through their D3DKMT objects: Premiere
+  2026's DirectX display hands every frame between CUDA and D3D12 this way (Neutron#21; kill
+  switch `NEUTRON_CUDA_D3D_INTEROP=0`).
 - **dxvk-nvapi** (`patches/dxvk-nvapi/`): not ours. These are Sveinar Søpler's 11 commits from
   [SveSop/dxvk-nvapi](https://github.com/SveSop/dxvk-nvapi), exported with `git format-patch`
   so his authorship is kept. They add the V2 `NvAPI_GPU_CudaEnumComputeCapableGpus`, newer GPU
