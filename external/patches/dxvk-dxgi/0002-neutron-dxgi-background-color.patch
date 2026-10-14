@@ -1,0 +1,63 @@
+dxgi: store and return the swap chain background color (Neutron#21)
+
+DxgiSwapChain::GetBackgroundColor / SetBackgroundColor were E_NOTIMPL stubs. Premiere Pro 2026 with its
+DirectX display (Adobe's default; needed for the Transform/Crop handles, which 26.x draws with its GPU
+overlay renderer) calls SetBackgroundColor on the Program Monitor swap chain every frame and treats the
+failure as fatal, so it never presented and the monitor stayed black. Windows validates each component
+is in [0,1] and returns E_INVALIDARG otherwise; the color is stored and returned. DXVK draws no letterbox
+background, so presentation is unchanged.
+
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -177,8 +177,12 @@
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::GetBackgroundColor(
+           DXGI_RGBA*                pColor) {
+-    Logger::err("DxgiSwapChain::GetBackgroundColor: Not implemented");
+-    return E_NOTIMPL;
++    if (!pColor)
++      return E_INVALIDARG;
++
++    std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
++    *pColor = m_backgroundColor;
++    return S_OK;
+   }
+   
+   
+@@ -563,8 +567,19 @@
+   
+   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetBackgroundColor(
+     const DXGI_RGBA*                pColor) {
+-    Logger::err("DxgiSwapChain::SetBackgroundColor: Not implemented");
+-    return E_NOTIMPL;
++    if (!pColor)
++      return E_INVALIDARG;
++
++    /* Windows validates that all components are within [0,1]. */
++    if (pColor->r < 0.0f || pColor->r > 1.0f
++     || pColor->g < 0.0f || pColor->g > 1.0f
++     || pColor->b < 0.0f || pColor->b > 1.0f
++     || pColor->a < 0.0f || pColor->a > 1.0f)
++      return E_INVALIDARG;
++
++    std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
++    m_backgroundColor = *pColor;
++    return S_OK;
+   }
+   
+   
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -204,6 +204,12 @@
+ 
+     DXGI_COLOR_SPACE_TYPE           m_colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+ 
++    /* NEUTRON (Neutron#21): Get/SetBackgroundColor were E_NOTIMPL stubs. Premiere 2026's D3D12
++     * presentation chain treats the failure as fatal every frame and never calls Present, so with
++     * Premiere's DirectX display the Program Monitor stays black. Store and return the color like
++     * Windows (opaque black default); DXVK does not draw a letterbox background. */
++    DXGI_RGBA                       m_backgroundColor = { 0.0f, 0.0f, 0.0f, 1.0f };
++
+     uint32_t                        m_globalHDRStateSerial = 0;
+     bool                            m_hasLatencyControl = false;
+ 

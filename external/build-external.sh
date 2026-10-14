@@ -200,9 +200,12 @@ must = {
     "nvapi/i386-windows/nvapi.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
 }
 never = [b"neutron-rtlog"]
-# dxgi must behave like the validated 2026-07-23 build: the bridge hooks above and nothing else.
+# dxgi must behave like the validated 2026-07-23 build plus the 11.10-121 background color: the bridge
+# hooks above, Get/SetBackgroundColor implemented (so the stubs' "BackgroundColor: Not implemented"
+# strings are gone; the implementation logs nothing), and nothing else.
 dxgi_never = [b"\xa1\xf6\xd0\xb5\x4e\x7c\x2a\x4d\x9b\x8e\x3f\x5a\x2c\x1d\x0e\x9f",  # IID_INeutronBoundedAcquire
-              b"NEUTRON_", b"neutron-acq", b"neutron-sctrace", b"GetBackgroundColor -> S_OK"]
+              b"NEUTRON_", b"neutron-acq", b"neutron-sctrace", b"GetBackgroundColor -> S_OK",
+              b"BackgroundColor"]
 home_needles = [home.encode() + b"/", (home + "/").encode("utf-16-le"),
                 home.replace("/", "\\").encode(), home.replace("/", "\\").encode("utf-16-le")]
 # DXVK's version is `git describe --dirty=+`; the hash abbreviation length varies by clone.

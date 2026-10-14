@@ -8,7 +8,7 @@ provision` copies them into each prefix and writes their DLL overrides.
 | Project | Upstream | Ships | Neutron patch | License |
 |---|---|---|---|---|
 | DXVK | [doitsujin/dxvk](https://github.com/doitsujin/dxvk) | x64 `d3d11` | yes | zlib |
-| DXVK (bridge hooks only) | same | x64 `dxgi` | yes (`patches/dxvk-dxgi`) | zlib |
+| DXVK (bridge hooks + background color) | same | x64 `dxgi` | yes (`patches/dxvk-dxgi`) | zlib |
 | DXVK (unmodified) | same | x64 `d3d8`, `d3d9`, `d3d10core`; all x86 | no | zlib |
 | vkd3d-proton | [HansKristian-Work/vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) | x64 `d3d12`, `d3d12core` | yes | LGPL-2.1 |
 | vkd3d-proton v3.0.1 | same | x86 `d3d12`, `d3d12core` | no | LGPL-2.1 |
@@ -28,10 +28,12 @@ Exact commits are in [`sources.conf`](sources.conf).
   `0002` adds d3d11's two WinRT interop exports, `CreateDirect3D11SurfaceFromDXGISurface` and
   `CreateDirect3D11DeviceFromDXGIDevice`, which WinRT media and capture APIs take their surfaces
   from (Lightroom Classic's video toolkit imports the first).
-- **dxgi** (`patches/dxvk-dxgi/`): only the two hooks that hand swapchains to Wine's
-  DirectComposition bridge, exactly what the validated dxgi carried. `patches/dxvk` also changes
-  dxgi (forwarding the bounded-wait handshake, storing the background color, tracing), but those
-  changes never ran in daily use, so dxgi is built without them and the build checks that.
+- **dxgi** (`patches/dxvk-dxgi/`): `0001` is the two hooks that hand swapchains to Wine's
+  DirectComposition bridge, exactly what the validated dxgi carried. `0002` (11.10-121) stores and
+  returns the swap chain's background color instead of failing with E_NOTIMPL: Premiere 2026's
+  DirectX display calls SetBackgroundColor every frame and never presents while it fails
+  (Neutron#21). `patches/dxvk` also changes dxgi (forwarding the bounded-wait handshake, tracing),
+  but those changes never ran in daily use, so dxgi is built without them and the build checks that.
 - **vkd3d-proton** (`patches/vkd3d-proton/`): the blit-to-window present path
   (`libs/vkd3d/blit_to_window.h`) and `NEUTRON_DISABLE_BTW`, which apps that draw better without
   it (Photoshop, Lightroom Classic, After Effects) set in their launch profiles.
