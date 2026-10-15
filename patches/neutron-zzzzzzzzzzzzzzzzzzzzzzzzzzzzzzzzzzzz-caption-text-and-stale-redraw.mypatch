@@ -1,0 +1,122 @@
+win32u: draw the caption from the window's own text, and draw a title set while WS_VISIBLE was off
+
+Lightroom Classic's title bar showed the previous module after every switch ("Library" while Develop was up),
+while the Win32 title was right. Measured on the nested desk with a caption trace: Lightroom retitles its frame
+with WS_VISIBLE cleared around the call -- SetWindowLong(GWL_STYLE) 17cf4000 -> 07cf4000, SetWindowText,
+07cf4000 -> 17cf4000. DefWindowProc(WM_SETTEXT) repainted the caption only if the window is visible, so nothing
+drew the new title until the next caption paint, which came with the next switch: one change behind.
+
+On Windows the desktop compositor draws a standard caption from the window text whenever it changes, with no
+paint by the app, so the new title shows regardless. Here:
+- WM_SETTEXT on a captioned window without WS_VISIBLE marks the caption stale (WIN_CAPTION_STALE);
+- when WS_VISIBLE comes back (set_window_long GWL_STYLE, set_window_style_bits -- e.g. WM_SETREDRAW TRUE) a
+  stale caption is redrawn (WM_NCPAINT to the window); any caption paint clears the mark.
+- The caption text is the window's own text (NtUserInternalGetWindowText), as Windows draws it, not a WM_GETTEXT
+  sent to the app. harnesses/caption-cache.c (an app that answers WM_GETTEXT from a cache it updates after
+  DefWindowProc): caption "ALPHA" after SetWindowText("ALPHA"), SetWindowText("BRAVO") before; "BRAVO" now.
+  NEUTRON_CAPTION_TEXT_SEND=1 restores the WM_GETTEXT.
+
+Lightroom: Library, Develop, Library, Develop -- the caption matches the Win32 title after each switch (it
+showed the previous one each time before). First Masking open unchanged (0.9 / 0.8 s).
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -328,9 +328,29 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON: WS_VISIBLE came back on a window whose title changed while it was off: draw the caption now, as the
++ * compositor on Windows shows the new title without the app (see WM_SETTEXT in default_window_proc) */
++void neutron_redraw_stale_caption( HWND hwnd )
++{
++    if (!(win_set_flags( hwnd, 0, WIN_CAPTION_STALE ) & WIN_CAPTION_STALE)) return;
++    if ((get_window_long( hwnd, GWL_STYLE ) & WS_CAPTION) != WS_CAPTION || !is_window_visible( hwnd )) return;
++    send_message( hwnd, WM_NCPAINT, 1, 0 );
++}
++
++/* the text the caption shows */
+ static int get_window_text( HWND hwnd, WCHAR *str, int count )
+ {
+     int ret;
++    static int send = -1;
++
++    /* NEUTRON (2026-10-15): Windows draws a caption from the window's own text (what DefWindowProc(WM_SETTEXT)
++     * stored), never by sending WM_GETTEXT. Lightroom Classic answers WM_GETTEXT from a cached title it updates
++     * only after DefWindowProc(WM_SETTEXT) returns, and DefWindowProc repaints the caption before that: its title
++     * bar showed the previous module every time ("Library" while Develop was up; the Win32 title was right).
++     * harnesses/caption-cache.c: "ALPHA" in the caption after SetWindowText("BRAVO") before, "BRAVO" now.
++     * NEUTRON_CAPTION_TEXT_SEND=1 restores the WM_GETTEXT. */
++    if (send < 0) { const char *e = getenv( "NEUTRON_CAPTION_TEXT_SEND" ); send = e && e[0] == '1'; }
++    if (!send) return NtUserInternalGetWindowText( hwnd, str, count );
+ 
+     if (is_current_process_window( hwnd ))
+     {
+@@ -1561,6 +1581,7 @@
+     }
+ 
+     len = get_window_text( hwnd, buffer, ARRAY_SIZE( buffer ));
++    win_set_flags( hwnd, 0, WIN_CAPTION_STALE );  /* NEUTRON: drawn with the current text */
+     if (len)
+     {
+         NONCLIENTMETRICSW nclm;
+@@ -2619,7 +2640,17 @@
+         if (result)
+             NtUserNotifyWinEvent( EVENT_OBJECT_NAMECHANGE, hwnd, OBJID_WINDOW, CHILDID_SELF );
+         if (result && (get_window_long( hwnd, GWL_STYLE ) & WS_CAPTION) == WS_CAPTION)
++        {
++            /* NEUTRON (2026-10-15): on Windows the desktop compositor draws a standard caption from the window
++             * text whenever it changes, so a title set while the app has redraw off (WM_SETREDRAW FALSE clears
++             * WS_VISIBLE) still shows. Here the caption is the app thread's own NC paint, which a window without
++             * WS_VISIBLE skips. Lightroom Classic retitles its frame with WS_VISIBLE cleared around the call
++             * (SetWindowLong(GWL_STYLE) off, SetWindowText, back on): SetWindowText arrived with style 07cf4000 and
++             * the title bar kept the previous module until the next change. Remember it, and draw it when
++             * WS_VISIBLE comes back (neutron_redraw_stale_caption) or at the next caption paint. */
++            if (!(get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE)) win_set_flags( hwnd, WIN_CAPTION_STALE, 0 );
+             handle_nc_paint( hwnd , (HRGN)1 );  /* repaint caption */
++        }
+         break;
+ 
+     case WM_GETTEXTLENGTH:
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -93,6 +93,7 @@
+ #define WIN_CHILDREN_MOVED        0x0040 /* children may have moved, ignore stored positions */
+ #define WIN_HAS_IME_WIN           0x0080 /* the window has been registered with imm32 */
+ #define WIN_IS_IN_ACTIVATION      0x0100 /* the window is in an activation process */
++#define WIN_CAPTION_STALE         0x0200 /* NEUTRON: text changed while the caption could not be drawn */
+ 
+ #define WND_OTHER_PROCESS ((WND *)1)  /* returned by get_win_ptr on unknown window handles */
+ #define WND_DESKTOP       ((WND *)2)  /* returned by get_win_ptr on the desktop window */
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -268,6 +268,9 @@
+ extern BOOL is_virtual_desktop(void);
+ extern BOOL is_service_process(void);
+ 
++/* defwnd.c (NEUTRON) */
++extern void neutron_redraw_stale_caption( HWND hwnd );
++
+ /* window.c */
+ struct tagWND;
+ extern BOOL client_to_screen( HWND hwnd, POINT *pt );
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1584,6 +1584,7 @@
+ 
+     user_driver->pSetWindowStyle( hwnd, GWL_STYLE, &style );
+     if (made_visible) update_window_state( hwnd );
++    if (made_visible) neutron_redraw_stale_caption( hwnd );  /* NEUTRON: e.g. WM_SETREDRAW TRUE */
+ 
+     return style.styleOld;
+ }
+@@ -1822,7 +1823,10 @@
+         if (offset == GWL_STYLE && (style.styleOld & WS_VISIBLE) && !(style.styleNew & WS_VISIBLE))
+             neutron_on_window_hidden( hwnd );  /* NEUTRON: window hidden via GWL_STYLE clear */
+         if (offset == GWL_STYLE && !(style.styleOld & WS_VISIBLE) && (style.styleNew & WS_VISIBLE))
++        {
+             neutron_log_shown( hwnd, "STYLE" );  /* NEUTRON diag: shown via GWL_STYLE set */
++            neutron_redraw_stale_caption( hwnd );
++        }
+     }
+ 
+     return retval;

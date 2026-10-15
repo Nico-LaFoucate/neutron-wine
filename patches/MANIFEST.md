@@ -781,8 +781,35 @@ patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON
    WM_PAINT breaker's per-window count is never reset, so every window loses one legitimate paint per 2000; fires in
    Animate and Premiere logs on 124.
 4. `dlls/dwmapi/dwmapi_main.c` P2c caption-button width fallback: reverted (a workaround for 1's garbage rects).
-5. `dlls/win32u/window.c` NEUTRON_SHELL_FIX HSHELL_WINDOWREPLACED block: replaced by a different version (not checked).
-OPEN: restore 1 and 3 (and decide 4); audit the rest of this delta for non-commented reverts.
+5. `dlls/win32u/window.c` NEUTRON_SHELL_FIX HSHELL_WINDOWREPLACED block: replaced by the newer "Path A" version on
+   purpose (not a revert).
+1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1). OPEN: audit the rest of
+this delta for reverts without a NEUTRON comment.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-caption-text-and-stale-redraw.mypatch` (2026-10-15) — LrC title bar one module behind
+Lightroom retitles its frame with WS_VISIBLE cleared around SetWindowText (SetWindowLong off, SetWindowText, back on);
+DefWindowProc(WM_SETTEXT) skipped the caption repaint of an invisible window, so the title bar showed the previous
+module until the next switch. On Windows the compositor draws the caption from the text regardless. Now WM_SETTEXT
+without WS_VISIBLE marks the caption stale (`WIN_CAPTION_STALE`) and WS_VISIBLE coming back (set_window_long,
+set_window_style_bits) redraws it (WM_NCPAINT). The caption text is the window's own text, not a WM_GETTEXT sent to
+the app, as on Windows (`harnesses/caption-cache.c`: ALPHA→BRAVO). Kill switch for the text source only:
+`NEUTRON_CAPTION_TEXT_SEND=1`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-window-tree-shm.mypatch` (2026-10-15) — GetWindow and friends from shared memory ⚠️ PROTOCOL BUMP
+The rest of LrC's Masking-open cost was ~220,000 wineserver requests/s, 165,000 of them get_window_tree: its UI
+framework calls GetWindow ~135,000×/s (GW_CHILD/GW_HWNDNEXT) and GetDlgItem ~30,000×/s. Windows reads the tree from the
+desktop heap in user mode. `window_shm_t` now carries parent/owner/next/prev/first/last child + has_region +
+pixel_format, refreshed by the server on every list change; win32u answers get_window_relative, the
+siblings/children NtUserBuildHwndList lists, the no-region get_window_region and the plain surface clip from it, and
+apply_window_pos no longer computes an owner hint (a WindowFromPoint request) for child windows. Masking open 0.9 / 0.8 s
+(kill switch 2.5 s; 13.5 s before today). `NEUTRON_TREE_VERIFY=1` cross-checks every shared answer with the server
+(0 mismatches). Kill switch `NEUTRON_TREE_SHM=0`. **Protocol version bumped — wineserver, ntdll and win32u of BOTH
+arches must come from one build.**
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-restore-ps2026-reverts.mypatch` (2026-10-15) — re-apply scale_dpi sign + breaker reset
+Re-applies the two fixes `neutron-zzz-ps2026-complete` reverted: `server/user.h` scale_dpi signed arithmetic (unaware
+GetWindowRect of LrC's maximized frame: left 25565278 → −3) and BeginPaint → `neutron_break_validate()` (`harnesses/
+paint-breaker.c`: 2 of 4500 paints drained → 0). Not restored: dwmapi P2c (only worked around the garbage rects).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-zorder-reuse.mypatch` (2026-10-15) — Lightroom Masking lag, part 1
 "Significant lag when I click on masking": the first Masking open of a session builds ~90 windows and took 13.5–14.5 s

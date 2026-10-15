@@ -1,0 +1,552 @@
+server, win32u: publish the window tree in shared memory; answer GetWindow, the child/sibling lists and the
+no-region case without a server round trip
+
+Lightroom Classic's first Masking open took seconds where Windows takes a fraction of one. With the stacking
+fixes in, wineserver request counts during the open (diagnostic counter in call_req_handler) showed why: ~220,000
+requests a second from Lightroom's UI thread, 165,000 of them get_window_tree. A counter in get_window_relative
+put ~90,000 GW_CHILD + ~45,000 GW_HWNDNEXT a second on the app side: its UI framework walks the window tree
+constantly. On Windows GetWindow reads the tree from the desktop heap mapped into the process; here each call
+was a round trip (~15 us), i.e. ~2 s per second of building.
+
+- protocol.def window_shm_t gains the links get_window_tree replies with (parent, owner, next/prev sibling,
+  first/last child) plus has_region and pixel_format. The server refreshes them, compare-before-write, wherever
+  the lists change: link_window, set_parent_window (old parent too), update_window_zorder, set_window_owner,
+  create_window, window_destroy, set_window_region, the pixel-format flags.
+- win32u get_window_relative answers GW_HWNDNEXT/PREV/CHILD/HWNDFIRST/HWNDLAST from the shared object
+  (seqlock read, as for the DPI context); NtUserBuildHwndList builds the "siblings from hwnd" and "children,
+  recursively" lists from it (GetDlgItem = one such list: ~30,000 a second); get_window_region returns "no
+  region" locally; update_surface_region builds the clip of a top-level window with no region and no custom
+  pixel format itself (the server's get_surface_region is then its visible rect). Anything the shared copy cannot
+  answer (no links, the desktop window, a desktop/thread filter, a window vanishing mid-walk) asks the server.
+- apply_window_pos computed the driver's owner hint for child windows too, with a WindowFromPoint request on
+  every child SetWindowPos; a child gets no driver surface and the driver never reads its hint.
+
+Measured (clean-room LrC 15.6, nested KWin, fresh launch each): first Masking open 0.9 s / 0.8 s;
+NEUTRON_TREE_SHM=0 on the same binaries 2.5 s (13.5 s before any of today's fixes). Requests during the open
+~220,000/s -> ~60,000/s; get_window_tree and get_window_list gone from the top.
+NEUTRON_TREE_VERIFY=1 (test switch) asks the server as well for every shared answer and logs
+"neutron-treeverify: MISMATCH": 0 across Masking open, Select Subject, photo and module switching.
+
+Protocol version bumped (make_requests): every component must come from the same build.
+Kill switch NEUTRON_TREE_SHM=0 (client side; the server always publishes).
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -821,8 +821,114 @@
+ }
+ 
+ /* see GetWindow */
++/* NEUTRON window-tree-shm: hwnd's links (parent, owner, next, prev, first child, last child) from session shared
++ * memory, as the server publishes them (server/window.c update_window_links). FALSE when not available, and the
++ * caller asks the server. */
++static BOOL get_shared_window_links( HWND hwnd, user_handle_t links[6] )
++{
++    struct object_lock lock = OBJECT_LOCK_INIT;
++    const window_shm_t *window_shm = NULL;
++    unsigned int valid = 0;
++    NTSTATUS status;
++
++    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
++    {
++        valid    = window_shm->tree_valid;
++        links[0] = window_shm->parent;
++        links[1] = window_shm->owner;
++        links[2] = window_shm->next_sibling;
++        links[3] = window_shm->prev_sibling;
++        links[4] = window_shm->first_child;
++        links[5] = window_shm->last_child;
++    }
++    return !status && valid;
++}
++
++/* NEUTRON window-tree-shm: whether hwnd has a window region / a custom pixel format in it or a child, as the server
++ * publishes them. FALSE when not available. */
++static BOOL get_shared_window_shape( HWND hwnd, BOOL *has_region, BOOL *pixel_format )
++{
++    struct object_lock lock = OBJECT_LOCK_INIT;
++    const window_shm_t *window_shm = NULL;
++    unsigned int valid = 0;
++    NTSTATUS status;
++
++    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
++    {
++        valid         = window_shm->tree_valid;
++        *has_region   = window_shm->has_region;
++        *pixel_format = window_shm->pixel_format;
++    }
++    return !status && valid;
++}
++
++static BOOL neutron_tree_shm(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_TREE_SHM" );
++        on = !e || e[0] != '0';
++        ERR( "neutron-gateresolved: NEUTRON_TREE_SHM = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++/* NEUTRON window-tree-shm: answer a GetWindow relation from shared memory; FALSE = ask the server */
++static BOOL get_window_relative_shared( HWND hwnd, UINT rel, HWND *ret )
++{
++    user_handle_t links[6], parent_links[6];
++
++    if (!neutron_tree_shm() || !get_shared_window_links( hwnd, links )) return FALSE;
++    switch (rel)
++    {
++    case GW_HWNDNEXT: *ret = wine_server_ptr_handle( links[2] ); return TRUE;
++    case GW_HWNDPREV: *ret = wine_server_ptr_handle( links[3] ); return TRUE;
++    case GW_CHILD:    *ret = wine_server_ptr_handle( links[4] ); return TRUE;
++    case GW_HWNDFIRST:
++    case GW_HWNDLAST:
++        if (!links[0]) { *ret = 0; return TRUE; }
++        if (!get_shared_window_links( wine_server_ptr_handle( links[0] ), parent_links )) return FALSE;
++        *ret = wine_server_ptr_handle( rel == GW_HWNDFIRST ? parent_links[4] : parent_links[5] );
++        return TRUE;
++    }
++    return FALSE;
++}
++
++/* NEUTRON window-tree-shm: NEUTRON_TREE_VERIFY=1 also asks the server and logs any difference (test switch) */
++static BOOL neutron_tree_verify(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_TREE_VERIFY" ); on = e && e[0] == '1'; }
++    return on;
++}
++
++static HWND get_window_relative_server( HWND hwnd, UINT rel );
++
+ HWND get_window_relative( HWND hwnd, UINT rel )
+ {
++    HWND shared;
++
++    /* GW_OWNER of this process's windows is answered locally below already */
++    if ((rel == GW_HWNDNEXT || rel == GW_HWNDPREV || rel == GW_CHILD || rel == GW_HWNDFIRST || rel == GW_HWNDLAST) &&
++        get_window_relative_shared( hwnd, rel, &shared ))
++    {
++        if (neutron_tree_verify())
++        {
++            static LONG checked, mismatches;
++            HWND server = get_window_relative_server( hwnd, rel );
++            InterlockedIncrement( &checked );
++            if (server != shared)
++                ERR( "neutron-treeverify: MISMATCH hwnd=%p rel=%u shared=%p server=%p (#%ld of %ld)\n", hwnd, rel,
++                     shared, server, (long)InterlockedIncrement( &mismatches ), (long)checked );
++        }
++        return shared;
++    }
++    return get_window_relative_server( hwnd, rel );
++}
++
++static HWND get_window_relative_server( HWND hwnd, UINT rel )
++{
+     HWND retval = 0;
+ 
+     if (rel == GW_ENABLEDPOPUP)
+@@ -2197,8 +2303,37 @@
+     return TRUE;
+ }
+ 
++static NTSTATUS get_window_region_server( HWND hwnd, BOOL surface, HRGN *region, RECT *visible );
++
++/* NEUTRON window-tree-shm: a window without a region (nearly all of them) has nothing to fetch. Every SetWindowPos
++ * asked the server for the region of the window being moved (get_window_surface's shape test) and again in
++ * update_surface_region; ~23,000 get_window_region requests a second while Lightroom built a panel. */
+ static NTSTATUS get_window_region( HWND hwnd, BOOL surface, HRGN *region, RECT *visible )
+ {
++    BOOL has_region, pixel_format;
++
++    if (!surface && neutron_tree_shm() && get_shared_window_shape( hwnd, &has_region, &pixel_format ) && !has_region)
++    {
++        *region = 0;
++        if (neutron_tree_verify())
++        {
++            HRGN check = 0;
++            RECT dummy;
++            static LONG mismatches;
++            if (!get_window_region_server( hwnd, FALSE, &check, &dummy ) && check)
++            {
++                ERR( "neutron-treeverify: MISMATCH region hwnd=%p: server has one (#%ld)\n", hwnd,
++                     (long)InterlockedIncrement( &mismatches ) );
++                NtGdiDeleteObjectApp( check );
++            }
++        }
++        return STATUS_SUCCESS;
++    }
++    return get_window_region_server( hwnd, surface, region, visible );
++}
++
++static NTSTATUS get_window_region_server( HWND hwnd, BOOL surface, HRGN *region, RECT *visible )
++{
+     NTSTATUS status;
+     RGNDATA *data;
+     size_t size = 256;
+@@ -2248,6 +2383,43 @@
+     if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+     if (!win->surface) goto done;
+ 
++    /* NEUTRON window-tree-shm: a top-level window with no window region and no custom pixel format in it or its
++     * children: the server's surface region is its visible rect when it is visible, nothing otherwise
++     * (server/window.c get_surface_region), so build that clip here instead of asking twice. */
++    {
++        BOOL has_region, pixel_format;
++        if (neutron_tree_shm() && win->parent == get_desktop_window() &&
++            get_shared_window_shape( hwnd, &has_region, &pixel_format ) && !has_region && !pixel_format)
++        {
++            HRGN clip = 0;
++
++            if (win->dwStyle & WS_VISIBLE)
++                clip = NtGdiCreateRectRgn( 0, 0, win->rects.visible.right - win->rects.visible.left,
++                                           win->rects.visible.bottom - win->rects.visible.top );
++            if (neutron_tree_verify())
++            {
++                /* what the server path below would set: its surface region, offset to the surface */
++                HRGN check = 0;
++                static LONG mismatches;
++                if (!get_window_region_server( hwnd, TRUE, &check, &visible ) && check)
++                    NtGdiOffsetRgn( check, -visible.left, -visible.top );
++                if (!!check != !!clip || (check && !NtGdiEqualRgn( check, clip )))
++                {
++                    RECT a = {0}, b = {0};
++                    if (check) NtGdiGetRgnBox( check, &a );
++                    if (clip) NtGdiGetRgnBox( clip, &b );
++                    ERR( "neutron-treeverify: MISMATCH surface clip hwnd=%p server %s local %s (#%ld)\n", hwnd,
++                         wine_dbgstr_rect( &a ), wine_dbgstr_rect( &b ), (long)InterlockedIncrement( &mismatches ) );
++                }
++                if (check) NtGdiDeleteObjectApp( check );
++            }
++            window_surface_set_shape( win->surface, 0 );
++            window_surface_set_clip( win->surface, clip );
++            if (clip) NtGdiDeleteObjectApp( clip );
++            goto done;
++        }
++    }
++
+     if (get_window_region( hwnd, FALSE, &shape, &visible )) goto done;
+     if (shape)
+     {
+@@ -2709,9 +2881,11 @@
+             user_driver->pSetWindowIcons( hwnd, icon, &ii, icon_small, &ii_small );
+         }
+ 
+-        owner_hint = NtUserGetWindowRelative(hwnd, GW_OWNER);
++        /* NEUTRON: only a top-level window has an owner; a child gets no driver surface and the driver never
++         * reads its hint. The WindowFromPoint fallback was a server request on every child SetWindowPos. */
++        owner_hint = is_child ? 0 : NtUserGetWindowRelative(hwnd, GW_OWNER);
+         /* fallback to any window that is right below our top left corner */
+-        if (!owner_hint) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
++        if (!owner_hint && !is_child) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
+         if (owner_hint) owner_hint = NtUserGetAncestor(owner_hint, GA_ROOT);
+ 
+         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
+@@ -3498,9 +3672,90 @@
+ /*****************************************************************************
+  *           NtUserBuildHwndList (win32u.@)
+  */
++/* NEUTRON window-tree-shm: the siblings of hwnd from hwnd on, or its children recursively (pre-order), as the
++ * server's get_window_list builds them, walked from the shared links. Lightroom's UI framework calls GetDlgItem
++ * (user32: one NtUserBuildHwndList of the siblings) ~30,000 times a second while it builds a panel; on Windows
++ * that walk never leaves user mode. FALSE = ask the server (no links, the desktop window, or a window that
++ * vanished mid-walk). */
++static BOOL build_hwnd_list_shared( HWND hwnd, BOOL children, ULONG count, HWND *buffer, ULONG *size,
++                                    NTSTATUS *status )
++{
++    user_handle_t links[6];
++    HWND cur, root = hwnd;
++    ULONG n = 0, steps = 0;
++
++    if (!neutron_tree_shm() || !get_shared_window_links( hwnd, links ) || !links[0]) return FALSE;
++
++    if (!children)
++    {
++        for (cur = hwnd; cur; cur = wine_server_ptr_handle( links[2] ))
++        {
++            if (++steps > MAX_USER_HANDLES) return FALSE;
++            if (cur != hwnd && !get_shared_window_links( cur, links )) return FALSE;
++            if (n + 1 < count) buffer[n] = cur;
++            n++;
++        }
++    }
++    else
++    {
++        cur = wine_server_ptr_handle( links[4] );
++        while (cur)
++        {
++            if (++steps > MAX_USER_HANDLES || !get_shared_window_links( cur, links )) return FALSE;
++            if (n + 1 < count) buffer[n] = cur;
++            n++;
++            if (links[4]) { cur = wine_server_ptr_handle( links[4] ); continue; }
++            /* no children: next sibling, else climb until an ancestor below root has one */
++            for (;;)
++            {
++                if (links[2]) { cur = wine_server_ptr_handle( links[2] ); break; }
++                cur = wine_server_ptr_handle( links[0] );
++                if (!cur || cur == root) { cur = 0; break; }
++                if (++steps > MAX_USER_HANDLES || !get_shared_window_links( cur, links )) return FALSE;
++            }
++        }
++    }
++
++    *size = n + 1;
++    if (n + 1 > count) { *status = STATUS_BUFFER_TOO_SMALL; return TRUE; }
++    buffer[n] = HWND_BOTTOM;
++    *status = STATUS_SUCCESS;
++    return TRUE;
++}
++
++static NTSTATUS build_hwnd_list_server( HDESK desktop, HWND hwnd, BOOL children, ULONG thread_id, ULONG count,
++                                        HWND *buffer, ULONG *size );
++
+ NTSTATUS WINAPI NtUserBuildHwndList( HDESK desktop, HWND hwnd, BOOL children, BOOL non_immersive,
+                                      ULONG thread_id, ULONG count, HWND *buffer, ULONG *size )
+ {
++    NTSTATUS status;
++
++    if (!desktop && hwnd && !thread_id && count &&
++        build_hwnd_list_shared( hwnd, children, count, buffer, size, &status ))
++    {
++        if (neutron_tree_verify() && !status)
++        {
++            static LONG checked, mismatches;
++            HWND *check = malloc( count * sizeof(HWND) );
++            ULONG check_size = 0;
++            NTSTATUS check_status = check ? build_hwnd_list_server( desktop, hwnd, children, thread_id, count,
++                                                                    check, &check_size ) : STATUS_NO_MEMORY;
++            InterlockedIncrement( &checked );
++            if (check && (check_status || check_size != *size || memcmp( check, buffer, *size * sizeof(HWND) )))
++                ERR( "neutron-treeverify: MISMATCH list hwnd=%p children=%d size %u vs server %u status %x (#%ld of %ld)\n",
++                     hwnd, children, (UINT)*size, (UINT)check_size, (UINT)check_status,
++                     (long)InterlockedIncrement( &mismatches ), (long)checked );
++            free( check );
++        }
++        return status;
++    }
++    return build_hwnd_list_server( desktop, hwnd, children, thread_id, count, buffer, size );
++}
++
++static NTSTATUS build_hwnd_list_server( HDESK desktop, HWND hwnd, BOOL children, ULONG thread_id, ULONG count,
++                                        HWND *buffer, ULONG *size )
++{
+     user_handle_t *list = (user_handle_t *)buffer;
+     int i;
+     NTSTATUS status;
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1053,6 +1053,17 @@
+     unsigned int         dpi_context;
+     unsigned int         fnid;
+     data_size_t          private_size;
++    /* NEUTRON window-tree-shm: the window's links, as get_window_tree would answer, so GetWindow() reads them
++     * from shared memory like Windows reads its desktop heap instead of making a server round trip */
++    unsigned int         tree_valid;
++    user_handle_t        parent;
++    user_handle_t        owner;
++    user_handle_t        next_sibling;
++    user_handle_t        prev_sibling;
++    user_handle_t        first_child;
++    user_handle_t        last_child;
++    unsigned int         has_region;
++    unsigned int         pixel_format;
+ } window_shm_t;
+ 
+ typedef volatile union
+@@ -7130,6 +7141,6 @@
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 943
++#define SERVER_PROTOCOL_VERSION 945
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1069,6 +1069,17 @@
+     unsigned int         dpi_context;      /* DPI awareness context */
+     unsigned int         fnid;             /* builtin class FNID, or 0 */
+     data_size_t          private_size;     /* length of private extra bytes range */
++    /* NEUTRON window-tree-shm: the window's links, as get_window_tree would answer, so GetWindow() reads them
++     * from shared memory like Windows reads its desktop heap instead of making a server round trip */
++    unsigned int         tree_valid;       /* the links below are maintained */
++    user_handle_t        parent;           /* parent window (the desktop for top-level windows) */
++    user_handle_t        owner;            /* owner window */
++    user_handle_t        next_sibling;     /* next sibling in z-order (below), 0 if last or unlinked */
++    user_handle_t        prev_sibling;     /* previous sibling in z-order (above), 0 if first or unlinked */
++    user_handle_t        first_child;      /* topmost child */
++    user_handle_t        last_child;       /* bottommost child */
++    unsigned int         has_region;       /* NEUTRON: a window region is set (SetWindowRgn) */
++    unsigned int         pixel_format;     /* NEUTRON: it or a child has a custom pixel format (GL/Vulkan) */
+ } window_shm_t;
+ 
+ typedef volatile union
+--- a/server/window.c
++++ b/server/window.c
+@@ -160,6 +160,8 @@
+     fprintf( stderr, "window %p handle %x\n", win, win->handle );
+ }
+ 
++static void update_children_links( struct window *parent );  /* NEUTRON window-tree-shm */
++
+ static void window_destroy( struct object *obj )
+ {
+     struct window *win = (struct window *)obj;
+@@ -169,6 +171,7 @@
+     if (win->parent)
+     {
+         list_remove( &win->entry );
++        if (win->is_linked) update_children_links( win->parent );  /* NEUTRON window-tree-shm */
+         release_object( win->parent );
+     }
+ 
+@@ -236,12 +239,73 @@
+     return ptr ? LIST_ENTRY( ptr, struct window, entry ) : NULL;
+ }
+ 
++/* NEUTRON window-tree-shm (2026-10-15): publish a window's links in its shared object.
++ *
++ * On Windows, GetWindow() reads the window tree from the desktop heap mapped into every process: no kernel call.
++ * Here every GW_CHILD/GW_HWNDNEXT/... was a get_window_tree request. Lightroom Classic walks its window tree
++ * while building a panel: ~135,000 GetWindow calls a second from the app during its first Masking open
++ * (diagnostic count), 75% of all requests the wineserver handled, and the reason that open took seconds where
++ * Windows takes a fraction of one. The links are refreshed from the lists below whenever they change, so the
++ * shared copy always matches what get_window_tree would reply; win32u reads it (get_window_relative). */
++static void update_window_links( struct window *win )
++{
++    user_handle_t parent = win->parent ? win->parent->handle : 0, next = 0, prev = 0, first = 0, last = 0;
++    unsigned int has_region = !!win->win_region;
++    unsigned int pixel_format = !!(win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD));
++    const window_shm_t *shm = win->shared;
++    struct window *ptr;
++
++    if (!shm) return;
++    if (win->parent && win->is_linked)
++    {
++        if ((ptr = get_next_window( win ))) next = ptr->handle;
++        if ((ptr = get_prev_window( win ))) prev = ptr->handle;
++    }
++    if ((ptr = get_first_child( win ))) first = ptr->handle;
++    if ((ptr = get_last_child( win ))) last = ptr->handle;
++
++    if (shm->tree_valid && shm->parent == parent && shm->owner == win->owner && shm->next_sibling == next &&
++        shm->prev_sibling == prev && shm->first_child == first && shm->last_child == last &&
++        shm->has_region == has_region && shm->pixel_format == pixel_format)
++        return;
++
++    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
++    {
++        shared->parent       = parent;
++        shared->owner        = win->owner;
++        shared->next_sibling = next;
++        shared->prev_sibling = prev;
++        shared->first_child  = first;
++        shared->last_child   = last;
++        shared->has_region   = has_region;
++        shared->pixel_format = pixel_format;
++        shared->tree_valid   = 1;
++    }
++    SHARED_WRITE_END;
++}
++
++/* a parent's z-order list changed: refresh its first/last child and every child's siblings */
++static void update_children_links( struct window *parent )
++{
++    struct window *ptr;
++
++    if (!parent) return;
++    update_window_links( parent );
++    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
++        update_window_links( ptr );
++}
++
+ /* set the PAINT_PIXEL_FORMAT_CHILD flag on all the parents */
+ /* note: we never reset the flag, it's just a heuristic */
++static void update_window_links( struct window *win );
++
+ static inline void update_pixel_format_flags( struct window *win )
+ {
+     for (win = win->parent; win && win->parent; win = win->parent)
++    {
+         win->paint_flags |= PAINT_PIXEL_FORMAT_CHILD;
++        update_window_links( win );  /* NEUTRON window-tree-shm: pixel_format */
++    }
+ }
+ 
+ static struct rectangle monitors_get_union_rect( struct winstation *winstation, int is_raw )
+@@ -397,6 +461,7 @@
+     }
+ 
+     win->is_linked = 1;
++    update_children_links( win->parent );  /* NEUTRON window-tree-shm */
+     return old_prev != win->entry.prev;
+ }
+ 
+@@ -417,9 +482,17 @@
+ 
+     if (parent)
+     {
++        /* NEUTRON window-tree-shm: the old parent's list loses this window; keep it alive to refresh it */
++        struct window *old_parent = win->parent ? (struct window *)grab_object( win->parent ) : NULL;
++
+         if (win->parent) release_object( win->parent );
+         win->parent = (struct window *)grab_object( parent );
+         link_window( win, WINPTR_TOP );
++        if (old_parent)
++        {
++            if (old_parent != parent) update_children_links( old_parent );
++            release_object( old_parent );
++        }
+ 
+         if (!is_desktop_window( parent ))
+         {
+@@ -444,6 +517,8 @@
+         list_add_head( &win->parent->unlinked, &win->entry );
+         win->is_linked = 0;
+         win->is_orphan = 1;
++        update_children_links( win->parent );  /* NEUTRON window-tree-shm */
++        update_window_links( win );
+     }
+     return 1;
+ }
+@@ -733,6 +808,7 @@
+     }
+ 
+     current->desktop_users++;
++    update_window_links( win );  /* NEUTRON window-tree-shm: parent + owner; unlinked until the first link */
+     return win;
+ 
+ failed:
+@@ -2115,6 +2191,7 @@
+ 
+     if (win->win_region) free_region( win->win_region );
+     win->win_region = region;
++    update_window_links( win );  /* NEUTRON window-tree-shm: has_region */
+ 
+     /* expose anything revealed by the change */
+     if (old_vis_rgn && ((exposed_rgn = expose_window( win, &win->window_rect, old_vis_rgn, 0 ))))
+@@ -2397,6 +2474,7 @@
+ 
+     reply->prev_owner = win->owner;
+     reply->full_owner = win->owner = owner ? owner->handle : 0;
++    update_window_links( win );  /* NEUTRON window-tree-shm */
+ }
+ 
+ 
+@@ -2746,6 +2824,7 @@
+ 
+     win->paint_flags = (win->paint_flags & ~PAINT_CLIENT_FLAGS) | (req->paint_flags & PAINT_CLIENT_FLAGS);
+     if (win->paint_flags & PAINT_HAS_PIXEL_FORMAT) update_pixel_format_flags( win );
++    update_window_links( win );  /* NEUTRON window-tree-shm: pixel_format */
+ 
+     win->monitor_dpi = req->monitor_dpi;
+     old_style = win->style;
+@@ -3073,6 +3152,7 @@
+         {
+             list_remove( &win->entry );
+             list_add_before( &ptr->entry, &win->entry );
++            update_children_links( win->parent );  /* NEUTRON window-tree-shm */
+         }
+         break;
+     }

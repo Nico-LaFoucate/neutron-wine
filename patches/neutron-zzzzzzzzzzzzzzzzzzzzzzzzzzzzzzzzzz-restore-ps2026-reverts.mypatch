@@ -1,0 +1,50 @@
+server, win32u: restore two fixes neutron-zzz-ps2026-complete reverted by accident
+
+neutron-zzz-ps2026-complete (2026-07-20) was made by diffing the hand-edited dev tree against a build of the patch
+set, so it undid every patch-set change the dev tree lacked. Two of them matter:
+
+- server/user.h scale_dpi() (neutron-server-scale-dpi-sign): "val * dpi_to" with an unsigned dpi wraps a negative
+  coordinate. Every maximized window has a negative origin, so a DPI-unaware read of one was garbage. Measured on
+  Lightroom Classic's maximized frame at 168 dpi with harnesses-local rectprobe: GetWindowRect left = 25565278 on
+  124; -3 with this.
+- dlls/win32u/dce.c BeginPaint -> neutron_break_validate() (neutron-win32u-wmpaint-circuitbreaker): the WM_PAINT
+  circuit breaker drains a window after 2000 WM_PAINTs with no BeginPaint; without the reset the count only grew,
+  so every window lost one legitimate paint per 2000 ("draining stuck WM_PAINT loop" in Animate and Premiere logs
+  on 124). harnesses/paint-breaker.c (4500 full invalidations through the message loop): drained=2 on 124,
+  drained=0 with this.
+
+Not restored: the dwmapi P2c caption-button fallback (it only worked around the garbage rects above). The
+fresh-surface fill is restored separately (win32u-fresh-surface-dark).
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -2058,6 +2058,12 @@
+     RECT rect;
+     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+ 
++    /* NEUTRON: a real BeginPaint means the app validated this window's update region -> clear its WM_PAINT
++     * circuit-breaker count (message.c) so legit paint/resize loops never trip it. Restores the reset that
++     * neutron-zzz-ps2026-complete reverted by accident: without it the count only ever grew, and every window
++     * lost one legitimate paint per 2000 ("draining stuck WM_PAINT loop" in Animate and Premiere logs on 124). */
++    { extern void neutron_break_validate( HWND hwnd ); neutron_break_validate( hwnd ); }
++
+     NtUserHideCaret( hwnd );
+ 
+     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+--- a/server/user.h
++++ b/server/user.h
+@@ -234,8 +234,12 @@
+ 
+ static inline int scale_dpi( int val, unsigned int dpi_from, unsigned int dpi_to )
+ {
+-    if (val >= 0) return (val * dpi_to + (dpi_from / 2)) / dpi_from;
+-    return (val * dpi_to - (dpi_from / 2)) / dpi_from;
++    /* NEUTRON: do the arithmetic in signed 64-bit. "val * dpi_to" with int * unsigned promotes val to unsigned,
++     * so a negative coordinate (the -5 origin of every maximized window) wrapped to a huge positive value: a
++     * DPI-unaware GetWindowRect of Lightroom's maximized frame at 168 dpi returned left = 25565278
++     * (2026-10-15). Restores neutron-server-scale-dpi-sign, reverted by accident in neutron-zzz-ps2026-complete. */
++    if (val >= 0) return ((__int64)val * dpi_to + (dpi_from / 2)) / dpi_from;
++    return ((__int64)val * dpi_to - (dpi_from / 2)) / dpi_from;
+ }
+ 
+ static inline void scale_dpi_rect( struct rectangle *rect, unsigned int dpi_from, unsigned int dpi_to )
