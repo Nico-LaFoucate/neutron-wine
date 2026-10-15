@@ -1,0 +1,65 @@
+win32u: copy a resized window's old contents into its new surface before the first flush
+
+A window that changes size gets a new window surface. apply_window_pos() called update_surface_region() right after
+the server request, and window_surface_set_shape() ends with a flush, so the driver published the brand-new, EMPTY
+surface; move_window_bits_surface() copied the old contents in only afterwards. On Wayland every flush is a commit,
+so a layered window showed one blank frame per resize. Windows never shows a resized window blank.
+
+Lightroom Classic's Masks panel (WS_EX_LAYERED) resizes three times per Select Subject; frame dumps of the flushed
+surface showed a whole-panel blank frame each time. Now, when the surface changed and there are bits to copy, the
+shape update (and its flush) runs after the copy. Harness preserved-fixes/harnesses/resize-blank.c (grow/shrink a
+red popup by 300 px six times, count dumped frames with no red): layered 6 blank -> 0; plain 0 -> 0.
+
+Kill switch NEUTRON_COPY_BEFORE_SHAPE=0.
+
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2690,6 +2690,24 @@
+  *
+  * Backend implementation of SetWindowPos.
+  */
++/* NEUTRON fresh-surface-no-blank (2026-10-15): a window that changes size gets a new, empty window surface. Its
++ * old contents are copied in by move_window_bits_surface(), but update_surface_region() ran first, and
++ * window_surface_set_shape() ends with a flush, so the driver published the EMPTY surface one frame before the
++ * copied one. Windows never shows a resized window blank: the contents follow the window. Lightroom Classic's Masks
++ * panel resizes three times per Select Subject, and frame dumps show a whole-panel blank frame each time.
++ * Copy first, then update the shape (and flush). Kill switch NEUTRON_COPY_BEFORE_SHAPE=0. */
++static BOOL neutron_copy_before_shape(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_COPY_BEFORE_SHAPE" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_COPY_BEFORE_SHAPE = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, struct window_surface *new_surface,
+                               const struct window_rects *new_rects, const RECT *valid_rects )
+ {
+@@ -2794,7 +2812,10 @@
+ 
+     if (ret)
+     {
+-        update_surface_region( surface_win );
++        /* NEUTRON fresh-surface-no-blank: when the window got a NEW surface, update_surface_region() (which
++         * flushes, window_surface_set_shape) runs below, after the old bits are copied into it. */
++        if (old_surface == new_surface || !old_surface || !valid_rects || !neutron_copy_before_shape())
++            update_surface_region( surface_win );
+         if (((swp_flags & SWP_AGG_NOPOSCHANGE) != SWP_AGG_NOPOSCHANGE) ||
+             (swp_flags & (SWP_HIDEWINDOW | SWP_SHOWWINDOW | SWP_STATECHANGED | SWP_FRAMECHANGED)))
+             invalidate_dce( win, &old_rects.window );
+@@ -2839,7 +2860,10 @@
+                 valid_rects = rects;
+ 
+                 if (old_surface != new_surface)
++                {
+                     move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, valid_rects );
++                    if (neutron_copy_before_shape()) update_surface_region( surface_win );
++                }
+                 else
+                 {
+                     OffsetRect( &rects[1], new_rects->visible.left - old_rects.visible.left, new_rects->visible.top - old_rects.visible.top );

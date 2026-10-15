@@ -786,6 +786,22 @@ patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON
 1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1). OPEN: audit the rest of
 this delta for reverts without a NEUTRON comment.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-copy-visible-bits-only.mypatch` (2026-10-15) — LrC "duplicated text lines": copy only the moved window's visible pixels
+Windows copies a moved window's pixels only where it was visible before AND after the move, minus its update region,
+and repaints the rest (ReactOS `co_WinPosSetWindowPos`, CopyRgn = VisAfter ∩ VisBefore). The server already invalidates
+the rest, but `move_window_bits()` excluded only the window's OWN update region; for a WS_CLIPCHILDREN container the
+invalidation lands in its children, so the whole old rectangle was copied, including what a sibling had just been
+moved over. LrC's Masks list rows (clip-sibling containers) move down one at a time; the first row's image ran down
+the list ("Mask 7" in six rows for >300 ms in frame dumps). `apply_window_pos()` now takes the visible region before
+the move (server `get_visible_region`, DCX_WINDOW) and the copy is clipped to it. Harness `rowcascade.c` (Windows: 1):
+nested 5 → 1, plain 1 → 1, layered 1 → 1. Kill switch `NEUTRON_COPY_VISIBLE_ONLY=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-copy-before-shape.mypatch` (2026-10-15) — no blank frame when a layered window is resized
+A resized window gets a new, empty surface; `update_surface_region()` (whose `window_surface_set_shape()` flushes)
+ran before `move_window_bits_surface()` copied the old contents in, so the driver committed the empty surface first.
+LrC's Masks panel (layered) showed a whole-panel blank frame on every resize. Now the shape update and flush follow
+the copy. Harness `resize-blank.c`: layered 6 blank frames → 0, plain 0 → 0. Kill switch `NEUTRON_COPY_BEFORE_SHAPE=0`.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-user32-window-info-shm.mypatch` (2026-10-15) — user32 answers the basic window queries from shared memory
 Windows' user32 answers IsWindow, GetParent, GetWindow, GetWindowLong and GetWindowThreadProcessId from the handle
 table and desktop heap mapped into every process; here each was a system call. The server now also publishes each

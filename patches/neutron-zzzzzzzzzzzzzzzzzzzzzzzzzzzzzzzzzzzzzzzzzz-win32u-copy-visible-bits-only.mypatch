@@ -1,0 +1,198 @@
+win32u: when a child window moves, copy only what was visible before and after, as Windows does
+
+Windows copies a moved window's pixels only where it was visible in the old position AND is visible in the new
+one, minus its update region, and repaints the rest (ReactOS co_WinPosSetWindowPos: CopyRgn = VisAfter AND
+VisBefore). The wineserver already invalidates the rest (expose_window: new minus old visible region), but
+move_window_bits() copied the whole old rectangle and excluded only the window's OWN update region. When the
+window is a WS_CLIPCHILDREN container whose contents are child windows, that invalidation lands in the children,
+so nothing was excluded: the copy included the part a sibling had just been moved over.
+
+Lightroom Classic moves the rows of its Masks list down one after another (separate SetWindowPos calls, no
+DeferWindowPos). Each row (a clip-sibling container with child labels) copied the row that had just landed on its
+old spot, so the first row's image ran down the list: frame dumps showed "Mask 7" in six rows for over 300 ms
+("duplicated text lines"). apply_window_pos() now takes the window's visible region before the move (server
+get_visible_region, DCX_WINDOW: siblings clipped per style, children not) and move_window_bits() clips the copy to
+it, moved to the new position, minus the update region. Harness preserved-fixes/harnesses/rowcascade.c (five
+colored clip-sibling rows moved down 90 px top to bottom, no painting between; Windows: row 0's color in 1 row):
+nested containers 5 -> 1; plain rows 1 -> 1; layered parent 1 -> 1.
+
+Kill switch NEUTRON_COPY_VISIBLE_ONLY=0.
+
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1992,7 +1992,43 @@
+  *
+  * Move the window bits when a window is resized, or moved within a parent window.
+  */
+-void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects )
++/* NEUTRON copy-visible-bits-only: hwnd's visible region (window area, siblings clipped as its style says,
++ * children not clipped), in screen coordinates, as the server computes it for a DC. 0 on failure. */
++HRGN get_window_visible_region( HWND hwnd )
++{
++    HRGN rgn = 0;
++    NTSTATUS status;
++    RGNDATA *data;
++    size_t size = 256;
++
++    do
++    {
++        if (!(data = malloc( sizeof(*data) + size - 1 ))) return 0;
++        SERVER_START_REQ( get_visible_region )
++        {
++            req->window = wine_server_user_handle( hwnd );
++            req->flags  = DCX_WINDOW;
++            wine_server_set_reply( req, data->Buffer, size );
++            if (!(status = wine_server_call( req )))
++            {
++                size_t reply_size = wine_server_reply_size( reply );
++                data->rdh.dwSize   = sizeof(data->rdh);
++                data->rdh.iType    = RDH_RECTANGLES;
++                data->rdh.nCount   = reply_size / sizeof(RECT);
++                data->rdh.nRgnSize = reply_size;
++                rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
++            }
++            else size = reply->total_size;
++        }
++        SERVER_END_REQ;
++        free( data );
++    } while (status == STATUS_BUFFER_OVERFLOW);
++    return rgn;
++}
++
++/* vis_before: when not 0, the window's visible region from just before the move, already offset to the new
++ * position (screen coordinates); only pixels inside it are copied (see apply_window_pos). Not consumed. */
++void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects, HRGN vis_before )
+ {
+     RECT dst = valid_rects[0], src = valid_rects[1];
+ 
+@@ -2001,7 +2037,23 @@
+     {
+         UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
+         HRGN rgn = get_update_region( hwnd, &flags, NULL );
+-        HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
++        HDC hdc;
++
++        if (vis_before)
++        {
++            /* Windows copies what was visible both before and after the move, minus the update region
++             * (ReactOS co_WinPosSetWindowPos: CopyRgn = VisAfter AND VisBefore, minus hrgnUpdate). The DC is
++             * clipped to VisAfter; intersect it with VisBefore minus the update region. */
++            HRGN clip = NtGdiCreateRectRgn( 0, 0, 0, 0 );
++            NtGdiCombineRgn( clip, vis_before, 0, RGN_COPY );
++            if (rgn)
++            {
++                NtGdiCombineRgn( clip, clip, rgn, RGN_DIFF );
++                NtGdiDeleteObjectApp( rgn );
++            }
++            hdc = NtUserGetDCEx( hwnd, clip, DCX_CACHE | DCX_WINDOW | DCX_INTERSECTRGN );
++        }
++        else hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+ 
+         TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
+         OffsetRect( &src, -rects->window.left, -rects->window.top );
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -50,7 +50,8 @@
+ extern struct window_surface *get_driver_window_surface( struct window_surface *surface, UINT monitor_dpi );
+ extern void erase_now( HWND hwnd, UINT rdw_flags );
+ extern void flush_window_surfaces( BOOL idle );
+-extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects );
++extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects, HRGN vis_before );
++extern HRGN get_window_visible_region( HWND hwnd );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                       const RECT *old_visible_rect, const RECT *valid_rects );
+ extern void register_window_surface( struct window_surface *old,
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2696,6 +2696,18 @@
+  * copied one. Windows never shows a resized window blank: the contents follow the window. Lightroom Classic's Masks
+  * panel resizes three times per Select Subject, and frame dumps show a whole-panel blank frame each time.
+  * Copy first, then update the shape (and flush). Kill switch NEUTRON_COPY_BEFORE_SHAPE=0. */
++static BOOL neutron_copy_visible_only(void)  /* NEUTRON copy-visible-bits-only; kill switch NEUTRON_COPY_VISIBLE_ONLY=0 */
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_COPY_VISIBLE_ONLY" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_COPY_VISIBLE_ONLY = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ static BOOL neutron_copy_before_shape(void)
+ {
+     static int on = -1;
+@@ -2714,6 +2726,7 @@
+     struct window_rects monitor_rects;
+     WND *win;
+     HWND owner_hint, surface_win = 0, toplevel;
++    HRGN vis_before = 0;  /* NEUTRON copy-visible-bits-only */
+     UINT raw_dpi, monitor_dpi, dpi = get_thread_dpi();
+     UINT old_raw_dpi = 0; /* NEUTRON: window's monitor raw dpi before the move (for WM_DPICHANGED) */
+     HMONITOR monitor_override;  /* NEUTRON: driver-authoritative monitor, or 0 */
+@@ -2752,7 +2765,24 @@
+     neutron_mask_trace( hwnd, swp_flags, &old_rects.window, &new_rects->window );  /* NEUTRON mask-storm delta */
+     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
+ 
+-    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
++    /* NEUTRON copy-visible-bits-only (2026-10-15): remember which part of a moving child window is visible before
++     * the move. Windows copies only the pixels that were visible in the old position AND are visible in the new
++     * one (ReactOS co_WinPosSetWindowPos: CopyRgn = VisAfter AND VisBefore, minus the update region) and
++     * invalidates the rest; the server already invalidates the rest (expose_window: new minus old visible region),
++     * but the copy below excluded only the window's OWN update region. When the window's contents are child
++     * windows (WS_CLIPCHILDREN container), that invalidation lands in the children, so the whole old rectangle was
++     * copied, including the part a sibling had just been moved over. Lightroom Classic moves its Masks list rows
++     * down one after another; each row then copied the row above it, and the first row's image ran down the
++     * whole list ("duplicated text lines"). Harness preserved-fixes/harnesses/rowcascade.c. */
++    if (is_child && valid_rects && !(swp_flags & SWP_NOCOPYBITS) && neutron_copy_visible_only() &&
++        (new_rects->window.left != old_rects.window.left || new_rects->window.top != old_rects.window.top))
++        vis_before = get_window_visible_region( hwnd );
++
++    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
++    {
++        if (vis_before) NtGdiDeleteObjectApp( vis_before );
++        return FALSE;
++    }
+     old_surface = win->surface;
+     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
+ 
+@@ -2848,6 +2878,11 @@
+ 
+     release_win_ptr( win );
+ 
++    /* NEUTRON copy-visible-bits-only: move the old visible region to the new position (screen coordinates) */
++    if (vis_before && ret)
++        NtGdiOffsetRgn( vis_before, new_rects->window.left - old_rects.window.left,
++                        new_rects->window.top - old_rects.window.top );
++
+     if (ret)
+     {
+         TRACE( "win %p surface %p -> %p\n", hwnd, old_surface, new_surface );
+@@ -2867,7 +2902,7 @@
+                 else
+                 {
+                     OffsetRect( &rects[1], new_rects->visible.left - old_rects.visible.left, new_rects->visible.top - old_rects.visible.top );
+-                    move_window_bits( hwnd, new_rects, valid_rects );
++                    move_window_bits( hwnd, new_rects, valid_rects, vis_before );
+                 }
+             }
+             window_surface_release( old_surface );
+@@ -2899,7 +2934,7 @@
+             {
+                 /* move a child window bits within its parent window surface, the surface itself
+                  * didn't move and valid rects are already relative to the surface rect. */
+-                move_window_bits( hwnd, new_rects, valid_rects );
++                move_window_bits( hwnd, new_rects, valid_rects, vis_before );
+             }
+         }
+ 
+@@ -2954,6 +2989,7 @@
+         }
+     }
+ 
++    if (vis_before) NtGdiDeleteObjectApp( vis_before );
+     return ret;
+ }
+ 
