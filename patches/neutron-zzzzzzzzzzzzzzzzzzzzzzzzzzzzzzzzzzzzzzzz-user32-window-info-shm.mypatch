@@ -1,0 +1,752 @@
+user32: answer IsWindow, GetParent, GetWindow, GetWindowLong and GetWindowThreadProcessId from shared memory
+
+On Windows, user32 answers these by reading the user handle table and the window's data in the desktop heap,
+which every process has mapped: no kernel call. In Wine each was a system call into win32u. The wineserver
+already publishes the handle table and, with window-tree-shm, each window's links in the session shared memory;
+it now also publishes each window's style, extended style, id, instance, user data and extra bytes there
+(server/window.c update_window_info, refreshed wherever the server changes them; extra bytes in set_window_info).
+user32 maps the session section read-only and answers from it:
+  - IsWindow, GetWindowThreadProcessId, WIN_IsCurrentProcess/Thread (DefWindowProc, GetWindowText*): handle table;
+  - GetWindow(GW_HWNDFIRST/LAST/NEXT/PREV/CHILD/OWNER): the window's links (follows NEUTRON_TREE_SHM);
+  - GetParent, GetWindowLong(Ptr)A/W (GWL_STYLE, GWL_EXSTYLE, GWLP_ID, GWLP_USERDATA, GWLP_HINSTANCE, extra bytes
+    with win32u's bounds and private-range checks): this process's windows.
+Everything else (other processes' windows for GetParent/GetWindowLong, GWLP_WNDPROC, GWLP_HWNDPARENT, DWLP_DLGPROC,
+GW_ENABLEDPOPUP, every error path) still goes to win32u, so errors and special cases are unchanged.
+window_shm_t's new fields sit at their natural alignment in 32- and 64-bit builds (user32 asserts the offsets);
+the window object is allocated with room for its extra bytes. Protocol 946: wineserver, ntdll and user32 go together.
+
+Measured (clean room, 125 + this): per call 51-85 ns -> 5-10 ns (64-bit), 63-117 ns -> 8-15 ns (32-bit).
+NEUTRON_WININFO_VERIFY=1 also asks win32u and logs any difference: 0 mismatches in 22 M harness calls (64- and
+32-bit, own/other thread, other process, 16-bit handles, dialogs, destroyed windows) and 1.6 M calls from
+Lightroom Classic (startup, Develop, Masking, Select Subject). Harness: preserved-fixes/harnesses/wininfo-bench.c.
+It did NOT shorten Lightroom's Select Subject panel repaint delay (4 paired runs, same within noise): that delay is
+~160 ms of UI-thread work, about 2/3 Lightroom's own code.
+
+Kill switch NEUTRON_WININFO_SHM=0.
+
+
+--- a/dlls/user32/win.c
++++ b/dlls/user32/win.c
+@@ -25,6 +25,7 @@
+ #include "wine/asm.h"
+ #include "wine/exception.h"
+ #include "wine/debug.h"
++#include "wine/server_protocol.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(win);
+ 
+@@ -36,6 +37,344 @@
+     return debugstr_wn( us->Buffer, us->Length / sizeof(WCHAR) );
+ }
+ 
++
++/* NEUTRON window-info-shm (2026-10-15): answer the basic window queries in user mode.
++ *
++ * On Windows, user32 answers IsWindow, GetParent, GetWindow, GetWindowLong and GetWindowThreadProcessId by
++ * reading the handle table and the desktop heap, which every process has mapped: no kernel call. In Wine each
++ * of them was a system call into win32u. Lightroom Classic makes ~150,000 of them a second while its Masking
++ * panel changes size; with the system call around each one the UI thread stays busy for ~200 ms before it
++ * repaints the panel, and the unpainted part shows as boxes and repeated rows.
++ *
++ * The wineserver publishes the same data in the session shared memory: the user handle table, and per window
++ * its links (window-tree-shm), styles, id, instance, user data and extra bytes (window-info-shm). win32u
++ * already reads it; user32 now maps the section read-only too and answers from it when it can. Whatever it
++ * cannot answer exactly (other processes' windows for GetParent/GetWindowLong, GWLP_WNDPROC, GWLP_HWNDPARENT,
++ * GW_ENABLEDPOPUP, any error) still goes to win32u, so errors and special cases are unchanged.
++ *
++ * NEUTRON_WININFO_SHM=0 sends every query back to win32u; NEUTRON_WININFO_VERIFY=1 (test switch) also asks
++ * win32u and logs any difference. */
++
++C_ASSERT( FIELD_OFFSET( shared_object_t, shm ) == 16 );
++C_ASSERT( FIELD_OFFSET( window_shm_t, tree_valid ) == 28 );
++C_ASSERT( FIELD_OFFSET( window_shm_t, style ) == 64 );
++C_ASSERT( FIELD_OFFSET( window_shm_t, id ) == 72 );
++C_ASSERT( FIELD_OFFSET( window_shm_t, user_data ) == 88 );
++C_ASSERT( FIELD_OFFSET( window_shm_t, extra ) == 104 );
++C_ASSERT( sizeof(struct user_entry) == 32 );
++
++#define USER_HANDLE_TO_INDEX(hwnd) ((LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1)
++#define USER_HANDLE_FROM_INDEX(index, generation) UlongToHandle( (index << 1) + FIRST_USER_HANDLE + (generation << 16) )
++
++#if defined(__i386__) || defined(__x86_64__)
++#define SHARED_READ_FENCE do { __asm__ __volatile__( "" ::: "memory" ); } while (0)
++#else
++#define SHARED_READ_FENCE __atomic_thread_fence( __ATOMIC_ACQUIRE )
++#endif
++
++struct session_view
++{
++    const char *base;  /* read-only view of the whole session section, from offset 0 */
++    SIZE_T      size;
++};
++
++static struct session_view *session_view;
++static SRWLOCK session_view_lock = SRWLOCK_INIT;
++static BOOL session_view_failed;
++
++static int wininfo_shm_on( void )
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_WININFO_SHM", buf, sizeof(buf) );
++        on = !(len && len < sizeof(buf) && buf[0] == '0');
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_WININFO_SHM = 0 (environment)\n" );
++    }
++    return on;
++}
++
++static int wininfo_tree_on( void )  /* the links follow win32u's NEUTRON_TREE_SHM switch */
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_TREE_SHM", buf, sizeof(buf) );
++        on = !(len && len < sizeof(buf) && buf[0] == '0');
++    }
++    return on;
++}
++
++static int wininfo_verify_on( void )
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_WININFO_VERIFY", buf, sizeof(buf) );
++        on = len && len < sizeof(buf) && buf[0] == '1';
++        if (on) ERR( "neutron-wininfo-verify: on\n" );
++    }
++    return on;
++}
++
++static void wininfo_verify( const char *what, HWND hwnd, INT arg, ULONG_PTR fast, ULONG_PTR slow )
++{
++    static LONG checks, mismatches;
++    LONG n = InterlockedIncrement( &checks );
++
++    if (fast != slow && InterlockedIncrement( &mismatches ) <= 200)
++        ERR( "neutron-wininfo-verify: MISMATCH %s hwnd=%p arg=%d shared=%p win32u=%p (check %ld)\n",
++             what, hwnd, arg, (void *)fast, (void *)slow, n );
++    if (!(n % 200000))
++        ERR( "neutron-wininfo-verify: %ld checks, %ld mismatches\n", n, ReadNoFence( &mismatches ) );
++}
++
++/* a view of the session section that covers [0, needed); NULL when it can't be mapped */
++static const struct session_view *get_session_view( SIZE_T needed )
++{
++    static const WCHAR nameW[] = L"\\KernelObjects\\__wine_session";
++    struct session_view *view = ReadPointerAcquire( (void **)&session_view );
++    UNICODE_STRING name;
++    OBJECT_ATTRIBUTES attr;
++    LARGE_INTEGER offset;
++    HANDLE section;
++    SIZE_T size = 0;
++    void *base = NULL;
++
++    if (view && needed <= view->size) return view;
++    if (session_view_failed) return NULL;
++
++    AcquireSRWLockExclusive( &session_view_lock );
++    view = session_view;
++    if (!view || needed > view->size)
++    {
++        /* the section grew since we mapped it: map it again. Older views stay mapped, since another thread may
++         * still be reading through one; the section grows by half each time, so there are only a few. */
++        RtlInitUnicodeString( &name, nameW );
++        InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
++        offset.QuadPart = 0;
++        if (NtOpenSection( &section, SECTION_MAP_READ, &attr ))
++        {
++            WARN( "can't open the session section, using win32u\n" );
++            session_view_failed = TRUE;
++        }
++        else
++        {
++            if (NtMapViewOfSection( section, GetCurrentProcess(), &base, 0, 0, &offset, &size,
++                                    ViewUnmap, 0, PAGE_READONLY ))
++            {
++                WARN( "can't map the session section, using win32u\n" );
++                session_view_failed = TRUE;
++            }
++            else if ((!view || size > view->size) && (view = HeapAlloc( GetProcessHeap(), 0, sizeof(*view) )))
++            {
++                view->base = base;
++                view->size = size;
++                WritePointerRelease( (void **)&session_view, view );
++            }
++            else NtUnmapViewOfSection( GetCurrentProcess(), base );  /* it didn't grow */
++            NtClose( section );
++        }
++    }
++    if (view && needed > view->size) view = NULL;
++    ReleaseSRWLockExclusive( &session_view_lock );
++    return view;
++}
++
++/* read hwnd's entry in the user handle table, as win32u's get_user_entry does */
++static BOOL read_user_entry( HWND hwnd, struct user_entry *entry, HWND *full )
++{
++    const struct session_view *view;
++    const volatile struct user_entry *src;
++    WORD index = USER_HANDLE_TO_INDEX( hwnd );
++    UINT64 uniq, expect;
++
++    if (index >= MAX_USER_HANDLES) return FALSE;
++    if (!(view = get_session_view( sizeof(session_shm_t) ))) return FALSE;
++    src = ((const session_shm_t *)view->base)->user_entries + index;
++
++    uniq = ReadAcquire64( (LONG64 *)&src->uniq );
++    if (!HIWORD(hwnd) || HIWORD(hwnd) == 0xffff)
++    {
++        if (LOWORD(uniq) != NTUSER_OBJ_WINDOW) return FALSE;
++    }
++    else
++    {
++        expect = MAKELONG( NTUSER_OBJ_WINDOW, HIWORD(hwnd) );
++        if (uniq != expect) return FALSE;
++    }
++    entry->offset = src->offset;
++    entry->tid = src->tid;
++    entry->pid = src->pid;
++    entry->id = src->id;
++    SHARED_READ_FENCE;
++    entry->uniq = ReadNoFence64( &src->uniq );
++    if (entry->uniq != uniq) return FALSE;
++    if (full) *full = USER_HANDLE_FROM_INDEX( index, entry->generation );
++    return TRUE;
++}
++
++/* the window data user32 answers from */
++struct window_snapshot
++{
++    struct user_entry entry;
++    UINT          style;
++    UINT          ex_style;
++    UINT64        id;
++    UINT64        instance;
++    UINT64        user_data;
++    UINT          private_size;
++    user_handle_t links[6];  /* parent, owner, next, prev, first child, last child */
++};
++
++/* read hwnd's window object; with extra_size, also copy the extra bytes at [extra_offset, extra_offset+extra_size)
++ * into *extra (FALSE if that range isn't readable by GetWindowLong) */
++static BOOL read_window_snapshot( HWND hwnd, struct window_snapshot *snap, INT extra_offset, UINT extra_size,
++                                  void *extra )
++{
++    const struct session_view *view;
++    const shared_object_t *object;
++    const window_shm_t *shm;
++    SIZE_T needed;
++    UINT64 seq;
++    UINT extra_total;
++    BOOL valid, in_view;
++
++    if (!read_user_entry( hwnd, &snap->entry, NULL )) return FALSE;
++    needed = snap->entry.offset + sizeof(shared_object_t);
++
++    for (;;)
++    {
++        if (!(view = get_session_view( needed ))) return FALSE;
++        object = (const shared_object_t *)(view->base + snap->entry.offset);
++        shm = &object->shm.window;
++
++        while ((seq = ReadNoFence64( &object->seq )) & 1) YieldProcessor();
++        SHARED_READ_FENCE;
++
++        if (object->id != snap->entry.id) return FALSE;  /* destroyed, or the object was reused */
++        valid = shm->tree_valid;
++        in_view = TRUE;
++        snap->style        = shm->style;
++        snap->ex_style     = shm->ex_style;
++        snap->id           = shm->id;
++        snap->instance     = shm->instance;
++        snap->user_data    = shm->user_data;
++        snap->private_size = shm->private_size;
++        snap->links[0]     = shm->parent;
++        snap->links[1]     = shm->owner;
++        snap->links[2]     = shm->next_sibling;
++        snap->links[3]     = shm->prev_sibling;
++        snap->links[4]     = shm->first_child;
++        snap->links[5]     = shm->last_child;
++        extra_total        = shm->extra_size;
++        if (valid && extra_size)
++        {
++            /* the bounds win32u's get_window_extra checks for GetWindowLong */
++            valid = extra_offset >= 0 && extra_size <= extra_total && extra_offset <= extra_total - extra_size &&
++                    extra_offset >= snap->private_size;
++            if (valid)
++            {
++                SIZE_T end = snap->entry.offset + FIELD_OFFSET( shared_object_t, shm.window.extra ) +
++                             extra_offset + extra_size;
++                if (end > view->size)
++                {
++                    in_view = FALSE;  /* map the grown section, then read again */
++                    needed = end;
++                }
++                else memcpy( extra, (const char *)shm->extra + extra_offset, extra_size );
++            }
++        }
++
++        SHARED_READ_FENCE;
++        if (ReadNoFence64( &object->seq ) == seq && in_view) break;
++    }
++    return valid;
++}
++
++static inline BOOL is_current_process_entry( const struct user_entry *entry )
++{
++    return entry->pid == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
++}
++
++/* GetParent: for this process's windows, as win32u's get_parent answers them */
++static BOOL get_parent_shm( HWND hwnd, HWND *ret )
++{
++    struct window_snapshot snap;
++
++    if (!wininfo_shm_on() || !read_window_snapshot( hwnd, &snap, 0, 0, NULL )) return FALSE;
++    if (!is_current_process_entry( &snap.entry )) return FALSE;
++    if (snap.style & WS_POPUP) *ret = UlongToHandle( snap.links[1] );
++    else if (snap.style & WS_CHILD) *ret = UlongToHandle( snap.links[0] );
++    else *ret = 0;
++    return TRUE;
++}
++
++/* GetWindow: the relations win32u's get_window_relative answers from shared memory, plus GW_OWNER */
++static BOOL get_window_relative_shm( HWND hwnd, UINT rel, HWND *ret )
++{
++    struct window_snapshot snap, parent;
++
++    if (!wininfo_shm_on() || !wininfo_tree_on()) return FALSE;
++    if (rel != GW_HWNDFIRST && rel != GW_HWNDLAST && rel != GW_HWNDNEXT && rel != GW_HWNDPREV &&
++        rel != GW_OWNER && rel != GW_CHILD)
++        return FALSE;
++    if (!read_window_snapshot( hwnd, &snap, 0, 0, NULL )) return FALSE;
++    switch (rel)
++    {
++    case GW_HWNDNEXT: *ret = UlongToHandle( snap.links[2] ); return TRUE;
++    case GW_HWNDPREV: *ret = UlongToHandle( snap.links[3] ); return TRUE;
++    case GW_CHILD:    *ret = UlongToHandle( snap.links[4] ); return TRUE;
++    case GW_OWNER:
++        if (!is_current_process_entry( &snap.entry )) return FALSE;
++        *ret = UlongToHandle( snap.links[1] );
++        return TRUE;
++    default:  /* GW_HWNDFIRST, GW_HWNDLAST */
++        if (!snap.links[0]) { *ret = 0; return TRUE; }
++        if (!read_window_snapshot( UlongToHandle( snap.links[0] ), &parent, 0, 0, NULL )) return FALSE;
++        *ret = UlongToHandle( parent.links[rel == GW_HWNDFIRST ? 4 : 5] );
++        return TRUE;
++    }
++}
++
++/* GetWindowLong*: for this process's windows, as win32u's get_window_long_size answers them */
++static BOOL get_window_long_shm( HWND hwnd, INT offset, UINT size, LONG_PTR *ret )
++{
++    struct window_snapshot snap;
++    LONG_PTR value = 0;
++
++    if (!wininfo_shm_on()) return FALSE;
++    switch (offset)
++    {
++    case GWL_STYLE:
++    case GWL_EXSTYLE:
++    case GWLP_ID:
++    case GWLP_USERDATA:
++    case GWLP_HINSTANCE:
++        if (!read_window_snapshot( hwnd, &snap, 0, 0, NULL )) return FALSE;
++        break;
++    default:
++        if (offset < 0) return FALSE;  /* GWLP_WNDPROC, GWLP_HWNDPARENT, invalid indexes */
++        if (!read_window_snapshot( hwnd, &snap, offset, size, &value )) return FALSE;
++        break;
++    }
++    if (!is_current_process_entry( &snap.entry )) return FALSE;
++
++    switch (offset)
++    {
++    case GWL_STYLE:      value = snap.style; break;
++    case GWL_EXSTYLE:    value = snap.ex_style; break;
++    case GWLP_ID:        value = (ULONG_PTR)snap.id; break;
++    case GWLP_USERDATA:  value = (LONG_PTR)snap.user_data; break;
++    case GWLP_HINSTANCE: value = (ULONG_PTR)snap.instance; break;
++    }
++    *ret = value;
++    return TRUE;
++}
++
+ #ifdef __i386__
+ /* Some apps pass a non-stdcall proc to EnumChildWindows,
+  * so we need a small assembly wrapper to call the proc.
+@@ -108,6 +447,17 @@
+  */
+ HWND WIN_IsCurrentProcess( HWND hwnd )
+ {
++    struct user_entry entry;
++    HWND full;
++
++    if (wininfo_shm_on() && hwnd && get_session_view( sizeof(session_shm_t) ))  /* NEUTRON window-info-shm */
++    {
++        HWND ret = (read_user_entry( hwnd, &entry, &full ) && is_current_process_entry( &entry )) ? full : 0;
++        if (wininfo_verify_on())
++            wininfo_verify( "IsCurrentProcess", hwnd, 0, (ULONG_PTR)ret,
++                            (ULONG_PTR)UlongToHandle( NtUserCallHwnd( hwnd, NtUserIsCurrentProcessWindow )));
++        return ret;
++    }
+     return UlongToHandle( NtUserCallHwnd( hwnd, NtUserIsCurrentProcessWindow ));
+ }
+ 
+@@ -119,6 +469,18 @@
+  */
+ HWND WIN_IsCurrentThread( HWND hwnd )
+ {
++    struct user_entry entry;
++    HWND full;
++
++    if (wininfo_shm_on() && hwnd && get_session_view( sizeof(session_shm_t) ))  /* NEUTRON window-info-shm */
++    {
++        HWND ret = (read_user_entry( hwnd, &entry, &full ) &&
++                    entry.tid == HandleToULong( NtCurrentTeb()->ClientId.UniqueThread )) ? full : 0;
++        if (wininfo_verify_on())
++            wininfo_verify( "IsCurrentThread", hwnd, 0, (ULONG_PTR)ret,
++                            (ULONG_PTR)UlongToHandle( NtUserCallHwnd( hwnd, NtUserIsCurrentThreadWindow )));
++        return ret;
++    }
+     return UlongToHandle( NtUserCallHwnd( hwnd, NtUserIsCurrentThreadWindow ));
+ }
+ 
+@@ -889,6 +1251,16 @@
+         return 0;
+ #endif
+     default:
++    {
++        LONG_PTR value;
++
++        if ((sizeof(void *) != sizeof(LONG) || offset != DWLP_DLGPROC) &&
++            get_window_long_shm( hwnd, offset, sizeof(LONG), &value ))  /* NEUTRON window-info-shm */
++        {
++            if (wininfo_verify_on())
++                wininfo_verify( "GetWindowLongA", hwnd, offset, (LONG)value, NtUserGetWindowLongA( hwnd, offset ));
++            return value;
++        }
+         if (sizeof(void *) == sizeof(LONG))
+         {
+             LONG_PTR ret = NtUserGetWindowLongA( hwnd, offset );
+@@ -896,6 +1268,7 @@
+         }
+         return NtUserGetWindowLongA( hwnd, offset );
+     }
++    }
+ }
+ 
+ 
+@@ -915,6 +1288,16 @@
+         return 0;
+ #endif
+     default:
++    {
++        LONG_PTR value;
++
++        if ((sizeof(void *) != sizeof(LONG) || offset != DWLP_DLGPROC) &&
++            get_window_long_shm( hwnd, offset, sizeof(LONG), &value ))  /* NEUTRON window-info-shm */
++        {
++            if (wininfo_verify_on())
++                wininfo_verify( "GetWindowLongW", hwnd, offset, (LONG)value, NtUserGetWindowLongW( hwnd, offset ));
++            return value;
++        }
+         if (sizeof(void *) == sizeof(LONG))
+         {
+             LONG_PTR ret = NtUserGetWindowLongW( hwnd, offset );
+@@ -922,6 +1305,7 @@
+         }
+         return NtUserGetWindowLongW( hwnd, offset );
+     }
++    }
+ }
+ 
+ 
+@@ -1181,6 +1565,16 @@
+  */
+ BOOL WINAPI IsWindow( HWND hwnd )
+ {
++    struct user_entry entry;
++
++    if (!hwnd) return FALSE;
++    if (wininfo_shm_on() && get_session_view( sizeof(session_shm_t) ))  /* NEUTRON window-info-shm */
++    {
++        BOOL ret = read_user_entry( hwnd, &entry, NULL );
++        if (wininfo_verify_on()) wininfo_verify( "IsWindow", hwnd, 0, ret, NtUserIsWindow( hwnd ));
++        if (!ret) SetLastError( ERROR_INVALID_WINDOW_HANDLE );
++        return ret;
++    }
+     return NtUserIsWindow( hwnd );
+ }
+ 
+@@ -1190,6 +1584,19 @@
+  */
+ DWORD WINAPI GetWindowThreadProcessId( HWND hwnd, LPDWORD process )
+ {
++    struct user_entry entry;
++
++    if (wininfo_shm_on() && read_user_entry( hwnd, &entry, NULL ))  /* NEUTRON window-info-shm */
++    {
++        if (wininfo_verify_on())
++        {
++            DWORD pid = 0, tid = NtUserGetWindowThread( hwnd, &pid );
++            wininfo_verify( "GetWindowThreadProcessId(tid)", hwnd, 0, entry.tid, tid );
++            wininfo_verify( "GetWindowThreadProcessId(pid)", hwnd, 0, entry.pid, pid );
++        }
++        if (process) *process = entry.pid;
++        return entry.tid;
++    }
+     return NtUserGetWindowThread( hwnd, process );
+ }
+ 
+@@ -1199,6 +1606,14 @@
+  */
+ HWND WINAPI GetParent( HWND hwnd )
+ {
++    HWND ret;
++
++    if (get_parent_shm( hwnd, &ret ))  /* NEUTRON window-info-shm */
++    {
++        if (wininfo_verify_on())
++            wininfo_verify( "GetParent", hwnd, 0, (ULONG_PTR)ret, (ULONG_PTR)NtUserGetParent( hwnd ));
++        return ret;
++    }
+     return NtUserGetParent( hwnd );
+ }
+ 
+@@ -1247,6 +1662,14 @@
+  */
+ HWND WINAPI GetWindow( HWND hwnd, UINT rel )
+ {
++    HWND ret;
++
++    if (get_window_relative_shm( hwnd, rel, &ret ))  /* NEUTRON window-info-shm */
++    {
++        if (wininfo_verify_on())
++            wininfo_verify( "GetWindow", hwnd, rel, (ULONG_PTR)ret, (ULONG_PTR)NtUserGetWindowRelative( hwnd, rel ));
++        return ret;
++    }
+     return NtUserGetWindowRelative( hwnd, rel );
+ }
+ 
+@@ -1542,7 +1965,15 @@
+  */
+ LONG_PTR WINAPI GetWindowLongPtrW( HWND hwnd, INT offset )
+ {
+-    LONG_PTR ret = NtUserGetWindowLongPtrW( hwnd, offset );
++    LONG_PTR ret;
++
++    if (offset != DWLP_DLGPROC && get_window_long_shm( hwnd, offset, sizeof(LONG_PTR), &ret ))  /* NEUTRON window-info-shm */
++    {
++        if (wininfo_verify_on())
++            wininfo_verify( "GetWindowLongPtrW", hwnd, offset, ret, NtUserGetWindowLongPtrW( hwnd, offset ));
++        return ret;
++    }
++    ret = NtUserGetWindowLongPtrW( hwnd, offset );
+     return get_window_long_ptr( hwnd, offset, ret, FALSE );
+ }
+ 
+@@ -1551,7 +1982,15 @@
+  */
+ LONG_PTR WINAPI GetWindowLongPtrA( HWND hwnd, INT offset )
+ {
+-    LONG_PTR ret = NtUserGetWindowLongPtrA( hwnd, offset );
++    LONG_PTR ret;
++
++    if (offset != DWLP_DLGPROC && get_window_long_shm( hwnd, offset, sizeof(LONG_PTR), &ret ))  /* NEUTRON window-info-shm */
++    {
++        if (wininfo_verify_on())
++            wininfo_verify( "GetWindowLongPtrA", hwnd, offset, ret, NtUserGetWindowLongPtrA( hwnd, offset ));
++        return ret;
++    }
++    ret = NtUserGetWindowLongPtrA( hwnd, offset );
+     return get_window_long_ptr( hwnd, offset, ret, TRUE );
+ }
+ 
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1064,6 +1064,14 @@
+     user_handle_t        last_child;
+     unsigned int         has_region;
+     unsigned int         pixel_format;
++    unsigned int         style;
++    unsigned int         ex_style;
++    lparam_t             id;
++    mod_handle_t         instance;
++    lparam_t             user_data;
++    data_size_t          extra_size;
++    unsigned int         __pad2;
++    char                 extra[];
+ } window_shm_t;
+ 
+ typedef volatile union
+@@ -7141,6 +7149,6 @@
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 945
++#define SERVER_PROTOCOL_VERSION 946
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1080,6 +1080,17 @@
+     user_handle_t        last_child;       /* bottommost child */
+     unsigned int         has_region;       /* NEUTRON: a window region is set (SetWindowRgn) */
+     unsigned int         pixel_format;     /* NEUTRON: it or a child has a custom pixel format (GL/Vulkan) */
++    /* NEUTRON window-info-shm: what GetWindowLong, GetParent and IsWindowVisible read, so user32 answers them from
++     * shared memory like Windows reads its desktop heap instead of making a system call. Every field below is at
++     * its natural alignment in both 32-bit and 64-bit builds (user32 checks the offsets). */
++    unsigned int         style;            /* window style (GWL_STYLE) */
++    unsigned int         ex_style;         /* window extended style (GWL_EXSTYLE) */
++    lparam_t             id;               /* window id (GWLP_ID) */
++    mod_handle_t         instance;         /* creator instance (GWLP_HINSTANCE) */
++    lparam_t             user_data;        /* user-specific data (GWLP_USERDATA) */
++    data_size_t          extra_size;       /* number of extra bytes (cbWndExtra) */
++    unsigned int         __pad2;
++    char                 extra[];          /* extra bytes storage (offsets >= 0) */
+ } window_shm_t;
+ 
+ typedef volatile union
+--- a/server/window.c
++++ b/server/window.c
+@@ -295,6 +295,40 @@
+         update_window_links( ptr );
+ }
+ 
++/* NEUTRON window-info-shm (2026-10-15): publish what GetWindowLong, GetParent and IsWindowVisible read.
++ *
++ * On Windows, user32 reads a window's styles, id, instance, user data and extra bytes from the desktop heap mapped
++ * into every process: no kernel call. Here each of those was a system call into win32u. Lightroom Classic makes
++ * ~150,000 of them a second while its Masking panel changes size, so a panel that grows stays unpainted for
++ * ~200 ms. The server refreshes the copies below whenever it changes a window, so they always match what
++ * get_window_info would reply (the extra bytes are written in set_window_info); user32 reads them. */
++C_ASSERT( sizeof(window_shm_t) == offsetof(window_shm_t, extra[0]) );
++
++static mem_size_t window_shm_size( int extra_bytes )
++{
++    return (offsetof(window_shm_t, extra[extra_bytes]) + 7) & ~(mem_size_t)7;
++}
++
++static void update_window_info( struct window *win )
++{
++    const window_shm_t *shm = win->shared;
++
++    if (!shm) return;
++    if (shm->style == win->style && shm->ex_style == win->ex_style && shm->id == win->id &&
++        shm->instance == win->instance && shm->user_data == win->user_data)
++        return;
++
++    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
++    {
++        shared->style     = win->style;
++        shared->ex_style  = win->ex_style;
++        shared->id        = win->id;
++        shared->instance  = win->instance;
++        shared->user_data = win->user_data;
++    }
++    SHARED_WRITE_END;
++}
++
+ /* set the PAINT_PIXEL_FORMAT_CHILD flag on all the parents */
+ /* note: we never reset the flag, it's just a heuristic */
+ static void update_window_links( struct window *win );
+@@ -462,6 +496,7 @@
+ 
+     win->is_linked = 1;
+     update_children_links( win->parent );  /* NEUTRON window-tree-shm */
++    update_window_info( win );  /* NEUTRON window-info-shm: WS_EX_TOPMOST */
+     return old_prev != win->entry.prev;
+ }
+ 
+@@ -759,13 +794,21 @@
+     list_init( &win->children );
+     list_init( &win->unlinked );
+ 
+-    if (!(win->shared = alloc_shared_object( sizeof(*win->shared) ))) goto failed;
++    if (!(win->shared = alloc_shared_object( window_shm_size( extra_bytes ) ))) goto failed;
+     SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+     {
+         shared->class           = class_locator;
+         shared->dpi_context     = NTUSER_DPI_PER_MONITOR_AWARE;
+         shared->fnid            = 0;
+         shared->private_size    = 0;
++        /* NEUTRON window-info-shm */
++        shared->style           = win->style;
++        shared->ex_style        = win->ex_style;
++        shared->id              = win->id;
++        shared->instance        = win->instance;
++        shared->user_data       = win->user_data;
++        shared->extra_size      = extra_bytes;
++        memset( (void *)shared->extra, 0, extra_bytes );
+     }
+     SHARED_WRITE_END;
+ 
+@@ -2036,6 +2079,7 @@
+     if (!(swp_flags & SWP_NOZORDER) && win->parent) zorder_changed |= link_window( win, previous );
+     if (swp_flags & SWP_SHOWWINDOW) win->style |= WS_VISIBLE;
+     else if (swp_flags & SWP_HIDEWINDOW) win->style &= ~WS_VISIBLE;
++    update_window_info( win );  /* NEUTRON window-info-shm */
+ 
+     /* keep children at the same position relative to top right corner when the parent is mirrored */
+     if (win->ex_style & WS_EX_LAYOUTRTL)
+@@ -2217,6 +2261,7 @@
+     {
+         struct region *vis_rgn = get_visible_region( win, DCX_WINDOW );
+         win->style &= ~WS_VISIBLE;
++        update_window_info( win );  /* NEUTRON window-info-shm */
+         if (vis_rgn)
+         {
+             struct region *exposed_rgn = expose_window( win, &win->window_rect, vis_rgn, 0 );
+@@ -2344,6 +2389,7 @@
+ 
+     win->style = req->style;
+     win->ex_style = req->ex_style;
++    update_window_info( win );  /* NEUTRON window-info-shm */
+ 
+     reply->handle      = win->handle;
+     reply->parent      = win->parent ? win->parent->handle : 0;
+@@ -2426,6 +2472,7 @@
+         {
+             detach_window_thread( desktop->top_window );
+             desktop->top_window->style  = WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
++            update_window_info( desktop->top_window );  /* NEUTRON window-info-shm */
+         }
+     }
+ 
+@@ -2439,6 +2486,7 @@
+         {
+             detach_window_thread( desktop->msg_window );
+             desktop->msg_window->style = WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
++            update_window_info( desktop->msg_window );  /* NEUTRON window-info-shm */
+         }
+     }
+ 
+@@ -2520,6 +2568,7 @@
+     win->style = req->style;
+     win->ex_style = req->ex_style;
+     win->is_unicode = req->is_unicode;
++    update_window_info( win );  /* NEUTRON window-info-shm */
+ 
+     /* changing window style triggers a non-client paint */
+     win->paint_flags |= PAINT_NONCLIENT;
+@@ -2576,8 +2625,14 @@
+         }
+         memcpy( &reply->old_info, win->extra_bytes + req->offset, req->size );
+         memcpy( win->extra_bytes + req->offset, &req->new_info, req->size );
++        SHARED_WRITE_BEGIN( win->shared, window_shm_t )  /* NEUTRON window-info-shm */
++        {
++            memcpy( (char *)shared->extra + req->offset, &req->new_info, req->size );
++        }
++        SHARED_WRITE_END;
+         break;
+     }
++    update_window_info( win );  /* NEUTRON window-info-shm */
+ }
+ 
+ 

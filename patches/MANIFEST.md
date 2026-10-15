@@ -786,6 +786,18 @@ patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON
 1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1). OPEN: audit the rest of
 this delta for reverts without a NEUTRON comment.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-user32-window-info-shm.mypatch` (2026-10-15) — user32 answers the basic window queries from shared memory
+Windows' user32 answers IsWindow, GetParent, GetWindow, GetWindowLong and GetWindowThreadProcessId from the handle
+table and desktop heap mapped into every process; here each was a system call. The server now also publishes each
+window's style, ex-style, id, instance, user data and extra bytes in `window_shm_t` (next to window-tree-shm's links);
+user32 maps the session section read-only and answers this process's windows from it (handle-table queries and
+GetWindow links for any window). Other processes' windows for GetParent/GetWindowLong, GWLP_WNDPROC, GWLP_HWNDPARENT,
+DWLP_DLGPROC, GW_ENABLEDPOPUP and every error path still go to win32u. Protocol 946 (wineserver + ntdll + user32 move
+together, both arches). Per call 51-85 → 5-10 ns. `NEUTRON_WININFO_VERIFY=1` cross-checks every answer with win32u:
+0 mismatches in 22 M harness calls (`harnesses/wininfo-bench.c`, 64/32-bit, cross-thread/-process, 16-bit handles,
+dialogs, destroyed windows) and 1.6 M LrC calls. Did NOT shorten LrC's Select Subject repaint delay (4 paired runs):
+that is ~160 ms of UI-thread work, ~2/3 LrC's own. Kill switch `NEUTRON_WININFO_SHM=0`.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-capture-tracking.mypatch` (2026-10-15) — no WM_MOUSELEAVE to a captured window
 LrC's panel scroll bars (ScrollBar class, tracked by LrC) stopped "the moment the mouse hovers outside of the scrollbar"
 while dragging: get_mouse_window() (TrackMouseEvent hover/leave) used the window under the cursor and posted
