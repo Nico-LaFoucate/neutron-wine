@@ -770,6 +770,57 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzz-ps2026-complete.mypatch` (2026-07-20) — PS 2026 dev-tree delta (16 files) ⚠️ REVERTS FIVE EARLIER FIXES
+Made by diffing the hand-edited dev tree against a reference build of the patch set (wiki PS2026-PERFECT.md), so it
+carries the dev tree's fixes (dwrite HitTestPoint, welcome-dismiss, dock, the SetWinMonitor wiring) AND undoes every
+patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON-commented lines it removes:
+1. `server/user.h` `scale_dpi()` signed arithmetic (`neutron-server-scale-dpi-sign`): reverted. A DPI-unaware read of a
+   maximized window again returns left = 25565278 (measured: LrC main frame, 168 dpi, `rectprobe`).
+2. `dlls/win32u/dce.c` dark fresh-surface fill: reverted. Restored by `…-win32u-fresh-surface-dark` (2026-10-15).
+3. `dlls/win32u/dce.c` BeginPaint → `neutron_break_validate()` (`neutron-win32u-wmpaint-circuitbreaker`): reverted. The
+   WM_PAINT breaker's per-window count is never reset, so every window loses one legitimate paint per 2000; fires in
+   Animate and Premiere logs on 124.
+4. `dlls/dwmapi/dwmapi_main.c` P2c caption-button width fallback: reverted (a workaround for 1's garbage rects).
+5. `dlls/win32u/window.c` NEUTRON_SHELL_FIX HSHELL_WINDOWREPLACED block: replaced by a different version (not checked).
+OPEN: restore 1 and 3 (and decide 4); audit the rest of this delta for non-commented reverts.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-zorder-reuse.mypatch` (2026-10-15) — Lightroom Masking lag, part 1
+"Significant lag when I click on masking": the first Masking open of a session builds ~90 windows and took 13.5–14.5 s
+(nested KWin, clean-room LrC 15.6, runtime 124). The subsurface restack ran ~800×/s and changed nothing; 48% of the UI
+thread was its phase-A walk of the Win32 tree (a GetProp by name, a monitor-dpi lookup + GetWindowRect and two
+GetWindowRelative per window, each a wineserver round trip). A process-wide `neutron_zorder_generation`, bumped on
+every change the mirror follows (z-order move, show/hide, destroy, style, subsurface role, client wl_subsurface), lets
+`neutron_zorder_get()` reuse the last walk per toplevel; rects are read only for the opt-in temporal rule, the CEF-host
+property only for client-surface windows (re-read on every reuse). Phase B unchanged. 5.1 / 4.5 s. Kill switch
+`NEUTRON_ZORDER_REUSE=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-roleless-flush.mypatch` (2026-10-15) — idle CPU: role-less windows reflushed forever
+The role gate (2026-09-01, xdg-shell: no buffer before the role) refused a role-less window's flush by FAILING it; win32u
+keeps the bounds dirty and retries on every message-loop pass, forever for a window never shown. Lightroom's four hidden
+"Shadow" windows (layered, per-pixel alpha) were reflushed ~460×/s each and held its UI thread at 45% CPU at idle (90%
+in `window_surface_flush`, the alpha-shape pass). The gate fired in 63 of the operator's 65 recent logs. Now the flush
+is consumed, `wayland_window_surface_note_roleless()` records the unpublished contents, and the role assignment requests
+an expose of the whole surface (same moment, same pixels as the retry). Only never-shown windows are role-less (a hide
+keeps the role). LrC idle 45% → 8.6%. `harnesses/roleless-show.c` (per-monitor aware; a DPI-unaware window goes through
+win32u's scaled wrapper, whose flush always succeeds, and never retried): never-shown + kill switch 1570 ms CPU / 3 s,
+fixed 50 ms; contents correct on show in all four cases. Kill switch `NEUTRON_ROLELESS_CONSUME=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-zorder-scan-reuse.mypatch` (2026-10-15) — Lightroom Masking lag, part 2; `NEUTRON_ZORDER_VERIFY`
+Phase B's two whole-tree scans (`wayland_client_subsurfaces_of`, `wayland_owned_subsurfaces_of`) were then the largest
+restack cost: 34% of LrC's UI thread after "Select Subject". Reused per (kind, parent, generation); every way a window
+JOINS a set bumps the generation after the change is in place (the `make_subsurface` bump moved below its field
+assignments; `set_client_surface` added). Both lists only propose windows; restack_apply re-validates live, so a stale
+extra is dropped. `NEUTRON_ZORDER_VERIFY=1` (test switch, off) recomputes every reused walk and scan and logs
+`neutron-zverify: STALE`: 0 through Masking, Select Subject, close/reopen, photo switching, Library↔Develop. Masking open
+4.1 / 4.1 s; Select Subject busy period 2.5 → 1.5 s. Off with `NEUTRON_ZORDER_REUSE=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-fresh-surface-dark.mypatch` (2026-10-15) — Lightroom "empty white boxes"; restores a lost fix
+The white boxes in the Masks panel during Select Subject are the fresh-surface fill: the flyout grows by a row while the
+UI thread is busy, win32u copies the old contents into the larger surface, and the rest stays the fill until the app
+paints (a diagnostic magenta fill turned the boxes magenta). The fill is now opaque dark grey (0xff202020; 0x20 bytes
+below 32 bpp). This restores "initialise a fresh surface to a dark neutral", which `neutron-zzz-ps2026-complete`
+reverted by accident on 2026-07-20 (see its entry above). No kill switch (a fill colour).
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzz-opencl-command-queue-with-properties.mypatch` (2026-10-15) — OpenCL 2.0 queue export (GitHub Neutron#18)
 Premiere 2026 crashed at startup on AMD with ROCm's OpenCL 2.1: its GPU check (GPUSniffer) created a context and died
 with c06d007f (delay-load procedure not found). Wine's OpenCL.dll exported only the 1.0–1.2 API; Windows' (the Khronos

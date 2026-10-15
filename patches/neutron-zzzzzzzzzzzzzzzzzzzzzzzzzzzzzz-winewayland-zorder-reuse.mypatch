@@ -1,0 +1,256 @@
+winewayland: reuse the subsurface z-order walk while the Win32 stacking is unchanged
+
+Lightroom Classic: "significant lag when I click on masking". The first Masking open of a session builds ~90
+windows. Measured on a nested KWin (his desk layout, 175%), clean-room LrC 15.6, runtime 124: Shift+W to the last
+window event 13.5 s / 14.5 s; neutron-stack-stats "calls=4023 applies=0" per 5 s: the subsurface restack ran ~800
+times a second and changed the stacking zero times. perf on the UI thread: 48% in neutron_zorder_collect, the
+phase-A walk that runs before every restack. Per visited window it made a GetProp by name, a monitor-dpi lookup +
+GetWindowRect and two GetWindowRelative calls, each a wineserver round trip.
+
+- A process-wide generation counter (neutron_zorder_generation) is bumped wherever the order the mirror follows
+  can change: a SetWindowPos without SWP_NOZORDER, a show or hide, DestroyWindow, SetWindowStyle, a subsurface
+  role set or cleared, a client wl_subsurface (re)created. A plain move or resize does not bump it.
+- neutron_zorder_get() reuses the last walk for that toplevel while the generation is unchanged (4 entries). The
+  generation is sampled before the walk, so a change during the walk leaves the entry stale and the next call
+  walks again. The CEF-host flag is re-read on every reuse (dcomp sets it without any window change).
+- The walk reads a window's rect only when the opt-in temporal rule (its one reader) is on, and the CEF-host
+  property only for a window that has a client surface (the only ones phase B reads it for).
+Phase B, the restack itself, is unchanged and still runs on every update.
+
+Measured, same binary, fresh launch each: reuse 5.1 s / 4.5 s; NEUTRON_ZORDER_REUSE=0 14.5 s / 13.5 s. The
+Masking panel and its flyout draw normally above the GPU canvas.
+
+Kill switch NEUTRON_ZORDER_REUSE=0 restores the full walk on every update.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -552,6 +552,11 @@
+ void neutron_workarea_save_measured(int logical_h);
+ /* NEUTRON workarea#3: per-output maximized heights (display.c), reported from app processes (wayland_output.c) */
+ BOOL neutron_workarea_per_output(void);
++/* NEUTRON zgen (2026-10-15): bumped whenever the Win32 stacking that the subsurface mirror follows can have changed:
++ * a z-order move, a show or hide, a destroy, a style change, a client (GPU) surface attached or (re)created. The
++ * mirror's tree walk is reused while it is unchanged (wayland_surface.c, neutron_zorder_get). */
++extern LONG neutron_zorder_generation;
++static inline void neutron_zorder_changed(void) { InterlockedIncrement(&neutron_zorder_generation); }
+ BOOL neutron_workarea_save_output(const char *name, int logical_h);
+ void wayland_report_output_maximized_h(uint32_t output_id, int logical_h);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -707,6 +707,7 @@
+ 
+     wayland_surface_clear_role(surface);
+     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
++    neutron_zorder_changed();   /* NEUTRON zgen: the owned-subsurface set changed */
+ 
+     TRACE("surface=%p parent=%p\n", surface, parent);
+ 
+@@ -929,6 +930,7 @@
+ void wayland_surface_clear_role(struct wayland_surface *surface)
+ {
+     TRACE("surface=%p\n", surface);
++    neutron_zorder_changed();   /* NEUTRON zgen: the owned-subsurface set may change */
+ 
+     switch (surface->role)
+     {
+@@ -3066,22 +3068,72 @@
+     return on;
+ }
+ 
++/* NEUTRON zgen (2026-10-15): the phase-A walk below ran on EVERY client-surface update -- every SetWindowPos that
++ * touches a window with a GPU surface, and every present. Lightroom Classic opening its Masking panel the first time
++ * in a session (the operator: "significant lag when I click on masking") builds ~90 windows; measured on a nested
++ * KWin with clean-room LrC 15.6, runtime 124: ~13 s from Shift+W to the panel, the restack ran ~700 times a second
++ * and changed the stacking ZERO times (neutron-stack-stats "calls=3555 applies=0" per 5 s), and 48% of the UI
++ * thread was this walk (perf): per visited window a GetProp by name, a monitor-dpi lookup + GetWindowRect, and two
++ * GetWindowRelative calls, each a wineserver round trip.
++ *
++ * Two changes, neither altering what phase B receives:
++ *  - the walk's result is reused while neutron_zorder_generation is unchanged. Only a z-order move, a show or hide,
++ *    a destroy, a style change or a client surface (re)attached can reorder the mirror (window.c bumps it there; a
++ *    plain move or resize cannot). Whether a listed window has a client surface is read live in phase B, and the
++ *    CEF-host flag is re-read for those windows on every reuse, so neither depends on the reuse.
++ *  - a visited window's rect is only read when the opt-in temporal rule (the one reader of zl->rect) is on, and the
++ *    CEF-host property only for a window that has a client surface (the only ones phase B reads it for).
++ * Kill switch NEUTRON_ZORDER_REUSE=0 restores the full walk on every update. */
++LONG neutron_zorder_generation = 0;
++
++static BOOL neutron_zorder_reuse(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_ZORDER_REUSE", TRUE);
++    return on;
++}
++
++static BOOL neutron_has_client_surface(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    BOOL ret;
++
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++    ret = data->client_surface != NULL;
++    wayland_win_data_release(data);
++    return ret;
++}
++
++static const WCHAR neutron_dcomp_present_prop[] =
++    {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','r','e','s','e','n','t',0};
++
+ /* phase A: build the bottom-to-top win32 order of a toplevel's tree.
+  * USER-LOCK calls only -- must be called WITHOUT win_data_mutex held. */
+ static void neutron_zorder_collect_rec(HWND hwnd, struct neutron_zlist *zl, const POINT *origin)
+ {
+-    static const WCHAR dcomp_present_prop[] =
+-        {'_','_','w','i','n','e','_','d','c','o','m','p','_','p','r','e','s','e','n','t',0};
+     HWND kids[NEUTRON_ZMAX];
+     UINT nk = 0, i;
+     RECT wr = {0};
+     HWND c;
+ 
+     if (zl->count >= NEUTRON_ZMAX) return;
+-    zl->cef_host[zl->count] = !!NtUserGetProp(hwnd, dcomp_present_prop);
+-    /* window rect in toplevel window-rect space (for temporal damage tests) */
+-    NtUserGetWindowRect(hwnd, &wr, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+-    OffsetRect(&wr, -origin->x, -origin->y);
++    if (!neutron_zorder_reuse())
++    {
++        zl->cef_host[zl->count] = !!NtUserGetProp(hwnd, neutron_dcomp_present_prop);
++        /* window rect in toplevel window-rect space (for temporal damage tests) */
++        NtUserGetWindowRect(hwnd, &wr, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++        OffsetRect(&wr, -origin->x, -origin->y);
++    }
++    else
++    {
++        /* NEUTRON zgen: only what phase B reads (see above) */
++        zl->cef_host[zl->count] = neutron_has_client_surface(hwnd) && NtUserGetProp(hwnd, neutron_dcomp_present_prop);
++        if (neutron_temporal())
++        {
++            NtUserGetWindowRect(hwnd, &wr, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
++            OffsetRect(&wr, -origin->x, -origin->y);
++        }
++    }
+     zl->rect[zl->count] = wr;
+     zl->hwnd[zl->count++] = hwnd;
+     /* GW_CHILD = topmost sibling; GW_HWNDNEXT walks DOWN the z-order */
+@@ -3106,6 +3158,64 @@
+         wayland_owned_subsurfaces_zorder(toplevel, zl->owned_z, NEUTRON_ZMAX) : 0;
+ }
+ 
++/* NEUTRON zgen: the last walk per toplevel, valid while neutron_zorder_generation has not moved. */
++struct neutron_zorder_cache
++{
++    HWND toplevel;
++    LONG generation;
++    struct neutron_zlist zl;
++};
++static struct neutron_zorder_cache neutron_zorder_caches[4];
++static unsigned int neutron_zorder_cache_next;
++static pthread_mutex_t neutron_zorder_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++/* phase A with reuse: same contract as neutron_zorder_collect (USER-LOCK calls only, WITHOUT win_data_mutex). */
++static void neutron_zorder_get(HWND toplevel, struct neutron_zlist *zl)
++{
++    LONG generation = InterlockedCompareExchange(&neutron_zorder_generation, 0, 0);
++    unsigned int i;
++    BOOL hit = FALSE;
++
++    /* the temporal rule reads rects, which a plain move changes without a generation bump */
++    if (!neutron_zorder_reuse() || neutron_temporal())
++    {
++        neutron_zorder_collect(toplevel, zl);
++        return;
++    }
++
++    pthread_mutex_lock(&neutron_zorder_cache_mutex);
++    for (i = 0; i < ARRAY_SIZE(neutron_zorder_caches); i++)
++    {
++        if (neutron_zorder_caches[i].toplevel != toplevel || neutron_zorder_caches[i].generation != generation) continue;
++        *zl = neutron_zorder_caches[i].zl;
++        hit = TRUE;
++        break;
++    }
++    pthread_mutex_unlock(&neutron_zorder_cache_mutex);
++
++    if (hit)
++    {
++        /* the CEF-host property is set by dcomp without any window change: re-read it where phase B uses it */
++        for (i = 0; i < zl->count; i++)
++            zl->cef_host[i] = neutron_has_client_surface(zl->hwnd[i]) &&
++                              NtUserGetProp(zl->hwnd[i], neutron_dcomp_present_prop);
++        return;
++    }
++
++    /* the generation is sampled BEFORE the walk: a change during it leaves an older generation stored, so the
++     * next call walks again */
++    neutron_zorder_collect(toplevel, zl);
++    pthread_mutex_lock(&neutron_zorder_cache_mutex);
++    for (i = 0; i < ARRAY_SIZE(neutron_zorder_caches); i++)
++        if (neutron_zorder_caches[i].toplevel == toplevel) break;
++    if (i == ARRAY_SIZE(neutron_zorder_caches))
++        i = neutron_zorder_cache_next++ % ARRAY_SIZE(neutron_zorder_caches);
++    neutron_zorder_caches[i].toplevel = toplevel;
++    neutron_zorder_caches[i].generation = generation;
++    neutron_zorder_caches[i].zl = *zl;
++    pthread_mutex_unlock(&neutron_zorder_cache_mutex);
++}
++
+ /* order cache: skip wl traffic when the applied order is unchanged.
+  * Guarded by win_data_mutex (restack_apply is always called under it). */
+ struct neutron_zcache
+@@ -3124,6 +3234,7 @@
+ static void neutron_zcache_invalidate(HWND toplevel)
+ {
+     unsigned i;
++    neutron_zorder_changed();   /* NEUTRON zgen: a (re)created subsurface needs a fresh walk too */
+     for (i = 0; i < 8; i++)
+         if (neutron_zcaches[i].toplevel == toplevel)
+             memset(&neutron_zcaches[i], 0, sizeof(neutron_zcaches[i]));
+@@ -3340,7 +3451,7 @@
+     struct wayland_win_data *data;
+ 
+     if (!neutron_owned_zorder()) return;
+-    neutron_zorder_collect(toplevel, &zl);
++    neutron_zorder_get(toplevel, &zl);
+     if (!(data = wayland_win_data_get(toplevel))) return;
+     neutron_restack_apply(toplevel, &zl);
+     wayland_win_data_release(data);
+@@ -3437,7 +3548,7 @@
+      * shipped a fix that provably does nothing; the "prove the flag reached the code" rule is
+      * what caught it. Either gate now arms the mirror. */
+     if ((neutron_native_stack() || neutron_owned_zorder()) && toplevel && visible)
+-        neutron_zorder_collect(toplevel, &zl);
++        neutron_zorder_get(toplevel, &zl);
+ 
+     if (((neutron_dbg_n++) & 0xFF) == 0)
+         ERR("NEUTRON-UPD hwnd=%p toplevel=%p visible=%d\n", hwnd, toplevel, visible);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -953,6 +953,7 @@
+ 
+     TRACE("%p\n", hwnd);
+ 
++    neutron_zorder_changed();
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     wayland_win_data_destroy(data);
+ }
+@@ -1028,6 +1029,11 @@
+ 
+     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
+ 
++    /* NEUTRON zgen: a z-order move, a show or a hide can reorder the subsurface mirror; a plain move or resize
++     * cannot. Bumped first, so a restack later in this call (wayland_restack_owned_now) walks afresh. */
++    if (!(swp_flags & SWP_NOZORDER) || (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)))
++        neutron_zorder_changed();
++
+     /* NEUTRON round-37 broad trace: z-order / geometry change events */
+     {
+         static int trace = -1;
+@@ -2151,6 +2157,7 @@
+     DWORD changed = style->styleNew ^ style->styleOld;
+ 
+     if (hwnd == NtUserGetDesktopWindow()) return;
++    neutron_zorder_changed();   /* NEUTRON zgen: WS_VISIBLE or an owner/role-relevant style can change here */
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+     /* Changing WS_EX_LAYERED resets attributes */

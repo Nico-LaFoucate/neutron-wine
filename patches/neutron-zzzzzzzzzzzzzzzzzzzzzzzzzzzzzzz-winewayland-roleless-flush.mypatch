@@ -1,0 +1,139 @@
+winewayland: hold a role-less window's flush and expose it at the role assignment, instead of retrying it forever
+
+The role gate (2026-09-01, Premiere's layered splash) refuses to attach a buffer to a surface that has no xdg role
+yet, as xdg-shell requires. It refused by failing the flush. A failed flush keeps win32u's bounds dirty, and
+win32u retries on every message-loop pass, for as long as the window has no role. A window that is never shown
+never gets one.
+
+Lightroom Classic 15.6 (clean room, nested KWin, runtime 124): its four hidden panel-drop-shadow windows
+("Shadow", WS_EX_LAYERED|WS_EX_TRANSPARENT, per-pixel alpha, never shown in the session) were each flushed ~460
+times a second while the app sat idle. win32u runs the alpha-shape pass before every flush, so Lightroom's UI
+thread was at 45% CPU doing nothing (top -H), 90% of its samples in window_surface_flush (perf). Every click
+waits behind that. The gate's own message names those windows; it appears in 63 of the operator's 65 recent
+logs (Premiere, Photoshop, ...).
+
+Now the gate consumes the flush (returns TRUE) and records that the window holds contents nothing has published
+(wayland_window_surface_note_roleless). When the role is assigned, wayland_win_data_create_wayland_surface asks
+for an expose of the whole window surface, which re-flushes it once the role exists: the moment the retry used to
+succeed, with the same pixels. The xdg-shell rule is unchanged: no buffer is attached before the role.
+
+Only a window that has never been shown is role-less: a hide clears the role's objects but not the role (a
+Wayland surface cannot change role).
+
+Measured:
+- Lightroom: UI thread at idle 45% -> 8.6%; the shadow windows flushed 1-3 times per session instead of ~2300
+  every 5 s (diagnostic count). Masking panel and flyout draw complete.
+- harnesses/roleless-show.c (per-monitor aware, like Lightroom; an owned and an unowned layered window, contents
+  via UpdateLayeredWindow while hidden): never-shown, NEUTRON_ROLELESS_CONSUME=0: 1570 ms of UI-thread CPU in a
+  3 s idle loop; with this: 50 ms. On show, both windows display the contents given while hidden, full rects, in
+  all four cases (never shown / shown-hidden-redrawn, each arm), and none of the earlier green frame.
+
+Kill switch NEUTRON_ROLELESS_CONSUME=0 restores the retry.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -631,6 +631,9 @@
+     BOOL is_fullscreen;
+     BOOL managed;
+     BOOL layered_attribs_set;
++    /* NEUTRON: the window surface was flushed while this window had no role; see
++     * wayland_window_surface_note_roleless() */
++    BOOL roleless_contents;
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+@@ -648,6 +651,7 @@
+ void ensure_window_surface_contents(HWND hwnd);
+ BOOL wayland_window_can_commit(HWND hwnd);
+ BOOL wayland_window_surface_has_role(HWND hwnd);
++BOOL wayland_window_surface_note_roleless(HWND hwnd);
+ BOOL neutron_gate(const char *name, BOOL dflt);
+ BOOL neutron_maxkeep_fix(void);
+ 
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -726,6 +726,15 @@
+         break;
+     }
+ 
++    /* NEUTRON roleless: what was flushed while the surface had no role was consumed, not committed (the role
++     * gate in wayland_window_surface_flush). Publish it now that a role exists: the expose re-flushes the whole
++     * window surface, and the flush waits for the first configure as any other would. */
++    if (role != WAYLAND_SURFACE_ROLE_NONE && data->roleless_contents && needs_expose)
++    {
++        data->roleless_contents = FALSE;
++        *needs_expose = TRUE;
++    }
++
+     if (visible && client) wayland_client_surface_attach(client, data->hwnd);
+     wayland_win_data_get_config(data, &surface->window);
+ 
+@@ -2412,6 +2421,22 @@
+     return has;
+ }
+ 
++/* NEUTRON roleless (2026-10-15): TRUE when the window's surface has no role, recording that it now holds
++ * contents nothing has published; the role assignment then exposes the whole window surface
++ * (wayland_win_data_create_wayland_surface). See the role gate in wayland_window_surface_flush(). */
++BOOL wayland_window_surface_note_roleless(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    BOOL roleless = FALSE;
++
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++    if (data->wayland_surface && data->wayland_surface->role == WAYLAND_SURFACE_ROLE_NONE)
++        roleless = data->roleless_contents = TRUE;
++    wayland_win_data_release(data);
++
++    return roleless;
++}
++
+ BOOL wayland_window_can_commit(HWND hwnd)
+ {
+     struct wayland_surface *surface;
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -448,6 +448,25 @@
+     if (!wayland_window_can_commit(window_surface->hwnd))
+         return FALSE;
+ 
++    /* NEUTRON roleless (2026-10-15): CONSUME a flush the gate below refuses, instead of returning FALSE.
++     *
++     * FALSE keeps win32u's bounds dirty, and win32u retries on every message-loop pass -- for as long as the
++     * window has no role. A hidden window never gets one, so a hidden window with contents was flushed again on
++     * every PeekMessage for the whole session. Measured on Lightroom Classic 15.6 (clean room, nested KWin,
++     * runtime 124): its four hidden panel-drop-shadow windows ("Shadow", layered, per-pixel alpha) were each
++     * flushed ~460 times a second at idle, and the alpha-shape pass win32u runs before every flush kept the UI
++     * thread at 45% CPU doing nothing (perf: 90% of its samples in window_surface_flush). This gate's own message
++     * named the same windows; it appears in 63 of the operator's 65 recent logs, so other apps pay for it too.
++     *
++     * Consuming loses nothing: wayland_window_surface_note_roleless() records that the window holds contents
++     * nothing published, and the role assignment exposes the whole window surface (window.c,
++     * wayland_win_data_create_wayland_surface), which re-flushes it once the role exists. That is the moment the
++     * retry used to succeed, with the same pixels. The xdg-shell rule the gate enforces is unchanged.
++     *
++     * Kill switch NEUTRON_ROLELESS_CONSUME=0 restores the retry. */
++    static int roleless_consume = -1;
++    if (roleless_consume < 0) roleless_consume = neutron_gate("NEUTRON_ROLELESS_CONSUME", TRUE);
++
+     /* NEUTRON: never attach a buffer to a surface that has no xdg role yet.
+      *
+      * MEASURED on a tester's machine 2026-09-01, 3/3 runs: for Premiere's LAYERED splash the chain
+@@ -466,7 +485,16 @@
+     {
+         static int gate = -1;
+         if (gate < 0) gate = neutron_gate("NEUTRON_ROLE_GATE", TRUE);
+-        if (gate && !wayland_window_surface_has_role(window_surface->hwnd))
++        if (gate && roleless_consume && wayland_window_surface_note_roleless(window_surface->hwnd))
++        {
++            static LONG consumed;
++            if (InterlockedIncrement(&consumed) <= 20)
++                ERR("neutron-rolegate: hwnd=%p HOLDING flush -- surface has no xdg role yet "
++                    "(attaching now would violate xdg-shell); the role assignment exposes it\n",
++                    window_surface->hwnd);
++            return TRUE;
++        }
++        if (gate && !roleless_consume && !wayland_window_surface_has_role(window_surface->hwnd))
+         {
+             static LONG deferred;
+             if (InterlockedIncrement(&deferred) <= 20)

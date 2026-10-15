@@ -1,0 +1,186 @@
+winewayland: reuse phase B's subsurface scans while the stacking is unchanged; NEUTRON_ZORDER_VERIFY
+
+With the phase-A walk reused (zorder-reuse), the largest cost left in a restack was phase B's two scans of the
+whole driver tree: the client subsurfaces of the toplevel's wl_surface (wayland_client_subsurfaces_of, issue #5)
+and the owned windows promoted to subsurfaces of it (wayland_owned_subsurfaces_of). Lightroom Classic has ~250
+windows; perf of its UI thread for the 2.5 s after "Select Subject": restack 31%, the two scans 34% between them
+(21% + 13% self).
+
+Both scans are now reused while neutron_zorder_generation is unchanged (8 entries, keyed by kind + parent).
+Every way a window joins either set bumps it, AFTER the change is in place: wayland_surface_make_subsurface (the
+bump moved below the field assignments), a client wl_subsurface created (neutron_zcache_invalidate),
+set_client_surface, a role cleared, a window destroyed. Both lists only propose windows; restack_apply
+re-validates each one live, so a window that has left a set since is dropped there.
+
+NEUTRON_ZORDER_VERIFY=1 (test switch, off by default) recomputes every reused result, the phase-A walk and both
+scans, and logs "neutron-zverify: STALE ..." on any difference. Lightroom with it on, through Masking open,
+Select Subject, Masking close/reopen, next/previous photo, Library and back: 0 reports.
+
+Measured (fresh launch each, nested KWin, his desk layout): first Masking open 4.1 s / 4.1 s (zorder-reuse
+alone 5.1 / 4.5, neither 14.5 / 13.5). Select Subject: the UI thread's busy period after the click 2.5 s -> 1.5 s,
+restack samples in it 30-36 -> 4-5 per half second.
+
+NEUTRON_ZORDER_REUSE=0 turns this reuse off too.
+
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -707,7 +707,6 @@
+ 
+     wayland_surface_clear_role(surface);
+     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+-    neutron_zorder_changed();   /* NEUTRON zgen: the owned-subsurface set changed */
+ 
+     TRACE("surface=%p parent=%p\n", surface, parent);
+ 
+@@ -724,6 +723,9 @@
+     surface->role = WAYLAND_SURFACE_ROLE_SUBSURFACE;
+     surface->toplevel_hwnd = parent->hwnd;
+     surface->subsurface_parent = parent->wl_surface;
++    /* NEUTRON zgen: the owned-subsurface set changed. Bumped AFTER the fields it is read from are set: a scan
++     * cached between a bump and the change it announces would keep the old set until the next bump. */
++    neutron_zorder_changed();
+ 
+     /* Present contents independently of the parent surface. */
+     wl_subsurface_set_desync(surface->wl_subsurface);
+@@ -3093,6 +3095,16 @@
+     return on;
+ }
+ 
++/* NEUTRON zgen: NEUTRON_ZORDER_VERIFY=1 recomputes every reused result (the phase-A walk, the two phase-B scans)
++ * and logs "neutron-zverify" when it differs from the reused one. A test switch: a clean run with it on is the
++ * evidence that the bumps cover every change the mirror follows. Costs what the reuse saves. */
++static BOOL neutron_zorder_verify(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_ZORDER_VERIFY", FALSE);
++    return on;
++}
++
+ static BOOL neutron_has_client_surface(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+@@ -3199,6 +3211,18 @@
+         for (i = 0; i < zl->count; i++)
+             zl->cef_host[i] = neutron_has_client_surface(zl->hwnd[i]) &&
+                               NtUserGetProp(zl->hwnd[i], neutron_dcomp_present_prop);
++        if (neutron_zorder_verify())
++        {
++            static struct neutron_zlist fresh;   /* large; phase A runs on one thread per toplevel at a time */
++            static LONG mismatches;
++            neutron_zorder_collect(toplevel, &fresh);
++            if (fresh.count != zl->count || memcmp(fresh.hwnd, zl->hwnd, zl->count * sizeof(HWND)) ||
++                fresh.owned_z_count != zl->owned_z_count ||
++                memcmp(fresh.owned_z, zl->owned_z, zl->owned_z_count * sizeof(HWND)))
++                ERR("neutron-zverify: STALE walk toplevel=%p count %u->%u owned %u->%u gen=%ld (#%ld)\n",
++                    toplevel, zl->count, fresh.count, zl->owned_z_count, fresh.owned_z_count, (long)generation,
++                    (long)InterlockedIncrement(&mismatches));
++        }
+         return;
+     }
+ 
+@@ -3253,6 +3277,76 @@
+ 
+ /* phase B: apply the collected order to the wl_subsurface stack.
+  * MUST be called with win_data_mutex held; makes NO user-lock calls. */
++/* NEUTRON zgen: phase B's two scans of the whole driver tree -- the client subsurfaces of the toplevel's wl_surface
++ * and the owned windows promoted to subsurfaces of it -- ran on every restack. With the walk reused they were the
++ * largest cost left: 31% of Lightroom's UI thread for the 2.5 s after "Select Subject" (perf), with ~250 windows in
++ * the tree. Reused while neutron_zorder_generation is unchanged: every way a window joins either set bumps it
++ * (wayland_surface_make_subsurface, a client wl_subsurface created, a role cleared, a window destroyed). Both lists
++ * only PROPOSE windows; restack_apply re-validates each one live, so a window that has since left a set is
++ * dropped there. Caller holds win_data_mutex, which also protects this cache. */
++enum neutron_scan { NEUTRON_SCAN_CLIENT, NEUTRON_SCAN_OWNED };
++static struct
++{
++    enum neutron_scan kind;
++    const void *key;
++    LONG generation;
++    UINT n;
++    HWND hwnd[NEUTRON_ZMAX];
++} neutron_scan_cache[8];
++static unsigned int neutron_scan_cache_next;
++
++static UINT neutron_scan_fresh(enum neutron_scan kind, const void *key, HWND *out, UINT max)
++{
++    if (kind == NEUTRON_SCAN_CLIENT) return wayland_client_subsurfaces_of((struct wl_surface *)key, out, max);
++    return wayland_owned_subsurfaces_of((HWND)key, out, max);
++}
++
++static int neutron_hwnd_cmp(const void *a, const void *b)
++{
++    ULONG_PTR x = (ULONG_PTR)*(const HWND *)a, y = (ULONG_PTR)*(const HWND *)b;
++    return x < y ? -1 : x > y;
++}
++
++static UINT neutron_scan(enum neutron_scan kind, const void *key, HWND *out, UINT max)
++{
++    LONG generation = InterlockedCompareExchange(&neutron_zorder_generation, 0, 0);
++    unsigned int i;
++    UINT n;
++
++    if (!neutron_zorder_reuse()) return neutron_scan_fresh(kind, key, out, max);
++
++    for (i = 0; i < ARRAY_SIZE(neutron_scan_cache); i++)
++    {
++        if (neutron_scan_cache[i].kind != kind || neutron_scan_cache[i].key != key ||
++            neutron_scan_cache[i].generation != generation) continue;
++        n = min(neutron_scan_cache[i].n, max);
++        memcpy(out, neutron_scan_cache[i].hwnd, n * sizeof(HWND));
++        if (neutron_zorder_verify())
++        {
++            HWND fresh[NEUTRON_ZMAX], cached[NEUTRON_ZMAX];
++            UINT nf = neutron_scan_fresh(kind, key, fresh, min(max, NEUTRON_ZMAX));
++            static LONG mismatches;
++            memcpy(cached, out, n * sizeof(HWND));
++            qsort(fresh, nf, sizeof(HWND), neutron_hwnd_cmp);
++            qsort(cached, n, sizeof(HWND), neutron_hwnd_cmp);
++            if (nf != n || memcmp(fresh, cached, n * sizeof(HWND)))
++                ERR("neutron-zverify: STALE %s scan key=%p count %u->%u gen=%ld (#%ld)\n",
++                    kind == NEUTRON_SCAN_CLIENT ? "client" : "owned", key, n, nf, (long)generation,
++                    (long)InterlockedIncrement(&mismatches));
++        }
++        return n;
++    }
++
++    n = neutron_scan_fresh(kind, key, out, max);
++    i = neutron_scan_cache_next++ % ARRAY_SIZE(neutron_scan_cache);
++    neutron_scan_cache[i].kind = kind;
++    neutron_scan_cache[i].key = key;
++    neutron_scan_cache[i].generation = generation;
++    neutron_scan_cache[i].n = min(n, NEUTRON_ZMAX);
++    memcpy(neutron_scan_cache[i].hwnd, out, neutron_scan_cache[i].n * sizeof(HWND));
++    return n;
++}
++
+ static void neutron_restack_apply(HWND toplevel, const struct neutron_zlist *zl)
+ {
+     struct wayland_win_data *tdata = wayland_win_data_get_nolock(toplevel);
+@@ -3315,7 +3409,7 @@
+      * the owned windows, which float above every child in Win32. */
+     {
+         HWND extra[NEUTRON_ZMAX];
+-        UINT ne = wayland_client_subsurfaces_of(tsurf->wl_surface, extra, NEUTRON_ZMAX), e, j;
++        UINT ne = neutron_scan(NEUTRON_SCAN_CLIENT, tsurf->wl_surface, extra, NEUTRON_ZMAX), e, j;
+ 
+         for (e = 0; e < ne && n < NEUTRON_ZMAX; e++)
+         {
+@@ -3341,7 +3435,7 @@
+     if (neutron_owned_zorder())
+     {
+         HWND owned[NEUTRON_ZMAX];
+-        UINT no = wayland_owned_subsurfaces_of(toplevel, owned, NEUTRON_ZMAX), k;
++        UINT no = neutron_scan(NEUTRON_SCAN_OWNED, toplevel, owned, NEUTRON_ZMAX), k;
+ 
+         /* Win32 order, not HWND order (the tree is keyed by HWND): sort by the z-order phase A
+          * recorded. A window phase A did not see keeps its place at the bottom of the owned
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -2341,6 +2341,8 @@
+             else
+                 wayland_client_surface_attach(new_client, NULL);
+         }
++        /* NEUTRON zgen: this window's client surface changed, after the change is in place */
++        neutron_zorder_changed();
+     }
+ 
+     wayland_win_data_release(data);

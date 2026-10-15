@@ -1,0 +1,45 @@
+win32u: start a fresh window surface opaque dark grey instead of white (restores a fix lost on 2026-07-20)
+
+Lightroom Classic: "There are empty white boxes in the masks panel itself until the effect finishes
+processing". On "Select Subject" the Masks flyout grows by a row while Lightroom's UI thread is busy. win32u
+copies the old contents into the new, larger surface; the rest is the fresh-surface fill until the app paints,
+and that fill was white (0xff). Measured 2026-10-15 (clean room, nested KWin): with fresh surfaces filled
+magenta by a diagnostic build, the boxes turned magenta, for ~2 s on 124 and ~1-1.5 s with the zorder fixes.
+With this fill the new row shows dark grey against the dark flyout; no near-white pixels appear in it.
+
+Opaque (0xff202020 on 32 bpp), so a layered window's ARGB buffer shows dark grey, not a see-through hole.
+
+This was a Neutron fix already ("initialise a fresh surface to a dark neutral", 0x20 bytes, for the white flash
+on every surface recreation during an interactive resize). neutron-zzz-ps2026-complete reverted it by accident:
+it was produced by diffing the hand-edited dev tree against a build of the patch set, and the dev tree never had
+it. Every runtime since 11.10-11 shipped the white fill.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -586,7 +586,25 @@
+ 
+     pthread_mutex_init( &surface->mutex, NULL );
+ 
+-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
++    /* NEUTRON: a fresh surface starts OPAQUE DARK GREY, not white. Until the application paints, this is what
++     * shows -- in a new window, and in the newly exposed part of a window that grew (win32u copies the old
++     * contents into the new surface and nothing else). Lightroom Classic's Masks flyout grows by a row on
++     * "Select Subject" while its UI thread is busy, so the new row showed as an empty WHITE box for 1-2 s
++     * ("There are empty white boxes in the masks panel itself until the effect finishes processing";
++     * measured 2026-10-15 by filling fresh surfaces magenta: the boxes turned magenta). White against the
++     * dark Adobe UIs is the glitch; a dark neutral blends in. Opaque, so a layered window's ARGB buffer does
++     * not show a see-through hole instead.
++     *
++     * History: this was neutron-win32u fix "initialise a fresh surface to a dark neutral" (0x20 bytes, for the
++     * full-window flash on every surface recreation during an interactive resize). The 2026-07-20 dev-tree
++     * delta neutron-zzz-ps2026-complete reverted it by accident (the dev tree it was diffed from never had
++     * it), and every runtime since shipped white. */
++    if (info->bmiHeader.biBitCount == 32)
++    {
++        UINT *px = window_surface_get_color( surface, info ), n = info->bmiHeader.biSizeImage / 4;
++        while (n--) *px++ = 0xff202020;
++    }
++    else memset( window_surface_get_color( surface, info ), 0x20, info->bmiHeader.biSizeImage );
+ 
+     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
+     return surface;
