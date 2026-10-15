@@ -1,0 +1,494 @@
+win32u, winewayland: maximize on a monitor that is not the primary on a mixed-DPI desktop
+
+Found 2026-10-14 testing the KDE-primary patch on a nested KWin laid out like GitHub Neutron#20 but at mixed scales
+(1440x2560 portrait at 175% = 168 dpi at the origin, 2560x1440 landscape at 200% = 192 dpi): Illustrator 2026
+maximized on whichever monitor was not Wine's primary came out wrong -- portrait-width on the landscape monitor with
+its configure rejected, or too tall with its menu bar above the screen (240+ rejected configures). The #20 follow-
+output fix had only been verified at 100%/100%. Three causes:
+
+1. win32u monitor_from_rect() (upstream Wine 11.10): for a per-monitor-aware caller (dpi 0, raw pixels, as on
+   Windows) map_dpi_rect() leaves the rect raw, but it was then compared against the monitors at the SYSTEM dpi.
+   With system dpi 192, the raw point (1440,581) -- the landscape monitor's origin -- came back as the portrait
+   monitor, whose 192-dpi rect is (0,0)-(1646,2926). The follow-output check therefore saw "same monitor" and never
+   moved the window. Now dpi 0 compares raw with raw (as get_monitor_from_rect(.., 0, MDT_RAW_DPI) elsewhere).
+   Kill switch NEUTRON_MONITOR_RAW_LOOKUP=0.
+
+2. winewayland follow-output converted the compositor's logical size with the scale of the monitor the window was
+   LEAVING: 823x1463 for the 175% portrait output became 1646x2926 at 200%. The size, and the frame overhang that is
+   carried over, are now converted at the output's own scale (mode width / logical width).
+   Kill switch NEUTRON_FOLLOW_SCALE=0.
+
+3. The maximized work-area measurement (workarea#1/#2) was ONE value for every output, applied to any output it
+   plausibly fit; a panel-less output got a borrowed or 32px-estimated inset, the window came out 32 logical px short
+   of the configure (823x1431 against 823x1463), the compositor rejected every commit, and Illustrator snapped back
+   to the short work area each time. Measurements now carry the output they were taken on (reported from follow-
+   output, which runs after every maximized configure and when a surface settles on one output) and are kept and
+   persisted per output name; the single value is used only while no output has its own. The prefix file keeps the
+   single value on its first line for older runtimes. Kill switch NEUTRON_WORKAREA_PER_OUTPUT=0.
+
+Also: a NEUTRON_WL_DIAG trace of the follow-output decision (probe and window monitors with their rects).
+
+Verified on the nested KWin, clean-room Illustrator 2026, runtime 11.10-123 + the maximized-crop and KDE-primary
+patches, LogPixels 192 (what the CLI sets for a 200% KDE primary):
+- landscape not primary (old rule): before -> portrait-width, configure rejected; with 1 -> moved, one rejection;
+  with 1+2 -> moved straight to (1440,581)-(4000,2021), no rejection; full size with its menu bar.
+- portrait not primary (KDE primary = landscape): before -> 1646x2926 placed, menu bar above the screen; with
+  1+2+3 -> moved to the portrait monitor at its own size.
+- every case clean (no rejection, menu bar visible) once the output has a measurement; the first maximize ever on
+  an output whose real work area differs from the 32px estimate can still come out misplaced in that session.
+- operator's desk (4K 175% with a top panel, second output at (2195,94)): the 4K unchanged, (-5,51)-(3845,2165),
+  no sliver; the prefix file gains "Virtual-0 1202" / "Virtual-1 1080".
+
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -4793,12 +4793,36 @@
+     return FALSE;
+ }
+ 
++/* NEUTRON: kill switch for the raw-coordinate lookup in monitor_from_rect (NEUTRON_MONITOR_RAW_LOOKUP=0). */
++static BOOL neutron_monitor_raw_lookup(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_MONITOR_RAW_LOOKUP" ); v = !(e && e[0] == '0'); }
++    return v;
++}
++
+ static HMONITOR monitor_from_rect( const RECT *rect, UINT flags, UINT dpi )
+ {
+     struct monitor *monitor;
+     HMONITOR ret = 0;
+     RECT r;
+ 
++    /* NEUTRON: dpi 0 is a per-monitor-aware caller, whose coordinates are raw (physical) pixels, as on Windows.
++     * map_dpi_rect() leaves them raw, but they were then compared against the monitors at the SYSTEM dpi, which
++     * is a different space for every monitor whose dpi differs from it. Measured 2026-10-14 (nested KWin, a
++     * 1440x2560 portrait monitor at 168 dpi beside a 2560x1440 landscape one at (1440,581), system dpi 192): the
++     * raw point (1440,581) came back as the portrait monitor, whose 192-dpi rect is (0,0)-(1646,2926), so a
++     * maximized window the compositor showed on the landscape output was never moved there and kept a portrait
++     * size. Compare raw with raw. */
++    if (!dpi && neutron_monitor_raw_lookup())
++    {
++        if (!lock_display_devices( FALSE )) return 0;
++        if ((monitor = get_monitor_from_rect( *rect, flags, 0, MDT_RAW_DPI ))) ret = monitor->handle;
++        unlock_display_devices();
++        TRACE( "%s flags %x raw returning %p\n", wine_dbgstr_rect(rect), flags, ret );
++        return ret;
++    }
++
+     r = map_dpi_rect( *rect, dpi, system_dpi );
+ 
+     if (!lock_display_devices( FALSE )) return 0;
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -529,37 +529,154 @@
+     else if (home && *home) snprintf(buf, len, "%s/.wine/.neutron-maximized-inset", home);
+ }
+ 
+-int neutron_workarea_load_measured(void)
++/* NEUTRON workarea#3 (2026-10-14): one measurement PER OUTPUT.
++ *
++ * workarea#1/#2 kept ONE maximized logical height, from whichever output a window was last maximized on, and
++ * applied it to every output whose height it plausibly fit. On a desktop whose outputs differ (a 4K with a top
++ * panel beside a panel-less portrait screen) that value was wrong for the other output: a window maximized there
++ * came out 32 logical px short of the compositor's configure (823x1431 against 823x1463), the compositor rejected
++ * every commit, and Illustrator snapped back to the short work area each time (240+ rejections, the menu bar
++ * above the screen). An unmeasured output got the borrowed value even when it was a whole panel off.
++ *
++ * Now each measurement carries the output it was taken on (wayland_report_output_maximized_h) and is kept, and
++ * persisted, by output name. An output without one gets the 32px estimate; the single value is only used while no
++ * output has its own (a file written by an older runtime, or none yet). File: the single value on the first line
++ * (what older runtimes read), then "<output-name> <height>" lines. Kill switch NEUTRON_WORKAREA_PER_OUTPUT=0. */
++#define NEUTRON_WORKAREA_OUTPUTS 16
++static pthread_mutex_t neutron_workarea_mutex = PTHREAD_MUTEX_INITIALIZER;
++static BOOL neutron_workarea_loaded;
++static int neutron_workarea_legacy;
++static struct { char name[64]; int h; } neutron_workarea_outputs[NEUTRON_WORKAREA_OUTPUTS];
++static int neutron_workarea_output_count;
++
++BOOL neutron_workarea_per_output(void)
+ {
+-    static int cached = -1;   /* -1 = not read yet, 0 = absent/unusable */
+-    char path[NEUTRON_WORKAREA_PATH_MAX];
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_WORKAREA_PER_OUTPUT", TRUE);
++    return on;
++}
++
++/* neutron_workarea_mutex held */
++static void neutron_workarea_load_locked(void)
++{
++    char path[NEUTRON_WORKAREA_PATH_MAX], line[256], name[64];
+     FILE *f;
+-    int v = 0;
++    int v;
+ 
+-    if (cached >= 0) return cached;
+-    cached = 0;
++    if (neutron_workarea_loaded) return;
++    neutron_workarea_loaded = TRUE;
+     neutron_workarea_path(path, sizeof(path));
+-    if (!path[0]) return 0;
+-    if (!(f = fopen(path, "r"))) return 0;
+-    if (fscanf(f, "%d", &v) != 1 || v <= 0 || v > 100000) v = 0;
++    if (!path[0] || !(f = fopen(path, "r"))) return;
++    while (fgets(line, sizeof(line), f))
++    {
++        if (sscanf(line, "%63s %d", name, &v) == 2)
++        {
++            if (v > 0 && v <= 100000 && neutron_workarea_output_count < NEUTRON_WORKAREA_OUTPUTS)
++            {
++                snprintf(neutron_workarea_outputs[neutron_workarea_output_count].name, 64, "%s", name);
++                neutron_workarea_outputs[neutron_workarea_output_count++].h = v;
++            }
++        }
++        else if (sscanf(line, "%d", &v) == 1 && v > 0 && v <= 100000 && !neutron_workarea_legacy)
++            neutron_workarea_legacy = v;
++    }
+     fclose(f);
+-    cached = v;
+-    if (v) TRACE("neutron-workarea: loaded persisted measured=%d from %s\n", v, path);
+-    return cached;
++    TRACE("neutron-workarea: loaded legacy=%d, %d output(s) from %s\n", neutron_workarea_legacy,
++          neutron_workarea_output_count, path);
+ }
+ 
+-void neutron_workarea_save_measured(int logical_h)
++/* neutron_workarea_mutex held */
++static void neutron_workarea_write_locked(void)
+ {
+     char path[NEUTRON_WORKAREA_PATH_MAX];
+     FILE *f;
++    int i;
+ 
+-    if (logical_h <= 0) return;
+     neutron_workarea_path(path, sizeof(path));
+-    if (!path[0]) return;
+-    if (!(f = fopen(path, "w"))) return;
+-    fprintf(f, "%d\n", logical_h);
++    if (!path[0] || !(f = fopen(path, "w"))) return;
++    if (neutron_workarea_legacy) fprintf(f, "%d\n", neutron_workarea_legacy);
++    for (i = 0; i < neutron_workarea_output_count; i++)
++        fprintf(f, "%s %d\n", neutron_workarea_outputs[i].name, neutron_workarea_outputs[i].h);
+     fclose(f);
+-    TRACE("neutron-workarea: persisted measured=%d to %s\n", logical_h, path);
++}
++
++int neutron_workarea_load_measured(void)
++{
++    int v;
++
++    pthread_mutex_lock(&neutron_workarea_mutex);
++    neutron_workarea_load_locked();
++    v = neutron_workarea_legacy;
++    pthread_mutex_unlock(&neutron_workarea_mutex);
++    return v;
++}
++
++void neutron_workarea_save_measured(int logical_h)
++{
++    if (logical_h <= 0) return;
++    pthread_mutex_lock(&neutron_workarea_mutex);
++    neutron_workarea_load_locked();
++    if (neutron_workarea_legacy != logical_h)
++    {
++        neutron_workarea_legacy = logical_h;
++        neutron_workarea_write_locked();
++        TRACE("neutron-workarea: persisted measured=%d\n", logical_h);
++    }
++    pthread_mutex_unlock(&neutron_workarea_mutex);
++}
++
++/* NEUTRON workarea#3: this output's measured maximized logical height, 0 if none */
++static int neutron_workarea_output_measured(const char *name)
++{
++    int i, v = 0;
++
++    if (!name || !neutron_workarea_per_output()) return 0;
++    pthread_mutex_lock(&neutron_workarea_mutex);
++    neutron_workarea_load_locked();
++    for (i = 0; i < neutron_workarea_output_count; i++)
++        if (!strcmp(neutron_workarea_outputs[i].name, name)) v = neutron_workarea_outputs[i].h;
++    pthread_mutex_unlock(&neutron_workarea_mutex);
++    return v;
++}
++
++static BOOL neutron_workarea_any_output(void)
++{
++    int n;
++
++    if (!neutron_workarea_per_output()) return FALSE;
++    pthread_mutex_lock(&neutron_workarea_mutex);
++    neutron_workarea_load_locked();
++    n = neutron_workarea_output_count;
++    pthread_mutex_unlock(&neutron_workarea_mutex);
++    return n > 0;
++}
++
++/* NEUTRON workarea#3: record (and persist) a measurement for an output; TRUE if it changed */
++BOOL neutron_workarea_save_output(const char *name, int logical_h)
++{
++    BOOL changed = FALSE;
++    int i;
++
++    if (!name || !*name || logical_h <= 0 || !neutron_workarea_per_output()) return FALSE;
++    pthread_mutex_lock(&neutron_workarea_mutex);
++    neutron_workarea_load_locked();
++    for (i = 0; i < neutron_workarea_output_count; i++)
++        if (!strcmp(neutron_workarea_outputs[i].name, name)) break;
++    if (i == neutron_workarea_output_count && i < NEUTRON_WORKAREA_OUTPUTS)
++    {
++        snprintf(neutron_workarea_outputs[i].name, 64, "%s", name);
++        neutron_workarea_outputs[i].h = 0;
++        neutron_workarea_output_count++;
++    }
++    if (i < neutron_workarea_output_count && neutron_workarea_outputs[i].h != logical_h)
++    {
++        neutron_workarea_outputs[i].h = logical_h;
++        neutron_workarea_write_locked();
++        changed = TRUE;
++    }
++    pthread_mutex_unlock(&neutron_workarea_mutex);
++    if (changed) TRACE("neutron-workarea: %s measured maximized height %d\n", name, logical_h);
++    return changed;
+ }
+ 
+ static void wayland_add_device_monitor(const struct gdi_device_manager *device_manager,
+@@ -615,9 +732,14 @@
+         int logical_h = output_info->output->logical_h;
+         int logical_inset = 32; /* fallback: KWin/Breeze titlebar ~= this */
+         int inset;
+-        LONG measured = InterlockedCompareExchange(&neutron_maximized_logical_h, 0, 0);
++        /* NEUTRON workarea#3: this output's own measurement; the single value only while no output has one */
++        LONG measured = neutron_workarea_output_measured(output_info->output->name);
+ 
+-        if (measured <= 0) measured = neutron_workarea_load_measured();
++        if (measured <= 0 && !neutron_workarea_any_output())
++        {
++            measured = InterlockedCompareExchange(&neutron_maximized_logical_h, 0, 0);
++            if (measured <= 0) measured = neutron_workarea_load_measured();
++        }
+ 
+         /* NEUTRON workarea#1: prefer the MEASURED inset over the 32px estimate.
+          *
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -550,6 +550,10 @@
+  * 2026-08-11: first launch unusable, second launch fine. Load returns 0 when unknown. */
+ int neutron_workarea_load_measured(void);
+ void neutron_workarea_save_measured(int logical_h);
++/* NEUTRON workarea#3: per-output maximized heights (display.c), reported from app processes (wayland_output.c) */
++BOOL neutron_workarea_per_output(void);
++BOOL neutron_workarea_save_output(const char *name, int logical_h);
++void wayland_report_output_maximized_h(uint32_t output_id, int logical_h);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+                                           enum wayland_surface_config_state state);
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -138,6 +138,35 @@
+  * So carry the value in wparam of the message the desktop process already handles. Caught in
+  * review by the build tester before this was ever built; it could not have been caught on the
+  * dev box, where measured and estimated insets are numerically identical. */
++/* NEUTRON workarea#3: the same, for the output the maximized toplevel is on (wl_registry global names are the same
++ * in every process). Sent once per (output, height) change from this process; the desktop process stores it under
++ * the output's name and rebuilds the monitor list only when it changed (display.c, window.c). */
++void wayland_report_output_maximized_h(uint32_t output_id, int logical_h)
++{
++    static uint32_t last_id[8];
++    static int last_h[8];
++    HWND desktop_hwnd;
++    int i, free_slot = -1;
++
++    if (!process_wayland.initialized || !output_id || logical_h <= 0 || !neutron_workarea_per_output()) return;
++    for (i = 0; i < ARRAY_SIZE(last_id); i++)
++    {
++        if (last_id[i] == output_id) break;
++        if (!last_id[i] && free_slot < 0) free_slot = i;
++    }
++    if (i < ARRAY_SIZE(last_id))
++    {
++        if (last_h[i] == logical_h) return;
++    }
++    else if (free_slot >= 0) i = free_slot;
++    else i = 0;
++    last_id[i] = output_id;
++    last_h[i] = logical_h;
++
++    if (!(desktop_hwnd = NtUserGetDesktopWindow())) return;
++    NtUserPostMessage(desktop_hwnd, WM_WAYLAND_INIT_DISPLAY_DEVICES, (WPARAM)logical_h, (LPARAM)output_id);
++}
++
+ void wayland_report_maximized_logical_h(int logical_h)
+ {
+     HWND desktop_hwnd;
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <math.h>
+ #include <stdlib.h>
+ 
+ #include "ntstatus.h"
+@@ -1704,6 +1705,14 @@
+  * or, if it is not a maximized rect of its monitor (it was sized for the other output), the compositor's
+  * maximized size at the work area's origin, as for a compositor-initiated maximize. A raw move: the WS_MAXIMIZE
+  * state and win32u's saved restore rect are untouched. */
++/* NEUTRON follow-scale: kill switch (NEUTRON_FOLLOW_SCALE=0 converts at the old monitor's scale, as before). */
++static BOOL neutron_follow_scale(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_FOLLOW_SCALE", TRUE);
++    return on;
++}
++
+ static void wayland_window_follow_output(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+@@ -1713,12 +1722,15 @@
+     INT win_w = 0, win_h = 0;
+     int out_x = 0, out_y = 0;
+     BOOL found = FALSE, moved = FALSE;
++    /* NEUTRON follow-scale: the configure in logical px, the frame the compositor draws (server-side decorations),
++     * and the raw px per logical px of the window's current monitor and of the output */
++    int cfg_w = 0, cfg_h = 0, decor_w = 0, decor_h = 0;
++    double cur_scale = 0.0, out_scale = 0.0;
+     RECT win = {0}, probe, cur_area, out_area, new_rect;
+-    HMONITOR win_mon, out_mon;
++    HMONITOR win_mon = 0, out_mon = 0;
+     MONITORINFO win_mi = {.cbSize = sizeof(win_mi)}, out_mi = {.cbSize = sizeof(out_mi)};
+     UINT context;
+ 
+-    if (!neutron_follow_output()) return;
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
+         surface->entered_output_count == 1)
+@@ -1728,19 +1740,30 @@
+         id = surface->entered_outputs[0];
+         state = cfg->state;
+         win = data->rects.window;
++        cur_scale = surface->window.scale;
+         if (cfg->width && cfg->height)
+         {
++            cfg_w = cfg->width;
++            cfg_h = cfg->height;
+             wayland_surface_coords_to_window(surface, cfg->width, cfg->height, &win_w, &win_h);
+             if (cfg->decor == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
+             {
+-                win_w += (surface->window.rect.left - surface->window.window_rect.left) +
+-                         (surface->window.window_rect.right - surface->window.rect.right);
+-                win_h += (surface->window.rect.top - surface->window.window_rect.top) +
+-                         (surface->window.window_rect.bottom - surface->window.rect.bottom);
++                decor_w = (surface->window.rect.left - surface->window.window_rect.left) +
++                          (surface->window.window_rect.right - surface->window.rect.right);
++                decor_h = (surface->window.rect.top - surface->window.window_rect.top) +
++                          (surface->window.window_rect.bottom - surface->window.rect.bottom);
++                win_w += decor_w;
++                win_h += decor_h;
+             }
+         }
+     }
+     wayland_win_data_release(data);
++    /* NEUTRON workarea#3: a maximized configure for a toplevel on exactly one output is that output's maximized
++     * area (the work area); report it for that output. Here because this runs after every maximized configure
++     * AND when the surface settles on one output, whichever comes last. */
++    if (id && (state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++        wayland_report_output_maximized_h(id, cfg_h);
++    if (!neutron_follow_output()) return;
+     if (!id || !(state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED | WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)))
+         return;
+ 
+@@ -1753,6 +1776,9 @@
+         if (output->global_id != id || !output->current.current_mode) continue;
+         out_x = output->current.x;
+         out_y = output->current.y;
++        if (output->current.logical_w > 0)
++            out_scale = wayland_output_mode_width(&output->current, output->current.current_mode) /
++                        (double)output->current.logical_w;
+         found = TRUE;
+         break;
+     }
+@@ -1766,7 +1792,7 @@
+         (win_mon = NtUserMonitorFromRect(&win, MONITOR_DEFAULTTONEAREST)) && win_mon != out_mon &&
+         NtUserGetMonitorInfo(out_mon, &out_mi) && NtUserGetMonitorInfo(win_mon, &win_mi))
+     {
+-        BOOL full = !!(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN);
++        BOOL full = !!(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN), keep;
+         INT left, top, right, bottom;
+ 
+         cur_area = full ? win_mi.rcMonitor : win_mi.rcWork;
+@@ -1775,8 +1801,29 @@
+         top = cur_area.top - win.top;
+         right = win.right - cur_area.right;
+         bottom = win.bottom - cur_area.bottom;
+-        if (left >= 0 && top >= 0 && right >= 0 && bottom >= 0 &&
+-            left <= 64 && top <= 64 && right <= 64 && bottom <= 64)
++        /* NEUTRON follow-scale: the window's raw size is in its current monitor's pixels. When the output's
++         * scale differs (mixed-DPI desktops) carry the frame overhang, and convert the compositor's logical
++         * size, at the OUTPUT's scale: a configure of 823x1463 for a 175% portrait output came out 1646x2926
++         * at the 200% monitor the window was leaving, and the compositor rejected the result. */
++        keep = left >= 0 && top >= 0 && right >= 0 && bottom >= 0 &&
++               left <= 64 && top <= 64 && right <= 64 && bottom <= 64;
++        if (neutron_follow_scale() && out_scale > 0.0 && cur_scale > 0.0 && fabs(out_scale - cur_scale) > 0.001)
++        {
++            double r = out_scale / cur_scale;
++            if (keep)
++            {
++                left = (INT)floor(left * r + 0.5);
++                top = (INT)floor(top * r + 0.5);
++                right = (INT)floor(right * r + 0.5);
++                bottom = (INT)floor(bottom * r + 0.5);
++            }
++            if (cfg_w > 0 && cfg_h > 0)
++            {
++                win_w = (INT)floor(cfg_w * out_scale + 0.5) + decor_w;
++                win_h = (INT)floor(cfg_h * out_scale + 0.5) + decor_h;
++            }
++        }
++        if (keep)
+             SetRect(&new_rect, out_area.left - left, out_area.top - top,
+                     out_area.right + right, out_area.bottom + bottom);
+         else if (win_w > 0 && win_h > 0)
+@@ -1785,6 +1832,17 @@
+             new_rect = out_area;
+         moved = TRUE;
+     }
++    if (neutron_wl_diag())
++    {
++        MONITORINFO a = {.cbSize = sizeof(a)}, b = {.cbSize = sizeof(b)};
++        HMONITOR pm = NtUserMonitorFromRect(&probe, MONITOR_DEFAULTTONULL);
++        HMONITOR wm = NtUserMonitorFromRect(&win, MONITOR_DEFAULTTONEAREST);
++        if (pm) NtUserGetMonitorInfo(pm, &a);
++        if (wm) NtUserGetMonitorInfo(wm, &b);
++        ERR("neutron-follow-diag: hwnd=%p output=%u out=(%d,%d) win=%s probe_mon=%p %s win_mon=%p %s state=%#x cfg_win=%dx%d thread_dpi_ctx=%#x\n",
++            hwnd, id, out_x, out_y, wine_dbgstr_rect(&win), pm, wine_dbgstr_rect(&a.rcMonitor), wm,
++            wine_dbgstr_rect(&b.rcMonitor), state, win_w, win_h, context);
++    }
+     NtUserSetThreadDpiAwarenessContext(context);
+     if (!moved) return;
+ 
+@@ -1893,7 +1951,22 @@
+          * Record it here, in the desktop process, because that is the only process that builds the
+          * monitor list and therefore the only one whose copy of this value display.c will read.
+          * Must be stored BEFORE the rebuild below, or the rebuild uses the stale estimate. */
+-        if (wp)
++        if (wp && lp)
++        {
++            /* NEUTRON workarea#3: a measurement for ONE output (lp = its wl_registry global name). Store it
++             * under that output's name; rebuild only if it changed. */
++            struct wayland_output *output;
++            char name[64] = "";
++
++            pthread_mutex_lock(&process_wayland.output_mutex);
++            wl_list_for_each(output, &process_wayland.output_list, link)
++                if (output->global_id == (uint32_t)lp && output->current.name)
++                    snprintf(name, sizeof(name), "%s", output->current.name);
++            pthread_mutex_unlock(&process_wayland.output_mutex);
++            if (!name[0] || !neutron_workarea_save_output(name, (int)wp)) return 0;
++            if (neutron_wl_diag()) ERR("neutron-workarea: output %s maximized height %d\n", name, (int)wp);
++        }
++        else if (wp)
+         {
+             /* NEUTRON workarea#2: also persist it, so the NEXT desktop process starts with the
+              * real inset instead of the 32px estimate. Without this the first launch in a fresh

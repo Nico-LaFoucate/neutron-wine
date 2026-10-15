@@ -770,6 +770,18 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzz-mixed-dpi-maximize.mypatch` (2026-10-14) — maximize on a non-primary monitor at mixed DPI
+Illustrator maximized on a monitor that was not Wine's primary, on a desktop whose monitors differ in DPI, came out
+portrait-width with its configure rejected or too tall with its menu bar above the screen (240+ rejections). Three
+causes, three kill switches: (1) win32u `monitor_from_rect()` (upstream) compared a per-monitor-aware caller's RAW
+rect with monitors at the SYSTEM dpi, so the landscape monitor's origin resolved to the portrait monitor and the
+#20 follow-output never moved the window — now raw vs raw (`NEUTRON_MONITOR_RAW_LOOKUP=0`); (2) follow-output
+converted the compositor's size at the scale of the monitor being left (823x1463 → 1646x2926) — now at the output's
+own scale (`NEUTRON_FOLLOW_SCALE=0`); (3) the maximized work-area measurement was one value for every output — now
+per output name, persisted in the prefix file after the legacy first line (`NEUTRON_WORKAREA_PER_OUTPUT=0`).
+Nested KWin, #20 layout at 175%/200%: every case clean once the output has a measurement; the first maximize ever on
+a panel-less output can still come out misplaced in that session. His desk: the 4K unchanged.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-kde-primary.mypatch` (2026-10-14) — Wine's primary monitor = the desktop's primary (KDE)
 Wine made the output at the layout's origin primary; Windows' primary is the one the user chose. On KDE the desktop
 process now reads `kde_output_order_v1` (first output = primary) on a throwaway connection, because KDE marks the
