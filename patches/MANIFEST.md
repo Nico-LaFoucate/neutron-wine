@@ -770,6 +770,16 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzz-opencl-command-queue-with-properties.mypatch` (2026-10-15) — OpenCL 2.0 queue export (GitHub Neutron#18)
+Premiere 2026 crashed at startup on AMD with ROCm's OpenCL 2.1: its GPU check (GPUSniffer) created a context and died
+with c06d007f (delay-load procedure not found). Wine's OpenCL.dll exported only the 1.0–1.2 API; Windows' (the Khronos
+loader) exports every version, and `clCreateCommandQueueWithProperties` is the only OpenCL function Premiere, After
+Effects, Media Encoder, Photoshop, Audition or Lightroom Classic import that Wine lacked. `make_opencl` now emits it
+(`%extra_newer_functions`, with `cl_properties`/`cl_queue_properties`); regenerated from the pinned registry (the
+unmodified generator reproduces the current files exactly). No kill switch: an added export changes nothing for code
+that doesn't call it. NVIDIA: `opencl-probe` creates its queue through it and runs a kernel correctly; GPUSniffer and
+Photoshop's sniffer unchanged. AMD/ROCm: test build sent to the reporter.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzz-mixed-dpi-maximize.mypatch` (2026-10-14) — maximize on a non-primary monitor at mixed DPI
 Illustrator maximized on a monitor that was not Wine's primary, on a desktop whose monitors differ in DPI, came out
 portrait-width with its configure rejected or too tall with its menu bar above the screen (240+ rejections). Three

@@ -1,0 +1,157 @@
+opencl: export clCreateCommandQueueWithProperties (OpenCL 2.0), as Windows' OpenCL loader does (GitHub Neutron#18)
+
+Premiere Pro 2026 crashed at startup on an AMD RX 6700 XT whenever ROCm's OpenCL ("AMD Accelerated Parallel
+Processing", OpenCL 2.1) was present; with it hidden Premiere started but had only the CPU renderer. Premiere's own
+GPU check, GPUSniffer.exe, on the reporter's machine with ROCm as the only platform and +opencl,+seh: platform and
+device queries, clCreateContext, clGetContextInfo(CL_CONTEXT_DEVICES), then on the same thread c06d007f -- the
+MSVC delay-load helper's "procedure not found" -- and Adobe's crash handler.
+
+GPUSniffer delay-loads OpenCL.dll (56 functions) and the only one Wine's OpenCL.dll did not export is
+clCreateCommandQueueWithProperties: make_opencl generates the 1.0-1.2 API only. Windows' OpenCL.dll is the Khronos
+ICD loader, which exports every version's functions. Of the 75 OpenCL functions Premiere's modules import (the app,
+GPUSniffer, PProHeadless, CrmSdk, ProResRAW, OpenVINO's Intel GPU plugin), and of those After Effects, Media
+Encoder, Photoshop, Audition and Lightroom Classic import, it is the only one missing. NVIDIA never reached it
+(Premiere skips NVIDIA's OpenCL and uses CUDA); Mesa's Rusticl is rejected by vendor name before a context exists.
+
+make_opencl now also emits functions from newer versions that applications import directly, with the types they
+need (%extra_newer_functions); the only entry is clCreateCommandQueueWithProperties with cl_properties and
+cl_queue_properties. The unix side already builds against the 2.2 headers and links it from the host libOpenCL
+(OPENCL_2.0). Regenerated with the pinned registry commit: the unmodified generator reproduces the current files
+exactly; the change adds one export, its thunks, its params struct and the two typedefs.
+
+Verified (RTX 5070, NVIDIA OpenCL 3.0): harnesses/opencl-probe.c -- stock OpenCL.dll "exports
+clCreateCommandQueueWithProperties: NO"; patched "yes", queue created through it, a kernel on 1M ints all correct.
+Premiere's GPUSniffer and Photoshop's sniffer unchanged on NVIDIA (same exit code, same OpenCL calls, 1 device).
+Not yet verified on AMD/ROCm.
+
+--- a/dlls/opencl/make_opencl
++++ b/dlls/opencl/make_opencl
+@@ -36,6 +36,17 @@
+ 
+ my %core_categories = ();
+ 
++# NEUTRON (GitHub Neutron#18): functions newer than the generated version that applications import directly, each
++# with the types it needs. Windows' OpenCL.dll is the Khronos ICD loader, which exports every version's functions;
++# Adobe's Premiere, GPUSniffer, After Effects, Media Encoder, Photoshop, Audition and Lightroom Classic all import
++# clCreateCommandQueueWithProperties (OpenCL 2.0) from it. The imports are delay-loaded, so the missing export only
++# showed when the call was made: on ROCm's OpenCL 2.1, right after clCreateContext, every one of them died with
++# c06d007f (delay-load procedure not found). It is the only OpenCL function any of them import that was missing.
++my %extra_newer_functions =
++    (
++        "clCreateCommandQueueWithProperties" => [ "cl_properties", "cl_queue_properties" ],
++    );
++
+ my %arg_types =
+     (
+         #                      spec      unixlib         format
+@@ -498,6 +509,20 @@
+     foreach my $feature ($xml->findnodes("/registry/feature"))
+     {
+         parse_feature($feature, 1) if defined $core_categories{$feature->{name}};
++
++        # NEUTRON: newer functions that applications import directly, with the types they need (see below)
++        foreach my $cmd ($feature->findnodes("./require/command"))
++        {
++            my $types = $extra_newer_functions{$cmd->{name}} or next;
++            next if $core_functions{$cmd->{name}};
++            $core_functions{$cmd->{name}} = $all_functions{$cmd->{name}};
++            foreach my $name (@$types)
++            {
++                next if $header_types{$name};
++                push @header_types, $name;
++                $header_types{$name} = $all_types{$name};
++            }
++        }
+     }
+ 
+     # generate extension list and functions
+--- a/dlls/opencl/opencl.spec
++++ b/dlls/opencl/opencl.spec
+@@ -2,6 +2,7 @@
+ @ stdcall clCompileProgram(ptr long ptr ptr long ptr ptr ptr ptr)
+ @ stdcall clCreateBuffer(ptr int64 long ptr ptr)
+ @ stdcall clCreateCommandQueue(ptr ptr int64 ptr)
++@ stdcall clCreateCommandQueueWithProperties(ptr ptr ptr ptr)
+ @ stdcall clCreateContext(ptr long ptr ptr ptr ptr)
+ @ stdcall clCreateContextFromType(ptr int64 ptr ptr ptr)
+ @ stdcall clCreateFromGLBuffer(ptr int64 long ptr)
+--- a/dlls/opencl/opencl_types.h
++++ b/dlls/opencl/opencl_types.h
+@@ -79,6 +79,8 @@
+  cl_mem mem_object;
+  };
+ } cl_image_desc;
++typedef cl_ulong         cl_properties;
++typedef cl_properties    cl_queue_properties;
+ typedef cl_uint          cl_gl_context_info;
+ typedef cl_uint          cl_gl_object_type;
+ typedef cl_uint          cl_gl_texture_info;
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -38,6 +38,15 @@
+     return __retval;
+ }
+ 
++cl_command_queue WINAPI clCreateCommandQueueWithProperties( cl_context context, cl_device_id device, const cl_queue_properties* properties, cl_int* errcode_ret )
++{
++    cl_command_queue __retval;
++    struct clCreateCommandQueueWithProperties_params params = { &__retval, context, device, properties, errcode_ret };
++    TRACE( "(%p, %p, %p, %p)\n", context, device, properties, errcode_ret );
++    OPENCL_CALL( clCreateCommandQueueWithProperties, &params );
++    return __retval;
++}
++
+ cl_context WINAPI clCreateContext( const cl_context_properties* properties, cl_uint num_devices, const cl_device_id* devices, void (WINAPI* pfn_notify)(const char* errinfo, const void* private_info, size_t cb, void* user_data), void* user_data, cl_int* errcode_ret )
+ {
+     cl_context __retval;
+--- a/dlls/opencl/unixlib.h
++++ b/dlls/opencl/unixlib.h
+@@ -42,6 +42,15 @@
+     cl_int* errcode_ret;
+ };
+ 
++struct clCreateCommandQueueWithProperties_params
++{
++    cl_command_queue* __retval;
++    cl_context context;
++    cl_device_id device;
++    const cl_queue_properties* properties;
++    cl_int* errcode_ret;
++};
++
+ struct clCreateContext_params
+ {
+     cl_context* __retval;
+@@ -804,6 +813,7 @@
+     unix_clCompileProgram,
+     unix_clCreateBuffer,
+     unix_clCreateCommandQueue,
++    unix_clCreateCommandQueueWithProperties,
+     unix_clCreateContext,
+     unix_clCreateContextFromType,
+     unix_clCreateImage,
+--- a/dlls/opencl/unix_thunks.c
++++ b/dlls/opencl/unix_thunks.c
+@@ -28,6 +28,14 @@
+     return STATUS_SUCCESS;
+ }
+ 
++static NTSTATUS wrap_clCreateCommandQueueWithProperties( void *args )
++{
++    struct clCreateCommandQueueWithProperties_params *params = args;
++
++    *params->__retval = clCreateCommandQueueWithProperties( params->context, params->device, params->properties, params->errcode_ret );
++    return STATUS_SUCCESS;
++}
++
+ static NTSTATUS wrap_clCreateImage( void *args )
+ {
+     struct clCreateImage_params *params = args;
+@@ -579,6 +587,7 @@
+     wrap_clCompileProgram,
+     wrap_clCreateBuffer,
+     wrap_clCreateCommandQueue,
++    wrap_clCreateCommandQueueWithProperties,
+     wrap_clCreateContext,
+     wrap_clCreateContextFromType,
+     wrap_clCreateImage,
