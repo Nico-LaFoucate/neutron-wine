@@ -1,0 +1,70 @@
+win32u: a click does not activate a WS_EX_NOACTIVATE top-level window
+
+"A top-level window created with [WS_EX_NOACTIVATE] does not become the foreground window when the user clicks it"
+(MSDN, Extended Window Styles). process_mouse_message activated the clicked top-level whenever WM_MOUSEACTIVATE
+answered MA_ACTIVATE (DefWindowProc's default) without looking at the flag; the existing Neutron rule covered
+SetActiveWindow/SetFocus only.
+
+Lightroom Classic: dragging the Masks panel by its handle "only moves a little then is stuck in place". Traced on
+the nested desk: the press on the handle (a child of the panel, ex 08080080 = NOACTIVATE|LAYERED|TOOLWINDOW)
+activated the panel -- frame WM_ACTIVATE(inactive), panel WM_ACTIVATE(WA_CLICKACTIVE) + focus -- and Lightroom
+answered by releasing the capture its handle had just taken (its own ReleaseCapture, ~90 ms after the press) and
+activating the frame again, so the drag had nothing to follow. Now the activation stays on the frame and the click
+is delivered as before.
+
+Measured (fresh launch each, same drag): panel (1747,136) -> (1614,233) for a (-133,+98) pointer drag, i.e. it
+follows; NEUTRON_NOACTIVATE_CLICK=0: it does not move. Menus, the mask menu and Select Subject unchanged.
+
+Kill switch NEUTRON_NOACTIVATE_CLICK=0.
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2200,6 +2200,28 @@
+     return neutron_noactivate_honor_on();
+ }
+ 
++/* NEUTRON noactivate-click (2026-10-15): "A top-level window created with [WS_EX_NOACTIVATE] does not become the
++ * foreground window when the user clicks it" (MSDN, Extended Window Styles). process_mouse_message activated the
++ * clicked top-level whenever WM_MOUSEACTIVATE answered MA_ACTIVATE -- DefWindowProc's default -- without looking at
++ * the flag. Lightroom Classic's Masks panel (ex 08080080, NOACTIVATE) took the activation from the frame on every
++ * click; Lightroom answers that by releasing the capture its drag handle had just taken (ReleaseCapture ~90 ms
++ * after the press, trace) and activating the frame again, so dragging the panel moved it a little, then stopped.
++ * The click itself is still delivered. Kill switch NEUTRON_NOACTIVATE_CLICK=0. */
++BOOL neutron_noactivate_click( HWND top )
++{
++    static int on = -1;
++
++    if (!top || (get_window_long( top, GWL_STYLE ) & WS_CHILD)) return FALSE;
++    if (!(get_window_long( top, GWL_EXSTYLE ) & WS_EX_NOACTIVATE)) return FALSE;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_NOACTIVATE_CLICK" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_NOACTIVATE_CLICK = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
+ /**********************************************************************
+  *           NtUserSetActiveWindow    (win32u.@)
+  */
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2850,6 +2850,7 @@
+                     /* fall through */
+                 case MA_ACTIVATE:
+                 case 0:
++                    if (neutron_noactivate_click( hwndTop )) break;  /* NEUTRON: a WS_EX_NOACTIVATE top-level */
+                     if (!set_foreground_window( hwndTop, TRUE, FALSE )) eat_msg = TRUE;
+                     break;
+                 default:
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -97,6 +97,7 @@
+ extern BOOL is_mouse_in_pointer_enabled( HWND hwnd );
+ extern HWND get_active_window(void);
+ extern HWND get_capture(void);
++extern BOOL neutron_noactivate_click( HWND top );
+ extern HWND get_focus(void);
+ extern DWORD get_input_state(void);
+ extern DWORD get_last_input_time(void);

@@ -786,6 +786,26 @@ patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON
 1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1). OPEN: audit the rest of
 this delta for reverts without a NEUTRON comment.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-capture-tracking.mypatch` (2026-10-15) — no WM_MOUSELEAVE to a captured window
+LrC's panel scroll bars (ScrollBar class, tracked by LrC) stopped "the moment the mouse hovers outside of the scrollbar"
+while dragging: get_mouse_window() (TrackMouseEvent hover/leave) used the window under the cursor and posted
+WM_MOUSELEAVE to the bar that held the capture. Windows/ReactOS track the window that gets the mouse messages — the
+capture window, HTCLIENT — so the leave only comes after release. 100-px thumb drag drifting 0/30/90 px sideways: moves
+100/100/100 (switch off: 100/22/16); hover highlight still clears after release. Kill switch `NEUTRON_CAPTURE_TRACKING=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-noactivate-click.mypatch` (2026-10-15) — a click does not activate a WS_EX_NOACTIVATE window
+"Does not become the foreground window when the user clicks it" (MSDN). process_mouse_message activated it on
+MA_ACTIVATE regardless. LrC's Masks panel (NOACTIVATE) took the activation on every click; LrC then released its drag
+handle's capture (~90 ms after the press) and re-activated the frame: dragging the panel "only moves a little then is
+stuck". Now the panel follows a (−133,+98) drag exactly; switch off: it does not move. Kill switch
+`NEUTRON_NOACTIVATE_CLICK=0`. (The existing NOACTIVATE rule covered SetActiveWindow/SetFocus only.)
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-popup-topmost-only.mypatch` (2026-10-15) — LrC Masks panel no longer floats over other apps
+Only a WS_EX_TOPMOST owned window becomes an xdg_popup (menus, dropdowns, tooltips are all topmost by the time they
+show); a normal owned window is a subsurface of its owner, as an owned window stacks on Windows. The panel (ex 08080080,
+not topmost) was an xdg_popup that KWin kept above every app. His check: panel stays behind other apps, menus fine.
+Kill switch `NEUTRON_POPUP_TOPMOST_ONLY=0`.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-caption-text-and-stale-redraw.mypatch` (2026-10-15) — LrC title bar one module behind
 Lightroom retitles its frame with WS_VISIBLE cleared around SetWindowText (SetWindowLong off, SetWindowText, back on);
 DefWindowProc(WM_SETTEXT) skipped the caption repaint of an invisible window, so the title bar showed the previous

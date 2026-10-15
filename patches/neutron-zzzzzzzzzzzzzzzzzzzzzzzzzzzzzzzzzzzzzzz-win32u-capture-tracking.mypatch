@@ -1,0 +1,63 @@
+win32u: mouse tracking follows the capture window, so a captured drag gets no WM_MOUSELEAVE
+
+The window the mouse is "in" for TrackMouseEvent is the window that receives the mouse messages: while the mouse is
+captured, the capture window, client area, whatever is under the cursor. ReactOS, which mirrors Windows here,
+hands IntTrackMouseMove the capture window with HTCLIENT (co_IntProcessMouseMessage), so a window that holds the
+capture never gets WM_MOUSELEAVE; the leave comes after the capture is released. get_mouse_window() looked up the
+window under the cursor instead, so a captured drag that crossed the window's edge was sent WM_MOUSELEAVE mid-drag.
+
+Lightroom Classic: "you can only scroll on the scrollbar with the mouse directly on top of it if clicking and
+dragging. The moment the mouse hovers outside of the scrollbar it stops scrolling". Its panel scroll bars are
+ScrollBar-class windows tracked by Lightroom itself; trace on the nested desk: capture held by the bar throughout,
+then LEAVECHECK track=bar under=(nil) -> WM_MOUSELEAVE posted, and the thumb stopped.
+
+Measured, same 100-px drag of the Develop panel's thumb with the pointer drifting sideways:
+  sideways 0 / 30 / 90 px: thumb moves 100 / 100 / 100 (NEUTRON_CAPTURE_TRACKING=0: 100 / 22 / 16).
+The hover highlight still clears after a drag released off the bar (the leave arrives once capture is gone), and
+dragging the Masks panel still works.
+
+Kill switch NEUTRON_CAPTURE_TRACKING=0.
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1673,12 +1673,39 @@
+     }
+ }
+ 
++/* NEUTRON capture-tracking (2026-10-15): the window the mouse is "in" for TrackMouseEvent is the window that gets
++ * the mouse messages, which while the mouse is captured is the capture window, client area -- whatever is under the
++ * cursor. Windows (and ReactOS, which mirrors it: co_IntProcessMouseMessage hands IntTrackMouseMove the capture
++ * window with HTCLIENT) therefore never sends WM_MOUSELEAVE to a window that holds the capture; the leave comes once
++ * it is released. Here the leave check looked up the window under the cursor, so a captured drag that crossed the
++ * window's edge got WM_MOUSELEAVE mid-drag. Lightroom Classic's panel scroll bars (ScrollBar class, tracked by
++ * Lightroom itself) stop on it: "you can only scroll on the scrollbar with the mouse directly on top of it if
++ * clicking and dragging. The moment the mouse hovers outside of the scrollbar it stops scrolling". Trace: capture
++ * held by the bar, LEAVECHECK under=(nil) -> WM_MOUSELEAVE posted. Kill switch NEUTRON_CAPTURE_TRACKING=0. */
++static BOOL neutron_capture_tracking(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_CAPTURE_TRACKING" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_CAPTURE_TRACKING = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
+ static HWND get_mouse_window( HWND hwnd, INT *hittest, POINT *ret_pos, struct mouse_tracking_info *tracking )
+ {
+     POINT pos;
+-    HWND ret;
++    HWND ret, capture;
+ 
+     NtUserGetCursorPos( &pos );
++    if ((capture = get_capture()) && neutron_capture_tracking())
++    {
++        *hittest = HTCLIENT;
++        *ret_pos = pos;
++        return capture;
++    }
+     ret = window_from_point( hwnd, pos, hittest, FALSE );
+     if (ret && ret == tracking->last_mouse_message_hwnd)
+     {

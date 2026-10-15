@@ -1,0 +1,58 @@
+winewayland: only a topmost owned window becomes an xdg_popup; a normal one is a subsurface of its owner
+
+Lightroom Classic's Masks panel floated above every other application ("the floating masks panel"). Reproduced on
+the nested desk (clean room, 125): Premiere, and a maximized Notepad from another prefix, opened over Lightroom
+both had the panel on top of them. Role trace: the panel (WS_POPUP, WS_EX_LAYERED|TOOLWINDOW|NOACTIVATE, owned by
+the frame, not topmost) was an xdg_popup, which KWin keeps above everything.
+
+On Windows an owned window stays in its owner's z-order band: above the owner, below another app's window raised
+over the owner. Only WS_EX_TOPMOST windows float above everything, and the transient ones are all topmost by the
+time they show: menus, combo dropdowns and tooltips SetWindowPos(HWND_TOPMOST) first (win32u menu.c, user32
+combo.c, comctl32 tooltips.c), as on Windows. So the popup branch now also requires WS_EX_TOPMOST; a non-topmost
+owned window takes the classic branch, a subsurface of its owner, which stacks with the owner and whose position
+Wine sets.
+
+Measured: the panel is a SUBSURFACE; a maximized Notepad over Lightroom now covers it; it draws in place; clicks on
+it work (Create New Mask opens its menu, a topmost NonActivateWindow, still an xdg_popup, placed correctly); Select
+Subject grows it correctly; the File menu (#32768, topmost when shown) is still an xdg_popup. Dragging the panel by
+its handle with injected pointer input moved it once and not at all on later tries -- with the popup role it did
+not move either -- so the drag is left to a hand test.
+
+Kill switch NEUTRON_POPUP_TOPMOST_ONLY=0.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1017,6 +1017,25 @@
+  * the dim layer, the highlight box and the help bubble. Disabled, it takes no input, so it is
+  * never a menu. As an xdg_popup it sat above all three -- the help could not be seen or
+  * dismissed, and Lightroom waited for it forever. */
++/* NEUTRON popup-topmost (2026-10-15): which unmanaged owned windows become xdg_popups.
++ *
++ * On Windows an owned window lives in its owner's z-order band: above the owner, below any other app's window
++ * raised over the owner. Only WS_EX_TOPMOST windows float above everything -- and every transient one is topmost by
++ * the time it shows: menus, combo dropdowns and tooltips all SetWindowPos(HWND_TOPMOST) first (win32u menu.c,
++ * user32 combo.c, comctl32 tooltips.c), as on Windows. An xdg_popup is what KWin keeps above everything, so it is
++ * the Wayland shape of a topmost owned window, not of a normal one. Lightroom Classic's Masks flyout (WS_POPUP,
++ * WS_EX_LAYERED|TOOLWINDOW|NOACTIVATE, owned by the frame, NOT topmost) was an xdg_popup and stayed on top of every
++ * other application's window ("the floating masks panel"; reproduced: a maximized Notepad from another prefix
++ * under it). A non-topmost owned window now takes the classic path: a subsurface of its owner, which stacks with
++ * the owner and whose position Wine sets (as for managed owned windows, see neutron_owned_subsurface).
++ * Kill switch NEUTRON_POPUP_TOPMOST_ONLY=0. */
++static BOOL neutron_popup_topmost_only(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_POPUP_TOPMOST_ONLY", TRUE);
++    return on;
++}
++
+ static BOOL neutron_is_clickthrough_overlay(HWND hwnd)
+ {
+     DWORD ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+@@ -1192,6 +1211,7 @@
+      * a standalone toplevel (which showed as a ghost second window). */
+     if (owner_surface && owner_surface->xdg_surface &&
+         !neutron_is_clickthrough_overlay(hwnd) &&
++        (!neutron_popup_topmost_only() || (NtUserGetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) &&
+         !(data->wayland_surface &&
+           data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE) &&
+         !((owner_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
