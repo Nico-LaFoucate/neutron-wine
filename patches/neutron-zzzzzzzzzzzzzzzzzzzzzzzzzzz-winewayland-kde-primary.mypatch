@@ -1,0 +1,440 @@
+winewayland: make the desktop's primary output Wine's primary monitor (KDE)
+
+Windows' primary monitor is the one the user chose, and it sits at (0,0). Wine made the output at the layout's origin
+primary, so on KDE with the primary set elsewhere (GitHub Neutron#20: a portrait screen at the origin, the landscape
+one set as primary) DISPLAY1, the primary work area and the (0,0) origin were on the other screen, and the CLI took
+the system DPI (LogPixels) from KDE's primary while Wine's primary had another DPI.
+
+KDE publishes its order in kde_output_order_v1; the first output is the primary. KDE marks that protocol a
+desktop-environment detail ("Regular clients must not use this protocol. Backward incompatible changes may be added
+without bumping the major version"), and an event this code does not know would be a protocol error, which kills the
+connection it arrives on. So it is never bound on the process's connection: the desktop process, when it builds the
+monitor list, opens a throwaway connection, reads one list, and disconnects (cached until the outputs change). Any
+failure, or a compositor without the protocol, keeps the layout-origin rule. The existing translation puts the
+primary at (0,0); other outputs may be at negative coordinates, as on Windows.
+
+KWin sends nothing to Wayland clients when only the order changes, so a monitor list can outlive a change of primary.
+App processes therefore do not ask KDE: wayland_output_arrange_positions (used to move maximized windows onto the
+output they are shown on) takes the primary whose arrangement matches win32u's monitors -- the layout-origin rule
+first, then each output -- so an app started after a change of primary agrees with the monitor list it runs against.
+A change of primary takes effect when the prefix's Wine restarts.
+
+Kill switch NEUTRON_KDE_PRIMARY=0.
+
+Verified on a nested KWin, clean-room prefixes, runtime 11.10-123 (+ the maximized-crop patch for the app runs):
+- #20 layout (portrait Virtual-0 at the origin, landscape Virtual-1 KDE priority 1): DISPLAY1 = Virtual-1 at (0,0),
+  Virtual-0 at (-1440,-581); =0 gives the shipped layout exactly (DISPLAY1 = the portrait at (0,0)).
+- Operator's desk (4K at the origin and KDE primary): monitor list unchanged. Primary swapped to the right output:
+  DISPLAY1 = it at (0,0), the 4K at (-3841,-164).
+- Primary swapped while an app ran, second app started after: its arrangement matched win32u with the layout-origin
+  primary (the list the desktop built), its maximized window landed on the right monitor.
+- Illustrator 2026, #20 layout, opened on the landscape KDE primary: maximized full size, no rejected configure
+  (=0: portrait-width window, configure rejected -- the #20 symptom at mixed scales, 1.75/2.0).
+- Maximized test window and ptrcheck on the 4K at negative coordinates: correct rect, pointer within 0 image px.
+Not changed by this (both rules): maximizing on a non-primary output whose DPI differs from the primary's.
+
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -30,8 +30,10 @@
+ #include "wine/debug.h"
+ 
+ #include "ntuser.h"
++#include "kde-output-order-v1-client-protocol.h"
+ 
+ #include <stdlib.h>
++#include <string.h>
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
+ 
+@@ -41,12 +43,23 @@
+     struct wayland_output_state *output;
+ };
+ 
++/* NEUTRON (kdeprimary): the output the desktop calls primary, for the sort below; NULL = the output at the
++ * layout origin. Set around the qsort, under output_mutex. */
++static const char *output_info_primary_name;
++
++static BOOL output_info_is_primary(const struct output_info *info)
++{
++    if (output_info_primary_name)
++        return info->output->name && !strcmp(info->output->name, output_info_primary_name);
++    return info->x == 0 && info->y == 0;
++}
++
+ static int output_info_cmp_primary_x_y(const void *va, const void *vb)
+ {
+     const struct output_info *a = va;
+     const struct output_info *b = vb;
+-    BOOL a_is_primary = a->x == 0 && a->y == 0;
+-    BOOL b_is_primary = b->x == 0 && b->y == 0;
++    BOOL a_is_primary = output_info_is_primary(a);
++    BOOL b_is_primary = output_info_is_primary(b);
+ 
+     if (a_is_primary && !b_is_primary) return -1;
+     if (!a_is_primary && b_is_primary) return 1;
+@@ -173,7 +186,122 @@
+     return found_overlap;
+ }
+ 
+-static void output_info_array_arrange_physical_coords(struct wl_array *output_info_array)
++/* NEUTRON (kdeprimary): KDE's output order (kde_output_order_v1), read on a separate, short-lived connection.
++ *
++ * Windows' primary monitor is the one the user chose, and it sits at (0,0). Wine made the output at the layout's
++ * origin primary, so with KDE's primary elsewhere (GitHub Neutron#20: a portrait screen at the origin, the landscape
++ * one set as primary) DISPLAY1, the primary work area and the (0,0) origin were all on the other screen.
++ * KDE publishes its order in kde_output_order_v1: the first output is the primary.
++ *
++ * KDE marks that protocol a desktop-environment detail ("Regular clients must not use this protocol. Backward
++ * incompatible changes may be added without bumping the major version"). An event this code does not know would be
++ * a protocol error, which kills the connection it arrives on. So it is never bound on the process's connection: a
++ * throwaway connection binds it, reads one list, and disconnects; any failure leaves the layout-origin rule in place.
++ * Only the desktop process asks, when it builds the monitor list; app processes match that list instead
++ * (wayland_output_arrange_positions). Returns a malloc'd output name or NULL. */
++struct neutron_kde_order
++{
++    struct kde_output_order_v1 *order;
++    char *first;     /* first output of the list being received */
++    char *primary;   /* first output of the last complete list */
++    BOOL done;
++};
++
++static void neutron_kde_order_output(void *data, struct kde_output_order_v1 *order, const char *name)
++{
++    struct neutron_kde_order *o = data;
++    if (!o->first && name) o->first = strdup(name);
++}
++
++static void neutron_kde_order_done(void *data, struct kde_output_order_v1 *order)
++{
++    struct neutron_kde_order *o = data;
++    free(o->primary);
++    o->primary = o->first;
++    o->first = NULL;
++    o->done = TRUE;
++}
++
++static const struct kde_output_order_v1_listener neutron_kde_order_listener =
++{
++    neutron_kde_order_output,
++    neutron_kde_order_done,
++};
++
++static void neutron_kde_registry_global(void *data, struct wl_registry *registry, uint32_t id,
++                                        const char *interface, uint32_t version)
++{
++    struct neutron_kde_order *o = data;
++    if (o->order || strcmp(interface, "kde_output_order_v1")) return;
++    o->order = wl_registry_bind(registry, id, &kde_output_order_v1_interface, 1);
++    if (o->order) kde_output_order_v1_add_listener(o->order, &neutron_kde_order_listener, o);
++}
++
++static void neutron_kde_registry_global_remove(void *data, struct wl_registry *registry, uint32_t id)
++{
++}
++
++static const struct wl_registry_listener neutron_kde_registry_listener =
++{
++    neutron_kde_registry_global,
++    neutron_kde_registry_global_remove,
++};
++
++static char *neutron_query_kde_primary(void)
++{
++    struct neutron_kde_order o = {0};
++    struct wl_display *display;
++    struct wl_registry *registry;
++    int i;
++
++    if (!(display = wl_display_connect(NULL))) return NULL;
++    if ((registry = wl_display_get_registry(display)))
++    {
++        wl_registry_add_listener(registry, &neutron_kde_registry_listener, &o);
++        /* globals, then the list the compositor sends on bind */
++        for (i = 0; i < 3 && !o.done; i++)
++            if (wl_display_roundtrip(display) == -1) break;
++        if (o.order) kde_output_order_v1_destroy(o.order);
++        wl_registry_destroy(registry);
++    }
++    if (wl_display_get_error(display)) o.done = FALSE;
++    wl_display_disconnect(display);
++    free(o.first);
++    if (!o.done)
++    {
++        free(o.primary);
++        return NULL;
++    }
++    return o.primary;
++}
++
++/* The KDE primary for the current output set, cached until the outputs change. Called with output_mutex held, by
++ * the desktop process only. */
++static const char *neutron_kde_primary(void)
++{
++    static int on = -1;
++    static char *cached;
++    static unsigned int cached_generation;
++    static BOOL valid;
++
++    if (on < 0) on = neutron_gate("NEUTRON_KDE_PRIMARY", TRUE);
++    if (!on || !process_wayland.has_kde_output_order) return NULL;
++    if (!valid || cached_generation != process_wayland.output_generation)
++    {
++        const char *gt = getenv("NEUTRON_GEOM_TRACE");
++
++        free(cached);
++        cached = neutron_query_kde_primary();
++        cached_generation = process_wayland.output_generation;
++        valid = TRUE;
++        if (gt && gt[0] == '1') ERR("neutron-primary: KDE output order: primary=%s\n", debugstr_a(cached));
++    }
++    return cached;
++}
++
++/* `primary`: the name of the output to make primary (NEUTRON kdeprimary), or NULL for the output at the layout's
++ * origin; a name that matches no output counts as NULL. */
++static void output_info_array_arrange_physical_coords(struct wl_array *output_info_array, const char *primary)
+ {
+     struct output_info *info;
+     size_t num_outputs = output_info_array->size / sizeof(struct output_info);
+@@ -194,8 +322,13 @@
+ 
+     /* Now that we have our physical pixel coordinates, sort from physical left
+      * to right, but ensure the primary output is first. */
++    output_info_primary_name = NULL;
++    if (primary)
++        wl_array_for_each(info, output_info_array)
++            if (info->output->name && !strcmp(info->output->name, primary)) output_info_primary_name = primary;
+     qsort(output_info_array->data, num_outputs, sizeof(struct output_info),
+           output_info_cmp_primary_x_y);
++    output_info_primary_name = NULL;
+ 
+     /* NEUTRON (GitHub Neutron#16): Windows always has the primary monitor at (0,0), and apps rely on
+      * it. With no output at logical (0,0) -- a 125% 4K monitor placed 443 px lower than the 1080p one
+@@ -224,17 +357,99 @@
+     }
+ }
+ 
++/* NEUTRON kdeprimary: does win32u have a monitor at exactly each of these rects? Per-monitor aware, so raw
++ * pixels, as the arrangement is. */
++static BOOL neutron_win32u_has_monitors(const RECT *rects, int count)
++{
++    UINT context = NtUserSetThreadDpiAwarenessContext(NTUSER_DPI_PER_MONITOR_AWARE);
++    BOOL ok = TRUE;
++    int i;
++
++    for (i = 0; i < count && ok; i++)
++    {
++        MONITORINFO mi = {.cbSize = sizeof(mi)};
++        HMONITOR monitor = NtUserMonitorFromRect(&rects[i], MONITOR_DEFAULTTONULL);
++
++        ok = monitor && NtUserGetMonitorInfo(monitor, &mi) &&
++             mi.rcMonitor.left == rects[i].left && mi.rcMonitor.top == rects[i].top &&
++             mi.rcMonitor.right == rects[i].right && mi.rcMonitor.bottom == rects[i].bottom;
++    }
++    NtUserSetThreadDpiAwarenessContext(context);
++    return ok;
++}
++
++/* Arrange the current outputs with `primary` and copy the result out; output_mutex held. */
++static int neutron_arrange_candidate(const char *primary, RECT *rects, int max)
++{
++    struct wayland_output *output;
++    struct output_info *info;
++    struct wl_array array;
++    int count = 0;
++
++    wl_array_init(&array);
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        if (!output->current.current_mode) continue;
++        if ((info = wl_array_add(&array, sizeof(*info)))) info->output = &output->current;
++    }
++    output_info_array_arrange_physical_coords(&array, primary);
++    wl_array_for_each(info, &array)
++    {
++        if (count == max) break;
++        SetRect(&rects[count++], info->x, info->y, info->x + output_info_width(info),
++                info->y + output_info_height(info));
++    }
++    wl_array_release(&array);
++    return count;
++}
++
+ /* NEUTRON: (re)compute each output's arranged physical position into output->current.x/y, running the
+  * same overlap resolution the display-device build uses. The display-device update only runs in the
+  * DESKTOP process (maybe_init_display_devices bails elsewhere), so an app process (e.g. Photoshop) that
+  * needs an output's monitor rect — to reposition a window on output-enter — must recompute it here
+- * rather than read a stale/zero value. Deterministic on the (global) compositor output state, so it
+- * matches win32u's monitor origins (which come from the desktop process). Locks output_mutex. */
++ * rather than read a stale/zero value. Locks output_mutex.
++ *
++ * NEUTRON kdeprimary: the arrangement depends on which output is primary, and the desktop process chose that
++ * from KDE's output order when it last built the monitor list. KDE does not tell Wayland clients when only the
++ * order changes, so an app started after such a change would read a different order than the one the monitor
++ * list was built with, and place windows on the wrong monitor. So do not ask KDE here: take the primary that
++ * matches win32u's monitors -- the layout-origin rule first (no KDE, or KDE agrees), then each output in turn --
++ * and fall back to the layout-origin rule when none matches (the monitor list is being rebuilt). */
+ void wayland_output_arrange_positions(void)
+ {
+     struct wayland_output *output;
+     struct output_info *output_info;
+     struct wl_array output_info_array;
++    char *names[8], *chosen = NULL;
++    RECT rects[8];
++    int n = 0, c, count;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    wl_list_for_each(output, &process_wayland.output_list, link)
++        if (output->current.current_mode && output->current.name && n < ARRAY_SIZE(names))
++            names[n++] = strdup(output->current.name);
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++
++    /* candidate -1 is the layout-origin rule */
++    for (c = -1; c < n; c++)
++    {
++        if (c >= 0 && !names[c]) continue;
++        pthread_mutex_lock(&process_wayland.output_mutex);
++        count = neutron_arrange_candidate(c < 0 ? NULL : names[c], rects, ARRAY_SIZE(rects));
++        pthread_mutex_unlock(&process_wayland.output_mutex);
++        /* win32u is asked without output_mutex held: it may call back into the driver */
++        if (count && neutron_win32u_has_monitors(rects, count))
++        {
++            if (c >= 0) chosen = names[c];
++            break;
++        }
++    }
++    {
++        const char *gt = getenv("NEUTRON_GEOM_TRACE");
++        if (gt && gt[0] == '1')
++            ERR("neutron-primary: app arrangement %s win32u's monitors, primary=%s\n",
++                c < n ? "matches" : "does not match", chosen ? debugstr_a(chosen) : "(layout origin)");
++    }
+ 
+     wl_array_init(&output_info_array);
+ 
+@@ -247,7 +462,7 @@
+         if (output_info) output_info->output = &output->current;
+     }
+ 
+-    output_info_array_arrange_physical_coords(&output_info_array);
++    output_info_array_arrange_physical_coords(&output_info_array, chosen);
+ 
+     wl_array_for_each(output_info, &output_info_array)
+     {
+@@ -257,6 +472,8 @@
+ 
+     wl_array_release(&output_info_array);
+     pthread_mutex_unlock(&process_wayland.output_mutex);
++
++    for (c = 0; c < n; c++) free(names[c]);
+ }
+ 
+ static void wayland_add_device_gpu(const struct gdi_device_manager *device_manager,
+@@ -524,7 +741,8 @@
+         else ERR("Failed to allocate space for output_info\n");
+     }
+ 
+-    output_info_array_arrange_physical_coords(&output_info_array);
++    /* NEUTRON kdeprimary: the desktop's primary, when the desktop names one */
++    output_info_array_arrange_physical_coords(&output_info_array, neutron_kde_primary());
+ 
+     /* Populate GDI devices. */
+     wayland_add_device_gpu(device_manager, param);
+--- a/dlls/winewayland.drv/kde-output-order-v1.xml
++++ b/dlls/winewayland.drv/kde-output-order-v1.xml
+@@ -0,0 +1,38 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="kde_output_order_v1">
++  <copyright><![CDATA[
++    SPDX-FileCopyrightText: 2022 Xaver Hugl <xaver.hugl@gmail.com>
++
++    SPDX-License-Identifier: MIT-CMU
++    ]]></copyright>
++
++  <interface name="kde_output_order_v1" version="1">
++    <description summary="announce order of outputs">
++        Announce the order in which desktop environment components should be placed on outputs.
++        The compositor will send the list of outputs when the global is bound and whenever there is a change.
++
++        Warning! The protocol described in this file is a desktop environment
++        implementation detail. Regular clients must not use this protocol.
++        Backward incompatible changes may be added without bumping the major
++        version of the extension.
++    </description>
++
++    <event name="output">
++      <description summary="output name">
++        Specifies the output identified by their wl_output.name.
++      </description>
++      <arg name="output_name" type="string" summary="the name of the output"/>
++    </event>
++
++    <event name="done">
++      <description summary="done">
++        Specifies that the output list is complete. On the next output event, a new list begins.
++      </description>
++    </event>
++
++    <request name="destroy" type="destructor">
++      <description summary="Destroy the output order notifier."/>
++    </request>
++  </interface>
++
++</protocol>
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -11,6 +11,7 @@
+ 	display.c \
+ 	dllmain.c \
+ 	fractional-scale-v1.xml \
++	kde-output-order-v1.xml \
+ 	opengl.c \
+ 	pointer-constraints-unstable-v1.xml \
+ 	pointer-warp-v1.xml \
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -121,6 +121,11 @@
+         if (!wayland_output_create(id, version))
+             ERR("Failed to create wayland_output for global id=%u\n", id);
+     }
++    else if (strcmp(interface, "kde_output_order_v1") == 0)
++    {
++        /* NEUTRON: only noted; display.c reads it on a separate connection */
++        process_wayland.has_kde_output_order = TRUE;
++    }
+     else if (strcmp(interface, "zxdg_output_manager_v1") == 0)
+     {
+         struct wayland_output *output;
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -271,6 +271,11 @@
+     struct wl_list output_list;
+     /* Protects the output_list and the wayland_output.current states. */
+     pthread_mutex_t output_mutex;
++    /* NEUTRON: bumped (under output_mutex) whenever an output's state changes or an output goes away, so
++     * results derived from the output set can be cached (see neutron_kde_primary in display.c). */
++    unsigned int output_generation;
++    /* NEUTRON: the compositor offers kde_output_order_v1 (never bound on this connection, see display.c) */
++    BOOL has_kde_output_order;
+     LONG input_serial;
+ };
+ 
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -205,6 +205,8 @@
+         output->current.logical_h = wayland_output_mode_height(&output->current, output->current.current_mode);
+     }
+ 
++    process_wayland.output_generation++;
++
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+     TRACE("name=%s logical=%d,%d+%dx%d transform=%d\n",
+@@ -406,6 +408,7 @@
+ {
+     pthread_mutex_lock(&process_wayland.output_mutex);
+     wl_list_remove(&output->link);
++    process_wayland.output_generation++;
+     pthread_mutex_unlock(&process_wayland.output_mutex);
+ 
+     wayland_output_state_deinit(&output->pending);

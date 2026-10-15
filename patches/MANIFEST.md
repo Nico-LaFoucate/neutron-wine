@@ -770,6 +770,16 @@ Kill switch `NEUTRON_WINMM_KEEP_CAPTURE=0`. Verified: `preserved-fixes/harnesses
 33-minute session. ⚠️ It does NOT fix the playback jumps: those come from the 180 ms chunks themselves (operator, run 6
 with `PULSE_LATENCY_MSEC` off: *"playback is smooth, no audio dropouts"*).
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-kde-primary.mypatch` (2026-10-14) — Wine's primary monitor = the desktop's primary (KDE)
+Wine made the output at the layout's origin primary; Windows' primary is the one the user chose. On KDE the desktop
+process now reads `kde_output_order_v1` (first output = primary) on a throwaway connection, because KDE marks the
+protocol internal and an unknown event would kill the connection it arrives on; any failure keeps the old rule. The
+existing translation puts the primary at (0,0), others possibly negative. App processes do not ask KDE: they take the
+primary whose arrangement matches win32u's monitors, so a change of primary mid-session (KWin sends clients nothing
+for it) cannot split them from the monitor list; it takes effect when the prefix's Wine restarts. Kill switch
+`NEUTRON_KDE_PRIMARY=0`. Verified on a nested KWin: #20 layout → DISPLAY1 = KDE's landscape primary and Illustrator
+maximizes full size there (=0: the #20 portrait-width window at mixed scales); the operator's desk unchanged.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-maximized-crop.mypatch` (2026-10-14) — a maximized window's frame on the next monitor
 Operator: *"I'm seeing a sliver of app on my right monitor again."* A maximized window's rect overhangs its work area
 by the frame (as on Windows); the surface carried the overhang and xdg geometry does not clip, so KWin drew the frame
