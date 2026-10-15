@@ -888,7 +888,9 @@ Effects, Media Encoder, Photoshop, Audition or Lightroom Classic import that Win
 (`%extra_newer_functions`, with `cl_properties`/`cl_queue_properties`); regenerated from the pinned registry (the
 unmodified generator reproduces the current files exactly). No kill switch: an added export changes nothing for code
 that doesn't call it. NVIDIA: `opencl-probe` creates its queue through it and runs a kernel correctly; GPUSniffer and
-Photoshop's sniffer unchanged. AMD/ROCm: test build sent to the reporter.
+Photoshop's sniffer unchanged. AMD/ROCm (reporter, RX 6750 XT, 10-15): crash gone; GPUSniffer lists `gfx1030`
+(Vendor AMD, 12272 MB) as a GPU-computation device, and Premiere's Renderer reads "Mercury Playback Engine GPU
+Acceleration (OpenCL)".
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzz-mixed-dpi-maximize.mypatch` (2026-10-14) — maximize on a non-primary monitor at mixed DPI
 Illustrator maximized on a monitor that was not Wine's primary, on a desktop whose monitors differ in DPI, came out
