@@ -1,0 +1,133 @@
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -642,6 +642,7 @@
+ }
+ 
+ static BOOL neutron_dc_suppress_flush(void);
++static BOOL neutron_resize_hold_active( struct window_surface *surface );
+ 
+ void window_surface_flush( struct window_surface *surface )
+ {
+@@ -658,6 +659,8 @@
+      * bracket entirely -- that path fires synchronously right after an arbitrary GDI
+      * primitive, i.e. mid-sequence by construction. See neutron_dc_suppress_flush(). */
+     if (neutron_dc_suppress_flush()) return;
++    /* NEUTRON: a grown top-level's new surface waits until its new area is painted (bounds stay dirty). */
++    if (neutron_resize_hold_active( surface )) return;
+ 
+     window_surface_lock( surface );
+ 
+@@ -1879,6 +1882,87 @@
+     return ret;
+ }
+ 
++/* NEUTRON resize hold (2026-10-16). When a top-level window grows, win32u gives it a new surface: the old pixels
++ * are copied in, but the newly exposed area holds nothing until the application paints it, and publishing that
++ * surface right away showed the unpainted area as a box. Lightroom Classic's Masks panel grows during Select
++ * Subject, then lays out its rows for ~100-200 ms before it paints, so a box sat in the panel for that long.
++ * Windows' compositor keeps showing a resized window's previous frame until the window has redrawn (INFERRED,
++ * not verified); do the same: hold the grown surface back until no window in its tree still needs painting,
++ * and never longer than NEUTRON_RESIZE_HOLD_MAX_MS. Kill switch NEUTRON_RESIZE_HOLD=0; NEUTRON_RESIZE_HOLD_TRACE=1
++ * logs each hold. */
++#define NEUTRON_RESIZE_HOLD_MAX_MS 250
++#define NEUTRON_RESIZE_HOLD_SLOTS 8
++
++static struct { struct window_surface *surface; HWND hwnd; DWORD start; } neutron_holds[NEUTRON_RESIZE_HOLD_SLOTS];
++static pthread_mutex_t neutron_hold_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static int neutron_resize_hold_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_RESIZE_HOLD" ); v = !(e && e[0] == '0'); }
++    return v;
++}
++
++static int neutron_resize_hold_trace(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_RESIZE_HOLD_TRACE" ); v = (e && e[0] == '1'); }
++    return v;
++}
++
++void neutron_resize_hold_set( struct window_surface *surface, HWND hwnd )
++{
++    int i, slot = 0;
++    DWORD now;
++
++    if (!neutron_resize_hold_on() || !surface || surface == &dummy_surface) return;
++    now = NtGetTickCount();
++    pthread_mutex_lock( &neutron_hold_lock );
++    for (i = 0; i < NEUTRON_RESIZE_HOLD_SLOTS; i++)
++    {
++        if (neutron_holds[i].surface == surface || neutron_holds[i].hwnd == hwnd) { slot = i; break; }
++        if (!neutron_holds[i].surface ||
++            (int)(now - neutron_holds[i].start) > (int)(now - neutron_holds[slot].start)) slot = i;
++    }
++    neutron_holds[slot].surface = surface;
++    neutron_holds[slot].hwnd = hwnd;
++    neutron_holds[slot].start = now;
++    pthread_mutex_unlock( &neutron_hold_lock );
++    if (neutron_resize_hold_trace()) ERR( "neutron-resize-hold: t=%u HOLD %p surface %p\n", (UINT)now, hwnd, surface );
++}
++
++static BOOL neutron_resize_hold_active( struct window_surface *surface )
++{
++    HWND hwnd = 0, child = 0;
++    UINT flags = UPDATE_PAINT | UPDATE_ALLCHILDREN;
++    DWORD now, start = 0;
++    int i, slot = -1;
++    BOOL hold = FALSE;
++
++    if (!neutron_resize_hold_on()) return FALSE;
++    pthread_mutex_lock( &neutron_hold_lock );
++    for (i = 0; i < NEUTRON_RESIZE_HOLD_SLOTS; i++)
++        if (neutron_holds[i].surface == surface) { slot = i; hwnd = neutron_holds[i].hwnd; start = neutron_holds[i].start; break; }
++    pthread_mutex_unlock( &neutron_hold_lock );
++    if (slot < 0) return FALSE;
++
++    now = NtGetTickCount();
++    if ((int)(now - start) < NEUTRON_RESIZE_HOLD_MAX_MS && surface->hwnd == hwnd &&
++        get_update_flags( hwnd, &child, &flags ) && (flags & UPDATE_PAINT))
++        hold = TRUE;
++
++    if (!hold)
++    {
++        pthread_mutex_lock( &neutron_hold_lock );
++        if (neutron_holds[slot].surface == surface) neutron_holds[slot].surface = NULL, neutron_holds[slot].hwnd = 0;
++        pthread_mutex_unlock( &neutron_hold_lock );
++        if (neutron_resize_hold_trace())
++            ERR( "neutron-resize-hold: t=%u RELEASE %p after %u ms (%s)\n", (UINT)now, hwnd, (UINT)(now - start),
++                 (int)(now - start) >= NEUTRON_RESIZE_HOLD_MAX_MS ? "cap" : "painted" );
++    }
++    return hold;
++}
++
+ /***********************************************************************
+  *           send_ncpaint
+  *
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -60,6 +60,7 @@
+ extern void window_surface_lock( struct window_surface *surface );
+ extern void window_surface_unlock( struct window_surface *surface );
+ extern void window_surface_flush( struct window_surface *surface );
++extern void neutron_resize_hold_set( struct window_surface *surface, HWND hwnd );
+ extern void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
+ extern void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+ 
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2854,6 +2854,13 @@
+ 
+     if (ret)
+     {
++        /* NEUTRON resize hold: a top-level that GREW onto a new surface is not shown at its new size until it
++         * has painted (see neutron_resize_hold_set in dce.c). Set before anything below can flush it. */
++        if (!is_child && new_surface && old_surface && new_surface != old_surface && valid_rects &&
++            (win->dwStyle & WS_VISIBLE) &&
++            (new_rects->window.right - new_rects->window.left > old_rects.window.right - old_rects.window.left ||
++             new_rects->window.bottom - new_rects->window.top > old_rects.window.bottom - old_rects.window.top))
++            neutron_resize_hold_set( new_surface, hwnd );
+         /* NEUTRON fresh-surface-no-blank: when the window got a NEW surface, update_surface_region() (which
+          * flushes, window_surface_set_shape) runs below, after the old bits are copied into it. */
+         if (old_surface == new_surface || !old_surface || !valid_rects || !neutron_copy_before_shape())
