@@ -1043,3 +1043,15 @@ desk. Every runtime back to 11.10-104 showed it, so not a code regression of our
 ruled out by running 2.14.3. The plain path now ORs 0xff000000 into every copied pixel, as the shaped path already
 did. A/B on the same build, LrC on the nested KWin 6.8 desk: fixed (menu bar, identity plate, gray panels, solid
 text) vs `NEUTRON_XRGB_OPAQUE=0` (all three symptoms back). Kill switch `NEUTRON_XRGB_OPAQUE=0`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-client-surface-subtree.mypatch` (2026-10-16) — LrC Masks panel boxes: update only the moved window's client surfaces
+After every SetWindowPos win32u's `update_client_surfaces(toplevel)` updated EVERY client surface of the toplevel, and
+winewayland's update walks each surface's ancestors (`neutron_ancestor_clip`, map_window_points per level). LrC's Masks
+panel moves its rows one SetWindowPos at a time, so each row move redid every row's GPU thumbnail surface; during
+Select Subject that kept the panel's grown area unpainted ~100-290 ms. A move that keeps z-order and visibility
+(`SWP_NOZORDER`, no SHOW/HIDE) can only change `hwnd`'s own subtree, as on Windows, so only those surfaces are updated
+now (z-order/visibility changes and the toplevel itself still update all). Nested KWin 6.8, clean-room LrC, GPU on,
+4 Select Subject runs per arm from an empty panel: long resize->first-paint gaps 769 -> 531 ms total, UI-thread CPU
+~1830 -> ~1510 ms per run; `wayland_client_surface_update` 50% -> 0.8% of Wine's samples in the gaps. Panel renders
+correctly. Kill switch `NEUTRON_CLIENT_SURFACE_SUBTREE=0`.
+
