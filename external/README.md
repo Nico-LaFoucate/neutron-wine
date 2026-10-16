@@ -25,8 +25,11 @@ Exact commits are in [`sources.conf`](sources.conf).
 
 On Windows with an AMD GPU, Premiere Pro, Media Encoder and After Effects encode H.264 and HEVC through
 AMD's AMF runtime, `amfrt64.dll`. `amfrt64/` is our own: `amfrt64.c` answers the AMF calls those apps
-make (laid out the way MSVC builds AMF's C++ interfaces), and `vkenc.c` encodes the frames through the
-host's Vulkan Video driver (Mesa RADV), so AMD users install nothing extra. The DLL loads only on a
+make (laid out the way MSVC builds AMF's C++ interfaces), and the encoder encodes the frames through
+Mesa, so AMD users install nothing extra: `vkenc.c` uses the Vulkan Video driver (RADV); where RADV
+hides its encoder (older VCN firmware, Polaris/Vega, the Steam Deck), `vaenc.c` uses Mesa's VA-API
+driver (`encoder.c` picks; `NEUTRON_AMF_BACKEND=vulkan|vaapi` forces one). Each load writes
+`<prefix>/neutron-amf.json` (what works, and why not), which `neutron doctor` reads. The DLL loads only on a
 machine with an AMD GPU, as on Windows; `NEUTRON_AMF_ANY_GPU=1` lets it run on another GPU for
 development. `test-vkenc.sh` tests the encoder on its own;
 `preserved-fixes/harnesses/amf/amfprobe.c` (Neutron repo) calls the DLL exactly the way Adobe does.
