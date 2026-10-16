@@ -1055,3 +1055,14 @@ now (z-order/visibility changes and the toplevel itself still update all). Neste
 ~1830 -> ~1510 ms per run; `wayland_client_surface_update` 50% -> 0.8% of Wine's samples in the gaps. Panel renders
 correctly. Kill switch `NEUTRON_CLIENT_SURFACE_SUBTREE=0`.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-resize-hold.mypatch` (2026-10-16) — LrC Masks panel boxes: a grown window waits until it has painted
+When a visible top-level window grows onto a new surface, the old pixels are copied in but the new area is empty
+until the app paints, and publishing at once showed it as a box: LrC's Masks panel grows during Select Subject and
+lays its rows out for ~100-200 ms before painting. Windows' compositor keeps showing a resized window's previous
+frame until it redraws (INFERRED); now `window_surface_flush` holds such a surface (bounds stay dirty) until the
+server reports nothing in the window's tree needs painting (`get_update_region` UPDATE_PAINT|UPDATE_ALLCHILDREN),
+at most 250 ms. Frame dumps, 2 Select Subject runs per arm: hold off = grown frames with an unpainted area reached
+the compositor; hold on = 4 holds released "painted" after 134-249 ms, first published frame fully painted. His
+check on the clean-room LrC: *"The box is gone now"*. Not covered: a window's first show; frames while rows move.
+Kill switch `NEUTRON_RESIZE_HOLD=0`; `NEUTRON_RESIZE_HOLD_TRACE=1` logs each hold.
+
