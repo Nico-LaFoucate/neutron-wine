@@ -1,0 +1,43 @@
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -313,15 +313,27 @@
+     }
+ }
+ 
+-static void update_client_surfaces( HWND hwnd )
++/* NEUTRON (2026-10-16): `moved` is the window whose position changed, or 0 to update every client surface of
++ * the toplevel as upstream does. A move or resize that keeps the z-order and visibility can only change the
++ * geometry and ancestor clip of `moved` and its descendants, so only their client surfaces need updating --
++ * Windows likewise touches only the moved window's subtree. Upstream updated every client surface of the
++ * toplevel on every SetWindowPos inside it: Lightroom Classic's Masks panel moves its rows one at a time and
++ * each row's update then redid every row's surface (each walking its ancestors), which kept the panel's grown
++ * area unpainted for ~100-200 ms during Select Subject. Kill switch: NEUTRON_CLIENT_SURFACE_SUBTREE=0. */
++static void update_client_surfaces( HWND hwnd, HWND moved )
+ {
+     struct client_surface *surface, *next;
++    static int subtree = -1;
++
++    if (subtree < 0) { const char *e = getenv( "NEUTRON_CLIENT_SURFACE_SUBTREE" ); subtree = !(e && e[0] == '0'); }
++    if (!subtree || moved == hwnd) moved = 0;
+ 
+     pthread_mutex_lock( &surfaces_lock );
+ 
+     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
+     {
+         if (NtUserGetAncestor( surface->hwnd, GA_ROOT ) != hwnd) continue;
++        if (moved && surface->hwnd != moved && !is_child( moved, surface->hwnd )) continue;
+         surface->funcs->update( surface );
+         InterlockedExchange( &surface->updated, 1 );
+     }
+@@ -2964,7 +2976,10 @@
+                     (int)old_rects.window.left, (int)old_rects.window.top,
+                     (int)old_rects.window.right, (int)old_rects.window.bottom);
+         }
+-        update_client_surfaces( toplevel );
++        /* NEUTRON: a z-order or visibility change can restack or reveal any client surface of the
++         * toplevel; anything else only moves `hwnd`'s own subtree. */
++        update_client_surfaces( toplevel, (swp_flags & SWP_NOZORDER) &&
++                                          !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ? hwnd : 0 );
+ 
+         /* NEUTRON: if this move took a per-monitor-DPI-aware top-level window onto a monitor with a
+          * different dpi, tell it so it re-renders its UI at the new dpi. Wine has no WM_DPICHANGED
