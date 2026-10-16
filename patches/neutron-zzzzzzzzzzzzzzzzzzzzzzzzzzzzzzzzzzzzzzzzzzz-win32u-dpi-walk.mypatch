@@ -1,0 +1,160 @@
+win32u: compute a child window's monitor DPI at its top-level window once; check the last session block lock-free
+
+get_win_monitor_dpi() recursed up the parent chain and, at EVERY level, looked up the window's DPI awareness context
+(a shared-object lookup under the session mutex) and its parent (another lock), then threw both away: only the
+top-level window's values were used. Lightroom Classic nests its panels up to 28 deep, and with Camera Raw's GPU on
+get_win_monitor_dpi was 11% of its UI thread during Select Subject (GetWindowRect, MapWindowPoints, SetWindowPos,
+peek_message all call it). It now walks up to the top-level window and computes the DPI there, with the same result.
+find_shared_session_block() took session_lock and walked the block list for every shared-object lookup; session
+blocks are never changed or freed once listed, so the block that answered the last lookup is checked first without
+the lock.
+
+Harness preserved-fixes/harnesses/dpinest.c (25-deep child chain on each monitor; values from per-monitor-aware,
+system-aware and unaware contexts): all 36 values identical with the switches on and off; at depth 25
+GetDpiForWindow 1144 -> 531 ns, MapWindowPoints 2467 -> 1319 ns, GetWindowRect 1336 -> 845 ns, SetWindowPos move
+35.6 -> 30.6 us.
+
+Kill switches NEUTRON_DPI_WALK=0, NEUTRON_SESSION_BLOCK_CACHE=0.
+
+
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3206,7 +3206,7 @@
+     return ret;
+ }
+ 
+-UINT get_win_monitor_dpi( HWND hwnd, UINT *raw_dpi )
++static UINT get_win_monitor_dpi_recursive( HWND hwnd, UINT *raw_dpi )
+ {
+     UINT dpi = NTUSER_DPI_CONTEXT_GET_DPI( get_window_dpi_awareness_context( hwnd ) );
+     HWND parent = get_parent( hwnd );
+@@ -3228,7 +3228,7 @@
+     else if ((parent = win->parent) && parent != get_desktop_window())
+     {
+         release_win_ptr( win );
+-        return get_win_monitor_dpi( parent, raw_dpi );
++        return get_win_monitor_dpi_recursive( parent, raw_dpi );
+     }
+     else
+     {
+@@ -3245,6 +3245,62 @@
+     return monitor_dpi_from_rect( rect, dpi, raw_dpi );
+ }
+ 
++/* NEUTRON dpi-walk (2026-10-15): a child window's monitor DPI is its top-level window's, so walk up to the
++ * top-level and compute the DPI there, once. The recursive version (kept below for the kill switch) looked up the
++ * DPI awareness context (a shared-memory lookup under the session mutex) and the parent (another lock) at EVERY
++ * level and threw both away; Lightroom Classic nests its panels up to 28 deep, and get_win_monitor_dpi was 11% of
++ * its UI thread during Select Subject (GetWindowRect, MapWindowPoints, SetWindowPos all call it). Same result:
++ * only the last level's values were ever used. Windows keeps the DPI on the window. Kill switch NEUTRON_DPI_WALK=0. */
++static BOOL neutron_dpi_walk(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_DPI_WALK" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_DPI_WALK = 0 (environment)\n" );
++    }
++    return on;
++}
++
++UINT get_win_monitor_dpi( HWND hwnd, UINT *raw_dpi )
++{
++    RECT rect = {0};
++    HWND parent;
++    UINT dpi;
++    WND *win;
++
++    if (!neutron_dpi_walk()) return get_win_monitor_dpi_recursive( hwnd, raw_dpi );
++
++    for (;;)
++    {
++        if (!(win = get_win_ptr( hwnd )))
++        {
++            RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
++            return 0;
++        }
++        if (win == WND_DESKTOP) return monitor_dpi_from_rect( rect, get_thread_dpi(), raw_dpi );
++        if (win == WND_OTHER_PROCESS)
++        {
++            dpi = NTUSER_DPI_CONTEXT_GET_DPI( get_window_dpi_awareness_context( hwnd ) );
++            if (!get_window_rect( hwnd, &rect, dpi )) return 0;
++            return monitor_dpi_from_rect( rect, dpi, raw_dpi );
++        }
++        /* avoid recursive calls from get_window_rects for the process windows */
++        if ((parent = win->parent) && parent != get_desktop_window())
++        {
++            release_win_ptr( win );
++            hwnd = parent;
++            continue;
++        }
++        rect = is_iconic( hwnd ) ? win->normal_rect : win->rects.window;
++        release_win_ptr( win );
++        /* NEUTRON: DELIBERATELY does NOT consult win->monitor_override (see get_win_monitor_dpi_recursive). */
++        dpi = NTUSER_DPI_CONTEXT_GET_DPI( get_window_dpi_awareness_context( hwnd ) );
++        return monitor_dpi_from_rect( rect, dpi, raw_dpi );
++    }
++}
++
+ /* keep in sync with user32 */
+ static BOOL is_valid_dpi_awareness_context( UINT context, UINT dpi )
+ {
+--- a/dlls/win32u/winstation.c
++++ b/dlls/win32u/winstation.c
+@@ -142,6 +142,25 @@
+     return status;
+ }
+ 
++/* NEUTRON session-block-cache (2026-10-15): the block that answered the last lookup. A session block is never
++ * changed or freed once it is in the list, so it can be checked without session_lock; nearly every lookup (window
++ * DPI contexts, classes, queues) lands in the same block. Lightroom Classic looked up a shared object for every
++ * level of its 28-deep panel tree; the mutex and list walk were ~3% of its UI thread. Kill switch
++ * NEUTRON_SESSION_BLOCK_CACHE=0. */
++static struct session_block *last_session_block;
++
++static BOOL neutron_session_block_cache(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SESSION_BLOCK_CACHE" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_SESSION_BLOCK_CACHE = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ static NTSTATUS find_shared_session_block( SIZE_T offset, SIZE_T size, struct session_block **ret )
+ {
+     struct session_block *block;
+@@ -149,6 +168,13 @@
+ 
+     assert( offset + size > offset );
+ 
++    if (neutron_session_block_cache() && (block = ReadPointerAcquire( (void **)&last_session_block )) &&
++        block->offset < offset && offset + size <= block->offset + block->size)
++    {
++        *ret = block;
++        return STATUS_SUCCESS;
++    }
++
+     pthread_mutex_lock( &session_lock );
+ 
+     LIST_FOR_EACH_ENTRY( block, &session_blocks, struct session_block, entry )
+@@ -156,6 +182,7 @@
+         if (block->offset < offset && offset + size <= block->offset + block->size)
+         {
+             *ret = block;
++            WritePointerRelease( (void **)&last_session_block, block );  /* NEUTRON session-block-cache */
+             pthread_mutex_unlock( &session_lock );
+             return STATUS_SUCCESS;
+         }
+@@ -166,6 +193,7 @@
+         WARN( "Failed to map session block for offset %s, size %s, status %#x\n",
+             wine_dbgstr_longlong(offset), wine_dbgstr_longlong(size), status );
+     }
++    else WritePointerRelease( (void **)&last_session_block, *ret );  /* NEUTRON session-block-cache */
+ 
+     pthread_mutex_unlock( &session_lock );
+ 

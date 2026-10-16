@@ -786,6 +786,14 @@ patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON
 1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1). OPEN: audit the rest of
 this delta for reverts without a NEUTRON comment.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-dpi-walk.mypatch` (2026-10-15) — child window DPI computed once at the top-level; lock-free session block check
+`get_win_monitor_dpi()` recursed up the parent chain and looked up the DPI awareness context (shared object, session
+mutex) and the parent at every level, using only the top-level's. It now walks up and computes once (same result:
+`harnesses/dpinest.c`, 36 values identical, 3 awareness contexts × 2 monitors). `find_shared_session_block()` checks
+the last block lock-free (blocks are never changed or freed once listed). Depth 25: GetDpiForWindow 1144 → 531 ns,
+MapWindowPoints 2467 → 1319 ns. LrC Select Subject (GPU on): get_win_monitor_dpi 10.4% → 5.5% of the UI thread,
+find_shared_session_block 3.4% → 0.6%. Kill switches `NEUTRON_DPI_WALK=0`, `NEUTRON_SESSION_BLOCK_CACHE=0`.
+
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-copy-visible-bits-only.mypatch` (2026-10-15) — LrC "duplicated text lines": copy only the moved window's visible pixels
 Windows copies a moved window's pixels only where it was visible before AND after the move, minus its update region,
 and repaints the rest (ReactOS `co_WinPosSetWindowPos`, CopyRgn = VisAfter ∩ VisBefore). The server already invalidates
