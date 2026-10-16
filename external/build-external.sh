@@ -5,12 +5,13 @@
 #   external/build-external.sh <wine-tree>
 #
 # Sources: sources.conf (upstream URL + pinned commit per project) + patches/<project>/*.patch,
-# plus our ucrtbase shim in ucrtshim/. Installs into <wine-tree>:
+# plus our ucrtbase shim in ucrtshim/ and our AMD encoder runtime in amfrt64/. Installs into <wine-tree>:
 #   lib/wine/dxvk/{x86_64,i386}-windows/{d3d8,d3d9,d3d10core,d3d11,dxgi}.dll
 #   lib/wine/vkd3d-proton/{x86_64,i386}-windows/{d3d12,d3d12core}.dll
 #   lib/wine/nvapi/x86_64-windows/{nvapi64,nvofapi64}.dll   lib/wine/nvapi/i386-windows/nvapi.dll
 #   lib/wine/nvidia-libs/x86_64-unix/{nvcuda,nvcuvid,nvencodeapi64,nvoptix}.dll   (ELF winelib)
 #   lib/wine/neutron/x86_64-windows/ucrtbase.dll
+#   lib/wine/neutron/x86_64-unix/amfrt64.dll   (ELF winelib: AMD AMF on Mesa Vulkan Video)
 #   share/neutron/natives.json   what `neutron prefix provision` stages: file, prefix dir,
 #                                DLL override, project, commit, sha256
 #   licenses/<project>/          each project's license files, submodules included
@@ -48,7 +49,7 @@ done < "$HERE/sources.conf"
 
 # Rebuild only when something that feeds the build changed.
 KEY="$( { cat "$HERE/sources.conf" "$REPO/build/WINE_BASE"
-          find "$HERE/patches" "$HERE/ucrtshim" -type f -print0 | sort -z | xargs -0 sha256sum
+          find "$HERE/patches" "$HERE/ucrtshim" "$HERE/amfrt64" -type f -print0 | sort -z | xargs -0 sha256sum
           sha256sum "$0"; } | sha256sum | cut -c1-16 )"
 OUT="$WORK/out-$KEY"
 B="$WORK/build"
@@ -138,6 +139,16 @@ else
     bash "$HERE/ucrtshim/build.sh" "$HERE/ucrtshim/ucrtbase-10.0.10586.15.exports" \
         "$L/neutron/x86_64-windows/ucrtbase.dll"
 
+    # amfrt64 (ours): AMD's AMF runtime for Premiere/AME/AE, encoding through Mesa's Vulkan Video.
+    # Vulkan headers with the video-encode extensions come from the DXVK checkout fetched above.
+    echo "  building amfrt64"
+    meson setup "$B/amfrt64" "$HERE/amfrt64" --cross-file "$HERE/amfrt64/build-wine64.txt" \
+        --buildtype release -Dvulkan_headers="$WORK/src/dxvk/include/vulkan/include" \
+        > "$B/amfrt64.setup.log" 2>&1 || { tail -30 "$B/amfrt64.setup.log" >&2; die "amfrt64: meson setup failed"; }
+    ninja -C "$B/amfrt64" > "$B/amfrt64.build.log" 2>&1 \
+        || { tail -30 "$B/amfrt64.build.log" >&2; die "amfrt64: build failed (log: $B/amfrt64.build.log)"; }
+    take amfrt64 amfrt64.dll.so "$L/neutron/x86_64-unix"
+
     # Licenses: every LICENSE/COPYING/NOTICE file in each source tree, submodules included.
     declare -A PROJ=( [dxvk]=dxvk [dxvk-dxgi]=dxvk [dxvk-stock]=dxvk [vkd3d-proton]=vkd3d-proton [vkd3d-x86]=vkd3d-proton
                       [nvcuda]=nvcuda [nvenc]=nvenc [wine-nvoptix]=wine-nvoptix [dxvk-nvapi]=dxvk-nvapi )
@@ -153,6 +164,9 @@ else
     mkdir -p "$OUT/licenses/ucrtshim"
     printf 'The ucrtbase shim is part of neutron-wine (external/ucrtshim): LGPL-2.1-or-later, see\nlicenses/wine/COPYING.LIB.\n' \
         > "$OUT/licenses/ucrtshim/README"
+    mkdir -p "$OUT/licenses/amfrt64"
+    printf 'amfrt64 is part of neutron-wine (external/amfrt64): LGPL-2.1-or-later, see\nlicenses/wine/COPYING.LIB.\n' \
+        > "$OUT/licenses/amfrt64/README"
 
     # --- gates + natives.json (fail the build, never warn) ----------------------
     SRCJSON="$(for n in "${NAMES[@]}"; do
@@ -188,6 +202,7 @@ rows.append(("nvapi/i386-windows/nvapi.dll", "dxvk-nvapi", "nvapi", "native", "s
 for dll, s in (("nvcuda", "nvcuda"), ("nvcuvid", "nvenc"), ("nvencodeapi64", "nvenc"), ("nvoptix", "wine-nvoptix")):
     rows.append((f"nvidia-libs/x86_64-unix/{dll}.dll", s, dll, "native", "system32"))
 rows.append(("neutron/x86_64-windows/ucrtbase.dll", "ucrtshim", "*ucrtbase", "native,builtin", "system32"))
+rows.append(("neutron/x86_64-unix/amfrt64.dll", "amfrt64", "amfrt64", "native", "system32"))
 
 # Our changes must be in the patched DLLs, and nowhere else.
 must = {
@@ -200,8 +215,10 @@ must = {
     # SveSop's additions (patches/dxvk-nvapi), absent from plain v0.9.2.
     "nvapi/x86_64-windows/nvapi64.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
     "nvapi/i386-windows/nvapi.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
+    # ours (external/amfrt64): the AMD-only load gate's dev override, and the real backend's GPU message.
+    "neutron/x86_64-unix/amfrt64.dll": [b"NEUTRON_AMF_ANY_GPU", b"AMD hardware encoding needs an AMD graphics card"],
 }
-never = [b"neutron-rtlog"]
+never = [b"neutron-rtlog", b"NEUTRON_VKENC_TEST_STUB"]   # the stub backend is test-only
 # dxgi must behave like the validated 2026-07-23 build plus the 11.10-121 background color: the bridge
 # hooks above, Get/SetBackgroundColor implemented (so the stubs' "BackgroundColor: Not implemented"
 # strings are gone; the implementation logs nothing), and nothing else.

@@ -1,0 +1,10 @@
+# TEST ONLY. Links vkenc_stub.c, a fake backend that encodes nothing, instead of vkenc.c. A DLL built
+# with it carries the string NEUTRON_VKENC_TEST_STUB and must never be shipped.
+option('test_stub', type: 'boolean', value: false,
+       description: 'TEST ONLY: link the fake vkenc_stub.c backend instead of vkenc.c (never ship)')
+
+# The real backend needs Vulkan headers with the video encode extensions (no link to libvulkan).
+# Empty: the system's. build-external.sh can point this at a fetched tree, e.g.
+# $NEUTRON_EXT_WORK/src/dxvk/include/vulkan/include.
+option('vulkan_headers', type: 'string', value: '',
+       description: 'directory containing vulkan/vulkan.h (default: the system include path)')

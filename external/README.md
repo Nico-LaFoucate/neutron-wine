@@ -17,8 +17,19 @@ provision` copies them into each prefix and writes their DLL overrides.
 | wine-nvoptix | [SveSop/wine-nvoptix](https://github.com/SveSop/wine-nvoptix) | `nvoptix` | no | LGPL-2.1 / MIT |
 | dxvk-nvapi v0.9.2 | [jp7677/dxvk-nvapi](https://github.com/jp7677/dxvk-nvapi) | `nvapi64`, `nvofapi64`, x86 `nvapi` | SveSop's | MIT |
 | ucrtbase shim | this repo (`ucrtshim/`) | x64 `ucrtbase` | ours | LGPL-2.1-or-later |
+| amfrt64 (AMD AMF runtime) | this repo (`amfrt64/`) | x64 `amfrt64` (ELF winelib) | ours | LGPL-2.1-or-later |
 
 Exact commits are in [`sources.conf`](sources.conf).
+
+## amfrt64: AMD hardware encoding on Mesa
+
+On Windows with an AMD GPU, Premiere Pro, Media Encoder and After Effects encode H.264 and HEVC through
+AMD's AMF runtime, `amfrt64.dll`. `amfrt64/` is our own: `amfrt64.c` answers the AMF calls those apps
+make (laid out the way MSVC builds AMF's C++ interfaces), and `vkenc.c` encodes the frames through the
+host's Vulkan Video driver (Mesa RADV), so AMD users install nothing extra. The DLL loads only on a
+machine with an AMD GPU, as on Windows; `NEUTRON_AMF_ANY_GPU=1` lets it run on another GPU for
+development. `test-vkenc.sh` tests the encoder on its own;
+`preserved-fixes/harnesses/amf/amfprobe.c` (Neutron repo) calls the DLL exactly the way Adobe does.
 
 ## What the patches do
 
