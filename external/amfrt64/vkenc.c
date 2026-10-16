@@ -3,6 +3,9 @@
  *
  * Copyright 2026 the Neutron project. LGPL-2.1-or-later.
  *
+ * This is the first of the two backends behind vkenc.h (vkenc_backend.h); encoder.c uses it when it
+ * offers the codec and falls back to VA-API (vaenc.c) when it does not.
+ *
  * How it works
  *
  * Each encoder owns a private VkInstance and VkDevice (no window system) on the GPU whose Vulkan
@@ -11,9 +14,9 @@
  * amfrt64 loads fine on machines without Vulkan.
  *
  * Every frame in flight gets a "slot": a source image, a bitstream buffer, a feedback query,
- * command buffers and a fence. vkenc_submit() copies the caller's pixels into the slot's staging
+ * command buffers and a fence. vkvideo_submit() copies the caller's pixels into the slot's staging
  * buffer (a transfer-capable queue copies it into the source image), records the encode and
- * submits it without waiting. vkenc_receive() hands finished slots back in submission order.
+ * submits it without waiting. vkvideo_receive() hands finished slots back in submission order.
  *
  * Frames are IDR or P frames with one reference, the previous frame. The DPB is one image with
  * two array layers that the frames use in turn: RADV before VCN 5 cannot take separate reference
@@ -35,7 +38,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "vkenc.h"
+#include "vkenc_backend.h"
 
 #define VKENC_MAX_SLOTS     8
 #define VKENC_DPB_SLOTS     2
@@ -180,7 +183,7 @@ struct vkenc_slot
     int with_headers;
 };
 
-struct vkenc
+struct vkvideo
 {
     vkenc_params params;
     struct vkenc_instance vk;
@@ -664,18 +667,30 @@ static enum gpu_problem check_gpu(const struct vkenc_instance *vk, VkPhysicalDev
     return GPU_OK;
 }
 
-/* Finds the GPU to encode `profile` on. Returns 0, or -1 with a plain sentence in `reason`. */
+/* "Mesa's Vulkan driver" on AMD (RADV is the only one left since AMDVLK was discontinued). */
+static const char *driver_label(uint32_t vendor_id, int capital)
+{
+    if (vendor_id == 0x1002) return "Mesa's Vulkan driver";
+    return capital ? "The Vulkan driver" : "the Vulkan driver";
+}
+
+/* Finds the GPU to encode `profile` on. Returns 0, or -1 with a plain sentence in `reason`, the
+ * problem of the device that got furthest in *worst_out, and that device's properties in out->props
+ * (vendorID 0 when there was none). */
 static int pick_gpu(const struct vkenc_instance *vk, vkenc_codec codec, const struct vkenc_profile *profile,
-                    struct vkenc_gpu *out, char *reason, size_t len)
+                    struct vkenc_gpu *out, char *reason, size_t len, enum gpu_problem *worst_out)
 {
     VkPhysicalDevice *devices = NULL;
+    VkPhysicalDeviceProperties worst_props;
     enum gpu_problem worst = GPU_NONE;
-    char problem_name[256] = "";
     uint32_t count = 0, i;
     int any = env_flag("NEUTRON_AMF_ANY_GPU"), best_score = -1;
 
+    memset(&worst_props, 0, sizeof(worst_props));
+    if (worst_out) *worst_out = GPU_NONE;
     if (vk->vkEnumeratePhysicalDevices(vk->instance, &count, NULL) != VK_SUCCESS || !count)
     {
+        memset(out, 0, sizeof(*out));
         set_reason(reason, len, "No Vulkan driver was found for any GPU.");
         return -1;
     }
@@ -700,7 +715,7 @@ static int pick_gpu(const struct vkenc_instance *vk, vkenc_codec codec, const st
             if (worst == GPU_NONE || problem > worst)
             {
                 worst = problem;
-                snprintf(problem_name, sizeof(problem_name), "%s", props.properties.deviceName);
+                worst_props = props.properties;
             }
             continue;
         }
@@ -716,6 +731,9 @@ static int pick_gpu(const struct vkenc_instance *vk, vkenc_codec codec, const st
     free(devices);
     if (best_score >= 0) return 0;
 
+    memset(out, 0, sizeof(*out));
+    out->props = worst_props;
+    if (worst_out) *worst_out = worst;
     switch (worst)
     {
     case GPU_NONE:
@@ -724,15 +742,19 @@ static int pick_gpu(const struct vkenc_instance *vk, vkenc_codec codec, const st
         break;
     case GPU_OLD_API:
         set_reason(reason, len, "The Vulkan driver for %s is too old (Vulkan 1.3 is needed for video encoding).",
-                   problem_name);
+                   worst_props.deviceName);
         break;
     case GPU_NO_VIDEO_ENCODE:
-        set_reason(reason, len, "The Vulkan driver for %s does not offer video encoding (Mesa may be too old, "
-                   "or this GPU's firmware needs RADV_PERFTEST=video_encode).", problem_name);
+        /* RADV hides its encoder below a VCN firmware version, and never offers it on VCE/UVD GPUs
+         * (Polaris, Vega) or VCN 1. Forcing it (RADV_EXPERIMENTAL=video_encode) is not an answer:
+         * it produced broken HEVC on the Steam Deck. */
+        set_reason(reason, len, "%s does not offer video encoding on %s (its video firmware, the GPU or Mesa "
+                   "is too old for Vulkan Video encoding).", driver_label(worst_props.vendorID, 1),
+                   worst_props.deviceName);
         break;
     case GPU_NO_CODEC:
-        set_reason(reason, len, "The Vulkan driver has no %s encoder (the distro may build Mesa without %s).",
-                   codec_name(codec), codec_name(codec));
+        set_reason(reason, len, "%s has no %s encoder (the distro may build Mesa without %s).",
+                   driver_label(worst_props.vendorID, 1), codec_name(codec), codec_name(codec));
         break;
     case GPU_NO_PROFILE:
         set_reason(reason, len, "The Vulkan driver's %s encoder does not support the %s profile.",
@@ -745,44 +767,101 @@ static int pick_gpu(const struct vkenc_instance *vk, vkenc_codec codec, const st
     return -1;
 }
 
-/* ---- vkenc_query_caps ----------------------------------------------------------------------- */
+/* ---- vkvideo_probe -------------------------------------------------------------------------- */
 
 static pthread_mutex_t caps_lock = PTHREAD_MUTEX_INITIALIZER;
-static vkenc_caps caps_cache[3];
-static int caps_cached[3];
+static struct enc_probe probe_cache[3];
+static int probe_cached[3];
 
-static void probe_caps(vkenc_codec codec, vkenc_caps *caps)
+/* The reason of a failed probe as a clause, for encoder.c to join with VA-API's. */
+static void set_clause(struct enc_probe *probe, enum gpu_problem problem, vkenc_codec codec)
 {
+    const vkenc_caps *caps = &probe->caps;
+
+    switch (problem)
+    {
+    case GPU_NONE:
+        probe->problem = ENC_PROBLEM_NO_GPU;
+        set_reason(probe->clause, sizeof(probe->clause), env_flag("NEUTRON_AMF_ANY_GPU")
+                   ? "no GPU has a working Vulkan driver" : "no AMD GPU has a Vulkan driver");
+        break;
+    case GPU_OLD_API:
+        probe->problem = ENC_PROBLEM_NO_DRIVER;
+        set_reason(probe->clause, sizeof(probe->clause), "the Vulkan driver is too old");
+        break;
+    case GPU_NO_VIDEO_ENCODE:
+        probe->problem = ENC_PROBLEM_ENCODE_HIDDEN;
+        set_reason(probe->clause, sizeof(probe->clause), "%s hides its video encoder on this GPU (older video "
+                   "firmware, GPU or Mesa)", driver_label(caps->vendor_id, 0));
+        break;
+    case GPU_NO_CODEC:
+    case GPU_NO_PROFILE:
+        probe->problem = ENC_PROBLEM_NO_CODEC;
+        set_reason(probe->clause, sizeof(probe->clause), "%s has no %s encoder", driver_label(caps->vendor_id, 0),
+                   codec_name(codec));
+        break;
+    default:
+        probe->problem = ENC_PROBLEM_OTHER;
+        set_reason(probe->clause, sizeof(probe->clause), "Vulkan Video cannot encode %s here", codec_name(codec));
+        break;
+    }
+}
+
+static void probe_caps(vkenc_codec codec, struct enc_probe *probe)
+{
+    vkenc_caps *caps = &probe->caps;
     struct vkenc_instance vk;
     struct vkenc_profile profile, profile10;
     struct vkenc_codec_caps codec_caps;
     struct vkenc_gpu gpu;
+    enum gpu_problem problem = GPU_NONE;
     VkVideoFormatPropertiesKHR fmt;
 
-    memset(caps, 0, sizeof(*caps));
-    if (instance_create(&vk, caps->reason, sizeof(caps->reason))) return;
+    memset(probe, 0, sizeof(*probe));
+    if (instance_create(&vk, caps->reason, sizeof(caps->reason)))
+    {
+        if (!p_vkGetInstanceProcAddr || !p_vkCreateInstance)
+        {
+            probe->problem = ENC_PROBLEM_NO_LIBRARY;
+            set_reason(probe->clause, sizeof(probe->clause), "Vulkan is not installed");
+        }
+        else
+        {
+            probe->problem = ENC_PROBLEM_NO_DRIVER;
+            set_reason(probe->clause, sizeof(probe->clause), "no Vulkan 1.3 driver works here");
+        }
+        return;
+    }
 
     profile_init(&profile, codec, std_profile_for(codec, 100, 8), 8);
-    if (pick_gpu(&vk, codec, &profile, &gpu, caps->reason, sizeof(caps->reason)) && codec == VKENC_CODEC_H264)
+    if (pick_gpu(&vk, codec, &profile, &gpu, caps->reason, sizeof(caps->reason), &problem)
+            && codec == VKENC_CODEC_H264)
     {
         /* No High profile: Main is still useful. */
         char reason[256];
+        struct vkenc_gpu main_gpu;
         profile_init(&profile, codec, STD_VIDEO_H264_PROFILE_IDC_MAIN, 8);
-        if (!pick_gpu(&vk, codec, &profile, &gpu, reason, sizeof(reason))) caps->reason[0] = 0;
+        if (!pick_gpu(&vk, codec, &profile, &main_gpu, reason, sizeof(reason), NULL))
+        {
+            caps->reason[0] = 0;
+            gpu = main_gpu;
+        }
     }
+    caps->vendor_id = gpu.props.vendorID;
+    caps->device_id = gpu.props.deviceID;
+    snprintf(caps->device_name, sizeof(caps->device_name), "%s", gpu.props.deviceName);
     if (caps->reason[0])
     {
+        set_clause(probe, problem, codec);
         instance_destroy(&vk);
         return;
     }
 
-    caps->vendor_id = gpu.props.vendorID;
-    caps->device_id = gpu.props.deviceID;
-    snprintf(caps->device_name, sizeof(caps->device_name), "%s", gpu.props.deviceName);
     if (get_codec_caps(&vk, gpu.phys, &profile, &codec_caps) != VK_SUCCESS)
     {
         set_reason(caps->reason, sizeof(caps->reason), "The Vulkan driver's %s encoder reported no capabilities.",
                    codec_name(codec));
+        set_clause(probe, GPU_OK, codec);
         instance_destroy(&vk);
         return;
     }
@@ -791,6 +870,7 @@ static void probe_caps(vkenc_codec codec, vkenc_caps *caps)
     {
         set_reason(caps->reason, sizeof(caps->reason), "The Vulkan driver's %s encoder does not take NV12 frames.",
                    codec_name(codec));
+        set_clause(probe, GPU_OK, codec);
         instance_destroy(&vk);
         return;
     }
@@ -813,22 +893,24 @@ static void probe_caps(vkenc_codec codec, vkenc_caps *caps)
     instance_destroy(&vk);
 }
 
-int vkenc_query_caps(vkenc_codec codec, vkenc_caps *caps)
+int vkvideo_probe(vkenc_codec codec, struct enc_probe *probe)
 {
-    if (!caps) return -1;
+    if (!probe) return -1;
     if (codec != VKENC_CODEC_H264 && codec != VKENC_CODEC_HEVC)
     {
-        memset(caps, 0, sizeof(*caps));
-        set_reason(caps->reason, sizeof(caps->reason), "This codec is not supported.");
+        memset(probe, 0, sizeof(*probe));
+        probe->problem = ENC_PROBLEM_OTHER;
+        set_reason(probe->caps.reason, sizeof(probe->caps.reason), "This codec is not supported.");
+        set_reason(probe->clause, sizeof(probe->clause), "this codec is not supported");
         return 0;
     }
     pthread_mutex_lock(&caps_lock);
-    if (!caps_cached[codec])
+    if (!probe_cached[codec])
     {
-        probe_caps(codec, &caps_cache[codec]);
-        caps_cached[codec] = 1;
+        probe_caps(codec, &probe_cache[codec]);
+        probe_cached[codec] = 1;
     }
-    *caps = caps_cache[codec];
+    *probe = probe_cache[codec];
     pthread_mutex_unlock(&caps_lock);
     return 0;
 }
@@ -892,7 +974,7 @@ static const struct h265_level h265_levels[] =
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-static uint64_t level_bitrate(const struct vkenc *enc)
+static uint64_t level_bitrate(const struct vkvideo *enc)
 {
     uint64_t rate = enc->params.target_bitrate;
     if (enc->params.rc == VKENC_RC_VBR && enc->params.peak_bitrate > rate) rate = enc->params.peak_bitrate;
@@ -901,7 +983,7 @@ static uint64_t level_bitrate(const struct vkenc *enc)
 
 /* The requested level, raised to the lowest one that holds the stream and capped at the device's
  * maximum. A level that is too low makes hardware decoders refuse the file. */
-static StdVideoH264LevelIdc choose_h264_level(const struct vkenc *enc, int high)
+static StdVideoH264LevelIdc choose_h264_level(const struct vkvideo *enc, int high)
 {
     uint64_t mbs = (uint64_t)(enc->coded_width / 16) * (enc->coded_height / 16);
     uint64_t mbps = (mbs * enc->fps_num + enc->fps_den - 1) / enc->fps_den;
@@ -935,7 +1017,7 @@ static StdVideoH264LevelIdc choose_h264_level(const struct vkenc *enc, int high)
     return h264_levels[chosen].idc;
 }
 
-static StdVideoH265LevelIdc choose_h265_level(const struct vkenc *enc, int high_tier)
+static StdVideoH265LevelIdc choose_h265_level(const struct vkvideo *enc, int high_tier)
 {
     uint64_t ps = (uint64_t)enc->coded_width * enc->coded_height;
     uint64_t sr = (ps * enc->fps_num + enc->fps_den - 1) / enc->fps_den;
@@ -1003,7 +1085,7 @@ static int vui_sar(const vkenc_params *p, uint16_t *w, uint16_t *h)
     return 255; /* Extended_SAR */
 }
 
-static void build_h264_params(struct vkenc *enc, int std_profile)
+static void build_h264_params(struct vkvideo *enc, int std_profile)
 {
     const vkenc_params *p = &enc->params;
     const VkVideoEncodeH264CapabilitiesKHR *caps = &enc->caps.h264;
@@ -1070,7 +1152,7 @@ static void build_h264_params(struct vkenc *enc, int std_profile)
     pps->num_ref_idx_l1_default_active_minus1 = 0;
 }
 
-static void build_h265_params(struct vkenc *enc, int std_profile)
+static void build_h265_params(struct vkvideo *enc, int std_profile)
 {
     const vkenc_params *p = &enc->params;
     const VkVideoEncodeH265CapabilitiesKHR *caps = &enc->caps.h265;
@@ -1188,7 +1270,7 @@ static void build_h265_params(struct vkenc *enc, int std_profile)
 
 /* ---- device objects ------------------------------------------------------------------------- */
 
-static int find_memory_type(const struct vkenc *enc, uint32_t type_bits, VkMemoryPropertyFlags required,
+static int find_memory_type(const struct vkvideo *enc, uint32_t type_bits, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags avoided)
 {
     const VkPhysicalDeviceMemoryProperties *mem = &enc->gpu.memory;
@@ -1211,7 +1293,7 @@ static int find_memory_type(const struct vkenc *enc, uint32_t type_bits, VkMemor
     return best;
 }
 
-static VkResult allocate_memory(struct vkenc *enc, const VkMemoryRequirements *req, VkMemoryPropertyFlags required,
+static VkResult allocate_memory(struct vkvideo *enc, const VkMemoryRequirements *req, VkMemoryPropertyFlags required,
                                 VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags avoided,
                                 VkDeviceMemory *memory, VkMemoryPropertyFlags *flags)
 {
@@ -1225,7 +1307,7 @@ static VkResult allocate_memory(struct vkenc *enc, const VkMemoryRequirements *r
     return enc->fn.vkAllocateMemory(enc->device, &info, NULL, memory);
 }
 
-static VkResult create_buffer(struct vkenc *enc, VkDeviceSize size, VkBufferUsageFlags usage, const void *pnext,
+static VkResult create_buffer(struct vkvideo *enc, VkDeviceSize size, VkBufferUsageFlags usage, const void *pnext,
                               VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred,
                               VkMemoryPropertyFlags avoided, VkBuffer *buffer, VkDeviceMemory *memory,
                               uint8_t **map, VkMemoryPropertyFlags *flags)
@@ -1246,7 +1328,7 @@ static VkResult create_buffer(struct vkenc *enc, VkDeviceSize size, VkBufferUsag
     return VK_SUCCESS;
 }
 
-static VkResult create_view(struct vkenc *enc, VkImage image, VkFormat format, VkImageViewType type,
+static VkResult create_view(struct vkvideo *enc, VkImage image, VkFormat format, VkImageViewType type,
                             uint32_t layers, VkImageView *view)
 {
     VkImageViewCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1260,7 +1342,7 @@ static VkResult create_view(struct vkenc *enc, VkImage image, VkFormat format, V
     return enc->fn.vkCreateImageView(enc->device, &info, NULL, view);
 }
 
-static int load_device_functions(struct vkenc *enc)
+static int load_device_functions(struct vkvideo *enc)
 {
 #define X(name) \
     if (!(enc->fn.name = (PFN_##name)enc->vk.vkGetDeviceProcAddr(enc->device, #name))) \
@@ -1273,7 +1355,7 @@ static int load_device_functions(struct vkenc *enc)
     return 0;
 }
 
-static VkResult create_device(struct vkenc *enc)
+static VkResult create_device(struct vkvideo *enc)
 {
     const char *exts[] =
     {
@@ -1333,7 +1415,7 @@ static VkResult create_device(struct vkenc *enc)
  * a semaphore (RADV's encode queue has no transfer bit). That is also how ffmpeg's Vulkan encoder
  * feeds RADV. NEUTRON_VKENC_UPLOAD=linear writes into a linear host-visible image instead, where
  * the driver offers one; NEUTRON_VKENC_UPLOAD=queue forces the separate-queue copy for testing. */
-static int choose_upload(struct vkenc *enc, VkFormat want, VkVideoFormatPropertiesKHR *fmt)
+static int choose_upload(struct vkvideo *enc, VkFormat want, VkVideoFormatPropertiesKHR *fmt)
 {
     const char *force = getenv("NEUTRON_VKENC_UPLOAD");
     int encode_can_copy = !!(enc->gpu.encode_flags & VK_QUEUE_TRANSFER_BIT);
@@ -1363,7 +1445,7 @@ static int choose_upload(struct vkenc *enc, VkFormat want, VkVideoFormatProperti
     return 0;
 }
 
-static VkResult create_source_image(struct vkenc *enc, struct vkenc_slot *slot)
+static VkResult create_source_image(struct vkvideo *enc, struct vkenc_slot *slot)
 {
     VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     uint32_t families[2] = {enc->gpu.encode_family, enc->gpu.upload_family};
@@ -1430,7 +1512,7 @@ static VkResult create_source_image(struct vkenc *enc, struct vkenc_slot *slot)
     return create_view(enc, slot->src_image, enc->src_format, VK_IMAGE_VIEW_TYPE_2D, 1, &slot->src_view);
 }
 
-static VkResult create_slot(struct vkenc *enc, struct vkenc_slot *slot)
+static VkResult create_slot(struct vkvideo *enc, struct vkenc_slot *slot)
 {
     VkCommandBufferAllocateInfo cmd = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     VkQueryPoolVideoEncodeFeedbackCreateInfoKHR feedback = {
@@ -1481,7 +1563,7 @@ static VkResult create_slot(struct vkenc *enc, struct vkenc_slot *slot)
     return enc->fn.vkCreateFence(enc->device, &fence, NULL, &slot->fence);
 }
 
-static VkResult create_dpb(struct vkenc *enc)
+static VkResult create_dpb(struct vkvideo *enc)
 {
     VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     VkMemoryRequirements req;
@@ -1510,7 +1592,7 @@ static VkResult create_dpb(struct vkenc *enc)
                        &enc->dpb_view);
 }
 
-static VkResult create_session(struct vkenc *enc)
+static VkResult create_session(struct vkvideo *enc)
 {
     VkVideoSessionCreateInfoKHR info = {VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR};
     VkVideoEncodeH264SessionCreateInfoKHR h264 = {VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_SESSION_CREATE_INFO_KHR};
@@ -1571,7 +1653,7 @@ static VkResult create_session(struct vkenc *enc)
 }
 
 /* Creates the session parameters and fetches their bitstream (with start codes) from the driver. */
-static VkResult create_session_params(struct vkenc *enc)
+static VkResult create_session_params(struct vkvideo *enc)
 {
     VkVideoSessionParametersCreateInfoKHR info = {VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR};
     VkVideoEncodeQualityLevelInfoKHR quality = {VK_STRUCTURE_TYPE_VIDEO_ENCODE_QUALITY_LEVEL_INFO_KHR};
@@ -1658,7 +1740,7 @@ static VkResult create_session_params(struct vkenc *enc)
     return VK_SUCCESS;
 }
 
-static void setup_rate_control(struct vkenc *enc)
+static void setup_rate_control(struct vkvideo *enc)
 {
     VkVideoEncodeRateControlModeFlagsKHR modes = enc->caps.encode.rateControlModes;
     uint64_t max_rate = enc->caps.encode.maxBitrate ? enc->caps.encode.maxBitrate : ~0ull;
@@ -1749,7 +1831,7 @@ static void setup_rate_control(struct vkenc *enc)
 
 /* Quality level: NEUTRON_AMF_QUALITY_LEVEL picks one; otherwise the middle of the device's range,
  * rounded up (RADV: 4 levels -> 2 "quality", 3 levels -> 1 "balanced"). */
-static uint32_t choose_quality_level(const struct vkenc *enc)
+static uint32_t choose_quality_level(const struct vkvideo *enc)
 {
     uint32_t count = enc->caps.encode.maxQualityLevels, level;
     const char *env = getenv("NEUTRON_AMF_QUALITY_LEVEL");
@@ -1761,7 +1843,7 @@ static uint32_t choose_quality_level(const struct vkenc *enc)
     return level;
 }
 
-static void log_quality_level(struct vkenc *enc)
+static void log_quality_level(struct vkvideo *enc)
 {
     VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR info = {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_ENCODE_QUALITY_LEVEL_INFO_KHR};
@@ -1791,7 +1873,7 @@ static void log_quality_level(struct vkenc *enc)
 
 /* ---- create / destroy ----------------------------------------------------------------------- */
 
-static void destroy_slot(struct vkenc *enc, struct vkenc_slot *slot)
+static void destroy_slot(struct vkvideo *enc, struct vkenc_slot *slot)
 {
     if (slot->fence) enc->fn.vkDestroyFence(enc->device, slot->fence, NULL);
     if (slot->upload_done) enc->fn.vkDestroySemaphore(enc->device, slot->upload_done, NULL);
@@ -1806,7 +1888,7 @@ static void destroy_slot(struct vkenc *enc, struct vkenc_slot *slot)
     memset(slot, 0, sizeof(*slot));
 }
 
-void vkenc_destroy(vkenc *enc)
+void vkvideo_destroy(struct vkvideo *enc)
 {
     uint32_t i;
 
@@ -1839,14 +1921,14 @@ void vkenc_destroy(vkenc *enc)
         goto fail; \
     } while (0)
 
-int vkenc_create(const vkenc_params *params, vkenc **out, char *err, size_t errlen)
+int vkvideo_create(const vkenc_params *params, struct vkvideo **out, char *err, size_t errlen)
 {
     VkCommandPoolCreateInfo pool = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     VkVideoFormatPropertiesKHR src_fmt, dpb_fmt;
     VkFormat want;
     uint32_t align_w, align_h, i;
     int bit_depth, std_profile;
-    vkenc *enc;
+    struct vkvideo *enc;
     VkResult res;
 
     if (!params || !out) return -1;
@@ -1906,7 +1988,7 @@ int vkenc_create(const vkenc_params *params, vkenc **out, char *err, size_t errl
     profile_init(&enc->profile, params->codec, std_profile, bit_depth);
 
     if (instance_create(&enc->vk, err, errlen)) goto fail;
-    if (pick_gpu(&enc->vk, params->codec, &enc->profile, &enc->gpu, err, errlen)) goto fail;
+    if (pick_gpu(&enc->vk, params->codec, &enc->profile, &enc->gpu, err, errlen, NULL)) goto fail;
     if (get_codec_caps(&enc->vk, enc->gpu.phys, &enc->profile, &enc->caps) != VK_SUCCESS)
         FAIL("The Vulkan driver's %s encoder does not support the %s profile.", codec_name(params->codec),
              profile_name(params->codec, std_profile));
@@ -1996,7 +2078,7 @@ int vkenc_create(const vkenc_params *params, vkenc **out, char *err, size_t errl
 fail:
     if (err && errlen && !err[0]) set_reason(err, errlen, "The video encoder could not be created.");
     INFO("%s", err ? err : "create failed");
-    vkenc_destroy(enc);
+    vkvideo_destroy(enc);
     return -1;
 }
 
@@ -2026,7 +2108,7 @@ static void write_plane(uint8_t *dst, size_t dst_pitch, const uint8_t *src, size
         write_row(dst + y * dst_pitch, src + (y < rows ? y : rows - 1) * src_pitch, row_bytes, pad_bytes, elem);
 }
 
-static void fill_slot(struct vkenc *enc, struct vkenc_slot *slot, const uint8_t *data, uint32_t pitch)
+static void fill_slot(struct vkvideo *enc, struct vkenc_slot *slot, const uint8_t *data, uint32_t pitch)
 {
     uint32_t bps = enc->bytes_per_sample;
     uint32_t luma_bytes = enc->src_width * bps, chroma_bytes = (enc->src_width + 1) / 2 * 2 * bps;
@@ -2075,7 +2157,7 @@ static VkImageMemoryBarrier2 image_barrier(VkImage image, VkPipelineStageFlags2 
     return b;
 }
 
-static void cmd_barriers(struct vkenc *enc, VkCommandBuffer cmd, const VkImageMemoryBarrier2 *images, uint32_t count,
+static void cmd_barriers(struct vkvideo *enc, VkCommandBuffer cmd, const VkImageMemoryBarrier2 *images, uint32_t count,
                          const VkBufferMemoryBarrier2 *buffer)
 {
     VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -2087,7 +2169,7 @@ static void cmd_barriers(struct vkenc *enc, VkCommandBuffer cmd, const VkImageMe
     enc->fn.vkCmdPipelineBarrier2(cmd, &dep);
 }
 
-static void cmd_copy_to_source(struct vkenc *enc, struct vkenc_slot *slot, VkCommandBuffer cmd)
+static void cmd_copy_to_source(struct vkvideo *enc, struct vkenc_slot *slot, VkCommandBuffer cmd)
 {
     VkBufferImageCopy regions[2];
     VkImageMemoryBarrier2 barrier;
@@ -2144,7 +2226,7 @@ struct frame_info
     VkVideoEncodeH265GopRemainingFrameInfoKHR h265_gop;
 };
 
-static void fill_h264_frame(struct vkenc *enc, struct frame_info *f, int idr)
+static void fill_h264_frame(struct vkvideo *enc, struct frame_info *f, int idr)
 {
     uint32_t max_frame_num = 1u << (enc->h264_sps.log2_max_frame_num_minus4 + 4);
     uint32_t frame_num = enc->gop_frame % max_frame_num;
@@ -2210,7 +2292,7 @@ static void fill_h264_frame(struct vkenc *enc, struct frame_info *f, int idr)
     f->h264_gop.gopRemainingP = enc->idr_period - enc->gop_frame - (idr ? 1 : 0);
 }
 
-static void fill_h265_frame(struct vkenc *enc, struct frame_info *f, int idr)
+static void fill_h265_frame(struct vkvideo *enc, struct frame_info *f, int idr)
 {
     int32_t poc = (int32_t)enc->gop_frame;
 
@@ -2284,7 +2366,7 @@ static void fill_h265_frame(struct vkenc *enc, struct frame_info *f, int idr)
     f->h265_gop.gopRemainingP = enc->idr_period - enc->gop_frame - (idr ? 1 : 0);
 }
 
-static VkResult record_encode(struct vkenc *enc, struct vkenc_slot *slot, int idr)
+static VkResult record_encode(struct vkvideo *enc, struct vkenc_slot *slot, int idr)
 {
     VkCommandBuffer cmd = slot->encode_cmd;
     VkCommandBufferBeginInfo begin_cmd = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2446,7 +2528,7 @@ static VkResult record_encode(struct vkenc *enc, struct vkenc_slot *slot, int id
     return enc->fn.vkEndCommandBuffer(cmd);
 }
 
-static VkResult record_upload(struct vkenc *enc, struct vkenc_slot *slot)
+static VkResult record_upload(struct vkvideo *enc, struct vkenc_slot *slot)
 {
     VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     VkResult res;
@@ -2458,7 +2540,7 @@ static VkResult record_upload(struct vkenc *enc, struct vkenc_slot *slot)
     return enc->fn.vkEndCommandBuffer(slot->upload_cmd);
 }
 
-static VkResult submit_slot(struct vkenc *enc, struct vkenc_slot *slot)
+static VkResult submit_slot(struct vkvideo *enc, struct vkenc_slot *slot)
 {
     VkCommandBufferSubmitInfo upload_cmd = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     VkCommandBufferSubmitInfo encode_cmd = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
@@ -2491,7 +2573,7 @@ static VkResult submit_slot(struct vkenc *enc, struct vkenc_slot *slot)
     return enc->fn.vkQueueSubmit2(enc->encode_queue, 1, &submit, slot->fence);
 }
 
-int vkenc_submit(vkenc *enc, const uint8_t *data, uint32_t pitch, int force_idr)
+int vkvideo_submit(struct vkvideo *enc, const uint8_t *data, uint32_t pitch, int force_idr)
 {
     struct vkenc_slot *slot;
     int idr, headers;
@@ -2555,7 +2637,7 @@ int vkenc_submit(vkenc *enc, const uint8_t *data, uint32_t pitch, int force_idr)
     return 0;
 }
 
-int vkenc_receive(vkenc *enc, uint8_t **buf, size_t *len, int *is_idr)
+int vkvideo_receive(struct vkvideo *enc, uint8_t **buf, size_t *len, int *is_idr)
 {
     VkQueryResultFlags flags = 0;
     struct vkenc_slot *slot;
@@ -2643,12 +2725,7 @@ done:
     return ret;
 }
 
-void vkenc_free_packet(uint8_t *buf)
-{
-    free(buf);
-}
-
-int vkenc_drain(vkenc *enc)
+int vkvideo_drain(struct vkvideo *enc)
 {
     VkFence fences[VKENC_MAX_SLOTS];
     uint32_t count, i, idx;
@@ -2661,7 +2738,7 @@ int vkenc_drain(vkenc *enc)
     for (i = 0, idx = enc->head; i < count; i++, idx = (idx + 1) % enc->slot_count)
         fences[i] = enc->slots[idx].fence;
     pthread_mutex_unlock(&enc->ring_lock);
-    /* Only vkenc_submit resets fences and we hold its lock, so these stay signaled once done. */
+    /* Only vkvideo_submit resets fences and we hold its lock, so these stay signaled once done. */
     res = count ? enc->fn.vkWaitForFences(enc->device, count, fences, VK_TRUE, VKENC_FENCE_TIMEOUT) : VK_SUCCESS;
     pthread_mutex_unlock(&enc->submit_lock);
     if (res != VK_SUCCESS)

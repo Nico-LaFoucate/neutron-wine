@@ -2,6 +2,10 @@
 # winegcc, like the nvenc bridge. Deployed as <prefix>/drive_c/windows/system32/amfrt64.dll with the
 # DLL override amfrt64=native.
 #
+# The encoder behind it (vkenc.h) has two backends, both loaded with dlopen() at run time: Vulkan
+# Video (vkenc.c) and VA-API (vaenc.c), with encoder.c choosing between them. Building needs the
+# Vulkan headers and the libva headers (va/va.h, va/va_drm.h), but no link to either library.
+#
 #   PATH=<our wine tree>/bin:$PATH
 #   meson setup build . --cross-file build-wine64.txt --buildtype release \
 #       -Dvulkan_headers=$NEUTRON_EXT_WORK/src/dxvk/include/vulkan/include
@@ -36,16 +40,19 @@ if get_option('test_stub')
   backend = static_library('vkenc_stub', 'vkenc_stub.c', c_args: backend_args, pic: true,
                            dependencies: amfrt64_deps)
 else
-  # The real backend (Vulkan Video). vkenc.c dlopen()s libvulkan.so.1 at run time, so it needs the
-  # Vulkan headers but no link to the loader: amfrt64 must load on machines without Vulkan.
+  # The real backends: Vulkan Video (vkenc.c) and VA-API (vaenc.c), chosen per codec by encoder.c.
+  # They dlopen() libvulkan.so.1 and libva.so.2 / libva-drm.so.2 at run time, so they need the headers
+  # but no link: amfrt64 must load on machines without Vulkan or VA-API.
   cc = meson.get_compiler('c')
   vk_args = []
   if get_option('vulkan_headers') != ''
     vk_args = ['-I' + get_option('vulkan_headers')]
   endif
   cc.has_header('vulkan/vulkan.h', args: vk_args, required: true)
-  backend = static_library('vkenc', 'vkenc.c', c_args: backend_args + vk_args, pic: true,
-                           dependencies: amfrt64_deps)
+  cc.has_header('va/va.h', required: true)
+  cc.has_header('va/va_drm.h', required: true)
+  backend = static_library('vkenc', 'vkenc.c', 'vaenc.c', 'encoder.c', c_args: backend_args + vk_args,
+                           pic: true, dependencies: amfrt64_deps)
   amfrt64_deps += cc.find_library('dl')
 endif
 

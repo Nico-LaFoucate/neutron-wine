@@ -7,10 +7,17 @@
  * IDR flag matches the slice type, IDR frames fall where they were asked for and carry the
  * parameter sets. Optionally writes the source pattern as raw video for ffmpeg's psnr filter.
  *
- *   vkenc-test --caps
- *   vkenc-test --codec h264 --profile high --size 1920x1080 --fps 30 --frames 300 \
- *              --rc cbr --bitrate 20000000 --idr 60 --out out.h264 [--raw-out src.yuv]
+ *   vkenc-test [--backend vulkan|vaapi] --caps
+ *   vkenc-test [--backend vulkan|vaapi] --codec h264 --profile high --size 1920x1080 --fps 30 \
+ *              --frames 300 --rc cbr --bitrate 20000000 --idr 60 --out out.h264 [--raw-out src.yuv]
  *              [--threads 2] [--bench] [--force-idr 100] [--pitch-pad 64] [--headers 30]
+ *   vkenc-test --vaapi-headers FILE --codec ... --frames N --idr N   (no GPU needed)
+ *
+ * --backend forces one backend (it sets NEUTRON_AMF_BACKEND); without it the backend is chosen as in
+ * amfrt64: Vulkan Video when it offers the codec, VA-API otherwise. VA-API encoding needs an AMD GPU
+ * (or Intel with NEUTRON_AMF_ANY_GPU=1); NVIDIA's VA-API driver only decodes.
+ * --vaapi-headers writes the packed parameter sets and slice headers the VA-API backend would send
+ * for the stream, for checking with ffmpeg's trace_headers.
  */
 
 #include <pthread.h>
@@ -22,6 +29,7 @@
 #include <unistd.h>
 
 #include "vkenc.h"
+#include "vkenc_backend.h"
 
 struct options
 {
@@ -328,18 +336,19 @@ static void print_caps(vkenc_codec codec)
         printf(", reason: %s\n", caps.reason);
         return;
     }
-    printf(", device %04x:%04x \"%s\", %ux%u..%ux%u, max %llu bit/s, 10-bit %d, CBR %d, VBR %d\n",
-           caps.vendor_id, caps.device_id, caps.device_name, caps.min_width, caps.min_height, caps.max_width,
-           caps.max_height, (unsigned long long)caps.max_bitrate, caps.supports_10bit, caps.supports_cbr,
-           caps.supports_vbr);
+    printf(", backend %s, device %04x:%04x \"%s\", %ux%u..%ux%u, max %llu bit/s, 10-bit %d, CBR %d, VBR %d\n",
+           vkenc_backend_name(codec), caps.vendor_id, caps.device_id, caps.device_name, caps.min_width,
+           caps.min_height, caps.max_width, caps.max_height, (unsigned long long)caps.max_bitrate,
+           caps.supports_10bit, caps.supports_cbr, caps.supports_vbr);
 }
 
 static void usage(void)
 {
-    fprintf(stderr, "usage: vkenc-test --caps | --codec h264|hevc --profile baseline|main|high|main10\n"
-            "  --size WxH --fps N[/D] --frames N --rc cbr|vbr --bitrate BPS [--peak BPS] [--idr N]\n"
-            "  [--headers N] [--level N] [--tier 0|1] [--sar N:D] [--color P,T,M,R] --out FILE\n"
-            "  [--raw-out FILE] [--threads 1|2] [--bench] [--force-idr N] [--pitch-pad BYTES]\n");
+    fprintf(stderr, "usage: vkenc-test [--backend vulkan|vaapi] --caps | --codec h264|hevc\n"
+            "  --profile baseline|main|high|main10 --size WxH --fps N[/D] --frames N --rc cbr|vbr\n"
+            "  --bitrate BPS [--peak BPS] [--idr N] [--headers N] [--level N] [--tier 0|1] [--sar N:D]\n"
+            "  [--color P,T,M,R] --out FILE [--raw-out FILE] [--threads 1|2] [--bench] [--force-idr N]\n"
+            "  [--pitch-pad BYTES] | --vaapi-headers FILE (with the stream options)\n");
     exit(2);
 }
 
@@ -352,6 +361,7 @@ int main(int argc, char **argv)
     uint32_t pitch, frame_size, nframes, i, f;
     double start, gen_time = 0, submit_time = 0, total;
     char err[256] = "";
+    const char *headers_out = NULL;
     FILE *raw = NULL;
     pthread_t thread;
     int bps, r, a;
@@ -371,6 +381,15 @@ int main(int argc, char **argv)
     p->full_range = 0;
     opt.frames = 300;
     opt.threads = 1;
+
+    /* The backend is chosen once, on the first vkenc call: set it before anything else. */
+    for (a = 1; a + 1 < argc; a++)
+    {
+        if (strcmp(argv[a], "--backend")) continue;
+        if (strcmp(argv[a + 1], "vulkan") && strcmp(argv[a + 1], "vaapi")) usage();
+        setenv("NEUTRON_AMF_BACKEND", argv[a + 1], 1);
+        printf("backend forced: %s\n", argv[a + 1]);
+    }
 
     for (a = 1; a < argc; a++)
     {
@@ -428,10 +447,19 @@ int main(int argc, char **argv)
         else if (!strcmp(arg, "--force-idr") && opt.force_idr_count < 16)
             opt.force_idr[opt.force_idr_count++] = strtol(val, NULL, 10);
         else if (!strcmp(arg, "--pitch-pad")) opt.pitch_pad = strtoul(val, NULL, 10);
+        else if (!strcmp(arg, "--backend")) continue;   /* handled above */
+        else if (!strcmp(arg, "--vaapi-headers")) headers_out = val;
         else usage();
     }
     if (!p->idr_period) p->idr_period = (2 * p->fps_num + p->fps_den / 2) / p->fps_den;
     if (p->codec == VKENC_CODEC_HEVC && p->profile != 2) p->profile = 1;
+
+    if (headers_out)
+    {
+        r = vaenc_dump_packed_headers(p, opt.frames, headers_out);
+        printf("VA-API packed headers for %u frames -> %s: %s\n", opt.frames, headers_out, r ? "FAILED" : "written");
+        return r ? 1 : 0;
+    }
 
     init_tables();
     bps = p->format == VKENC_FMT_P010 ? 2 : 1;

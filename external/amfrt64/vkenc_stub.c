@@ -27,7 +27,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "vkenc.h"
+#include "vkenc_backend.h"
 
 #define STUB "vkenc_stub (NEUTRON_VKENC_TEST_STUB, encodes nothing)"
 
@@ -101,6 +101,15 @@ int vkenc_query_caps(vkenc_codec codec, vkenc_caps *caps)
     caps->supports_10bit = codec == VKENC_CODEC_HEVC && !env_long("VKENC_STUB_NO_10BIT", 0);
     caps->supports_cbr = caps->supports_vbr = 1;
     return 0;
+}
+
+/* For amfrt64's status file; "stub" so that a test-only DLL is never mistaken for a real backend. */
+const char *vkenc_backend_name(vkenc_codec codec)
+{
+    vkenc_caps caps;
+
+    vkenc_query_caps(codec, &caps);
+    return caps.available ? "stub" : "none";
 }
 
 static int fail(char *err, size_t errlen, const char *msg)

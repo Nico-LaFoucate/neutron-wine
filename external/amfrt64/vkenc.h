@@ -3,8 +3,10 @@
  *
  * amfrt64.dll answers Adobe's AMF calls (Premiere Pro, Media Encoder, After Effects) and hands the
  * frames to this backend, which encodes them through the host's Vulkan Video driver (Mesa RADV on
- * AMD; the NVIDIA driver works too, for development). Plain C, Linux calling convention, no Wine
- * types: the backend can be built and tested on its own.
+ * AMD; the NVIDIA driver works too, for development) or, where RADV hides its encoder (older VCN
+ * firmware, Polaris/Vega, the Steam Deck), through Mesa's VA-API driver (encoder.c picks; vkenc.c is
+ * the Vulkan backend, vaenc.c the VA-API one). Plain C, Linux calling convention, no Wine types: the
+ * backend can be built and tested on its own.
  *
  * What Adobe needs (RE 2026-10-16, ~/neutron-handoffs/amf-adobe-usage-2026-10-16.md):
  *   - host-memory NV12 (8-bit) or P010 (10-bit) frames, top-down, chroma plane at data + pitch * height;

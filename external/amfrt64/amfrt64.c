@@ -3,7 +3,8 @@
  *
  * On Windows with an AMD GPU, Premiere Pro, Media Encoder and After Effects encode H.264 and HEVC
  * through AMD's AMF runtime, amfrt64.dll. This winelib DLL answers the AMF calls those apps make and
- * hands the frames to vkenc (vkenc.h), which encodes them on the host through Vulkan Video.
+ * hands the frames to vkenc (vkenc.h), which encodes them on the host through Mesa's Vulkan Video
+ * driver or, where that hides its encoder, Mesa's VA-API driver.
  *
  * The AMF interfaces are C++ classes and Adobe's code is built with MSVC, so every object here is laid
  * out the way MSVC lays out those classes: a vtable pointer first, then the slots in declaration order,
@@ -25,13 +26,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "windef.h"
 #include "winbase.h"
 #include "objbase.h"
 #include "wine/debug.h"
 
-#include "vkenc.h"
+#include "vkenc_backend.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(amf);
 
@@ -3439,6 +3441,95 @@ static BOOL find_amd_gpu(unsigned int *seen)
     return found;
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * Status file for `neutron doctor`
+ *
+ * After the caps query (once per process, from AMFInit), $WINEPREFIX/neutron-amf.json says whether
+ * hardware encoding works here and, if not, why:
+ *   {"format":1,"time":"2026-10-16T14:03:22Z","gpu":{"vendor":"0x1002","device":"0x73df","name":"..."},
+ *    "codecs":{"h264":{"available":true,"backend":"vulkan","max_width":4096,"max_height":2304,
+ *    "tenbit":false,"reason":""},"hevc":{...}}}
+ * Only a loaded amfrt64 writes it (DllMain found an AMD GPU, or NEUTRON_AMF_ANY_GPU=1). WINEPREFIX comes
+ * from the Unix environment; no file when it is unset or the prefix is not writable. Written to a
+ * temporary file and renamed, so a reader never sees half a file.
+ */
+
+static void json_string(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; *s; s++)
+    {
+        unsigned char c = *s;
+
+        if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
+        else if (c < 0x20) fprintf(f, "\\u%04x", c);
+        else if (c >= 0x7f) fputc('?', f);    /* GPU names and reasons are ASCII; keep the JSON valid */
+        else fputc(c, f);
+    }
+    fputc('"', f);
+}
+
+static void write_status_file(void)
+{
+    const char *prefix = getenv("WINEPREFIX");
+    const vkenc_caps *gpu = NULL;
+    char path[4096], temp[4096], stamp[32] = "";
+    struct tm tm;
+    time_t now;
+    unsigned int i;
+    FILE *f;
+    int ok;
+
+    if (!prefix || !*prefix) return;
+    if (snprintf(path, sizeof(path), "%s/neutron-amf.json", prefix) >= (int)sizeof(path)) return;
+    if (snprintf(temp, sizeof(temp), "%s/.neutron-amf.json.%lu.tmp", prefix,
+                 (unsigned long)GetCurrentProcessId()) >= (int)sizeof(temp))
+        return;
+
+    /* The GPU: the one that encodes, else whichever a backend found. */
+    for (i = 0; i < ARRAY_SIZE(codec_descs) && !gpu; i++)
+        if (codec_caps[i].available) gpu = &codec_caps[i];
+    for (i = 0; i < ARRAY_SIZE(codec_descs) && !gpu; i++)
+        if (codec_caps[i].vendor_id) gpu = &codec_caps[i];
+
+    now = time(NULL);
+    if (gmtime_r(&now, &tm)) strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", &tm);
+
+    if (!(f = fopen(temp, "w")))
+    {
+        TRACE("cannot write %s\n", debugstr_a(temp));
+        return;
+    }
+    fprintf(f, "{\"format\":1,\"time\":");
+    json_string(f, stamp);
+    fprintf(f, ",\"gpu\":{\"vendor\":\"0x%04x\",\"device\":\"0x%04x\",\"name\":", gpu ? gpu->vendor_id : 0,
+            gpu ? gpu->device_id : 0);
+    json_string(f, gpu ? gpu->device_name : "");
+    fprintf(f, "},\"codecs\":{");
+    for (i = 0; i < ARRAY_SIZE(codec_descs); i++)
+    {
+        const vkenc_caps *caps = &codec_caps[i];
+
+        fprintf(f, "%s\"%s\":{\"available\":%s,\"backend\":", i ? "," : "",
+                codec_descs[i]->codec == VKENC_CODEC_HEVC ? "hevc" : "h264", caps->available ? "true" : "false");
+        json_string(f, caps->available ? vkenc_backend_name(codec_descs[i]->codec) : "none");
+        fprintf(f, ",\"max_width\":%u,\"max_height\":%u,\"tenbit\":%s,\"reason\":", caps->max_width,
+                caps->max_height, caps->available && caps->supports_10bit ? "true" : "false");
+        json_string(f, caps->available ? "" : caps->reason);
+        fputc('}', f);
+    }
+    fprintf(f, "}}\n");
+    ok = !ferror(f);
+    if (fclose(f)) ok = 0;
+    if (!ok || rename(temp, path))
+    {
+        TRACE("cannot write %s\n", debugstr_a(path));
+        remove(temp);
+        return;
+    }
+    TRACE("wrote %s\n", debugstr_a(path));
+}
+
 static BOOL CALLBACK query_codec_caps(INIT_ONCE *once, void *param, void **context)
 {
     unsigned int i;
@@ -3464,6 +3555,7 @@ static BOOL CALLBACK query_codec_caps(INIT_ONCE *once, void *param, void **conte
         else
             TRACE("%s: unavailable: %s\n", codec_descs[i]->name, caps->reason);
     }
+    write_status_file();
     return TRUE;
 }
 

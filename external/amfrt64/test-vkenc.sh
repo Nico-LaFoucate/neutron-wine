@@ -5,10 +5,14 @@
 # Copyright 2026 the Neutron project. LGPL-2.1-or-later.
 #
 #   external/amfrt64/test-vkenc.sh [workdir]        (default /var/tmp/vkenc-work)
+#   NEUTRON_AMF_BACKEND=vaapi external/amfrt64/test-vkenc.sh   (every encode through VA-API; AMD only)
 #
-# Needs gcc, ffmpeg, ffprobe and Vulkan headers (VULKAN_HEADERS=<dir with vulkan/vulkan.h>, or one
-# of the Vulkan-Headers checkouts the external build already has). On a machine without an AMD GPU
-# it sets NEUTRON_AMF_ANY_GPU=1 so the tests run on whatever GPU encodes.
+# Needs gcc, ffmpeg, ffprobe, Vulkan headers (VULKAN_HEADERS=<dir with vulkan/vulkan.h>, or one of
+# the Vulkan-Headers checkouts the external build already has) and libva headers (va/va.h; Arch's
+# libva package has them, Debian/Ubuntu: libva-dev, Fedora: libva-devel). On a machine without an AMD
+# GPU it sets NEUTRON_AMF_ANY_GPU=1 so the tests run on whatever GPU encodes. Without
+# NEUTRON_AMF_BACKEND the backend is picked as in amfrt64 (Vulkan Video when it offers the codec);
+# the caps lines in the log say which one ran.
 
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
@@ -39,16 +43,24 @@ if [ -z "$headers" ]; then
     exit 1
 fi
 echo "Vulkan headers: $headers ($(grep -m1 '#define VK_HEADER_VERSION ' "$headers/vulkan/vulkan_core.h"))"
+if [ ! -f /usr/include/va/va.h ]; then
+    echo "No libva headers (/usr/include/va/va.h); install libva's development files." >&2
+    exit 1
+fi
+echo "libva headers: $(grep -m1 '#define VA_VERSION_S' /usr/include/va/va_version.h)"
+echo "backend: ${NEUTRON_AMF_BACKEND:-automatic}"
 
 cflags="-std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Wno-missing-field-initializers -fPIC -I$headers -I$here"
-if ! gcc $cflags "$here/vkenc.c" "$here/vkenc-test.c" -o vkenc-test -ldl -lpthread 2> logs/build.log; then
+backend_src="$here/vkenc.c $here/vaenc.c $here/encoder.c"
+if ! gcc $cflags $backend_src "$here/vkenc-test.c" -o vkenc-test -ldl -lpthread 2> logs/build.log; then
     cat logs/build.log
     exit 1
 fi
 if [ -s logs/build.log ]; then cat logs/build.log; bad "build has warnings"; else pass "build (no warnings)"; fi
-# The backend must not link libvulkan: it is dlopen()ed so amfrt64 loads without Vulkan.
-gcc $cflags -shared "$here/vkenc.c" -o libvkenc-check.so -ldl -lpthread
-if readelf -d libvkenc-check.so | grep NEEDED | grep -q vulkan; then bad "vkenc.c links libvulkan"; else pass "vkenc.c does not link libvulkan"; fi
+# The backends must not link libvulkan or libva: they are dlopen()ed so amfrt64 loads without them.
+gcc $cflags -shared $backend_src -o libvkenc-check.so -ldl -lpthread
+if readelf -d libvkenc-check.so | grep NEEDED | grep -q 'vulkan\|libva'; then bad "the backends link libvulkan or libva"
+else pass "the backends do not link libvulkan or libva"; fi
 
 # ---- helpers --------------------------------------------------------------------------------------
 probe() { ffprobe -v error -select_streams v:0 -show_entries "stream=$2" -of default=nw=1:nk=1 "$1" | head -1; }
@@ -129,6 +141,26 @@ run() {
     return 1
 }
 
+# ---- VA-API checks that need no GPU ----------------------------------------------------------------
+# The packed parameter sets and slice headers the VA-API backend sends, read back by ffmpeg's
+# parser (trace_headers): no parse errors, and the VUI as asked.
+for spec in "h264 high 1920x1080" "h264 main 1280x720" "h264 baseline 720x480" "hevc main 1920x1080" \
+            "hevc main10 3840x2160"; do
+    set -- $spec
+    name=va-headers-$1-$2
+    if ./vkenc-test --vaapi-headers $name.$1 --codec $1 --profile $2 --size $3 --fps 30000/1001 --frames 9 \
+            --idr 4 --sar 4:3 --color 9,16,9,1 > logs/$name.log 2>&1; then
+        errs=$(ffmpeg -v error -f $1 -i $name.$1 -c copy -bsf:v trace_headers -f null - 2>&1 \
+               | grep -c 'trace_headers\|Error applying bitstream')
+        c="$(probe $name.$1 color_primaries)/$(probe $name.$1 color_transfer)/$(probe $name.$1 color_space)/$(probe $name.$1 color_range)"
+        sar=$(probe $name.$1 sample_aspect_ratio)
+        size="$(probe $name.$1 width)x$(probe $name.$1 height)"
+        if [ "$errs" = 0 ] && [ "$c" = "bt2020/smpte2084/bt2020nc/pc" ] && [ "$sar" = "4:3" ] && [ "$size" = "$3" ]; then
+            pass "$name: parses clean, $size, SAR $sar, color $c"
+        else bad "$name: $errs parse errors, $size, SAR $sar, color $c"; fi
+    else bad "$name: header dump failed"; fi
+done
+
 # ---- tests ----------------------------------------------------------------------------------------
 ./vkenc-test --caps > logs/caps-amd-only.log 2>&1
 echo "Caps (AMD only):"; sed 's/^/  /' logs/caps-amd-only.log
@@ -140,6 +172,11 @@ fi
 if ! grep -q "available 1" logs/caps-amd-only.log; then export NEUTRON_AMF_ANY_GPU=1; fi
 ./vkenc-test --caps > logs/caps.log 2>&1
 echo "Caps:"; sed 's/^/  /' logs/caps.log
+# VA-API on its own: available, or a reason sentence and no crash (NVIDIA's VA driver only decodes).
+if ./vkenc-test --backend vaapi --caps > logs/caps-vaapi.log 2>&1 \
+        && [ "$(grep -c 'available 1, backend vaapi\|available 0, reason: .' logs/caps-vaapi.log)" = 2 ]; then
+    pass "VA-API caps: $(sed -n 's/^\(H.264\|HEVC\): query 0, //p' logs/caps-vaapi.log | tr '\n' ' ')"
+else bad "VA-API caps: $(tail -2 logs/caps-vaapi.log | tr '\n' ' ')"; fi
 
 # 1. H.264 High 1080p30, 300 frames, CBR 20 Mbit/s, IDR every 60 (raw source kept for PSNR).
 if run t1-h264-1080p --codec h264 --profile high --size 1920x1080 --fps 30 --frames 300 --rc cbr \
@@ -237,6 +274,7 @@ if run x-color --codec hevc --profile main10 --size 1920x1080 --fps 24 --frames 
     fr=$(probe x-color.hevc r_frame_rate)
     if [ "$fr" = "24/1" ]; then pass "x-color: frame rate $fr"; else bad "x-color: frame rate $fr"; fi
 else bad "x-color: encode failed"; fi
+if grep -q "backend vulkan" logs/caps.log; then   # the upload queue is Vulkan Video's
 export NEUTRON_VKENC_UPLOAD=queue
 if run x-queue --codec h264 --profile high --size 1920x1080 --fps 30 --frames 300 \
         --rc cbr --bitrate 20000000 --idr 60 --out x-queue.h264; then
@@ -245,6 +283,7 @@ if run x-queue --codec h264 --profile high --size 1920x1080 --fps 30 --frames 30
     else bad "x-queue: separate-queue upload output differs from t1"; fi
 else bad "x-queue: encode failed"; fi
 unset NEUTRON_VKENC_UPLOAD
+fi
 rm -f src-1080p.nv12
 
 echo
