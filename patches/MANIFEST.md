@@ -1033,3 +1033,13 @@ Reads UXP surface pixels before the present blit (diagnostic for the home-screen
 Temporary `ERR("NEUTRON-DL …")` markers in `winewayland.drv` (`window.c`, `wayland_surface.c`) tracing
 `WindowPosChanging`/`WindowPosChanged` for the Photoshop `win_data_mutex` deadlock investigation.
 Self-labeled **NOT for production** — re-apply only to re-instrument.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-xrgb-opaque.mypatch` (2026-10-16) — every Wine window see-through where GDI drew, after Plasma 6.8
+A plain (non-layered, unshaped) window's SHM buffer is XRGB8888, whose top byte is undefined; GDI leaves it 0 in
+everything it paints (fills, text, blits), and winewayland copied it through unchanged. After the 2026-10-15 upgrade
+to KDE Plasma 6.8.0 (KWin 6.8.0) that byte is composited as alpha: Lightroom Classic showed black panels, hollow
+outlined text and no menu bar; Notepad, Photoshop and a bare GDI test window did not appear at all on the nested
+desk. Every runtime back to 11.10-104 showed it, so not a code regression of ours; FreeType 2.15 (same upgrade) was
+ruled out by running 2.14.3. The plain path now ORs 0xff000000 into every copied pixel, as the shaped path already
+did. A/B on the same build, LrC on the nested KWin 6.8 desk: fixed (menu bar, identity plate, gray panels, solid
+text) vs `NEUTRON_XRGB_OPAQUE=0` (all three symptoms back). Kill switch `NEUTRON_XRGB_OPAQUE=0`.
