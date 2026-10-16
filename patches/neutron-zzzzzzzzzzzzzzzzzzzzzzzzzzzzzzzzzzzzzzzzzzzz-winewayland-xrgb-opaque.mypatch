@@ -1,0 +1,21 @@
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -657,7 +657,17 @@
+                 else alpha_bits = 0xff000000;
+             }
+         }
+-        else alpha_bits = shape_bits ? 0xff000000 : 0;
++        else
++        {
++            /* NEUTRON (2026-10-16): a plain window's buffer is XRGB8888, whose top byte is
++             * undefined, and GDI leaves it 0 in everything it paints (fills, text, blits). KWin
++             * 6.8 composites that byte as alpha, so a non-layered window came out see-through
++             * where GDI drew: black panels, hollow text, missing menus (LrC, every Wine window).
++             * Write it as opaque, as the shaped path already did. Kill switch: NEUTRON_XRGB_OPAQUE=0. */
++            static int xo = -1;
++            if (xo < 0) { const char *e = getenv("NEUTRON_XRGB_OPAQUE"); xo = !(e && e[0] == '0'); }
++            alpha_bits = (shape_bits || xo) ? 0xff000000 : 0;
++        }
+         {   /* NEUTRON layer-trace (NEUTRON_LAYER_TRACE=1)
+              *
+              * ⛔ NEVER CALL WIN32U FROM IN HERE. THIS TRACE DEADLOCKED PHOTOSHOP (2026-09-09).
