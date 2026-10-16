@@ -1,0 +1,148 @@
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -897,11 +897,21 @@
+         if (enabled && rt->bitmap && SUCCEEDED(IWICBitmap_QueryInterface(rt->bitmap,
+                 &IID_INeutronWicGpuBitmap3, (void **)&gen_iface)))
+         {
+-            if (SUCCEEDED(gen_iface->lpVtbl->GetWriteGeneration(gen_iface, &gen)))
++            /* 🚨 ~0 is not a generation. windowscodecs reports it while a write lock is
++             * outstanding, meaning "pixels may be changing right now -- you must seed". It is the
++             * same value every time, so comparing it with the ~0 recorded at the previous
++             * acquisition said "untouched" -- the opposite of what it means. MEASURED (Premiere
++             * 2026, 2026-10-16): the timeline ruler's bitmap answered ~0 for its whole life (an
++             * uninitialized lock count in windowscodecs, fixed there too), 209 of 210 acquisitions
++             * skipped the seed on ~0 == ~0 and published a stale copy, and old ruler numbers piled
++             * up after every zoom step. A ~0 answer now neither skips nor gets recorded. */
++            if (SUCCEEDED(gen_iface->lpVtbl->GetWriteGeneration(gen_iface, &gen)) && gen != ~0u)
++            {
++                have_gen = TRUE;
+                 untouched = rt->bitmap == rt->pool_last_bitmap
+                         && rt->pool_last_gen_valid && gen == rt->pool_last_gen;
++            }
+             gen_iface->lpVtbl->Release(gen_iface);
+-            have_gen = TRUE;
+         }
+         /* ⛔ Do NOT record "the texture holds this bitmap's pixels" here. That is not known yet --
+          * the seed below can FAIL, and the failure path CLEARS the texture instead. Recording it
+--- a/dlls/windowscodecs/bitmap.c
++++ b/dlls/windowscodecs/bitmap.c
+@@ -107,6 +107,26 @@
+     return CONTAINING_RECORD(iface, BitmapLockImpl, IWICBitmapLock_iface);
+ }
+ 
++/* NEUTRON v3: write generations come from ONE counter for the whole process, never from a
++ * per-bitmap count starting at zero.
++ *
++ * A consumer remembers (bitmap pointer, generation) and skips its upload when both match. Pointers
++ * are reused: the allocator hands a new bitmap the address of one just freed. With per-bitmap
++ * counts the new bitmap could reach the generation remembered for the old one and be taken for
++ * it, publishing the old bitmap's pixels. A generation drawn from a process-wide counter names one
++ * state of one bitmap, so the pair can only match the bitmap and state it was taken from.
++ * Never 0 (a consumer's "nothing recorded") and never ~0 ("write lock outstanding"). */
++static LONG neutron_write_gen_counter;
++
++static ULONG neutron_next_write_gen(void)
++{
++    ULONG gen;
++
++    do gen = (ULONG)InterlockedIncrement(&neutron_write_gen_counter);
++    while (!gen || gen == ~0u);
++    return gen;
++}
++
+ static BOOL BitmapImpl_AcquireLock(BitmapImpl *This, int write)
+ {
+     if (write)
+@@ -148,7 +168,7 @@
+              * Bumping here means the generation differs across any lock/unlock cycle, held or
+              * not. Consumers must also refuse to skip while a write lock is OUTSTANDING, which is
+              * what write_locks_held below is for. */
+-            ++This->write_gen;
++            This->write_gen = neutron_next_write_gen();
+             if (This->write_locks_held)
+                 --This->write_locks_held;
+         }
+@@ -567,14 +587,6 @@
+         LeaveCriticalSection(&This->cs);
+     }
+ 
+-    /* NEUTRON: a write lock hands out a raw pointer, so assume it is used. */
+-    if (flags & WICBitmapLockWrite)
+-    {
+-        This->pristine = FALSE;
+-        ++This->write_gen;              /* NEUTRON v3 */
+-        ++This->write_locks_held;       /* ...and no skipping while it is outstanding */
+-    }
+-
+     result = malloc(sizeof(BitmapLockImpl));
+     if (!result)
+         return E_OUTOFMEMORY;
+@@ -585,6 +597,17 @@
+         return WINCODEC_ERR_ALREADYLOCKED;
+     }
+ 
++    /* NEUTRON: a write lock hands out a raw pointer, so assume it is used -- but only once the
++     * lock is actually GRANTED. This used to run before AcquireLock, so a refused write lock
++     * (WINCODEC_ERR_ALREADYLOCKED) still counted as outstanding, with no lock object that could
++     * ever un-count it, and the bitmap reported "write lock outstanding" for the rest of its life. */
++    if (flags & WICBitmapLockWrite)
++    {
++        This->pristine = FALSE;
++        This->write_gen = neutron_next_write_gen();       /* NEUTRON v3 */
++        ++This->write_locks_held;       /* ...and no skipping while it is outstanding */
++    }
++
+     result->IWICBitmapLock_iface.lpVtbl = &BitmapLockImpl_Vtbl;
+     result->ref = 1;
+     result->parent = This;
+@@ -683,7 +706,7 @@
+     /* NEUTRON: an attached source is content, and stays content after it materialises into
+      * This->data -- so this is a permanent transition out of pristine, not a state that
+      * follows gpu_ops. */
+-    if (ops) { This->pristine = FALSE; ++This->write_gen; }   /* NEUTRON v3 */
++    if (ops) { This->pristine = FALSE; This->write_gen = neutron_next_write_gen(); }   /* NEUTRON v3 */
+     LeaveCriticalSection(&This->cs);
+ 
+     if (ops)
+@@ -779,8 +802,8 @@
+ 
+     if (!gen) return E_POINTER;
+     EnterCriticalSection(&This->cs);
+-    /* An outstanding write lock means pixels may be changing RIGHT NOW, so report a value the
+-     * caller cannot match: it must seed. */
++    /* An outstanding write lock means pixels may be changing RIGHT NOW: report ~0, which callers
++     * must treat as "seed" and never compare (it is the same value every time). */
+     *gen = This->write_locks_held ? ~0u : This->write_gen;
+     LeaveCriticalSection(&This->cs);
+     return S_OK;
+@@ -1167,6 +1190,15 @@
+     /* A bitmap built over caller memory (CreateBitmapFromMemory and friends) already holds
+      * pixels; one we calloc'd is transparent black and has nothing worth retaining. */
+     This->pristine = (view == NULL);
++    /* 🚨 Both counters MUST be set here: This comes from malloc, not calloc. Left as heap
++     * garbage, a nonzero write_locks_held made a brand-new bitmap report "write lock
++     * outstanding" for its whole life. MEASURED (Premiere 2026, 2026-10-16): the timeline
++     * ruler's 1775x102 bitmap answered ~0 from its first acquisition, with no lock ever refused,
++     * and d2d1's seed skip -- which compared that ~0 with the ~0 it had recorded -- republished a
++     * stale copy of the ruler on 209 of 210 acquisitions: after every zoom step in Display Format
++     * = Frames the previous step's numbers stayed on the ruler under the new ones. */
++    This->write_gen = neutron_next_write_gen();
++    This->write_locks_held = 0;
+     This->INeutronWicGpuBitmap2_iface.lpVtbl = &neutron_wicgpu2_vtbl;
+     This->INeutronWicGpuBitmap3_iface.lpVtbl = &neutron_wicgpu3_vtbl;
+     InitializeCriticalSectionEx(&This->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
+--- a/include/wine/neutron_wicgpu.h
++++ b/include/wine/neutron_wicgpu.h
+@@ -164,8 +164,10 @@
+     ULONG   (STDMETHODCALLTYPE *AddRef)(INeutronWicGpuBitmap3 *iface);
+     ULONG   (STDMETHODCALLTYPE *Release)(INeutronWicGpuBitmap3 *iface);
+ 
+-    /* Monotonically increasing; bumped by anything that can put new pixels in the bitmap.
+-     * Never reset, so a wrap is the only false "unchanged" and it takes 2^32 writes. */
++    /* Bumped by anything that can put new pixels in the bitmap, from one process-wide counter
++     * (so a value names one state of one bitmap, even when a freed bitmap's address is reused).
++     * ~0 is NOT a generation: it means a write lock is outstanding, and a caller must seed --
++     * never compare it, since it is the same value every time. */
+     HRESULT (STDMETHODCALLTYPE *GetWriteGeneration)(INeutronWicGpuBitmap3 *iface, ULONG *gen);
+ } INeutronWicGpuBitmap3Vtbl;
+ 

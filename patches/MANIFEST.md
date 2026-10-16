@@ -1066,3 +1066,22 @@ the compositor; hold on = 4 holds released "painted" after 134-249 ms, first pub
 check on the clean-room LrC: *"The box is gone now"*. Not covered: a window's first show; frames while rows move.
 Kill switch `NEUTRON_RESIZE_HOLD=0`; `NEUTRON_RESIZE_HOLD_TRACE=1` logs each hold.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-wic-seed-skip-stale-busy-generation.mypatch` (2026-10-16) — Premiere ruler numbers pile up after zooming (Display Format = Frames)
+His report (10-13): the timeline ruler *"numbers pile up ... It happens after zooming the timeline"* with the sequence's
+Display Format = Frames. Each zoom step left the previous step's numbers on the ruler, fading under the new ones, and
+the ruler got lighter. Cause, ours: windowscodecs `BitmapImpl_Create` mallocs the bitmap and never set the v3 counters
+(`write_gen`, `write_locks_held`), so a bitmap could start with a garbage nonzero lock count and answer ~0 ("write lock
+outstanding") for its whole life; d2d1's seed skip (`…zzzzzzzzzze`) compared that ~0 with the ~0 it recorded last time,
+took it for "untouched", and published its stale texture over the content Premiere had written through its own lock.
+Fix: windowscodecs sets both counters at creation and draws generations from one process-wide counter (a freed
+bitmap's reused address can no longer match a recorded generation); the write-lock bookkeeping runs only once the
+lock is granted (a refused lock used to count as held forever); d2d1 never compares or records ~0.
+MEASURED, clean-room Premiere 2026, Hideout_1 copy, 8 zoom-ins then 9 zoom-outs, ruler captured each step:
+131 = pile-up 2/2 runs; `NEUTRON_WIC_SEED_SKIP=0` = clean; fix with the skip on = clean (3 runs). Log on 131: the
+ruler's 1775x102 bitmap answered ~0 from its first acquisition with no lock ever refused; 209 of 210 acquisitions
+skipped. Disproved on the way: primitive blend (Premiere never calls SetPrimitiveBlend with a non-default mode).
+⚠️ Cost: the skip now fires 0% in Premiere (131: 62.8% in the same zoom test, all on the false ~0 match) because
+Premiere write-locks these bitmaps between our draws, so the upload is genuinely needed. The 2026-08-24 same-session
+A/B credited the skip with 22 -> 24 fps while scrolling; that gain came from this bug. Kill switch for the skip is
+unchanged (`NEUTRON_WIC_SEED_SKIP=0`). His check: pending.
+
