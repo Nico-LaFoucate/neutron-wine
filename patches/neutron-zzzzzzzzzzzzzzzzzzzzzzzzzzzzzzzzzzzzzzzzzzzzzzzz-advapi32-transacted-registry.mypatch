@@ -1,0 +1,137 @@
+--- a/dlls/advapi32/advapi32.spec
++++ b/dlls/advapi32/advapi32.spec
+@@ -627,8 +627,8 @@
+ @ stdcall RegDeleteKeyA(long str)
+ @ stdcall -import RegDeleteKeyExA(long str long long)
+ @ stdcall -import RegDeleteKeyExW(long wstr long long)
+-# @ stub RegDeleteKeyTransactedA
+-# @ stub RegDeleteKeyTransactedW
++@ stdcall RegDeleteKeyTransactedA(long str long long ptr ptr)
++@ stdcall RegDeleteKeyTransactedW(long wstr long long ptr ptr)
+ @ stdcall -import RegDeleteKeyValueA(long str str)
+ @ stdcall -import RegDeleteKeyValueW(long wstr wstr)
+ @ stdcall RegDeleteKeyW(long wstr)
+@@ -661,8 +661,8 @@
+ @ stdcall RegOpenKeyA(long str ptr)
+ @ stdcall -import RegOpenKeyExA(long str long long ptr)
+ @ stdcall -import RegOpenKeyExW(long wstr long long ptr)
+-# @ stub RegOpenKeyTransactedA
+-# @ stub RegOpenKeyTransactedW
++@ stdcall RegOpenKeyTransactedA(long str long long ptr ptr ptr)
++@ stdcall RegOpenKeyTransactedW(long wstr long long ptr ptr ptr)
+ @ stdcall RegOpenKeyW(long wstr ptr)
+ @ stdcall -import RegOpenUserClassesRoot(ptr long long ptr)
+ @ stdcall RegOverridePredefKey(long long)
+--- a/dlls/advapi32/registry.c
++++ b/dlls/advapi32/registry.c
+@@ -92,6 +92,22 @@
+ }
+ 
+ 
++/* NEUTRON TRANSACTED REGISTRY: Wine has no kernel transaction manager. NtCreateTransaction hands
++ * out a placeholder handle and NtCommitTransaction always succeeds, so a transaction here already
++ * behaves as "commit immediately". The transacted registry calls now do the same: they perform
++ * the operation directly. RegCreateKeyTransacted used to fail with ERROR_CALL_NOT_IMPLEMENTED and
++ * RegOpenKeyTransacted / RegDeleteKeyTransacted did not exist at all, so any caller was aborted
++ * ("unimplemented function ADVAPI32.dll.RegOpenKeyTransactedW").
++ *
++ * MEASURED (2026-10-17): Adobe's installer runs CoreSyncCustomHook.exe --uninstall ... --mode=update
++ * while updating Photoshop's CoreSync 7.8 -> 7.10; the hook calls RegOpenKeyTransactedW at once
++ * and Wine's crash dialog appeared in the middle of the update. Every RegCreateKeyTransactedW of
++ * its install pass failed with error 120 (shell-extension and COM registrations).
++ *
++ * Known difference from Windows: the change takes effect at once, not at commit, and a rollback
++ * cannot undo it (NtRollbackTransaction is not implemented either). The commit path -- the one
++ * installers take when they succeed -- matches Windows. */
++
+ /******************************************************************************
+  * RegCreateKeyTransactedW   [ADVAPI32.@]
+  */
+@@ -99,9 +115,9 @@
+                                         DWORD options, REGSAM access, SECURITY_ATTRIBUTES *sa,
+                                         PHKEY retkey, LPDWORD dispos, HANDLE transaction, PVOID reserved2 )
+ {
+-    FIXME( "(%p,%s,%lu,%s,%lu,%lu,%p,%p,%p,%p,%p): stub\n", hkey, debugstr_w(name), reserved,
++    TRACE( "(%p,%s,%lu,%s,%lu,%lu,%p,%p,%p,%p,%p)\n", hkey, debugstr_w(name), reserved,
+            debugstr_w(class), options, access, sa, retkey, dispos, transaction, reserved2 );
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    return RegCreateKeyExW( hkey, name, reserved, class, options, access, sa, retkey, dispos );
+ }
+ 
+ 
+@@ -112,9 +128,55 @@
+                                         DWORD options, REGSAM access, SECURITY_ATTRIBUTES *sa,
+                                         PHKEY retkey, LPDWORD dispos, HANDLE transaction, PVOID reserved2 )
+ {
+-    FIXME( "(%p,%s,%lu,%s,%lu,%lu,%p,%p,%p,%p,%p): stub\n", hkey, debugstr_a(name), reserved,
++    TRACE( "(%p,%s,%lu,%s,%lu,%lu,%p,%p,%p,%p,%p)\n", hkey, debugstr_a(name), reserved,
+            debugstr_a(class), options, access, sa, retkey, dispos, transaction, reserved2 );
+-    return ERROR_CALL_NOT_IMPLEMENTED;
++    return RegCreateKeyExA( hkey, name, reserved, class, options, access, sa, retkey, dispos );
++}
++
++
++/******************************************************************************
++ * RegOpenKeyTransactedW   [ADVAPI32.@]
++ */
++LSTATUS WINAPI RegOpenKeyTransactedW( HKEY hkey, LPCWSTR name, DWORD options, REGSAM access,
++                                      PHKEY retkey, HANDLE transaction, PVOID reserved )
++{
++    TRACE( "(%p,%s,%lu,%lu,%p,%p,%p)\n", hkey, debugstr_w(name), options, access, retkey,
++           transaction, reserved );
++    return RegOpenKeyExW( hkey, name, options, access, retkey );
++}
++
++
++/******************************************************************************
++ * RegOpenKeyTransactedA   [ADVAPI32.@]
++ */
++LSTATUS WINAPI RegOpenKeyTransactedA( HKEY hkey, LPCSTR name, DWORD options, REGSAM access,
++                                      PHKEY retkey, HANDLE transaction, PVOID reserved )
++{
++    TRACE( "(%p,%s,%lu,%lu,%p,%p,%p)\n", hkey, debugstr_a(name), options, access, retkey,
++           transaction, reserved );
++    return RegOpenKeyExA( hkey, name, options, access, retkey );
++}
++
++
++/******************************************************************************
++ * RegDeleteKeyTransactedW   [ADVAPI32.@]
++ */
++LSTATUS WINAPI RegDeleteKeyTransactedW( HKEY hkey, LPCWSTR name, REGSAM access, DWORD reserved,
++                                        HANDLE transaction, PVOID reserved2 )
++{
++    TRACE( "(%p,%s,%lu,%lu,%p,%p)\n", hkey, debugstr_w(name), access, reserved, transaction, reserved2 );
++    return RegDeleteKeyExW( hkey, name, access, reserved );
++}
++
++
++/******************************************************************************
++ * RegDeleteKeyTransactedA   [ADVAPI32.@]
++ */
++LSTATUS WINAPI RegDeleteKeyTransactedA( HKEY hkey, LPCSTR name, REGSAM access, DWORD reserved,
++                                        HANDLE transaction, PVOID reserved2 )
++{
++    TRACE( "(%p,%s,%lu,%lu,%p,%p)\n", hkey, debugstr_a(name), access, reserved, transaction, reserved2 );
++    return RegDeleteKeyExA( hkey, name, access, reserved );
+ }
+ 
+ 
+--- a/include/winreg.h
++++ b/include/winreg.h
+@@ -121,6 +121,15 @@
+ #define                    RegDeleteKey WINELIB_NAME_AW(RegDeleteKey)
+ WINADVAPI LSTATUS   WINAPI RegDeleteKeyExA(HKEY,LPCSTR,REGSAM,DWORD);
+ WINADVAPI LSTATUS   WINAPI RegDeleteKeyExW(HKEY,LPCWSTR,REGSAM,DWORD);
++WINADVAPI LSTATUS   WINAPI RegCreateKeyTransactedA(HKEY,LPCSTR,DWORD,LPSTR,DWORD,REGSAM,LPSECURITY_ATTRIBUTES,PHKEY,LPDWORD,HANDLE,PVOID);
++WINADVAPI LSTATUS   WINAPI RegCreateKeyTransactedW(HKEY,LPCWSTR,DWORD,LPWSTR,DWORD,REGSAM,LPSECURITY_ATTRIBUTES,PHKEY,LPDWORD,HANDLE,PVOID);
++#define                    RegCreateKeyTransacted WINELIB_NAME_AW(RegCreateKeyTransacted)
++WINADVAPI LSTATUS   WINAPI RegDeleteKeyTransactedA(HKEY,LPCSTR,REGSAM,DWORD,HANDLE,PVOID);
++WINADVAPI LSTATUS   WINAPI RegDeleteKeyTransactedW(HKEY,LPCWSTR,REGSAM,DWORD,HANDLE,PVOID);
++#define                    RegDeleteKeyTransacted WINELIB_NAME_AW(RegDeleteKeyTransacted)
++WINADVAPI LSTATUS   WINAPI RegOpenKeyTransactedA(HKEY,LPCSTR,DWORD,REGSAM,PHKEY,HANDLE,PVOID);
++WINADVAPI LSTATUS   WINAPI RegOpenKeyTransactedW(HKEY,LPCWSTR,DWORD,REGSAM,PHKEY,HANDLE,PVOID);
++#define                    RegOpenKeyTransacted WINELIB_NAME_AW(RegOpenKeyTransacted)
+ #define                    RegDeleteKeyEx WINELIB_NAME_AW(RegDeleteKeyEx)
+ WINADVAPI LSTATUS   WINAPI RegDeleteKeyValueA(HKEY,LPCSTR,LPCSTR);
+ WINADVAPI LSTATUS   WINAPI RegDeleteKeyValueW(HKEY,LPCWSTR,LPCWSTR);
