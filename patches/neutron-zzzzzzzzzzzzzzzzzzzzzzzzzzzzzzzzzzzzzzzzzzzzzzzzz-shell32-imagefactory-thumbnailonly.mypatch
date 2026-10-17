@@ -1,0 +1,57 @@
+shell32: IShellItemImageFactory::GetImage fails a thumbnail-only request (LrC card thumbnails)
+
+GetImage was a stub that returned S_OK with a blank 1x1 bitmap for every request. Lightroom
+Classic's Import asks the shell for a thumbnail-only image (SIIGBF_THUMBNAILONLY) for each photo on
+a card shown under Devices; it took the blank bitmap as the thumbnail and showed white squares
+(GitHub Neutron#26). Windows fails a thumbnail-only request when no handler produces a thumbnail;
+Wine has no thumbnail handlers, so it now returns WTS_E_FAILEDEXTRACTION and no bitmap, and
+Lightroom falls back to reading the photo itself. Other requests are unchanged.
+Kill switch: NEUTRON_SHELL_THUMBONLY_FAIL=0.
+
+--- a/dlls/shell32/shellitem.c
++++ b/dlls/shell32/shellitem.c
+@@ -28,6 +28,7 @@
+ 
+ #include "pidl.h"
+ #include "shell32_main.h"
++#include "thumbcache.h"
+ #include "debughlp.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(shell);
+@@ -576,10 +577,36 @@
+         .biCompression = BI_RGB
+     };
+     static int once;
++    static int thumbonly_fail = -1;
+ 
+     if (!once++)
+         FIXME("%p ({%lu, %lu} %d %p): stub\n", This, size.cx, size.cy, flags, phbm);
+ 
++    /* Neutron: Wine has no thumbnail handlers, so a thumbnail-only request can never be served.
++     * Windows fails such a request when no handler produces a thumbnail ("not all items have
++     * thumbnails, so SIIGBF_THUMBNAILONLY will cause the method to fail in these cases"). The
++     * blank 1x1 bitmap below made callers believe they had one: Lightroom Classic's Import showed
++     * white squares for a card under Devices. Kill switch NEUTRON_SHELL_THUMBONLY_FAIL=0. */
++    if (thumbonly_fail < 0)
++    {
++        WCHAR v[8];
++        thumbonly_fail = !(GetEnvironmentVariableW(L"NEUTRON_SHELL_THUMBONLY_FAIL", v, ARRAY_SIZE(v)) && v[0] == '0');
++        ERR("neutron-gateresolved: NEUTRON_SHELL_THUMBONLY_FAIL = %d\n", thumbonly_fail);
++    }
++    if (flags & SIIGBF_THUMBNAILONLY && thumbonly_fail)
++    {
++        if (WARN_ON(shell))
++        {
++            WCHAR *name = NULL;
++            SHGetNameFromIDList(This->pidl, SIGDN_DESKTOPABSOLUTEPARSING, &name);
++            WARN("neutron-thumbonly: %s ({%lu, %lu} flags %#x): no thumbnail handler -> WTS_E_FAILEDEXTRACTION\n",
++                 debugstr_w(name), size.cx, size.cy, flags);
++            CoTaskMemFree(name);
++        }
++        *phbm = NULL;
++        return WTS_E_FAILEDEXTRACTION;
++    }
++
+     if (!(*phbm = CreateDIBSection(NULL, (const BITMAPINFO *)&dummy_bmi_header,
+                                    DIB_RGB_COLORS, NULL, NULL, 0)))
+     {

@@ -1096,3 +1096,14 @@ Known difference: changes apply at once, not at commit; a rollback cannot undo t
 MEASURED (lab, copy of the pre-update prefix, scratch runtime = 132 + this advapi32, test desktop): the 7.8 CoreSync and
 CoreSyncExtension uninstall passes went from `EXCEPTION_WINE_STUB`, exit 1, to exit 0 with no stub exception; the helper went on
 to move and mark its DLLs as Adobe intends. NOT BUILT yet (his call: hold until the sign-in test finishes).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-shell32-imagefactory-thumbnailonly.mypatch` (2026-10-17) — LrC Import: blank thumbnails for a card under Devices (Neutron#26)
+Reporter: a card under **Devices** "shows the expected number of files but all the thumbnails are blank"; the same drive
+under **Files** shows them. For a device source Lightroom Classic asks the shell for each photo's thumbnail with
+`IShellItemImageFactory::GetImage({240,240}, SIIGBF_BIGGERSIZEOK|SIIGBF_THUMBNAILONLY)` (8 calls for 8 photos). Wine's
+GetImage was a stub that returned S_OK with a blank 1x1 DIB, so Lightroom took the blank as the thumbnail. Windows fails a
+thumbnail-only request when no handler produces a thumbnail; Wine has no thumbnail handlers, so it now returns
+`WTS_E_FAILEDEXTRACTION` and no bitmap, and Lightroom falls back to reading the photo itself. Other flags unchanged (still
+the blank DIB; an icon fallback would be the next step). Kill switch `NEUTRON_SHELL_THUMBONLY_FAIL=0` (PE-side getenv).
+MEASURED (lab prefix on runtime 130 + this shell32 only, udisks2 mock card with 8 a6700 ARWs, test desktop): Devices
+source shows real thumbnails; `=0` in the same setup brings back the white squares. NOT BUILT yet; his check pending.
