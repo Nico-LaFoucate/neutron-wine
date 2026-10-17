@@ -1106,4 +1106,4 @@ thumbnail-only request when no handler produces a thumbnail; Wine has no thumbna
 `WTS_E_FAILEDEXTRACTION` and no bitmap, and Lightroom falls back to reading the photo itself. Other flags unchanged (still
 the blank DIB; an icon fallback would be the next step). Kill switch `NEUTRON_SHELL_THUMBONLY_FAIL=0` (PE-side getenv).
 MEASURED (lab prefix on runtime 130 + this shell32 only, udisks2 mock card with 8 a6700 ARWs, test desktop): Devices
-source shows real thumbnails; `=0` in the same setup brings back the white squares. NOT BUILT yet; his check pending.
+source shows real thumbnails; `=0` in the same setup brings back the white squares. His real-card check: PASSED (fix on: thumbnails; `=0`: white squares). NOT BUILT yet.
