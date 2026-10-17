@@ -1085,3 +1085,14 @@ Premiere write-locks these bitmaps between our draws, so the upload is genuinely
 A/B credited the skip with 22 -> 24 fps while scrolling; that gain came from this bug. Kill switch for the skip is
 unchanged (`NEUTRON_WIC_SEED_SKIP=0`). His check: pending.
 
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-advapi32-transacted-registry.mypatch` (2026-10-17) — Adobe CoreSync helper crash during updates
+During his Photoshop 27.8 → 27.11 update, Wine's crash dialog appeared for `CoreSyncCustomHook.exe`. Adobe's installer runs the
+OLD CoreSync 7.8 helper with `--uninstall=… --mode=update`; it calls `RegOpenKeyTransactedW` at once, which Wine did not export
+at all ("Call from 7BF91BD8 to unimplemented function ADVAPI32.dll.RegOpenKeyTransactedW, aborting"). The new 7.10 helper's
+install pass also failed every `RegCreateKeyTransactedW` with error 120 (a stub). Wine has no transaction manager:
+`NtCreateTransaction` hands out a placeholder handle and `NtCommitTransaction` succeeds, i.e. transactions already behave as
+"commit immediately". Now `RegCreate/Open/DeleteKeyTransacted{A,W}` do the same: the plain operation (+ winreg.h prototypes).
+Known difference: changes apply at once, not at commit; a rollback cannot undo them (NtRollbackTransaction is unimplemented).
+MEASURED (lab, copy of the pre-update prefix, scratch runtime = 132 + this advapi32, test desktop): the 7.8 CoreSync and
+CoreSyncExtension uninstall passes went from `EXCEPTION_WINE_STUB`, exit 1, to exit 0 with no stub exception; the helper went on
+to move and mark its DLLs as Adobe intends. NOT BUILT yet (his call: hold until the sign-in test finishes).
