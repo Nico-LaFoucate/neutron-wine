@@ -1,0 +1,286 @@
+ntdll: on the first critical-section timeout, log every thread's stack (hang report)
+
+A critical section wait that times out logs "wait timed out in thread X, blocked by Y": THAT a
+process is stuck, never WHERE. Neutron#27 (Lightroom Classic greyed out, four workers blocked by a
+fifth) and Neutron#19 (preview build stuck) left nothing to act on.
+
+On the first timeout in a process (after 5 s), log one line per thread: its name, where it is
+executing, and the return addresses on its stack as module+offset, with the lock's OWNER and the
+WAITER marked. Each thread is suspended only to copy its registers and the top of its stack; while
+one is suspended this makes system calls only (no heap, loader or PEB lock). Frames come from a
+stack scan for return addresses after call instructions, so a stale address can appear.
+Once per process; costs nothing until a wait has timed out. Kill switch NEUTRON_HANG_REPORT=0.
+
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -292,6 +292,262 @@
+ }
+ 
+ 
++/* =========================================================================================
++ * NEUTRON HANG REPORT.
++ *
++ * A critical section wait that times out already logs "wait timed out in thread X, blocked by
++ * Y". That says THAT a process is stuck, never WHERE: Neutron#27 (Lightroom Classic greyed out,
++ * four workers blocked by a fifth) and Neutron#19 (preview build stuck) left nothing to act on.
++ *
++ * On the FIRST timeout in a process this writes one line per thread: its name, where it is
++ * executing, and the return addresses found on its stack, as module+offset -- the lock's owner
++ * and the waiter marked. Each thread is suspended only for as long as it takes to copy its
++ * registers and the top of its stack, then resumed; the analysis runs afterwards. While a thread
++ * is suspended this code makes system calls only: no heap, no loader lock, no PEB lock, so it
++ * cannot wait on the very lock that is stuck.
++ *
++ * The frames come from a stack scan (values that point just after a call instruction inside an
++ * executable image), not an unwind: a scan needs no unwind tables and no loader lock. It can list
++ * a stale return address now and then; the first frames are the reliable ones.
++ *
++ * Once per process. Costs nothing until a wait has already timed out.
++ * Kill switch NEUTRON_HANG_REPORT=0.
++ * ========================================================================================= */
++
++#define NEUTRON_HANG_MAX_FRAMES 14
++#define NEUTRON_HANG_SCAN_BYTES (32 * 1024)
++
++static int neutron_hang_gate = -1;
++static LONG neutron_hang_done;
++
++static void neutron_hang_resolve_gate( RTL_CRITICAL_SECTION *crit )
++{
++    static const WCHAR nameW[] = L"NEUTRON_HANG_REPORT";
++    TEB *teb = NtCurrentTeb();
++    UNICODE_STRING name, value;
++    WCHAR buf[8];
++
++    if (neutron_hang_gate >= 0) return;
++    if (!teb || !teb->Peb || !teb->Peb->ProcessParameters) return;
++    /* Reading the environment takes the PEB lock; never while that is the contended lock. */
++    if (crit == teb->Peb->FastPebLock) return;
++
++    name.Buffer = (WCHAR *)nameW;
++    name.Length = sizeof(nameW) - sizeof(WCHAR);
++    name.MaximumLength = sizeof(nameW);
++    value.Buffer = buf;
++    value.Length = 0;
++    value.MaximumLength = sizeof(buf);
++    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) || !value.Length) neutron_hang_gate = 1;
++    else neutron_hang_gate = (buf[0] != '0');
++}
++
++/* Executable image ranges and non-image ranges already looked up, so the scan of a 32 KB stack
++ * costs a handful of system calls, not thousands. Static: only the one reporting thread uses it. */
++struct neutron_hang_range { ULONG_PTR start, end, base; char name[40]; BOOL image; };
++static struct neutron_hang_range neutron_hang_ranges[256];
++static unsigned int neutron_hang_nranges, neutron_hang_next;
++
++static const struct neutron_hang_range *neutron_hang_lookup( ULONG_PTR addr )
++{
++    MEMORY_BASIC_INFORMATION mbi;
++    struct neutron_hang_range *r;
++    unsigned int i;
++
++    for (i = 0; i < neutron_hang_nranges; i++)
++        if (addr >= neutron_hang_ranges[i].start && addr < neutron_hang_ranges[i].end) return &neutron_hang_ranges[i];
++
++    if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)addr, MemoryBasicInformation, &mbi, sizeof(mbi), NULL ))
++        return NULL;
++    if (mbi.State != MEM_COMMIT && mbi.State != MEM_RESERVE && mbi.State != MEM_FREE) return NULL;
++
++    if (neutron_hang_nranges < ARRAY_SIZE(neutron_hang_ranges)) r = &neutron_hang_ranges[neutron_hang_nranges++];
++    else r = &neutron_hang_ranges[neutron_hang_next++ % ARRAY_SIZE(neutron_hang_ranges)];
++    r->start = (ULONG_PTR)mbi.BaseAddress;
++    r->end = r->start + mbi.RegionSize;
++    r->base = (ULONG_PTR)mbi.AllocationBase;
++    r->image = mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE &&
++               (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
++    r->name[0] = 0;
++    if (r->image)
++    {
++        struct { MEMORY_SECTION_NAME n; WCHAR buf[MAX_PATH]; } sn;
++        const WCHAR *p, *start, *end;
++        unsigned int k = 0;
++
++        if (!NtQueryVirtualMemory( NtCurrentProcess(), (void *)r->base, MemoryMappedFilenameInformation, &sn, sizeof(sn), NULL ))
++        {
++            start = sn.n.SectionFileName.Buffer;
++            end = start + sn.n.SectionFileName.Length / sizeof(WCHAR);
++            for (p = start; p < end; p++)
++                if (*p == '\\' || *p == '/') start = p + 1;
++            for (p = start; p < end && k < sizeof(r->name) - 1; p++)
++                r->name[k++] = (*p >= 0x20 && *p < 0x7f) ? *p : '?';
++        }
++        r->name[k] = 0;
++        if (!k) strcpy( r->name, "?" );
++    }
++    return r;
++}
++
++/* Does the code just before addr end in a call instruction? (x86/x86_64 call forms.) */
++static BOOL neutron_hang_after_call( ULONG_PTR addr )
++{
++    unsigned char b[7];
++    SIZE_T got = 0;
++
++    if (NtReadVirtualMemory( NtCurrentProcess(), (void *)(addr - 7), b, 7, &got ) || got != 7) return FALSE;
++    if (b[2] == 0xe8) return TRUE;                                     /* call rel32 */
++    if (b[1] == 0xff && (b[2] == 0x15 || (b[2] & 0xf8) == 0x90)) return TRUE;  /* call [rip+d32] / [r+d32] */
++    if (b[0] == 0xff && b[1] == 0x94) return TRUE;                     /* call [r+sib+d32] */
++    if (b[5] == 0xff && ((b[6] & 0xf8) == 0xd0 || (b[6] & 0xf8) == 0x10)) return TRUE; /* call r / [r] */
++    if (b[4] == 0xff && (b[5] & 0xf8) == 0x50) return TRUE;            /* call [r+d8] */
++    if (b[3] == 0xff && b[4] == 0x54) return TRUE;                     /* call [r+sib+d8] */
++    if (b[4] == 0xff && b[5] == 0x14) return TRUE;                     /* call [r+sib] */
++    return FALSE;
++}
++
++static int neutron_hang_format( char *out, int room, ULONG_PTR addr )
++{
++    const struct neutron_hang_range *r = neutron_hang_lookup( addr );
++    if (r && r->image) return snprintf( out, room, " %s+%#lx", r->name, (unsigned long)(addr - r->base) );
++    return snprintf( out, room, " %p", (void *)addr );
++}
++
++static void neutron_hang_thread( HANDLE pid, HANDLE tid, RTL_CRITICAL_SECTION *crit, void *scan,
++                                 ULONG_PTR waiter_sp, ULONG_PTR waiter_pc )
++{
++    OBJECT_ATTRIBUTES attr;
++    CLIENT_ID cid;
++    HANDLE thread = 0;
++    THREAD_BASIC_INFORMATION tbi;
++    struct { THREAD_NAME_INFORMATION info; WCHAR buf[64]; } tn;
++    char line[1024], tname[64];
++    ULONG_PTR pc = 0, sp = 0, top = 0, *words;
++    SIZE_T got = 0;
++    BOOL self = HandleToULong( tid ) == GetCurrentThreadId();
++    int len, frames = 0, i;
++    unsigned int k;
++
++    tname[0] = 0;
++    if (self)
++    {
++        /* From RtlpWaitForCriticalSection's own frame, not this one: the report's own calls
++         * would otherwise fill the frame budget. */
++        sp = waiter_sp & ~(ULONG_PTR)(sizeof(ULONG_PTR) - 1);
++        pc = waiter_pc;
++        top = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase;
++        got = min( NEUTRON_HANG_SCAN_BYTES, top - sp );
++        memcpy( scan, (void *)sp, got );
++        thread = GetCurrentThread();
++    }
++    else
++    {
++        CONTEXT ctx DECLSPEC_ALIGN(16);
++
++        cid.UniqueProcess = pid;
++        cid.UniqueThread = tid;
++        InitializeObjectAttributes( &attr, NULL, 0, NULL, NULL );
++        if (NtOpenThread( &thread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, &attr, &cid ))
++        {
++            ERR( "neutron-hang: tid %04lx: cannot open\n", HandleToULong( tid ) );
++            return;
++        }
++        if (NtSuspendThread( thread, NULL ))
++        {
++            NtClose( thread );
++            return;
++        }
++        memset( &ctx, 0, sizeof(ctx) );
++        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++        if (!NtGetContextThread( thread, &ctx ) &&
++            !NtQueryInformationThread( thread, ThreadBasicInformation, &tbi, sizeof(tbi), NULL ) && tbi.TebBaseAddress)
++        {
++#ifdef __x86_64__
++            pc = ctx.Rip; sp = ctx.Rsp;
++#elif defined(__i386__)
++            pc = ctx.Eip; sp = ctx.Esp;
++#endif
++            top = (ULONG_PTR)((NT_TIB *)tbi.TebBaseAddress)->StackBase;
++            if (sp && top > sp)
++                NtReadVirtualMemory( NtCurrentProcess(), (void *)sp, scan, min( NEUTRON_HANG_SCAN_BYTES, top - sp ), &got );
++        }
++        NtResumeThread( thread, NULL );
++    }
++
++    if (!NtQueryInformationThread( thread, ThreadNameInformation, &tn, sizeof(tn), NULL ))
++    {
++        for (k = 0; k < tn.info.ThreadName.Length / sizeof(WCHAR) && k < sizeof(tname) - 1; k++)
++            tname[k] = (tn.info.ThreadName.Buffer[k] >= 0x20 && tn.info.ThreadName.Buffer[k] < 0x7f) ? tn.info.ThreadName.Buffer[k] : '?';
++        tname[k] = 0;
++    }
++    if (!self) NtClose( thread );
++
++    len = snprintf( line, sizeof(line), "neutron-hang: tid %04lx%s%s \"%s\" at",
++                    HandleToULong( tid ),
++                    HandleToULong( crit->OwningThread ) == HandleToULong( tid ) ? " OWNER" : "",
++                    self ? " WAITER" : "", tname );
++    if (pc) len += neutron_hang_format( line + len, sizeof(line) - len, pc );
++    else len += snprintf( line + len, sizeof(line) - len, " ?" );
++    len += snprintf( line + len, sizeof(line) - len, " |" );
++
++    words = scan;
++    for (i = 0; i < got / sizeof(ULONG_PTR) && frames < NEUTRON_HANG_MAX_FRAMES && len < sizeof(line) - 64; i++)
++    {
++        const struct neutron_hang_range *r;
++        ULONG_PTR v = words[i];
++
++        if (v < 0x10000 || (v >= sp && v < top)) continue;
++        if (!(r = neutron_hang_lookup( v )) || !r->image) continue;
++        if (!neutron_hang_after_call( v )) continue;
++        len += neutron_hang_format( line + len, sizeof(line) - len, v );
++        frames++;
++    }
++    ERR( "%s\n", line );
++}
++
++static void neutron_hang_report( RTL_CRITICAL_SECTION *crit, ULONG_PTR waiter_sp, ULONG_PTR waiter_pc )
++{
++    SYSTEM_PROCESS_INFORMATION *spi, *proc = NULL;
++    SIZE_T size = 4 << 20, scan_size = NEUTRON_HANG_SCAN_BYTES;
++    void *buf = NULL, *scan = NULL;
++    HANDLE pid = ULongToHandle( GetCurrentProcessId() );
++    ULONG offset = 0, i;
++
++    if (neutron_hang_gate < 0) neutron_hang_resolve_gate( crit );
++    if (neutron_hang_gate == 0) return;
++    if (InterlockedCompareExchange( &neutron_hang_done, 1, 0 )) return;
++
++    if (NtAllocateVirtualMemory( NtCurrentProcess(), &buf, 0, &size, MEM_COMMIT, PAGE_READWRITE ) ||
++        NtAllocateVirtualMemory( NtCurrentProcess(), &scan, 0, &scan_size, MEM_COMMIT, PAGE_READWRITE ) ||
++        NtQuerySystemInformation( SystemProcessInformation, buf, size, NULL ))
++    {
++        ERR( "neutron-hang: cannot list threads\n" );
++        goto done;
++    }
++    for (;;)
++    {
++        spi = (SYSTEM_PROCESS_INFORMATION *)((char *)buf + offset);
++        if (spi->UniqueProcessId == pid) { proc = spi; break; }
++        if (!spi->NextEntryOffset) break;
++        offset += spi->NextEntryOffset;
++    }
++    if (!proc) goto done;
++
++    ERR( "neutron-hang: section %p %s: thread %04lx waited, owner %04lx; %lu threads follow (NEUTRON_HANG_REPORT=0 turns this off)\n",
++         crit, debugstr_a( crit_section_get_name( crit ) ), GetCurrentThreadId(),
++         HandleToULong( crit->OwningThread ), (unsigned long)proc->dwThreadCount );
++    for (i = 0; i < proc->dwThreadCount; i++)
++        neutron_hang_thread( pid, proc->ti[i].ClientId.UniqueThread, crit, scan, waiter_sp, waiter_pc );
++    ERR( "neutron-hang: end of report\n" );
++
++done:
++    size = 0;
++    if (buf) NtFreeVirtualMemory( NtCurrentProcess(), &buf, &size, MEM_RELEASE );
++    size = 0;
++    if (scan) NtFreeVirtualMemory( NtCurrentProcess(), &scan, &size, MEM_RELEASE );
++}
++
+ /******************************************************************************
+  *      RtlpWaitForCriticalSection   (NTDLL.@)
+  */
+@@ -318,6 +574,7 @@
+ 
+         ERR( "section %p %s wait timed out in thread %04lx, blocked by %04lx, retrying (%u sec)\n",
+              crit, debugstr_a(crit_section_get_name(crit)), GetCurrentThreadId(), HandleToULong(crit->OwningThread), timeout );
++        neutron_hang_report( crit, (ULONG_PTR)&timeout, (ULONG_PTR)__builtin_return_address(0) );
+     }
+     if (crit_section_has_debuginfo( crit )) crit->DebugInfo->ContentionCount++;
+     return STATUS_SUCCESS;

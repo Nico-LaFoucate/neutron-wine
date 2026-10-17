@@ -1107,3 +1107,17 @@ thumbnail-only request when no handler produces a thumbnail; Wine has no thumbna
 the blank DIB; an icon fallback would be the next step). Kill switch `NEUTRON_SHELL_THUMBONLY_FAIL=0` (PE-side getenv).
 MEASURED (lab prefix on runtime 130 + this shell32 only, udisks2 mock card with 8 a6700 ARWs, test desktop): Devices
 source shows real thumbnails; `=0` in the same setup brings back the white squares. His real-card check: PASSED (fix on: thumbnails; `=0`: white squares). NOT BUILT yet.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-ntdll-hang-report.mypatch` (2026-10-17) — hang report on the first critical-section timeout (Neutron#27, #19)
+A timed-out critical section wait logged THAT a process was stuck ("blocked by 01b8"), never WHERE. Now, on the first
+timeout in a process (5 s), `RtlpWaitForCriticalSection` also logs one `neutron-hang:` line per thread: thread name, where
+it executes, and return addresses on its stack as `module+offset`, OWNER and WAITER marked. Per thread: NtOpenThread →
+NtSuspendThread → NtGetContextThread + TEB StackBase → NtReadVirtualMemory (32 KB from SP) → NtResumeThread; analysis after
+the resume. Frames = stack scan (value inside an executable MEM_IMAGE region AND preceded by a call instruction), module
+names via MemoryMappedFilenameInformation, ranges cached (256). No heap / loader / PEB lock while a thread is suspended;
+the gate read skips the PEB lock if that is the contended section. Once per process (InterlockedCompareExchange). Kill switch
+`NEUTRON_HANG_REPORT=0`.
+MEASURED (lab runtime = 134 + this ntdll, x86_64 + i386): `deadlock.exe` (`/var/tmp/neutron-hang/`) — OWNER line
+`deadlock-x86_64.exe+0x1596` (holder_waits_forever) `+0x160e` (holder), WAITER `+0x15ad` (main_waits_for_section) `+0x16e1`
+(main); i386 likewise (+0x1579/+0x1609, +0x1590/+0x1707). 202 threads reported in 89 ms; second timeout at 60 s → no second
+report; `=0` → no report. Lightroom Classic normal session on it: 0 report lines, runs normally. NOT BUILT.
