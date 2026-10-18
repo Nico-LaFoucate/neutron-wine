@@ -1,0 +1,75 @@
+winewayland: an app's main window is never a subsurface of the window under its corner (GitHub Neutron#28)
+
+The owned-subsurface rule falls back to win32u's owner_hint when a window has no GW_OWNER. For an
+unowned window that hint is NtUserWindowFromPoint(left - 1, top - 1): whatever lies just past the
+top-left corner. A modal dialog placed over the main window's corner made Photoshop 2025's main
+window a wl_subsurface of its own Open dialog: drawn from the dialog's client origin and off the
+screen, then gone once the dialog closed.
+
+Use the hint only for windows the Windows taskbar would not list (WS_EX_TOOLWINDOW without
+WS_EX_APPWINDOW, like the Premiere Button Editor the rule was written for), and never when the
+window owns the hinted window. Reproduced and verified with harnesses/ownerhint-dialog.c on a
+nested KWin: main window inside the dialog on 135 (3/3), in place on the fix (2/2), the tool-window
+control still becomes a subsurface. Kill switch: NEUTRON_OWNER_HINT_STRICT=0.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -510,6 +510,46 @@
+     return on;
+ }
+ 
++/* NEUTRON (GitHub Neutron#28): may the owned-subsurface rule treat owner_hint as the owner of a window that has NO
++ * owner? owner_hint is not an ownership fact. For an unowned window win32u computes it as
++ * NtUserWindowFromPoint(window.left - 1, window.top - 1) -- whatever window happens to lie just past the top-left
++ * corner. For the Premiere Button Editor that is the main frame, which is what the rule was written for. For an APP'S
++ * MAIN WINDOW it is whatever covers its corner, and a modal dialog usually does: Photoshop 2025's main window became a
++ * wl_subsurface of its own Open dialog, drawn from the dialog's client origin and off the screen, and vanished when the
++ * dialog closed (harnesses/ownerhint-dialog.c reproduces both).
++ *
++ * The line Windows draws is the taskbar's: an unowned window gets its own taskbar button -- it is an independent
++ * application window -- unless it is WS_EX_TOOLWINDOW, and WS_EX_APPWINDOW forces one. Only a window the shell would NOT
++ * list (the Button Editor is WS_EX_TOOLWINDOW|NOACTIVATE|TOPMOST) may borrow the window under it as an owner. And never
++ * a window it owns itself: Windows keeps an owned window above its owner, so nesting the owner inside it inverts that.
++ * Kill switch: NEUTRON_OWNER_HINT_STRICT=0 restores the unconditional fallback. */
++static BOOL neutron_owner_hint_usable(HWND hwnd, HWND hint)
++{
++    static int on = -1;
++    static HWND last_hwnd, last_hint;
++    DWORD ex;
++    HWND o;
++    int depth;
++    const char *why = NULL;
++
++    if (!hint || hint == hwnd) return FALSE;
++    if (on < 0) on = neutron_gate("NEUTRON_OWNER_HINT_STRICT", TRUE);
++    if (!on) return TRUE;
++    ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    if ((ex & WS_EX_APPWINDOW) || !(ex & WS_EX_TOOLWINDOW)) why = "it is an independent app window (taskbar rule)";
++    for (o = hint, depth = 0; !why && o && depth < 32; o = NtUserGetWindowRelative(o, GW_OWNER), depth++)
++        if (o == hwnd) why = "it owns that window";
++    if (!why) return TRUE;
++    if (hwnd != last_hwnd || hint != last_hint)
++    {
++        ERR("neutron-ownerhint: hwnd=%p (ex=%08x) stays a toplevel, not a subsurface of owner_hint=%p: %s\n",
++            hwnd, (unsigned)ex, hint, why);
++        last_hwnd = hwnd;
++        last_hint = hint;
++    }
++    return FALSE;
++}
++
+ /**********************************************************************
+  *          neutron_maxkeep_fix
+  *
+@@ -1152,8 +1192,9 @@
+             DWORD st = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+ 
+             /* GW_OWNER is NULL for exactly the windows this is meant to catch; owner_hint is the
+-             * value win32u actually passed us and it is correct. */
+-            if (!gwowner) gwowner = owner_hint;
++             * value win32u actually passed us -- but for an unowned window it is only the window
++             * under the corner, see neutron_owner_hint_usable (#28). */
++            if (!gwowner && neutron_owner_hint_usable( hwnd, owner_hint )) gwowner = owner_hint;
+ 
+             /* CAPTIONED OWNED WINDOWS ARE INCLUDED as of 2026-08-27. The previous rule excluded
+              * them because a subsurface cannot be moved by the COMPOSITOR. True -- but the reason

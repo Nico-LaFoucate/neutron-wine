@@ -1121,3 +1121,18 @@ MEASURED (lab runtime = 134 + this ntdll, x86_64 + i386): `deadlock.exe` (`/var/
 `deadlock-x86_64.exe+0x1596` (holder_waits_forever) `+0x160e` (holder), WAITER `+0x15ad` (main_waits_for_section) `+0x16e1`
 (main); i386 likewise (+0x1579/+0x1609, +0x1590/+0x1707). 202 threads reported in 89 ms; second timeout at 60 s → no second
 report; `=0` → no report. Lightroom Classic normal session on it: 0 report lines, runs normally. NOT BUILT.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-owner-hint-strict.mypatch` (2026-10-18) — PS main window drawn inside its own Open dialog (Neutron#28)
+Reporter (Photoshop 2025 26.10, KDE Wayland, AMD, 11.10-135, launched from Collider): "The open file dialog isn't opened
+correctly". Screenshot: the dialog's title bar, and under it the whole Photoshop window starting at the dialog's client origin
+and running off the screen. The owned-subsurface rule (`zzzzzzzzzzm`) falls back to win32u's `owner_hint` when a managed window
+has no GW_OWNER. For an unowned window win32u computes that hint as `NtUserWindowFromPoint(left - 1, top - 1)`, so a modal
+dialog covering the main window's top-left corner became the main window's subsurface parent. Now the hint is used only for
+windows the Windows taskbar would not list (`WS_EX_TOOLWINDOW` without `WS_EX_APPWINDOW`; the Button Editor the rule was written
+for is NOACTIVATE|TOOLWINDOW|TOPMOST), and never when the window owns the hinted window. Logs `neutron-ownerhint:` when it
+refuses. Kill switch `NEUTRON_OWNER_HINT_STRICT=0`.
+MEASURED (`neutron/preserved-fixes/harnesses/ownerhint-dialog.c`, lab prefix `/var/tmp/neutron-i28/pfx`, nested KWin 1920x1080):
+on 135 the main window logs `neutron-ownedsub ... SUBSURFACE of owner=<dialog>`, shows inside the dialog and is gone after it
+closes (3/3, incl. `=0` on the fix); on 135 + this winewayland.so it stays in place and returns after the dialog (2/2, one
+with a forced SetWindowPos). `tool` control (unowned Button Editor-style popup): still `neutron-ownedsub ... owner=<main>` on
+both. With `NEUTRON_OWNED_SUBSURFACE=0` on 135 the main window also stays in place. Reporter check: pending. NOT BUILT.
