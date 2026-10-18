@@ -1135,4 +1135,5 @@ MEASURED (`neutron/preserved-fixes/harnesses/ownerhint-dialog.c`, lab prefix `/v
 on 135 the main window logs `neutron-ownedsub ... SUBSURFACE of owner=<dialog>`, shows inside the dialog and is gone after it
 closes (3/3, incl. `=0` on the fix); on 135 + this winewayland.so it stays in place and returns after the dialog (2/2, one
 with a forced SetWindowPos). `tool` control (unowned Button Editor-style popup): still `neutron-ownedsub ... owner=<main>` on
-both. With `NEUTRON_OWNED_SUBSURFACE=0` on 135 the main window also stays in place. Reporter check: pending. NOT BUILT.
+both. With `NEUTRON_OWNED_SUBSURFACE=0` on 135 the main window also stays in place. Reporter check: pending. SHIPPED in 11.10-136
+(packaged winewayland.so == the lab-tested build).
