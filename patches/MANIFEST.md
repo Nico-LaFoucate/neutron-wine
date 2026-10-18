@@ -1150,7 +1150,8 @@ to COLOR_HIGHLIGHTTEXT, under the same three conditions; rows that are mostly CO
 (blue highlight) never triggers it.
 MEASURED: `odmenu-text.c` row 4 (selected, COLOR_MENUHILIGHT fill, black text): dark palette 136 FAIL (darkest 0), patched PASS
 (64..255), rows 1-3 unchanged; light palette passes both. InDesign (lab LrcI19, Windows 10 mode, 175%): hovered row background
-64, text to 255, nothing darker than 64. Lab-tested as a win32u.so swap on 136 (`/var/tmp/neutron-i19/rt136hl2`). NOT YET SHIPPED.
+64, text to 255, nothing darker than 64. Lab-tested as a win32u.so swap on 136 (`/var/tmp/neutron-i19/rt136hl2`). SHIPPED in 11.10-137 (packaged x86_64 win32u.so
+code == the lab-tested module).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-menu-arrow-glyph.mypatch` (2026-10-18) — submenu arrow drawn in a blue box
 Seen on the same hovered InDesign row: the submenu arrow sat in a box of COLOR_HIGHLIGHT (48,150,250), because `draw_popup_arrow`
@@ -1158,4 +1159,4 @@ SRCCOPYs the monochrome arrow with the DC's preset background. Now blitted as a 
 the glyph is drawn, as on Windows.
 MEASURED: `odmenu-text.c` row 4 with a submenu: dark palette 136 FAIL (52 COLOR_HIGHLIGHT pixels around the glyph), patched PASS
 (0); light palette passes both. InDesign: no blue around the hovered row's arrow; the Type menu (Wine-drawn items) is
-pixel-identical to 136 apart from the submenu's edge. NOT YET SHIPPED.
+pixel-identical to 136 apart from the submenu's edge. SHIPPED in 11.10-137.
