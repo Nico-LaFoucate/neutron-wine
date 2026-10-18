@@ -1,0 +1,60 @@
+win32u: draw the submenu arrow as a glyph, not a box (InDesign font menu)
+
+On InDesign's hovered font row (Windows 10 path, which fills the row with COLOR_MENUHILIGHT) the
+submenu arrow sat in a small blue box. draw_popup_arrow SRCCOPYs the monochrome OBM_MNARROW into
+the menu DC, so its whole cell takes the DC's background color, which Wine presets to
+COLOR_HIGHLIGHT (48,150,250 in Neutron's palette) for the selected item. That only matches items
+Wine fills with that same color; an owner-drawn item, or a flat menu's COLOR_MENUHILIGHT selection,
+shows the box. Windows draws the arrow's shape alone over the item.
+
+The arrow is now blitted as a mask: text black and background white for the blit, a brush of the
+DC's text color, ROP PSDPxax, so the brush lands where the glyph is and the destination is kept
+elsewhere. The glyph keeps its color (COLOR_HIGHLIGHTTEXT selected, COLOR_MENUTEXT otherwise).
+
+Harness preserved-fixes/harnesses/odmenu-text.c, row 4 now opens a submenu: dark palette on
+11.10-136 FAILS (25 glyph pixels, 52 COLOR_HIGHLIGHT pixels around them), patched PASSES (25 glyph
+pixels, 0 around them); light palette passes before and after. InDesign 2026: no blue around the
+arrow on the hovered row; the Type menu (Wine-drawn items, selected and not) is pixel-identical to
+11.10-136 apart from the submenu's edge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -2318,17 +2318,35 @@
+     NtGdiDeleteObjectApp( mem );
+ }
+ 
++/* NEUTRON: draw only the arrow's shape, in the DC's text color, over whatever the item already shows.
++ * A SRCCOPY of the monochrome arrow paints its whole cell in the DC's background color (COLOR_HIGHLIGHT
++ * for the selected item). That matched only items Wine fills with that same color; on an owner-drawn
++ * item (InDesign fills its selected font row with COLOR_MENUHILIGHT) or a flat menu's COLOR_MENUHILIGHT
++ * selection it left a box of another color around the arrow. Windows draws the glyph alone. The arrow
++ * bitmap's 0 bits are the glyph: with text black and background white for the blit, PSDPxax puts the
++ * brush where the glyph is and keeps the destination elsewhere. */
+ static void draw_popup_arrow( HDC hdc, RECT rect, UINT arrow_width, UINT arrow_height )
+ {
+     HDC mem_hdc = NtGdiCreateCompatibleDC( hdc );
+     HBITMAP prev_bitmap;
++    DWORD color, old_text, old_bk;
++    HBRUSH brush, old_brush;
+ 
++    NtGdiGetDCDword( hdc, NtGdiGetTextColor, &color );
++    brush = NtGdiCreateSolidBrush( color, NULL );
++    old_brush = NtGdiSelectBrush( hdc, brush );
++    NtGdiGetAndSetDCDword( hdc, NtGdiSetTextColor, RGB( 0, 0, 0 ), &old_text );
++    NtGdiGetAndSetDCDword( hdc, NtGdiSetBkColor, RGB( 255, 255, 255 ), &old_bk );
+     prev_bitmap = NtGdiSelectBitmap( mem_hdc, get_arrow_bitmap() );
+     NtGdiBitBlt( hdc, rect.right - arrow_width - 1,
+                  (rect.top + rect.bottom - arrow_height) / 2,
+-                 arrow_width, arrow_height, mem_hdc, 0, 0, SRCCOPY, 0, 0 );
++                 arrow_width, arrow_height, mem_hdc, 0, 0, 0x00b8074a /* PSDPxax */, 0, 0 );
+     NtGdiSelectBitmap( mem_hdc, prev_bitmap );
+     NtGdiDeleteObjectApp( mem_hdc );
++    NtGdiGetAndSetDCDword( hdc, NtGdiSetTextColor, old_text, NULL );
++    NtGdiGetAndSetDCDword( hdc, NtGdiSetBkColor, old_bk, NULL );
++    NtGdiSelectBrush( hdc, old_brush );
++    NtGdiDeleteObjectApp( brush );
+ }
+ 
+ static void draw_bitmap_item( HWND hwnd, HDC hdc, struct menu_item *item, const RECT *rect,

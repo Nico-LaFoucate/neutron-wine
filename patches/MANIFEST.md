@@ -1141,3 +1141,21 @@ closes (3/3, incl. `=0` on the fix); on 135 + this winewayland.so it stays in pl
 with a forced SetWindowPos). `tool` control (unowned Button Editor-style popup): still `neutron-ownedsub ... owner=<main>` on
 both. With `NEUTRON_OWNED_SUBSURFACE=0` on 135 the main window also stays in place. Reporter check: pending. SHIPPED in 11.10-136
 (packaged winewayland.so == the lab-tested build).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-owner-drawn-menu-readable-selected.mypatch` (2026-10-18) — InDesign: hovered font row's text black
+Operator, on InDesign run as Windows 10 (CLI c888fdd, so its font menu fills the hovered row with COLOR_MENUHILIGHT): "Why does
+the highlighted text become black?" The readable-text rule (`zzzzzzzzzzzzzs`) only acts when half the row is exactly COLOR_MENU,
+so the hovered row kept InDesign's black text on 64 gray. The selected item may now instead be mostly COLOR_MENUHILIGHT, mapped
+to COLOR_HIGHLIGHTTEXT, under the same three conditions; rows that are mostly COLOR_MENU are unchanged; Windows' light palette
+(blue highlight) never triggers it.
+MEASURED: `odmenu-text.c` row 4 (selected, COLOR_MENUHILIGHT fill, black text): dark palette 136 FAIL (darkest 0), patched PASS
+(64..255), rows 1-3 unchanged; light palette passes both. InDesign (lab LrcI19, Windows 10 mode, 175%): hovered row background
+64, text to 255, nothing darker than 64. Lab-tested as a win32u.so swap on 136 (`/var/tmp/neutron-i19/rt136hl2`). NOT YET SHIPPED.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-menu-arrow-glyph.mypatch` (2026-10-18) — submenu arrow drawn in a blue box
+Seen on the same hovered InDesign row: the submenu arrow sat in a box of COLOR_HIGHLIGHT (48,150,250), because `draw_popup_arrow`
+SRCCOPYs the monochrome arrow with the DC's preset background. Now blitted as a mask (PSDPxax, brush = DC text color), so only
+the glyph is drawn, as on Windows.
+MEASURED: `odmenu-text.c` row 4 with a submenu: dark palette 136 FAIL (52 COLOR_HIGHLIGHT pixels around the glyph), patched PASS
+(0); light palette passes both. InDesign: no blue around the hovered row's arrow; the Type menu (Wine-drawn items) is
+pixel-identical to 136 apart from the submenu's edge. NOT YET SHIPPED.
