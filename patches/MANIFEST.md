@@ -783,8 +783,12 @@ patch-set change the dev tree never had. Found 2026-10-15 by listing the NEUTRON
 4. `dlls/dwmapi/dwmapi_main.c` P2c caption-button width fallback: reverted (a workaround for 1's garbage rects).
 5. `dlls/win32u/window.c` NEUTRON_SHELL_FIX HSHELL_WINDOWREPLACED block: replaced by the newer "Path A" version on
    purpose (not a revert).
-1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1). OPEN: audit the rest of
-this delta for reverts without a NEUTRON comment.
+1 and 3 restored by `…-restore-ps2026-reverts` (2026-10-15); 4 left out (a workaround for 1).
+AUDITED 2026-10-18 for reverts without a NEUTRON comment (`neutron/preserved-fixes/harnesses/revert-audit.py`: every line it
+removes that an earlier patch added, every line it adds back that an earlier patch removed, in build order): 7 of 48 hunks.
+Five are the items above; the other two keep the earlier code's behavior (winewayland `preferred_scale` set via a variable plus
+the per-monitor DPI post; the OWL document match widened to PS 2026's `OWL.Document`). No further reverts. In the 136 source
+the scale_dpi sign, breaker reset and dark fill are present; the doc-create geometry trace in this patch is env-gated off.
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-dpi-walk.mypatch` (2026-10-15) — child window DPI computed once at the top-level; lock-free session block check
 `get_win_monitor_dpi()` recursed up the parent chain and looked up the DPI awareness context (shared object, session
