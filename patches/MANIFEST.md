@@ -1169,3 +1169,10 @@ AISniffer reads AdapterRAM; InDesign requires > 1000 MB (Layout UI GPU status ch
 MEASURED: `wmi-adapterram.c` 137 FAIL (185 MB), patched PASS (4095 MB). InDesign on the patched win32u.so: GPU detected, GPU
 Preview renders like CPU (zoom levels, placed PNG), clean quit. Illustrator 2026 unchanged (still blocked: dxdiagn DirectX 9.0).
 Lab-tested as a win32u.so swap on 137 (`/var/tmp/neutron-i19/rt137gpu`). NOT YET SHIPPED.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-comdlg32-itemdlg-wrapped-label-height.mypatch` (2026-10-19) — InDesign Save As / Export labels clipped
+InDesign Save As: "Always Save Preview Images with Documents" cut onto two clipped lines; Export: only "Name as the Output" of
+"Use InDesign Document Name as the Output Filename" visible. IFileDialogCustomize controls have a fixed width; `ctrl_resize`
+sized the height from '\n' count only (upstream FIXME). Now measures the wrapped label (DT_WORDBREAK, in the button's text room).
+MEASURED: `fd-checkbox.c` 137 FAIL (needs 46, has 31), patched PASS (54; short label stays 31). InDesign: Save As 2 lines, Export
+3 lines, Place unchanged. Lab-tested as a comdlg32.dll swap (`/var/tmp/neutron-i19/rt138pre`). NOT YET SHIPPED.
