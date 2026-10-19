@@ -1,0 +1,37 @@
+win32u: cap the adapter's 32-bit memory size instead of truncating it (InDesign GPU Performance)
+
+InDesign 2026's Preferences > GPU Performance said "Compatible GPU and Monitor not detected", with
+the option greyed out and Total Memory "185MB" on a 12 GB RTX 5070. Adobe's AISniffer (InDesign and
+Illustrator) reads WMI's Win32_VideoController.AdapterRAM, which Wine fills from the display class
+key's HardwareInformation.MemorySize. add_gpu wrote that DWORD as (ULONG)min(size, ULONG_MAX), but
+win32u is host code, where <limits.h>'s ULONG_MAX is the 64-bit maximum: min() never capped, and
+the cast kept the low 32 bits (0x30B900000 -> 0x0B900000 = 185 MB; any exact multiple of 4 GB
+became 0). Windows reports about 4 GB in AdapterRAM for larger cards. InDesign enables GPU
+Performance only with AdapterRAM above 1000 MB (decompiled: Layout UI's GPU status check). Now
+capped at MAXDWORD; HardwareInformation.qwMemorySize still carries the full size.
+
+Harness preserved-fixes/harnesses/wmi-adapterram.c (WMI query as an app makes it vs the registry's
+qwMemorySize): 11.10-137 FAILS (185 MB), patched PASSES (4095 MB). InDesign on the patched win32u.so
+(lab LrcI19, 175%): "Compatible GPU and Monitor detected", GPU Performance + Animated Zoom on,
+"More than 3 GB"; a document in [GPU Preview] renders like the CPU path (75%, 150%, 50%, Fit Page,
+a placed PNG), quits clean, no exceptions. Illustrator 2026 now sees "More than 3 GB" but stays
+"Compatible GPU not available" (its sniffer also needs DirectX 12; Wine's dxdiagn reports 9.0), so
+its behavior is unchanged. Other AdapterRAM readers: Adobe's crash reporter (report contents only).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -1619,7 +1619,11 @@
+     set_reg_value( hkey, dac_typeW, REG_SZ, ramdacW, sizeof(ramdacW) );
+ 
+     set_reg_value( hkey, qw_memory_sizeW, REG_QWORD, &memory_size, sizeof(memory_size) );
+-    value = (ULONG)min( memory_size, (ULONGLONG)ULONG_MAX );
++    /* NEUTRON: cap at the 32-bit maximum. This file is built for the host, where <limits.h>'s ULONG_MAX is
++     * the 64-bit maximum, so min() never capped and the cast kept only the low 32 bits: a 12 GB card read as
++     * 185 MB, and one with an exact multiple of 4 GB as 0. WMI's Win32_VideoController.AdapterRAM reads this
++     * value; Windows reports about 4 GB there for larger cards. */
++    value = (ULONG)min( memory_size, (ULONGLONG)MAXDWORD );
+     set_reg_value( hkey, memory_sizeW, REG_DWORD, &value, sizeof(value) );
+ 
+     set_reg_ascii_value( hkey, "DriverVersion", driver_vendor_to_version( pci->vendor ) );

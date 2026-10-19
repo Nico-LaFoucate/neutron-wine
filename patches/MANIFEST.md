@@ -1160,3 +1160,12 @@ the glyph is drawn, as on Windows.
 MEASURED: `odmenu-text.c` row 4 with a submenu: dark palette 136 FAIL (52 COLOR_HIGHLIGHT pixels around the glyph), patched PASS
 (0); light palette passes both. InDesign: no blue around the hovered row's arrow; the Type menu (Wine-drawn items) is
 pixel-identical to 136 apart from the submenu's edge. SHIPPED in 11.10-137.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-adapter-memory-cap.mypatch` (2026-10-19) — InDesign GPU Performance "not detected", 185MB
+Found in the InDesign smoke test (10-18): Preferences > GPU Performance greyed out, "Compatible GPU and Monitor not detected",
+Total Memory 185MB on a 12 GB card. `add_gpu` wrote `HardwareInformation.MemorySize` as `(ULONG)min(size, ULONG_MAX)`; in host
+code ULONG_MAX is 2^64-1, so the cast truncated (12 GB -> 185 MB; multiples of 4 GB -> 0). WMI AdapterRAM reads it; Adobe's
+AISniffer reads AdapterRAM; InDesign requires > 1000 MB (Layout UI GPU status check, decompiled). Capped at MAXDWORD.
+MEASURED: `wmi-adapterram.c` 137 FAIL (185 MB), patched PASS (4095 MB). InDesign on the patched win32u.so: GPU detected, GPU
+Preview renders like CPU (zoom levels, placed PNG), clean quit. Illustrator 2026 unchanged (still blocked: dxdiagn DirectX 9.0).
+Lab-tested as a win32u.so swap on 137 (`/var/tmp/neutron-i19/rt137gpu`). NOT YET SHIPPED.
