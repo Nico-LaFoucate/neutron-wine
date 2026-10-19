@@ -1,0 +1,76 @@
+comdlg32: give a wrapped custom-control label the height its lines need (InDesign Save As / Export)
+
+InDesign 2026's Save As clipped its "Always Save Preview Images with Documents" check box onto two
+cut lines, and its Export dialog showed only the middle line ("Name as the Output") of "Use
+InDesign Document Name as the Output Filename". The Common Item Dialog gives every
+IFileDialogCustomize control a fixed width (160 px at 96 dpi); a longer label wraps, but
+ctrl_resize computed the height from the number of '\n' in it ("FIXME: line-wrap"), so the wrapped
+lines had no room.
+
+ctrl_resize now measures the label with DrawText(DT_CALCRECT|DT_WORDBREAK) in the room the control
+gives its text (for a check or radio button, beside its box as user32's button paints it: 12 px *
+dpi / 96 + 1, then half a '0') and takes the larger of that and the old height. A label that fits
+keeps the height it had; widths and the column layout are unchanged.
+
+Harness preserved-fixes/harnesses/fd-checkbox.c (IFileDialogCustomize Save dialog with InDesign's
+label, a short one and a push button): 11.10-137 FAILS (needs 46 px tall, control 31), patched
+PASSES (control 54; the short label stays 31). InDesign 2026: Save As shows both lines; Export
+shows all three; Place's check boxes unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -1011,24 +1011,47 @@
+     font = (HFONT)SendMessageW(hctrl, WM_GETFONT, 0, 0);
+     font = SelectObject(hdc, font);
+     GetTextExtentPoint32W(hdc, text, lstrlenW(text), &size);
+-    SelectObject(hdc, font);
+-    ReleaseDC(hctrl, hdc);
++
++    final_width = min(max(size.cx, min_width) + 4, max_width);
+ 
+     if(len && multiline)
+     {
+-        /* FIXME: line-wrap */
++        /* NEUTRON: a label wider than its control wraps, so measure the lines it wraps to in the room the
++         * control gives its text, instead of counting only the '\n' in it ("FIXME: line-wrap" upstream). A
++         * check or radio button paints its text beside its box (user32 button.c: 12 px * dpi / 96 + 1, then
++         * half a '0'). InDesign's Save As "Always Save Preview Images with Documents" wrapped onto a second
++         * line that the control had no height for. A label that fits keeps the height it had. */
++        RECT text_rc;
++        UINT room = final_width;
++        LONG style = GetWindowLongW(hctrl, GWL_STYLE) & BS_TYPEMASK;
++        WCHAR cls[16];
++
++        GetClassNameW(hctrl, cls, ARRAY_SIZE(cls));
++        if(!wcsicmp(cls, L"Button") &&
++           (style == BS_CHECKBOX || style == BS_AUTOCHECKBOX || style == BS_3STATE || style == BS_AUTO3STATE ||
++            style == BS_RADIOBUTTON || style == BS_AUTORADIOBUTTON))
++        {
++            INT zero;
++            GetCharWidthW(hdc, '0', '0', &zero);
++            room -= min(room, 12 * GetDpiForWindow(hctrl) / 96 + 1 + zero / 2);
++        }
++        SetRect(&text_rc, 0, 0, room, 0);
++        DrawTextW(hdc, text, -1, &text_rc, DT_CALCRECT | DT_WORDBREAK);
++
++        /* as before for a label that does not wrap */
+         for(lines = 1, c = text; *c != '\0'; c++)
+             if(*c == '\n') lines++;
+ 
+-        final_height = size.cy*lines + 2*4;
++        final_height = max(size.cy*lines, text_rc.bottom) + 2*4;
+     }
+     else
+     {
+         GetWindowRect(hctrl, &rc);
+         final_height = rc.bottom - rc.top;
+     }
++    SelectObject(hdc, font);
++    ReleaseDC(hctrl, hdc);
+ 
+-    final_width = min(max(size.cx, min_width) + 4, max_width);
+     SetWindowPos(hctrl, NULL, 0, 0, final_width, final_height,
+                  SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE);
+ 
