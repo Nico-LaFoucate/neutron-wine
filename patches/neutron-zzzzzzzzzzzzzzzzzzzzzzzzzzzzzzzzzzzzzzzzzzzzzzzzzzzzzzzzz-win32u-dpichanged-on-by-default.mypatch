@@ -1,0 +1,41 @@
+win32u: send WM_DPICHANGED on a cross-monitor move by default
+
+Windows sends WM_DPICHANGED when a per-monitor-aware window moves to a monitor of another dpi. Our sender
+(NEUTRON_DPI_34) was off since the 124 work, where it had destabilized Photoshop's floating windows. Without it,
+Photoshop on a 100% screen next to a 175% one kept the 175% layout of its floating options bar at the bottom of
+the screen (Contextual Task Bar 947x56 instead of 541x32).
+
+On 138 with the sender on (lab copy of the operator's Photoshop 2026 on his Cintiq): the bar is normal size and his
+drags between the two screens, floating and maximized, were clean. His call: on for every app, as on Windows.
+Kill switch NEUTRON_DPI_34=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2667,13 +2667,21 @@
+ #define WM_DPICHANGED 0x02e0
+ #endif
+ 
+-/* NEUTRON: gate for the experimental cross-monitor WM_DPICHANGED sender (the ③+④ approach). OFF by
+- * default — on Wayland the win32 window position is fictional so this fights the restore logic; the
+- * shipping default relies on the winewayland driver-side scale fix. Set NEUTRON_DPI_34=1 to enable. */
++/* NEUTRON: gate for the cross-monitor WM_DPICHANGED sender (the ③+④ approach). ON by default since 2026-10-20:
++ * Windows sends WM_DPICHANGED when a per-monitor-aware window moves to a monitor of another dpi, and without it
++ * Photoshop on a 100% screen next to a 175% one kept the 175% layout of its floating options bar (Contextual Task
++ * Bar, 947x56 instead of 541x32). It was off since the 124 work, where it had destabilized Photoshop's floating
++ * windows; on 138 the operator's drags between the two screens, floating and maximized, were clean. Kill switch
++ * NEUTRON_DPI_34=0. */
+ static BOOL neutron_dpi_34(void)
+ {
+     static int v = -1;
+-    if (v < 0) { const char *e = getenv( "NEUTRON_DPI_34" ); v = (e && e[0] == '1') ? 1 : 0; }
++    if (v < 0)
++    {
++        const char *e = getenv( "NEUTRON_DPI_34" );
++        v = !e || e[0] != '0';
++        if (!v) ERR( "neutron-gateresolved: NEUTRON_DPI_34 = 0 (environment)\n" );
++    }
+     return v;
+ }
+ 
