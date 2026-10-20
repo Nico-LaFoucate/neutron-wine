@@ -1,0 +1,202 @@
+win32u, server: per-monitor-aware windows on a second screen with another scale
+
+Photoshop 2026 (per-monitor-v2) on a 100% screen next to a 175% one (the operator's Cintiq 22HD beside a 4K):
+menus drew their items at 57% of their box, too small to read; tool icons never highlighted on hover; and an open
+menu did not follow the cursor along the menu bar. All three were fine on the 175% screen.
+
+1. Surface dpi (NEUTRON_SURFACE_TARGET_DPI=0 to turn off). A menu window is created on the primary and shown on the
+   other screen by one SetWindowPos. create_window_surface() took get_dpi_for_window(), which for a
+   per-monitor-aware window reads the monitor of its CURRENT rect, still the old one, so the surface became a
+   168->96 scaled_surface. get_window_surface() now passes the dpi of the rect being applied for monitor-aware
+   top-levels.
+
+2. Hit test (NEUTRON_POINT_MONITOR_DPI=0 to turn off). For a per-monitor-aware caller, window_from_point() sent
+   the server the desktop's monitor dpi (the primary's) with a raw point; the server rescaled the point by it and
+   WindowFromPoint(GetCursorPos) returned the desktop on the other screen. win32u now sends dpi 0 for such a
+   caller with the desktop as scope, and the server tests each top-level at its own monitor's dpi for dpi 0, as its
+   input routing (shallow_window_from_point) already does.
+
+Tests (nested KWin, 175% + 100% outputs; harnesses in neutron preserved-fixes):
+- menupm.exe (owner-drawn TrackPopupMenu on the 100% screen): items fill 56% of the box on 138, 98% fixed.
+- mousepos.exe (fake-pointer sweep): WindowFromPoint(GetCursorPos) wrong 27/27 on 138, 0/27 fixed.
+- Operator, Photoshop 2026 on his Cintiq (lab copy, NEUTRON_DPI_34=1): "menus are readable now"; then hover and
+  menu-bar tracking "all three work now, menus and drags still good".
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -278,11 +278,16 @@
+     return rect;
+ }
+ 
++/* NEUTRON surface-target-dpi: window_dpi is the dpi the window will have at the rect being applied (0 = ask the
++ * window). get_dpi_for_window() reads a per-monitor-aware window's dpi from its CURRENT rect, which during
++ * apply_window_pos is still the old one: a menu created on a 175% monitor and shown on a 100% one in the same
++ * SetWindowPos got a 168->96 scaled surface, so everything it drew came out at 57% of its box (Photoshop's menus
++ * on a 100% Cintiq next to a 175% screen). */
+ void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT monitor_dpi,
+-                            struct window_surface **window_surface )
++                            UINT window_dpi, struct window_surface **window_surface )
+ {
+     struct window_surface *previous, *driver_surface;
+-    UINT dpi = get_dpi_for_window( hwnd );
++    UINT dpi = window_dpi ? window_dpi : get_dpi_for_window( hwnd );
+     RECT monitor_rect;
+ 
+ 
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -46,7 +46,7 @@
+ /* dce.c */
+ extern struct window_surface dummy_surface;
+ extern void create_window_surface( HWND hwnd, BOOL create_layered, const RECT *surface_rect, UINT monitor_dpi,
+-                                   struct window_surface **window_surface );
++                                   UINT window_dpi, struct window_surface **window_surface );
+ extern struct window_surface *get_driver_window_surface( struct window_surface *surface, UINT monitor_dpi );
+ extern void erase_now( HWND hwnd, UINT rdw_flags );
+ extern void flush_window_surfaces( BOOL idle );
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2536,6 +2536,19 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON surface-target-dpi; kill switch NEUTRON_SURFACE_TARGET_DPI=0 (see get_window_surface). */
++static BOOL neutron_surface_target_dpi(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SURFACE_TARGET_DPI" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_SURFACE_TARGET_DPI = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ static struct window_surface *get_window_surface( HWND hwnd, UINT swp_flags, BOOL create_layered,
+                                                   struct window_rects *rects, RECT *surface_rect )
+ {
+@@ -2543,7 +2556,7 @@
+     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+     struct window_surface *new_surface;
+     struct window_rects monitor_rects;
+-    UINT raw_dpi, style, ex_style;
++    UINT raw_dpi, style, ex_style, window_dpi = 0;
+     RECT dummy;
+     HRGN shape;
+ 
+@@ -2552,7 +2565,16 @@
+     is_child = parent && parent != NtUserGetDesktopWindow();
+ 
+     if (is_child) get_win_monitor_dpi( parent, &raw_dpi );
+-    else monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
++    else
++    {
++        UINT new_dpi = monitor_dpi_from_rect( rects->window, get_thread_dpi(), &raw_dpi );
++        /* NEUTRON surface-target-dpi: a per-monitor-aware top-level draws at the dpi of the monitor it is moving
++         * to, so size its surface for that, not for the monitor of its old rect (see create_window_surface).
++         * Kill switch NEUTRON_SURFACE_TARGET_DPI=0. */
++        if (neutron_surface_target_dpi() &&
++            NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) ))
++            window_dpi = new_dpi;
++    }
+ 
+     if (get_window_region( hwnd, FALSE, &shape, &dummy )) shaped = FALSE;
+     else if ((shaped = !!shape)) NtGdiDeleteObjectApp( shape );
+@@ -2594,7 +2616,7 @@
+     else if (create_layered || is_layered) needs_surface = TRUE;
+ 
+     if (needs_surface)
+-        create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, &new_surface );
++        create_window_surface( hwnd, create_layered, surface_rect, raw_dpi, window_dpi, &new_surface );
+     else if (new_surface && new_surface != &dummy_surface)
+     {
+         window_surface_release( new_surface );
+@@ -3351,6 +3373,19 @@
+     return NULL;
+ }
+ 
++/* NEUTRON point-monitor-dpi; kill switch NEUTRON_POINT_MONITOR_DPI=0 (see window_from_point). */
++static BOOL neutron_point_monitor_dpi(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_POINT_MONITOR_DPI" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_POINT_MONITOR_DPI = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ /***********************************************************************
+  *           window_from_point
+  *
+@@ -3364,7 +3399,17 @@
+     UINT dpi, raw_dpi;
+ 
+     if (!hwnd) hwnd = get_desktop_window();
+-    if (!(dpi = get_thread_dpi())) dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
++    if (!(dpi = get_thread_dpi()))
++    {
++        /* NEUTRON point-monitor-dpi: a per-monitor-aware caller's point is in raw (physical) coordinates. The
++         * desktop's "monitor dpi" is the primary's, so on a second monitor with another scale the server rescaled
++         * the point by primary/that dpi and WindowFromPoint(GetCursorPos) returned the desktop (or nothing) instead
++         * of the window under the cursor. Photoshop on a 100% Cintiq next to a 175% screen: no tool hover highlights,
++         * and an open menu did not follow the cursor along the menu bar. Kill switch NEUTRON_POINT_MONITOR_DPI=0. */
++        if (hwnd == get_desktop_window() && neutron_point_monitor_dpi())
++            dpi = 0;  /* the server tests each top-level at its own monitor's dpi (all_windows_from_point) */
++        else dpi = get_win_monitor_dpi( hwnd, &raw_dpi );
++    }
+ 
+     *hittest = HTNOWHERE;
+ 
+--- a/server/window.c
++++ b/server/window.c
+@@ -1134,7 +1134,7 @@
+ }
+ 
+ /* find all children of 'parent' that contain the given point */
+-static int get_window_children_from_point( struct window *parent, int x, int y,
++static int get_window_children_from_point( struct window *parent, int x, int y, unsigned int dpi,
+                                            struct user_handle_array *array )
+ {
+     struct window *ptr;
+@@ -1143,13 +1143,13 @@
+     {
+         int x_child = x, y_child = y;
+ 
+-        if (!is_point_in_window( ptr, &x_child, &y_child, get_window_dpi( parent ) )) continue;  /* skip it */
++        if (!is_point_in_window( ptr, &x_child, &y_child, dpi )) continue;  /* skip it */
+ 
+         /* if point is in client area, and window is not minimized or disabled, check children */
+         if (!(ptr->style & (WS_MINIMIZE|WS_DISABLED)) && point_in_rect( &ptr->client_rect, x_child, y_child ))
+         {
+             if (!get_window_children_from_point( ptr, x_child - ptr->client_rect.left,
+-                                                 y_child - ptr->client_rect.top, array ))
++                                                 y_child - ptr->client_rect.top, get_window_dpi( ptr ), array ))
+                 return 0;
+         }
+ 
+@@ -1197,6 +1197,12 @@
+ static int all_windows_from_point( struct window *top, int x, int y, unsigned int dpi,
+                                    struct user_handle_array *array )
+ {
++    /* NEUTRON point-monitor-dpi: dpi 0 with the desktop as the scope is a raw (physical) point from a
++     * per-monitor-aware caller. Test each top-level window at its own monitor's dpi, as input routing does
++     * (shallow_window_from_point), instead of rescaling the point by the desktop's dpi (the primary's): on a second
++     * monitor with another scale that missed every window (Photoshop on a 100% Cintiq next to a 175% screen). */
++    unsigned int child_dpi = (!dpi && is_desktop_window( top )) ? 0 : get_window_dpi( top );
++
+     if (!is_desktop_window( top ) && !is_desktop_window( top->parent ))
+     {
+         screen_to_client( top->parent, &x, &y, dpi );
+@@ -1212,7 +1218,7 @@
+             x -= top->client_rect.left;
+             y -= top->client_rect.top;
+         }
+-        if (!get_window_children_from_point( top, x, y, array )) return 0;
++        if (!get_window_children_from_point( top, x, y, child_dpi, array )) return 0;
+     }
+     /* now add window to the array */
+     if (!add_handle_to_array( array, top->handle )) return 0;

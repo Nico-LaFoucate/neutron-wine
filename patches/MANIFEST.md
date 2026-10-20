@@ -1176,3 +1176,19 @@ InDesign Save As: "Always Save Preview Images with Documents" cut onto two clipp
 sized the height from '\n' count only (upstream FIXME). Now measures the wrapped label (DT_WORDBREAK, in the button's text room).
 MEASURED: `fd-checkbox.c` 137 FAIL (needs 46, has 31), patched PASS (54; short label stays 31). InDesign: Save As 2 lines, Export
 3 lines, Place unchanged. Lab-tested as a comdlg32.dll swap (`/var/tmp/neutron-i19/rt138pre`). SHIPPED in 11.10-138 (harness PASS on the package; FAIL on 137).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-second-screen-dpi.mypatch` (2026-10-20) — Photoshop on a 100% screen next to a 175% one
+Operator, Photoshop 2026 on his Cintiq 22HD (100%) beside a 4K at 175%: menus drew their items at 57% of their box ("render too
+small within a box"), tool icons never highlighted on hover, and an open menu did not follow the cursor along the menu bar;
+all fine on the 175% screen. Two Wine bugs for per-monitor-aware windows on a second screen with another scale:
+(1) `create_window_surface` took `get_dpi_for_window()`, which reads the monitor of the window's CURRENT rect; a menu created on
+the primary and shown on the other screen in one SetWindowPos got a 168->96 `scaled_surface`. `get_window_surface` now passes
+the dpi of the rect being applied for monitor-aware top-levels (kill switch `NEUTRON_SURFACE_TARGET_DPI=0`).
+(2) `window_from_point` sent the server the desktop's (primary's) dpi with a per-monitor caller's raw point; the server rescaled
+it and WindowFromPoint(GetCursorPos) returned the desktop. win32u now sends dpi 0 for that case and the server
+(`all_windows_from_point`) tests each top-level at its own monitor's dpi, as `shallow_window_from_point` does for input
+(kill switch `NEUTRON_POINT_MONITOR_DPI=0`). Touches server/window.c: wineserver changes too.
+MEASURED (nested KWin, 175% + 100%): `menupm.c` items fill 56% of the box on 138, 98% patched; `mousepos.c`
+WindowFromPoint wrong 27/27 on 138, 0/27 patched. Operator, lab copy on his Cintiq (with NEUTRON_DPI_34=1): "menus are readable
+now", then "all three work now, menus and drags still good". Lab-tested as win32u.so x2 + wineserver swapped into 138
+(`/var/tmp/neutron-i19/rt138std`). NOT SHIPPED.
