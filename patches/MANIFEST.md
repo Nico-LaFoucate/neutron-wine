@@ -1201,3 +1201,12 @@ the bottom of the screen (947x56 instead of 541x32). Windows sends WM_DPICHANGED
 MEASURED: operator, lab copy on his Cintiq with the sender on: bar normal size, drags between the screens floating and maximized
 clean. Nested desk with no env set: the bar ("Start Bar" state) got WM_DPICHANGED 168->96 and is 459x32 (32 = 100% height).
 SHIPPED in 11.10-139.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-imapi2-disc-master.mypatch` (2026-10-20) — Lightroom Classic crash on Export To: CD/DVD (Neutron#30)
+Reporter: *"Crash on export creating user preset"* (log: `class {2735412e-…} not registered`, then a NULL read). Lightroom's
+DiscBurning.dll creates MsftDiscMaster2 and uses it unchecked; Wine had no imapi2. New `dlls/imapi2` (new DLL: the build's
+`tools/make_makefiles` + `autoreconf` pick it up; wineboot registers the class from `imapi2_classes.idl`): MsftDiscMaster2 =
+supported environment, 0 recorders, empty enumeration. Recording is not implemented.
+MEASURED: `imapi2-master.c` 139 FAIL (0x80040154), patched PASS. Lightroom Classic 15.6 lab: CD/DVD export shows its own "cannot
+locate a drive that supports burning" message instead of Adobe's error report. Lab-tested as imapi2.dll (x86_64) added to 139
+(`/var/tmp/neutron-i19/rt139imapi`) + `wineboot -u`. NOT SHIPPED.
