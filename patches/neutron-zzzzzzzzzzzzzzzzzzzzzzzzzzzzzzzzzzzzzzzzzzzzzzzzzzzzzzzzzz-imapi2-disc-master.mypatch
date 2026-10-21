@@ -1,0 +1,427 @@
+imapi2: add the disc master of a PC without an optical drive (Neutron#30)
+
+Lightroom Classic crashed into Adobe's error report on Export To: CD/DVD. Its DiscBurning.dll creates
+MsftDiscMaster2 and uses the object without checking the result; Wine had no imapi2.dll, so CoCreateInstance
+returned REGDB_E_CLASSNOTREG and Adobe read through a NULL pointer (access violation in DiscBurning.dll+0x2689,
+RAX = 0x80040154). Windows always ships imapi2.dll.
+
+New imapi2.dll with MsftDiscMaster2 (IDiscMaster2): a supported environment with no recorders, as Windows
+reports on a PC without an optical drive. Recording itself (MsftDiscRecorder2, MsftDiscFormat2Data, ...) is not
+implemented.
+
+Tests: harness imapi2-master.c FAILS on 139 (class not registered) and PASSES with the DLL (supported, 0
+recorders, empty enumeration). Lightroom Classic 15.6 (lab, 139 + this DLL): Export To: CD/DVD shows the CD/DVD
+settings, and Export ends in Lightroom's own "Lightroom cannot burn data because it cannot locate a drive that
+supports burning." — the Windows behavior without a burner.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/imapi2/imapi2_classes.idl
++++ b/dlls/imapi2/imapi2_classes.idl
+@@ -0,0 +1,29 @@
++/*
++ * COM classes for imapi2.dll
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep register
++
++import "imapi2_private.idl";
++
++[
++    helpstring("Microsoft IMAPI v2 Disc Master"),
++    threading(both),
++    progid("IMAPI2.MsftDiscMaster2"),
++    uuid(2735412e-7f64-5b0f-8f00-5d77afbe261e)
++]
++coclass MsftDiscMaster2 { interface IDiscMaster2; }
+--- a/dlls/imapi2/imapi2_private.idl
++++ b/dlls/imapi2/imapi2_private.idl
+@@ -0,0 +1,43 @@
++/*
++ * Image Mastering API v2 (IMAPI2) interfaces implemented by imapi2.dll
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep header
++
++import "oaidl.idl";
++
++[
++    object,
++    uuid(27354130-7f64-5b0f-8f00-5d77afbe261e),
++    dual,
++    nonextensible,
++    pointer_default(unique)
++]
++interface IDiscMaster2 : IDispatch
++{
++    [propget, id(DISPID_NEWENUM), restricted, hidden]
++    HRESULT _NewEnum([out, retval] IEnumVARIANT **ppunk);
++
++    [propget, id(DISPID_VALUE)]
++    HRESULT Item([in] LONG index, [out, retval] BSTR *value);
++
++    [propget, id(1)]
++    HRESULT Count([out, retval] LONG *value);
++
++    [propget, id(2)]
++    HRESULT IsSupportedEnvironment([out, retval] VARIANT_BOOL *value);
++}
+--- a/dlls/imapi2/imapi2.spec
++++ b/dlls/imapi2/imapi2.spec
+@@ -0,0 +1,4 @@
++@ stdcall -private DllCanUnloadNow()
++@ stdcall -private DllGetClassObject(ptr ptr ptr)
++@ stdcall -private DllRegisterServer()
++@ stdcall -private DllUnregisterServer()
+--- a/dlls/imapi2/main.c
++++ b/dlls/imapi2/main.c
+@@ -0,0 +1,309 @@
++/*
++ * Image Mastering API v2 (IMAPI2)
++ *
++ * NEUTRON imapi2 (2026-10-20, GitHub Neutron#30): Windows always ships imapi2.dll. Lightroom Classic's Export dialog,
++ * on "Export To: CD/DVD", creates MsftDiscMaster2 and uses it without checking the result (Adobe's DiscBurning.dll),
++ * so on Wine, which had no imapi2, it crashed into Adobe's error report. This provides the disc master of a PC
++ * without an optical drive: no recorders (Count 0) in a supported environment, which Windows reports on such a PC.
++ * Recording itself (MsftDiscRecorder2, MsftDiscFormat2Data, ...) is not implemented.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#define COBJMACROS
++
++#include "windef.h"
++#include "winbase.h"
++#include "ole2.h"
++#include "olectl.h"
++#include "initguid.h"
++#include "imapi2_private.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(imapi2);
++
++DEFINE_GUID(CLSID_MsftDiscMaster2, 0x2735412e, 0x7f64, 0x5b0f, 0x8f, 0x00, 0x5d, 0x77, 0xaf, 0xbe, 0x26, 0x1e);
++
++/* an IEnumVARIANT over no recorders */
++struct empty_enum
++{
++    IEnumVARIANT IEnumVARIANT_iface;
++    LONG ref;
++};
++
++static inline struct empty_enum *impl_from_IEnumVARIANT( IEnumVARIANT *iface )
++{
++    return CONTAINING_RECORD( iface, struct empty_enum, IEnumVARIANT_iface );
++}
++
++static HRESULT empty_enum_create( IEnumVARIANT **ret );
++
++static HRESULT WINAPI empty_enum_QueryInterface( IEnumVARIANT *iface, REFIID riid, void **obj )
++{
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IEnumVARIANT ))
++    {
++        *obj = iface;
++        IEnumVARIANT_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI empty_enum_AddRef( IEnumVARIANT *iface )
++{
++    return InterlockedIncrement( &impl_from_IEnumVARIANT( iface )->ref );
++}
++
++static ULONG WINAPI empty_enum_Release( IEnumVARIANT *iface )
++{
++    struct empty_enum *enumerator = impl_from_IEnumVARIANT( iface );
++    ULONG ref = InterlockedDecrement( &enumerator->ref );
++    if (!ref) free( enumerator );
++    return ref;
++}
++
++static HRESULT WINAPI empty_enum_Next( IEnumVARIANT *iface, ULONG celt, VARIANT *var, ULONG *fetched )
++{
++    if (fetched) *fetched = 0;
++    return celt ? S_FALSE : S_OK;
++}
++
++static HRESULT WINAPI empty_enum_Skip( IEnumVARIANT *iface, ULONG celt )
++{
++    return celt ? S_FALSE : S_OK;
++}
++
++static HRESULT WINAPI empty_enum_Reset( IEnumVARIANT *iface )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI empty_enum_Clone( IEnumVARIANT *iface, IEnumVARIANT **ret )
++{
++    if (!ret) return E_POINTER;
++    return empty_enum_create( ret );
++}
++
++static const IEnumVARIANTVtbl empty_enum_vtbl =
++{
++    empty_enum_QueryInterface,
++    empty_enum_AddRef,
++    empty_enum_Release,
++    empty_enum_Next,
++    empty_enum_Skip,
++    empty_enum_Reset,
++    empty_enum_Clone,
++};
++
++static HRESULT empty_enum_create( IEnumVARIANT **ret )
++{
++    struct empty_enum *enumerator;
++
++    if (!(enumerator = calloc( 1, sizeof(*enumerator) ))) return E_OUTOFMEMORY;
++    enumerator->IEnumVARIANT_iface.lpVtbl = &empty_enum_vtbl;
++    enumerator->ref = 1;
++    *ret = &enumerator->IEnumVARIANT_iface;
++    return S_OK;
++}
++
++/* MsftDiscMaster2 */
++struct disc_master
++{
++    IDiscMaster2 IDiscMaster2_iface;
++    LONG ref;
++};
++
++static inline struct disc_master *impl_from_IDiscMaster2( IDiscMaster2 *iface )
++{
++    return CONTAINING_RECORD( iface, struct disc_master, IDiscMaster2_iface );
++}
++
++static HRESULT WINAPI disc_master_QueryInterface( IDiscMaster2 *iface, REFIID riid, void **obj )
++{
++    TRACE( "%p, %s, %p\n", iface, debugstr_guid( riid ), obj );
++
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IDispatch ) ||
++        IsEqualIID( riid, &IID_IDiscMaster2 ))
++    {
++        *obj = iface;
++        IDiscMaster2_AddRef( iface );
++        return S_OK;
++    }
++    FIXME( "interface %s not implemented\n", debugstr_guid( riid ) );
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI disc_master_AddRef( IDiscMaster2 *iface )
++{
++    return InterlockedIncrement( &impl_from_IDiscMaster2( iface )->ref );
++}
++
++static ULONG WINAPI disc_master_Release( IDiscMaster2 *iface )
++{
++    struct disc_master *master = impl_from_IDiscMaster2( iface );
++    ULONG ref = InterlockedDecrement( &master->ref );
++    if (!ref) free( master );
++    return ref;
++}
++
++static HRESULT WINAPI disc_master_GetTypeInfoCount( IDiscMaster2 *iface, UINT *count )
++{
++    *count = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI disc_master_GetTypeInfo( IDiscMaster2 *iface, UINT index, LCID lcid, ITypeInfo **info )
++{
++    FIXME( "%p, %u, %#lx, %p: stub\n", iface, index, lcid, info );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI disc_master_GetIDsOfNames( IDiscMaster2 *iface, REFIID riid, LPOLESTR *names, UINT count,
++                                                 LCID lcid, DISPID *dispid )
++{
++    FIXME( "%p, %s, %p, %u, %#lx, %p: stub\n", iface, debugstr_guid( riid ), names, count, lcid, dispid );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI disc_master_Invoke( IDiscMaster2 *iface, DISPID member, REFIID riid, LCID lcid, WORD flags,
++                                          DISPPARAMS *params, VARIANT *result, EXCEPINFO *excepinfo, UINT *argerr )
++{
++    FIXME( "%p, %ld, %s, %#lx, %#x, %p, %p, %p, %p: stub\n", iface, member, debugstr_guid( riid ), lcid, flags,
++           params, result, excepinfo, argerr );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI disc_master_get__NewEnum( IDiscMaster2 *iface, IEnumVARIANT **ret )
++{
++    TRACE( "%p, %p\n", iface, ret );
++    if (!ret) return E_POINTER;
++    return empty_enum_create( ret );
++}
++
++static HRESULT WINAPI disc_master_get_Item( IDiscMaster2 *iface, LONG index, BSTR *value )
++{
++    TRACE( "%p, %ld, %p\n", iface, index, value );
++    if (!value) return E_POINTER;
++    *value = NULL;
++    return E_INVALIDARG;   /* no recorders */
++}
++
++static HRESULT WINAPI disc_master_get_Count( IDiscMaster2 *iface, LONG *value )
++{
++    TRACE( "%p, %p\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = 0;
++    return S_OK;
++}
++
++static HRESULT WINAPI disc_master_get_IsSupportedEnvironment( IDiscMaster2 *iface, VARIANT_BOOL *value )
++{
++    TRACE( "%p, %p\n", iface, value );
++    if (!value) return E_POINTER;
++    *value = VARIANT_TRUE;
++    return S_OK;
++}
++
++static const IDiscMaster2Vtbl disc_master_vtbl =
++{
++    disc_master_QueryInterface,
++    disc_master_AddRef,
++    disc_master_Release,
++    disc_master_GetTypeInfoCount,
++    disc_master_GetTypeInfo,
++    disc_master_GetIDsOfNames,
++    disc_master_Invoke,
++    disc_master_get__NewEnum,
++    disc_master_get_Item,
++    disc_master_get_Count,
++    disc_master_get_IsSupportedEnvironment,
++};
++
++static HRESULT disc_master_create( REFIID riid, void **obj )
++{
++    struct disc_master *master;
++    HRESULT hr;
++
++    if (!(master = calloc( 1, sizeof(*master) ))) return E_OUTOFMEMORY;
++    master->IDiscMaster2_iface.lpVtbl = &disc_master_vtbl;
++    master->ref = 1;
++    hr = IDiscMaster2_QueryInterface( &master->IDiscMaster2_iface, riid, obj );
++    IDiscMaster2_Release( &master->IDiscMaster2_iface );
++    return hr;
++}
++
++/* class factory */
++static HRESULT WINAPI factory_QueryInterface( IClassFactory *iface, REFIID riid, void **obj )
++{
++    if (IsEqualIID( riid, &IID_IUnknown ) || IsEqualIID( riid, &IID_IClassFactory ))
++    {
++        *obj = iface;
++        IClassFactory_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IClassFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IClassFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID riid, void **obj )
++{
++    TRACE( "%p, %p, %s, %p\n", iface, outer, debugstr_guid( riid ), obj );
++    *obj = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    return disc_master_create( riid, obj );
++}
++
++static HRESULT WINAPI factory_LockServer( IClassFactory *iface, BOOL lock )
++{
++    return S_OK;
++}
++
++static const IClassFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateInstance,
++    factory_LockServer,
++};
++
++static IClassFactory disc_master_factory = { &factory_vtbl };
++
++HRESULT WINAPI DllGetClassObject( REFCLSID clsid, REFIID riid, void **obj )
++{
++    TRACE( "%s, %s, %p\n", debugstr_guid( clsid ), debugstr_guid( riid ), obj );
++
++    if (IsEqualCLSID( clsid, &CLSID_MsftDiscMaster2 ))
++        return IClassFactory_QueryInterface( &disc_master_factory, riid, obj );
++
++    FIXME( "class %s not available\n", debugstr_guid( clsid ) );
++    *obj = NULL;
++    return CLASS_E_CLASSNOTAVAILABLE;
++}
+--- a/dlls/imapi2/Makefile.in
++++ b/dlls/imapi2/Makefile.in
+@@ -0,0 +1,9 @@
++MODULE    = imapi2.dll
++IMPORTS   = uuid oleaut32
++
++EXTRADLLFLAGS = -Wb,--prefer-native
++
++SOURCES = \
++	imapi2_classes.idl \
++	imapi2_private.idl \
++	main.c
