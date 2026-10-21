@@ -1191,7 +1191,7 @@ it and WindowFromPoint(GetCursorPos) returned the desktop. win32u now sends dpi 
 MEASURED (nested KWin, 175% + 100%): `menupm.c` items fill 56% of the box on 138, 98% patched; `mousepos.c`
 WindowFromPoint wrong 27/27 on 138, 0/27 patched. Operator, lab copy on his Cintiq (with NEUTRON_DPI_34=1): "menus are readable
 now", then "all three work now, menus and drags still good". Lab-tested as win32u.so x2 + wineserver swapped into 138
-(`/var/tmp/neutron-i19/rt138std`). NOT SHIPPED.
+(`/var/tmp/neutron-i19/rt138std`). SHIPPED in 11.10-139 (package: menupm 98% vs 56% on 138; mousepos 0 mismatches vs all on 138).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-dpichanged-on-by-default.mypatch` (2026-10-20) — WM_DPICHANGED on a cross-monitor move, by default
 The sender (`NEUTRON_DPI_34`, in `neutron-zzz-ps2026-complete`) was off since the 124 work, where it had destabilized Photoshop's
@@ -1200,4 +1200,4 @@ the bottom of the screen (947x56 instead of 541x32). Windows sends WM_DPICHANGED
 `NEUTRON_DPI_34=0`.
 MEASURED: operator, lab copy on his Cintiq with the sender on: bar normal size, drags between the screens floating and maximized
 clean. Nested desk with no env set: the bar ("Start Bar" state) got WM_DPICHANGED 168->96 and is 459x32 (32 = 100% height).
-NOT SHIPPED.
+SHIPPED in 11.10-139.
