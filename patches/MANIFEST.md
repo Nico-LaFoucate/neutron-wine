@@ -1209,7 +1209,7 @@ DiscBurning.dll creates MsftDiscMaster2 and uses it unchecked; Wine had no imapi
 supported environment, 0 recorders, empty enumeration. Recording is not implemented.
 MEASURED: `imapi2-master.c` 139 FAIL (0x80040154), patched PASS. Lightroom Classic 15.6 lab: CD/DVD export shows its own "cannot
 locate a drive that supports burning" message instead of Adobe's error report. Lab-tested as imapi2.dll (x86_64) added to 139
-(`/var/tmp/neutron-i19/rt139imapi`) + `wineboot -u`. NOT SHIPPED.
+(`/var/tmp/neutron-i19/rt139imapi`) + `wineboot -u`. SHIPPED in 11.10-140 (package: imapi2-master PASS after `wineboot -u`).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-create-on-second-screen.mypatch` (2026-10-20) — windows created on a 100% screen beside a 175% one
 Found reproducing #30: Lightroom Classic's Export dialog was invisible on a 100% second screen, placed at (15626,2462), past the
@@ -1218,4 +1218,4 @@ requested rect was scaled 96->168 and read back at 168 (x 3.0625). Now the dpi o
 (`NEUTRON_CREATE_TARGET_DPI=0`). Also: no WM_DPICHANGED for a never-sized window's first placement (`NEUTRON_DPICHG_SKIP_UNPLACED=0`).
 MEASURED: `createpos.c` 139 6/6 FAIL, patched 6/6 PASS, kill switch FAIL; primary-monitor windows 6/6 PASS both. Lightroom: the
 dialog appears (nested desk; his Cintiq). NOT fixed by it: Lightroom's UI at 175% on the 100% screen (also on 139) and a stale copy
-of the Export dialog's settings panel. Lab runtime `/var/tmp/neutron-i19/rt140pre`. NOT SHIPPED.
+of the Export dialog's settings panel. Lab runtime `/var/tmp/neutron-i19/rt140pre`. SHIPPED in 11.10-140 (package: createpos 6/6 on both screens).
