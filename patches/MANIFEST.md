@@ -1243,3 +1243,16 @@ appear), patched PASS 6/6; each kill switch alone brings back its failure. Regre
 mismatched, createpos 6/6 both screens. Lightroom with `AppCompatFlags\Layers lightroom.exe="~ HIGHDPIAWARE"` (lab prefix):
 right size opened on either screen, after both moves, Export dialog on the 100% screen whole; GetDpiForMonitor(100% screen) = 168.
 Lab runtime `/var/tmp/neutron-i19/rt142lab`. SHIPPED in 11.10-141 (package: sysmax 6/6, menupm 98%, mousepos 0 mismatched, createpos 6/6 both screens, imapi2 PASS; Lightroom via CLI beta.21 right on both screens). The Lightroom Layers value: CLI beta.21 (his call, C83).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-pen-side-buttons.mypatch` (2026-10-21) — the pen's side buttons (GitHub neutron-wine#2)
+Reporter (Cintiq 16, KDE 6.8 Wayland): *"Pen buttons currently do not work as intended on a Cintiq 16. No context menu is displayed
+for quick switching when pressing the buttons on the pro pen."* `wayland_wintab_button` was an empty stub; KWin delivers the side
+buttons as tablet tool buttons (measured on his Cintiq 22HD: BTN_STYLUS 0x14b lower, BTN_STYLUS2 0x14c upper, hovering and in
+contact) and they were dropped. Now as a Wacom driver on Windows: pkButtons bit (tip 0, lower 1, upper 2, third 3) + the system
+button map's click at the pen (lower = right click, upper = middle click), serial-tagged; BTN_LEFT/RIGHT/MIDDLE tool buttons (a
+compositor remap) pass through. Tip sets/clears bit 0 only; its LEFTDOWN/UP no longer overwrites a pending side click. Pen/eraser
+declare 4 buttons, SYSBTNMAP L/R/M. `NEUTRON_PEN_BUTTONS=0`.
+MEASURED (his Cintiq, `penbtn.c`): 141 FAIL (no side message, pkButtons 0/1); patched: lower -> WM_RBUTTONDOWN/UP + WM_CONTEXTMENU,
+0x2 (0x3 in contact); upper -> WM_MBUTTONDOWN/UP, 0x4 (0x5). Photoshop 2026 (lab pfx): his *"it worked. Brush picker appeared"*.
+Second report item (pen lost after the mouse visits another screen) NOT reproduced: test window and Photoshop kept the pen with
+pressure (his check). Lab runtime `/var/tmp/neutron-i19/rt142pen`. NOT YET SHIPPED.
