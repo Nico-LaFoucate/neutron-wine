@@ -1,0 +1,145 @@
+winewayland: the pen's side buttons (neutron-wine#2)
+
+"Pen buttons currently do not work as intended on a Cintiq 16. No context menu is displayed for quick
+switching when pressing the buttons on the pro pen." wayland_wintab_button was an empty stub. KWin
+delivers the side buttons as tablet tool buttons (measured, Cintiq 22HD, KWin 6.8: BTN_STYLUS 0x14b
+lower, BTN_STYLUS2 0x14c upper, hovering and in contact), and they were dropped.
+
+Now, as a Wacom driver does on Windows: the button sets its pkButtons bit (tip bit 0, lower 1, upper 2,
+a third side button 3), and the system button map's click is injected at the pen (lower = right click,
+upper = middle click), tagged with the packet serial like the tip's click. A tool button the compositor
+already reports as BTN_LEFT/RIGHT/MIDDLE is passed on as that button. The tip now sets and clears only
+bit 0, and its LEFTDOWN/UP no longer overwrites a side button's click pending in the same frame. The pen
+and eraser declare 4 buttons, BUTTONMAP identity, SYSBTNMAP left/right/middle. NEUTRON_PEN_BUTTONS=0.
+
+Harness penbtn.c on the Cintiq: 141 no side-button message, pkButtons only 0/1 (FAIL); patched: lower ->
+WM_RBUTTONDOWN/UP + WM_CONTEXTMENU, pkButtons 0x2 (0x3 in contact); upper -> WM_MBUTTONDOWN/UP, 0x4
+(0x5). Photoshop 2026: the lower button opens the brush picker over the canvas.
+
+--- a/dlls/winewayland.drv/wayland_tablet.c
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -194,7 +194,7 @@
+     struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
+     /* NEUTRON: record; the LEFTDOWN is injected in wayland_wintab_frame after the
+      * pen-down packet is published (see the pending_* fields). */
+-    tool->pending_buttons = MOUSEEVENTF_LEFTDOWN;
++    tool->pending_buttons |= MOUSEEVENTF_LEFTDOWN;   /* |=: a side button may change in the same frame */
+     wayland_wintab_down(tool, serial);
+ }
+ 
+@@ -203,7 +203,7 @@
+ {
+     struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
+     /* NEUTRON: record; LEFTUP injected in wayland_wintab_frame after the packet. */
+-    tool->pending_buttons = MOUSEEVENTF_LEFTUP;
++    tool->pending_buttons |= MOUSEEVENTF_LEFTUP;
+     wayland_wintab_up(tool);
+ }
+ 
+--- a/dlls/winewayland.drv/wintab.c
++++ b/dlls/winewayland.drv/wintab.c
+@@ -408,14 +408,14 @@
+ void wayland_wintab_down(struct wayland_tablet_tool *tool, uint32_t serial)
+ {
+     struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
+-    data->current_packet.pkButtons = 1;
++    data->current_packet.pkButtons |= 1;   /* NEUTRON pen-buttons: bit 0; a held side button keeps its bit */
+     TRACE("neutron-pen: DOWN\n");
+ }
+ 
+ void wayland_wintab_up(struct wayland_tablet_tool *tool)
+ {
+     struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
+-    data->current_packet.pkButtons = 0;
++    data->current_packet.pkButtons &= ~1u;
+     TRACE("neutron-pen: UP\n");
+ }
+ 
+@@ -582,9 +582,58 @@
+ {
+ }
+ 
++/* NEUTRON pen-buttons (GitHub neutron-wine#2): the pen's side buttons. "Pen buttons currently do not work as intended on
++ * a Cintiq 16. No context menu is displayed for quick switching when pressing the buttons on the pro pen." This was an
++ * empty stub: KDE delivers the side buttons as tablet tool buttons (measured on a Cintiq 22HD, KWin 6.8: BTN_STYLUS 0x14b
++ * for the lower button, BTN_STYLUS2 0x14c for the upper, hovering and in contact) and they were dropped, so an app got
++ * neither the button in its WinTab packets nor a click. A Wacom driver on Windows gives both: the button as a pkButtons
++ * bit (bit 0 the tip, then the side buttons) and, from its system button map, a mouse click at the pen -- the lower
++ * button's right click is what opens Photoshop's brush picker. A tool button the compositor already reports as a mouse
++ * button (BTN_LEFT/RIGHT/MIDDLE, a remap) is passed on as that button. Kill switch NEUTRON_PEN_BUTTONS=0. */
++static BOOL neutron_pen_buttons(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_PEN_BUTTONS", TRUE);
++    return on;
++}
++
++#define NEUTRON_BTN_LEFT    0x110
++#define NEUTRON_BTN_RIGHT   0x111
++#define NEUTRON_BTN_MIDDLE  0x112
++#define NEUTRON_BTN_STYLUS3 0x149
++#define NEUTRON_BTN_STYLUS  0x14b
++#define NEUTRON_BTN_STYLUS2 0x14c
++
+ void wayland_wintab_button(struct wayland_tablet_tool *tool, uint32_t serial, uint32_t button,
+                            uint32_t state)
+ {
++    struct wayland_wintab_tool_data *data = get_wintab_tool_data(tool);
++    BOOL down = state == ZWP_TABLET_TOOL_V2_BUTTON_STATE_PRESSED;
++    DWORD bit = 0;
++    UINT flags = 0;
++
++    if (!neutron_pen_buttons()) return;
++    switch (button)
++    {
++    case NEUTRON_BTN_STYLUS:  bit = 1 << 1; flags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP; break;
++    case NEUTRON_BTN_STYLUS2: bit = 1 << 2; flags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; break;
++    case NEUTRON_BTN_STYLUS3: bit = 1 << 3; break;   /* a third side button: WinTab only */
++    case NEUTRON_BTN_RIGHT:   bit = 1 << 1; flags = down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP; break;
++    case NEUTRON_BTN_MIDDLE:  bit = 1 << 2; flags = down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP; break;
++    case NEUTRON_BTN_LEFT:    flags = down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP; break;
++    default:
++        WARN("pen button %#x not mapped\n", button);
++        return;
++    }
++    if (bit)
++    {
++        if (down) data->current_packet.pkButtons |= bit;
++        else data->current_packet.pkButtons &= ~bit;
++    }
++    /* recorded; injected in wayland_wintab_frame after the frame's packet, at the pen's position (see there) */
++    tool->pending_buttons |= flags;
++    TRACE("neutron-pen: button %#x %s -> pkButtons %#x, mouse %#x\n", button, down ? "down" : "up",
++          (unsigned)data->current_packet.pkButtons, flags);
+ }
+ 
+ void wayland_wintab_frame(struct wayland_tablet_tool *tool, uint32_t time)
+@@ -769,7 +818,8 @@
+         /* (b) fold the move and the button into ONE event, so the button is inseparable
+          * from the contact position. On a down frame we always carry the position, even
+          * if no fresh motion arrived, so LEFTDOWN can never inherit a stale cursor. */
+-        if (tool->pending_move || (tool->pending_buttons & MOUSEEVENTF_LEFTDOWN))
++        if (tool->pending_move ||
++            (tool->pending_buttons & (MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_RIGHTDOWN | MOUSEEVENTF_MIDDLEDOWN)))
+         {
+             in.mi.dx = tool->pending_pos.x;
+             in.mi.dy = tool->pending_pos.y;
+@@ -937,8 +987,16 @@
+         wcscpy(pen->NAME, SZ_PEN_NAME);
+         pen->ACTIVE       = TRUE;
+         pen->PKTDATA      = gSysContext.lcPktData;
+-        pen->BUTTONS      = 1;
+-        pen->BUTTONBITS   = 1;
++        /* NEUTRON pen-buttons: the tip and three side buttons (bits 0-3 of pkButtons); the system button map says
++         * what a Wacom driver's defaults do with them: tip = left click, lower = right click, upper = middle click */
++        pen->BUTTONS      = 4;
++        pen->BUTTONBITS   = 4;
++        pen->BUTTONMAP[0] = 0;
++        pen->BUTTONMAP[1] = 1;
++        pen->BUTTONMAP[2] = 2;
++        pen->BUTTONMAP[3] = 3;
++        pen->SYSBTNMAP[1] = SBN_RCLICK;
++        pen->SYSBTNMAP[2] = SBN_MCLICK;
+         pen->NPBUTTON     = 1;
+         pen->NPBTNMARKS[0] = 0;
+         pen->NPBTNMARKS[1] = 1;
