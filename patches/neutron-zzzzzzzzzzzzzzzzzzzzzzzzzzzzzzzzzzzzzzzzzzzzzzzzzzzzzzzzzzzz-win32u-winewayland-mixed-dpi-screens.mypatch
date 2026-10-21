@@ -1,0 +1,342 @@
+win32u, winewayland: windows on, and moved between, screens of different scale
+
+Lightroom Classic on a 100% Cintiq next to a 175% main screen (operator: "The UI scale is totally messed up",
+"It launched on my main monitor at 100% scale instead of the 175% it should be"). Lightroom reads its scale once at
+launch and ignores WM_DPICHANGED, so on Windows a mixed-dpi desktop gets it right through DPI virtualization (the
+"System" high-DPI override: system-aware process, bitmap scaled per monitor). Wine has that machinery; our stack
+broke it, and broke maximized windows of every awareness moved between the screens:
+
+- win32u get_surface_rect: crop the window surface against the virtual screen in the THREAD's coordinates, not the
+  raw one. A system-aware window on the 96-dpi screen (coordinates 1.75x its pixels) was drawn into 640x1280 of its
+  3840x2160. NEUTRON_SURFACE_CROP_DPI=0 restores the old crop.
+- win32u set_raw_window_pos: map a driver rect to the app's coordinates through the monitor the window is mostly on
+  (map_window_rect_raw_to_virt), as map_window_rects_virt_to_raw does the other way. A maximized window's frame
+  overhangs onto the neighbor monitor; its top-left picked the wrong scale, the driver's resize came back 1254x687
+  instead of 2194x1202, nothing committed, and a system-aware or dpi-unaware window maximized on the second screen
+  never appeared. NEUTRON_RAW_WINDOW_MONITOR=0.
+- win32u: a maximized window moved to another monitor by the driver keeps its restore rect on that monitor
+  (per-monitor-aware windows; normal_rect follows, scaled to the new work area). NEUTRON_NORMAL_FOLLOWS_MONITOR=0.
+- winewayland attach_shm: when the new buffer covers the window, set the viewport destination to the window size.
+  Reconfigure runs before the attach and measured the previous buffer; a window moved back to the 175% screen was
+  shown at 1317x731 of 2194x1202 until its next paint. NEUTRON_ATTACH_DEST=0.
+- winewayland follow_output: record a maximized configure's height for an output only when it belongs to that output
+  (fits it, and the surface's preferred scale is that output's). During a move the new output's size was stored, in
+  the prefix, under the output being left. NEUTRON_WORKAREA_GUARD=0.
+- winewayland: neutron-attach diagnostic (NEUTRON_WL_DIAG=1).
+
+Harness sysmax.c + run-sysmax.sh (KWin's presented buffer vs frame, saved heights), system/pm/unaware x start on
+either screen: 140 FAIL 6/6, patched PASS 6/6; each kill switch brings back its own failure.
+
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3119,6 +3119,34 @@
+     return rect;
+ }
+ 
++/* NEUTRON raw-window-monitor: map a WINDOW rect from MDT_RAW_DPI to MDT_DEFAULT coordinates through the monitor the
++ * window is mostly on, as map_window_rects_virt_to_raw() does the other way. map_rect_raw_to_virt() takes the monitor
++ * under the top-left corner, which for a maximized window is the NEIGHBOR monitor: its frame hangs a few pixels past
++ * the work area. A system-dpi-aware Lightroom maximized on a 100% screen right of a 175% one had its left edge at raw
++ * x=3838, on the 175% screen; a driver resize to 2194x1202 raw was converted there (1:1), applied in place on the 100%
++ * screen and came back to the driver as 1254x687 -- smaller than the compositor's configure, so nothing ever committed
++ * and the window could not be moved. Kill switch NEUTRON_RAW_WINDOW_MONITOR=0. */
++RECT map_window_rect_raw_to_virt( RECT rect, UINT dpi_to )
++{
++    static int on = -1;
++    struct monitor *monitor;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_RAW_WINDOW_MONITOR" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_RAW_WINDOW_MONITOR = 0 (environment)\n" );
++    }
++    if (!on) return map_rect_raw_to_virt( rect, dpi_to );
++
++    if (!lock_display_devices( FALSE )) return rect;
++    if ((monitor = get_monitor_from_rect( rect, MONITOR_DEFAULTTONEAREST, 0, MDT_RAW_DPI )))
++        rect = map_monitor_rect( monitor, rect, 0, MDT_RAW_DPI, dpi_to, MDT_DEFAULT );
++    unlock_display_devices();
++
++    return rect;
++}
++
+ /* map a monitor rect from MDT_DEFAULT to MDT_RAW_DPI coordinates */
+ RECT map_rect_virt_to_raw( RECT rect, UINT dpi_from )
+ {
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -189,6 +189,7 @@
+ extern HRGN map_dpi_region( HRGN region, UINT dpi_from, UINT dpi_to );
+ extern struct window_rects map_dpi_window_rects( struct window_rects rects, UINT dpi_from, UINT dpi_to );
+ extern RECT map_rect_raw_to_virt( RECT rect, UINT dpi_to );
++extern RECT map_window_rect_raw_to_virt( RECT rect, UINT dpi_to );
+ extern RECT map_rect_virt_to_raw( RECT rect, UINT dpi_from );
+ extern struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, UINT dpi_from );
+ extern POINT point_phys_to_win_dpi( HWND hwnd, POINT pt );
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2486,9 +2486,28 @@
+ }
+ 
+ 
++/* NEUTRON surface-crop-dpi: visible_rect is in the thread's dpi coordinates (get_window_surface works in them), so
++ * the virtual screen it is cropped to must be too. Against the RAW virtual screen, a system-dpi-aware window (168 dpi)
++ * on a 96-dpi second screen -- whose coordinates are 1.75x its raw pixels -- was cut to the part left of the raw
++ * desktop's right edge: a maximized 3840x2160 window was drawn into a 640x1280 surface (Lightroom Classic run with the
++ * Windows "System" DPI override, on a 100% Cintiq next to a 175% screen). Per-monitor-aware threads use raw
++ * coordinates, so for them nothing changes. Kill switch NEUTRON_SURFACE_CROP_DPI=0. */
++static BOOL neutron_surface_crop_dpi(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SURFACE_CROP_DPI" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_SURFACE_CROP_DPI = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ static BOOL get_surface_rect( const RECT *visible_rect, RECT *surface_rect )
+ {
+-    RECT virtual_rect = get_virtual_screen_rect( 0, MDT_RAW_DPI );
++    RECT virtual_rect = neutron_surface_crop_dpi() ? get_virtual_screen_rect( get_thread_dpi(), MDT_DEFAULT )
++                                                   : get_virtual_screen_rect( 0, MDT_RAW_DPI );
+ 
+     *surface_rect = *visible_rect;
+ 
+@@ -7396,11 +7415,75 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON normal-follows-monitor; kill switch NEUTRON_NORMAL_FOLLOWS_MONITOR=0 (see set_raw_window_pos). */
++static BOOL neutron_normal_follows_monitor(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_NORMAL_FOLLOWS_MONITOR" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_NORMAL_FOLLOWS_MONITOR = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/* NEUTRON normal-follows-monitor: the graphics driver moved a maximized window to the monitor the compositor shows
++ * it on (on Wayland the compositor, not the app, picks the output). Windows keeps a maximized window's restore rect
++ * on the monitor it is maximized on, so carry the restore rect over: same offset from the work area, scaled by the
++ * dpi ratio, kept inside the new work area. Without it Lightroom Classic, maximized on a 100% screen, saved a restore
++ * rect on the 175% primary and took its whole UI scale from that rect at the next launch (substrate.dll
++ * MonitorFromRect(normalPosition) -> GetDpiForMonitor). Per-monitor-aware windows only: their restore rect is in
++ * raw coordinates. */
++static void neutron_move_normal_rect( HWND hwnd, RECT new_raw )
++{
++    MONITORINFO old_info, new_info;
++    UINT old_dpi, new_dpi, raw_dpi;
++    RECT normal;
++    LONG w, h, x, y, work_w, work_h;
++    WND *win;
++
++    if (!neutron_normal_follows_monitor()) return;
++    if (!NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) )) return;
++    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
++    normal = win->normal_rect;
++    if (!(win->dwStyle & WS_MAXIMIZE) || (win->dwStyle & WS_CHILD) || IsRectEmpty( &normal ))
++    {
++        release_win_ptr( win );
++        return;
++    }
++    release_win_ptr( win );
++
++    old_info = monitor_info_from_rect( normal, 0 );
++    new_info = monitor_info_from_rect( new_raw, 0 );
++    if (EqualRect( &old_info.rcMonitor, &new_info.rcMonitor ) || IsRectEmpty( &new_info.rcWork )) return;
++    if (!(old_dpi = monitor_dpi_from_rect( normal, 0, &raw_dpi ))) return;
++    if (!(new_dpi = monitor_dpi_from_rect( new_raw, 0, &raw_dpi ))) return;
++
++    work_w = new_info.rcWork.right - new_info.rcWork.left;
++    work_h = new_info.rcWork.bottom - new_info.rcWork.top;
++    w = min( muldiv( normal.right - normal.left, new_dpi, old_dpi ), work_w );
++    h = min( muldiv( normal.bottom - normal.top, new_dpi, old_dpi ), work_h );
++    x = new_info.rcWork.left + muldiv( normal.left - old_info.rcWork.left, new_dpi, old_dpi );
++    y = new_info.rcWork.top + muldiv( normal.top - old_info.rcWork.top, new_dpi, old_dpi );
++    x = max( new_info.rcWork.left, min( x, new_info.rcWork.right - w ) );
++    y = max( new_info.rcWork.top, min( y, new_info.rcWork.bottom - h ) );
++
++    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
++    ERR( "neutron-normal-follows: hwnd=%p restore rect %s -> (%d,%d)-(%d,%d), dpi %u -> %u\n", hwnd,
++         wine_dbgstr_rect( &normal ), (int)x, (int)y, (int)(x + w), (int)(y + h), old_dpi, new_dpi );
++    SetRect( &win->normal_rect, x, y, x + w, y + h );
++    release_win_ptr( win );
++}
++
+ static BOOL set_raw_window_pos( HWND hwnd, RECT rect, UINT flags, BOOL internal )
+ {
++    RECT raw = rect;
++    BOOL ret;
++
+     TRACE( "hwnd %p, rect %s, flags %#x, internal %u\n", hwnd, wine_dbgstr_rect(&rect), flags, internal );
+ 
+-    rect = map_rect_raw_to_virt( rect, get_thread_dpi() );
++    rect = map_window_rect_raw_to_virt( rect, get_thread_dpi() );
+ 
+     if (internal)
+     {
+@@ -7408,7 +7491,9 @@
+         return TRUE;
+     }
+ 
+-    return NtUserSetWindowPos( hwnd, 0, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags );
++    ret = NtUserSetWindowPos( hwnd, 0, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, flags );
++    if (ret && !(flags & SWP_NOMOVE)) neutron_move_normal_rect( hwnd, raw );
++    return ret;
+ }
+ 
+ BOOL get_present_rect( HWND hwnd, RECT *rect, UINT dpi )
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -465,6 +465,7 @@
+      * wayland_surface_clear_role() on every hide, so it cannot distinguish "was drawn, hidden,
+      * re-shown" from "brand new, never painted". This one is never cleared. */
+     BOOL ever_had_content;
++    int neutron_diag_buf_w, neutron_diag_buf_h; /* NEUTRON diag: last buffer size logged by neutron-attach */
+     HCURSOR hcursor;
+ };
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1026,6 +1026,15 @@
+                                                  RECT *rect);
+ static BOOL wayland_surface_viewport_destination(struct wayland_surface *surface,
+                                                  int *width, int *height);
++static void wayland_surface_reconfigure_size(struct wayland_surface *surface, int width, int height);
++
++/* NEUTRON attach-dest: kill switch NEUTRON_ATTACH_DEST=0 (see wayland_surface_attach_shm). */
++static BOOL neutron_attach_dest(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_ATTACH_DEST", TRUE);
++    return on;
++}
+ 
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+@@ -1119,6 +1128,31 @@
+ 
+         if (wayland_surface_viewport_destination(surface, &dest_width, &dest_height))
+             wp_viewport_set_destination(surface->wp_viewport, dest_width, dest_height);
++        else if (neutron_attach_dest())
++        {
++            /* NEUTRON attach-dest: the buffer covers the window, so present it at the window's size -- the destination
++             * wayland_surface_reconfigure() sets. Reconfigure runs BEFORE this attach and measured the PREVIOUS
++             * buffer: a window that changed monitor and buffer size in one flush kept the destination of the old,
++             * smaller buffer until its next paint. A maximized window dragged from a 100% screen back to a 175%
++             * one was shown at 1317x731 of its 2194x1202 (the 2304x1280 buffer of the 100% screen, at 1.75).
++             * Kill switch NEUTRON_ATTACH_DEST=0. */
++            wayland_surface_coords_from_window(surface, surface->window.rect.right - surface->window.rect.left,
++                                               surface->window.rect.bottom - surface->window.rect.top,
++                                               &dest_width, &dest_height);
++            wayland_surface_reconfigure_size(surface, dest_width, dest_height);
++        }
++    }
++
++    /* NEUTRON diag: one line whenever the presented buffer or window size changes (NEUTRON_WL_DIAG=1). */
++    if (neutron_wl_surf_diag() &&
++        (win_width != surface->content_width || win_height != surface->content_height ||
++         surface->neutron_diag_buf_w != shm_buffer->width || surface->neutron_diag_buf_h != shm_buffer->height))
++    {
++        ERR("neutron-attach: hwnd=%p buffer=%dx%d window=%s scale=%.4f src=%dx%d\n", surface->hwnd,
++            shm_buffer->width, shm_buffer->height, wine_dbgstr_rect(&surface->window.rect), surface->window.scale,
++            win_width, win_height);
++        surface->neutron_diag_buf_w = shm_buffer->width;
++        surface->neutron_diag_buf_h = shm_buffer->height;
+     }
+ 
+     surface->content_width = win_width;
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1781,6 +1781,14 @@
+  * or, if it is not a maximized rect of its monitor (it was sized for the other output), the compositor's
+  * maximized size at the work area's origin, as for a compositor-initiated maximize. A raw move: the WS_MAXIMIZE
+  * state and win32u's saved restore rect are untouched. */
++/* NEUTRON workarea-guard: kill switch NEUTRON_WORKAREA_GUARD=0 (record every maximized configure, as before). */
++static BOOL neutron_workarea_guard(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_WORKAREA_GUARD", TRUE);
++    return on;
++}
++
+ /* NEUTRON follow-scale: kill switch (NEUTRON_FOLLOW_SCALE=0 converts at the old monitor's scale, as before). */
+ static BOOL neutron_follow_scale(void)
+ {
+@@ -1802,6 +1810,9 @@
+      * and the raw px per logical px of the window's current monitor and of the output */
+     int cfg_w = 0, cfg_h = 0, decor_w = 0, decor_h = 0;
+     double cur_scale = 0.0, out_scale = 0.0;
++    /* NEUTRON workarea-guard: the compositor's preferred scale for the surface and the output's logical size */
++    double pref_scale = 0.0;
++    int out_lw = 0, out_lh = 0;
+     RECT win = {0}, probe, cur_area, out_area, new_rect;
+     HMONITOR win_mon = 0, out_mon = 0;
+     MONITORINFO win_mi = {.cbSize = sizeof(win_mi)}, out_mi = {.cbSize = sizeof(out_mi)};
+@@ -1817,6 +1828,7 @@
+         state = cfg->state;
+         win = data->rects.window;
+         cur_scale = surface->window.scale;
++        pref_scale = surface->preferred_scale;
+         if (cfg->width && cfg->height)
+         {
+             cfg_w = cfg->width;
+@@ -1834,12 +1846,6 @@
+         }
+     }
+     wayland_win_data_release(data);
+-    /* NEUTRON workarea#3: a maximized configure for a toplevel on exactly one output is that output's maximized
+-     * area (the work area); report it for that output. Here because this runs after every maximized configure
+-     * AND when the surface settles on one output, whichever comes last. */
+-    if (id && (state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
+-        wayland_report_output_maximized_h(id, cfg_h);
+-    if (!neutron_follow_output()) return;
+     if (!id || !(state & (WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED | WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN)))
+         return;
+ 
+@@ -1852,6 +1858,8 @@
+         if (output->global_id != id || !output->current.current_mode) continue;
+         out_x = output->current.x;
+         out_y = output->current.y;
++        out_lw = output->current.logical_w;
++        out_lh = output->current.logical_h;
+         if (output->current.logical_w > 0)
+             out_scale = wayland_output_mode_width(&output->current, output->current.current_mode) /
+                         (double)output->current.logical_w;
+@@ -1859,6 +1867,28 @@
+         break;
+     }
+     pthread_mutex_unlock(&process_wayland.output_mutex);
++
++    /* NEUTRON workarea#3: a maximized configure for a toplevel on exactly one output is that output's maximized
++     * area (the work area); report it for that output. Here because this runs after every maximized configure
++     * AND when the surface settles on one output, whichever comes last.
++     * NEUTRON workarea-guard: when a maximized window moves to another output the compositor sends the NEW output's
++     * maximized size while the surface has not entered it yet, so the size was recorded -- and persisted in the
++     * prefix -- under the output the window was LEAVING: dragging a maximized window from a 100% screen (2160 logical
++     * tall) to a 175% one (1202) stored "1202" for the 100% screen, and every later maximize there came out 958 px
++     * short. Report only a configure that belongs to this output: it fits inside it, and the compositor's preferred
++     * scale for the surface (sent before the configure when the output changes) is this output's scale. The settled
++     * call after the enter event then reports the right output. Kill switch NEUTRON_WORKAREA_GUARD=0. */
++    if ((state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) && !(state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++    {
++        BOOL fits = !found || out_lw <= 0 || out_lh <= 0 || (cfg_w <= out_lw + 1 && cfg_h <= out_lh + 1);
++        BOOL same_scale = !found || pref_scale <= 0.0 || out_scale <= 0.0 || fabs(pref_scale - out_scale) < 0.01;
++        if (!neutron_workarea_guard() || (fits && same_scale))
++            wayland_report_output_maximized_h(id, cfg_h);
++        else if (neutron_wl_diag())
++            ERR("neutron-workarea-guard: hwnd=%p configure %dx%d (preferred scale %.4f) is not for output %u"
++                " (%dx%d, scale %.4f): not recorded\n", hwnd, cfg_w, cfg_h, pref_scale, id, out_lw, out_lh, out_scale);
++    }
++    if (!neutron_follow_output()) return;
+     if (!found) return;
+ 
+     /* Raw rects throughout: see neutron_window_work_area_part. */
