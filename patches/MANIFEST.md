@@ -1255,4 +1255,4 @@ declare 4 buttons, SYSBTNMAP L/R/M. `NEUTRON_PEN_BUTTONS=0`.
 MEASURED (his Cintiq, `penbtn.c`): 141 FAIL (no side message, pkButtons 0/1); patched: lower -> WM_RBUTTONDOWN/UP + WM_CONTEXTMENU,
 0x2 (0x3 in contact); upper -> WM_MBUTTONDOWN/UP, 0x4 (0x5). Photoshop 2026 (lab pfx): his *"it worked. Brush picker appeared"*.
 Second report item (pen lost after the mouse visits another screen) NOT reproduced: test window and Photoshop kept the pen with
-pressure (his check). Lab runtime `/var/tmp/neutron-i19/rt142pen`. NOT YET SHIPPED.
+pressure (his check). Lab runtime `/var/tmp/neutron-i19/rt142pen`. SHIPPED in 11.10-142 (package winewayland.so = the lab-tested build: same build ID).
