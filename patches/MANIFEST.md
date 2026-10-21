@@ -1242,4 +1242,4 @@ saved heights), system/pm/unaware x start on either screen: 140 FAIL 6/6 (unawar
 appear), patched PASS 6/6; each kill switch alone brings back its failure. Regression: menupm 98% (= 140), mousepos 27 moves 0
 mismatched, createpos 6/6 both screens. Lightroom with `AppCompatFlags\Layers lightroom.exe="~ HIGHDPIAWARE"` (lab prefix):
 right size opened on either screen, after both moves, Export dialog on the 100% screen whole; GetDpiForMonitor(100% screen) = 168.
-Lab runtime `/var/tmp/neutron-i19/rt142lab`. NOT YET SHIPPED; the Lightroom Layers value is a CLI change awaiting his decision.
+Lab runtime `/var/tmp/neutron-i19/rt142lab`. SHIPPED in 11.10-141 (package: sysmax 6/6, menupm 98%, mousepos 0 mismatched, createpos 6/6 both screens, imapi2 PASS; Lightroom via CLI beta.21 right on both screens). The Lightroom Layers value: CLI beta.21 (his call, C83).
