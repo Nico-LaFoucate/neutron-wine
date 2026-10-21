@@ -1,0 +1,113 @@
+win32u: a per-monitor-aware window created on a second screen with another scale lands where it was asked
+
+Lightroom Classic's Export dialog never appeared on a 100% screen next to a 175% one: Wine placed it at
+(15626,2462)-(19661,4794), past the right edge of the 7681-px desktop. A per-monitor-aware top-level has no rect
+yet when NtUserCreateWindowEx asks get_dpi_for_window(), which then answers with the primary monitor's dpi; the
+requested rect was mapped 96->168 and read back at 168 once it was on the 96-dpi monitor, scaled twice
+(x 3.0625). Creation now takes the dpi of the monitor of the requested rect (NEUTRON_CREATE_TARGET_DPI=0 to turn
+off).
+
+WM_DPICHANGED (sent on a cross-monitor move since 11.10-139) is no longer sent for a window's first placement
+when it has never had a size: Lightroom creates its dialogs 0x0 at (0,0) and sizes and places them with one
+SetWindowPos, which was announced as a 168->96 move (NEUTRON_DPICHG_SKIP_UNPLACED=0 to turn off). The
+neutron-dpichg log line now also shows the old rect and the thread dpi.
+
+Tests: harness createpos.c (overlapped, popup and owned dialog created on the 100% screen): 139 6/6 FAIL
+(x 3.0625), patched 6/6 PASS, kill switch FAIL again; the same windows on the primary monitor 6/6 PASS before
+and after. menupm (98%) and mousepos (0 mismatches) unchanged. Lightroom Classic 15.6 (lab, nested desk and the
+operator's Cintiq): the Export dialog now appears on the 100% screen.
+
+Not fixed by this: Lightroom draws its whole UI at 175% on the 100% screen (also on 139), and its Export dialog
+shows a stale copy of the settings panel there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2685,6 +2685,19 @@
+     return v;
+ }
+ 
++/* NEUTRON dpichg-skip-unplaced; kill switch NEUTRON_DPICHG_SKIP_UNPLACED=0 (see apply_window_pos). */
++static BOOL neutron_dpichg_skip_unplaced(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_DPICHG_SKIP_UNPLACED" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_DPICHG_SKIP_UNPLACED = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ /* NEUTRON: set (monitor!=0) or clear a window's driver-authoritative monitor. If this changes the
+  * window's effective raw dpi and it is per-monitor-DPI aware, notify it with WM_DPICHANGED so it
+  * re-renders at the new dpi. Called by the graphics driver when the surface enters a new output. */
+@@ -3025,7 +3038,12 @@
+          * driver repositioned — so the app's synchronous SetWindowPos in response reenters cleanly
+          * (and finds the dpi unchanged, terminating). Matches Windows, which sends WM_DPICHANGED
+          * synchronously during the cross-monitor move. */
++        /* NEUTRON dpichg-skip-unplaced: a window that has never had a size (created 0x0, then sized and placed
++         * by its first SetWindowPos, as Lightroom Classic creates its dialogs) has not been on any monitor, so
++         * its first placement is not a move between monitors. Announcing 168->96 for it made Lightroom shrink
++         * its Export dialog to the suggested 57% and back. Kill switch NEUTRON_DPICHG_SKIP_UNPLACED=0. */
+         if (neutron_dpi_34() && !is_child && raw_dpi && old_raw_dpi && raw_dpi != old_raw_dpi &&
++            !(neutron_dpichg_skip_unplaced() && IsRectEmpty( &old_rects.window )) &&
+             NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) ))
+         {
+             RECT suggested = new_rects->window;
+@@ -3034,9 +3052,10 @@
+              * as Windows does; the app may honor or override it. */
+             suggested.right  = suggested.left + muldiv( w, raw_dpi, old_raw_dpi );
+             suggested.bottom = suggested.top  + muldiv( h, raw_dpi, old_raw_dpi );
+-            ERR( "neutron-dpichg: hwnd=%p dpi %u->%u suggest=(%ld,%ld,%ld,%ld)\n", hwnd,
+-                 old_raw_dpi, raw_dpi, (long)suggested.left, (long)suggested.top,
+-                 (long)suggested.right, (long)suggested.bottom );
++            ERR( "neutron-dpichg: hwnd=%p dpi %u->%u old=(%ld,%ld,%ld,%ld) suggest=(%ld,%ld,%ld,%ld) thread dpi %u\n",
++                 hwnd, old_raw_dpi, raw_dpi, (long)old_rects.window.left, (long)old_rects.window.top,
++                 (long)old_rects.window.right, (long)old_rects.window.bottom, (long)suggested.left,
++                 (long)suggested.top, (long)suggested.right, (long)suggested.bottom, dpi );
+             send_message( hwnd, WM_DPICHANGED, MAKELONG( raw_dpi, raw_dpi ), (LPARAM)&suggested );
+         }
+     }
+@@ -6974,6 +6993,19 @@
+     }
+ }
+ 
++/* NEUTRON create-target-dpi; kill switch NEUTRON_CREATE_TARGET_DPI=0 (see NtUserCreateWindowEx). */
++static BOOL neutron_create_target_dpi(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_CREATE_TARGET_DPI" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_CREATE_TARGET_DPI = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ /***********************************************************************
+  *           map_dpi_create_struct
+  */
+@@ -7174,6 +7206,19 @@
+     release_win_ptr( win );
+ 
+     win_dpi = get_dpi_for_window( hwnd );
++    /* NEUTRON create-target-dpi: a per-monitor-aware top-level has no rect yet, so get_dpi_for_window() answers with
++     * the primary monitor's dpi. Created at a position on a monitor of another scale, its rect was mapped from that
++     * monitor's dpi to the primary's, then read back at the primary's once it was on the other monitor: scaled twice
++     * (x 3.0625 for a 100% screen beside a 175% one), so Lightroom Classic's Export dialog landed past the desktop's
++     * right edge and never appeared. Windows gives such a window the dpi of the monitor it is created on. */
++    if (parent == get_desktop_window() && neutron_create_target_dpi() &&
++        NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) ) &&
++        !is_default_coord( cs.x ) && !is_default_coord( cs.cx ))
++    {
++        RECT rect = { cs.x, cs.y, cs.x + cs.cx, cs.y + cs.cy };
++        UINT raw_dpi;
++        win_dpi = monitor_dpi_from_rect( rect, get_thread_dpi(), &raw_dpi );
++    }
+     if (parent) map_dpi_create_struct( &cs, win_dpi );
+ 
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
