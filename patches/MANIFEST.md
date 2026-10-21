@@ -1268,4 +1268,4 @@ reset at axis_stop; a frame with a click keeps the click path. NEUTRON_WHEEL_NOT
 MEASURED (`scrolltest.c` + `fakeptr scroll`, KWin fake input = smooth axis, no clicks, nested desk): 142 FAIL (36 axis events, 0 wheel
 messages); patched: down -24 x10, up +24 x10, right +24 x10, Alt held -24 x6 with Alt in the key state; NOTCH=1 -> -120/+120 notches.
 Real mouse wheel on his MX Master (his screen): 893 value120 events -> 892 WM_MOUSEWHEEL, identical deltas, none doubled. NOT tested: a
-real touchpad, or Premiere/Photoshop themselves (no touchpad here). Lab runtime `/var/tmp/neutron-i19/rt143scroll`. NOT YET SHIPPED.
+real touchpad, or Premiere/Photoshop themselves (no touchpad here). Lab runtime `/var/tmp/neutron-i19/rt143scroll`. SHIPPED in 11.10-143 (package winewayland.so = the lab build, same build ID; package scroll test 36/36 events).
