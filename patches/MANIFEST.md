@@ -1219,3 +1219,27 @@ requested rect was scaled 96->168 and read back at 168 (x 3.0625). Now the dpi o
 MEASURED: `createpos.c` 139 6/6 FAIL, patched 6/6 PASS, kill switch FAIL; primary-monitor windows 6/6 PASS both. Lightroom: the
 dialog appears (nested desk; his Cintiq). NOT fixed by it: Lightroom's UI at 175% on the 100% screen (also on 139) and a stale copy
 of the Export dialog's settings panel. Lab runtime `/var/tmp/neutron-i19/rt140pre`. SHIPPED in 11.10-140 (package: createpos 6/6 on both screens).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-winewayland-mixed-dpi-screens.mypatch` (2026-10-21) — windows on, and moved between, screens of different scale
+His words: *"The UI scale is totally messed up and it's cutting off the export dialog"* (Lightroom Classic on the 100% Cintiq),
+*"It launched on my main monitor at 100% scale instead of the 175% it should be"*, *"every other fucking app has no problem
+with scaling between the two screens"*. Lightroom reads its scale once at launch and ignores WM_DPICHANGED (Fable trace,
+`~/neutron/preserved-fixes/lrc-scale-investigation-2026-10-21.md`); Windows handles it with DPI virtualization (the "System"
+high-DPI override). Five fixes, each with its own kill switch:
+- `NEUTRON_SURFACE_CROP_DPI` (win32u get_surface_rect): crop against the virtual screen in the thread's coordinates. A
+  system-aware window on the 96-dpi screen was drawn into 640x1280 of 3840x2160.
+- `NEUTRON_RAW_WINDOW_MONITOR` (win32u set_raw_window_pos -> new map_window_rect_raw_to_virt): map through the monitor the
+  window is mostly on, not its top-left (a maximized frame overhangs onto the neighbor). A system-aware or dpi-unaware window
+  maximized on the second screen never appeared (driver resize came back 1254x687, nothing committed).
+- `NEUTRON_NORMAL_FOLLOWS_MONITOR` (win32u): a maximized per-monitor-aware window moved by the driver keeps its restore rect
+  on the new monitor (from 10-20; Windows behavior).
+- `NEUTRON_ATTACH_DEST` (winewayland attach_shm): viewport destination = window size when the new buffer covers it; a window
+  moved back to the 175% screen showed at 1317x731 of 2194x1202 until it repainted (all awarenesses, incl. per-monitor).
+- `NEUTRON_WORKAREA_GUARD` (winewayland follow_output): record a maximized height only for the output the configure belongs
+  to; a move stored the 175% screen's 1202 for the 100% screen in `<prefix>/.neutron-maximized-inset`.
+MEASURED (nested desk, 175% + 100%): `sysmax.c` + `/var/tmp/neutron-pen-lab/run-sysmax.sh` (KWin's presented buffer vs frame,
+saved heights), system/pm/unaware x start on either screen: 140 FAIL 6/6 (unaware and system started on the second screen never
+appear), patched PASS 6/6; each kill switch alone brings back its failure. Regression: menupm 98% (= 140), mousepos 27 moves 0
+mismatched, createpos 6/6 both screens. Lightroom with `AppCompatFlags\Layers lightroom.exe="~ HIGHDPIAWARE"` (lab prefix):
+right size opened on either screen, after both moves, Export dialog on the 100% screen whole; GetDpiForMonitor(100% screen) = 168.
+Lab runtime `/var/tmp/neutron-i19/rt142lab`. NOT YET SHIPPED; the Lightroom Layers value is a CLI change awaiting his decision.
