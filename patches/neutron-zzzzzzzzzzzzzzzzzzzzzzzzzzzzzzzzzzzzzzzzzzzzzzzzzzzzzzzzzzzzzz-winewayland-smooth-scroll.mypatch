@@ -1,0 +1,112 @@
+winewayland: touchpad and TrackPoint scrolling (Neutron#31)
+
+"Scrolling on the timeline doesn't work on trackpad using two-finger gesture, also will not zoom when
+holding alt. Same goes for using the trackpoint scrolling button on ThinkPad laptops. Using a mouse
+works fine." The compositor gives a wheel's scrolling as clicks (axis_value120) and a touchpad's or a
+TrackPoint's as smooth amounts only (wl_pointer.axis); pointer_handle_axis was empty, so smooth
+scrolling never reached an app (upstream 11.10 too).
+
+Per frame, an axis with smooth movement and no click becomes WM_MOUSEWHEEL / WM_MOUSEHWHEEL of
+value * 120 / 15 (15 scroll units per wheel click, as the compositor reports a click and as Wine's X11
+driver converts smooth scrolling), the fraction carried to the next frame and reset at axis_stop. A
+frame with a click keeps the click path, so a wheel is unchanged; NEUTRON_WHEEL_NOTCH (Premiere)
+still accumulates the result into whole notches. NEUTRON_SMOOTH_SCROLL=0.
+
+Harness scrolltest.c + fakeptr scroll (KWin fake input = smooth axis, no clicks), 36 events: 142 FAIL
+(0 wheel messages); patched: down -24 x10, up +24 x10, right +24 x10, Alt held -24 x6 with Alt in the
+key state; with NEUTRON_WHEEL_NOTCH=1 whole notches (-120/+120).
+
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -360,13 +360,68 @@
+     NtUserSendHardwareInput(hwnd, 0, &input, 0);
+ }
+ 
++/* NEUTRON smooth-scroll (GitHub Neutron#31): "Scrolling on the timeline doesn't work on trackpad using two-finger
++ * gesture, also will not zoom when holding alt. Same goes for using the trackpoint scrolling button on ThinkPad laptops.
++ * Using a mouse works fine." The compositor gives a wheel's scrolling as clicks (axis_value120) and a touchpad's or a
++ * TrackPoint's as smooth amounts only (wl_pointer.axis with no clicks); this driver turned only the clicks into
++ * WM_MOUSEWHEEL, so smooth scrolling never reached an app (measured: 36 axis events, 0 wheel messages). Windows gives a
++ * classic app a touchpad's scrolling as WM_MOUSEWHEEL/WM_MOUSEHWHEEL with small deltas, and Wine's X11 driver converts
++ * smooth scrolling the same way, 15 scroll units to one WHEEL_DELTA -- the amount the compositor reports per wheel click.
++ * Per frame: an axis with smooth movement and no click becomes a wheel message of value * 120 / 15, the fraction carried
++ * to the next frame so the sum is exact; a frame with a click keeps today's click path. Kill switch
++ * NEUTRON_SMOOTH_SCROLL=0. Events arrive on the single wayland event thread (see neutron_wheel_accumulate). */
++static BOOL neutron_smooth_scroll(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_SMOOTH_SCROLL", TRUE);
++    return on;
++}
++
++#define NEUTRON_SCROLL_UNITS_PER_NOTCH 15.0
++
++static struct
++{
++    double value[2];      /* smooth movement this frame, per axis (0 vertical, 1 horizontal) */
++    BOOL moved[2];
++    BOOL clicked[2];      /* an axis_value120 / axis_discrete arrived this frame */
++    double carry[2];      /* the fraction of a WHEEL_DELTA unit left over from earlier frames */
++} neutron_scroll;
++
++static void pointer_send_wheel(uint32_t axis, int32_t value120);
++
++static void neutron_scroll_flush(void)
++{
++    int i;
++
++    for (i = 0; i < 2; i++)
++    {
++        if (neutron_scroll.moved[i] && !neutron_scroll.clicked[i])
++        {
++            double d = neutron_scroll.value[i] * WHEEL_DELTA / NEUTRON_SCROLL_UNITS_PER_NOTCH + neutron_scroll.carry[i];
++            int32_t out = (int32_t)d;   /* toward zero */
++            neutron_scroll.carry[i] = d - out;
++            if (out) pointer_send_wheel(i ? WL_POINTER_AXIS_HORIZONTAL_SCROLL : WL_POINTER_AXIS_VERTICAL_SCROLL, out);
++        }
++        neutron_scroll.value[i] = 0.0;
++        neutron_scroll.moved[i] = neutron_scroll.clicked[i] = FALSE;
++    }
++}
++
+ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
+                                 uint32_t time, uint32_t axis, wl_fixed_t value)
+ {
++    int i = axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL;
++
++    if (!neutron_smooth_scroll() || axis > WL_POINTER_AXIS_HORIZONTAL_SCROLL) return;
++    neutron_scroll.value[i] += wl_fixed_to_double(value);
++    neutron_scroll.moved[i] = TRUE;
++    /* before version 5 there are no frame events: each axis event stands alone */
++    if (wl_proxy_get_version((struct wl_proxy *)wl_pointer) < WL_POINTER_FRAME_SINCE_VERSION) neutron_scroll_flush();
+ }
+ 
+ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
+ {
++    if (neutron_smooth_scroll()) neutron_scroll_flush();
+ }
+ 
+ static void pointer_handle_axis_source(void *data, struct wl_pointer *wl_pointer,
+@@ -377,6 +432,8 @@
+ static void pointer_handle_axis_stop(void *data, struct wl_pointer *wl_pointer,
+                                      uint32_t time, uint32_t axis)
+ {
++    /* the fingers left the touchpad: a new scroll starts from a whole unit */
++    if (axis <= WL_POINTER_AXIS_HORIZONTAL_SCROLL) neutron_scroll.carry[axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL] = 0.0;
+ }
+ 
+ /* NEUTRON: snap fragmented wheel input to whole notches (NEUTRON_WHEEL_NOTCH=1).
+@@ -429,6 +486,13 @@
+ static void pointer_handle_axis_value120(void *data, struct wl_pointer *wl_pointer,
+                                          uint32_t axis, int32_t value120)
+ {
++    /* NEUTRON smooth-scroll: a click this frame; the frame's smooth amount for this axis is the same movement */
++    if (axis <= WL_POINTER_AXIS_HORIZONTAL_SCROLL) neutron_scroll.clicked[axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL] = TRUE;
++    pointer_send_wheel(axis, value120);
++}
++
++static void pointer_send_wheel(uint32_t axis, int32_t value120)
++{
+     INPUT input = {0};
+     HWND hwnd;
+ 
