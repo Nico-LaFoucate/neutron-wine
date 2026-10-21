@@ -1256,3 +1256,16 @@ MEASURED (his Cintiq, `penbtn.c`): 141 FAIL (no side message, pkButtons 0/1); pa
 0x2 (0x3 in contact); upper -> WM_MBUTTONDOWN/UP, 0x4 (0x5). Photoshop 2026 (lab pfx): his *"it worked. Brush picker appeared"*.
 Second report item (pen lost after the mouse visits another screen) NOT reproduced: test window and Photoshop kept the pen with
 pressure (his check). Lab runtime `/var/tmp/neutron-i19/rt142pen`. SHIPPED in 11.10-142 (package winewayland.so = the lab-tested build: same build ID).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-smooth-scroll.mypatch` (2026-10-21) — touchpad and TrackPoint scrolling (GitHub Neutron#31)
+Reporter (ThinkPad, Fedora 44, KDE 6.7): *"Scrolling on the timeline doesn't work on trackpad using two-finger gesture, also will not
+zoom when holding alt. Same goes for using the trackpoint scrolling button on ThinkPad laptops. Using a mouse works fine."*
+`pointer_handle_axis` was empty (upstream 11.10 too): only wheel clicks (axis_value120/discrete) became WM_MOUSEWHEEL; a touchpad's or
+TrackPoint's smooth axis events (no clicks) were dropped. Now per frame: smooth movement without a click -> WM_MOUSEWHEEL/HWHEEL of
+value*120/15 (15 units per wheel click, as the compositor reports a click and as winex11 converts smooth scrolling), fraction carried,
+reset at axis_stop; a frame with a click keeps the click path. NEUTRON_WHEEL_NOTCH (Premiere) still snaps to whole notches.
+`NEUTRON_SMOOTH_SCROLL=0`.
+MEASURED (`scrolltest.c` + `fakeptr scroll`, KWin fake input = smooth axis, no clicks, nested desk): 142 FAIL (36 axis events, 0 wheel
+messages); patched: down -24 x10, up +24 x10, right +24 x10, Alt held -24 x6 with Alt in the key state; NOTCH=1 -> -120/+120 notches.
+Real mouse wheel on his MX Master (his screen): 893 value120 events -> 892 WM_MOUSEWHEEL, identical deltas, none doubled. NOT tested: a
+real touchpad, or Premiere/Photoshop themselves (no touchpad here). Lab runtime `/var/tmp/neutron-i19/rt143scroll`. NOT YET SHIPPED.
