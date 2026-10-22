@@ -1269,3 +1269,41 @@ MEASURED (`scrolltest.c` + `fakeptr scroll`, KWin fake input = smooth axis, no c
 messages); patched: down -24 x10, up +24 x10, right +24 x10, Alt held -24 x6 with Alt in the key state; NOTCH=1 -> -120/+120 notches.
 Real mouse wheel on his MX Master (his screen): 893 value120 events -> 892 WM_MOUSEWHEEL, identical deltas, none doubled. NOT tested: a
 real touchpad, or Premiere/Photoshop themselves (no touchpad here). Lab runtime `/var/tmp/neutron-i19/rt143scroll`. SHIPPED in 11.10-143 (package winewayland.so = the lab build, same build ID; package scroll test 36/36 events).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-msxml3-embedded-xml-declarations.mypatch` (2026-10-22) — an `<?xml?>` declaration past the start of the document (GitHub Neutron Discussion #34)
+No user report: found while comparing PhialsBasement/wine-adobe-installers with our tree. Known-good = Microsoft's msxml3 8.110.26100.8328
+(Neutron's `runtime/dlls/system32` bundle) in a scratch prefix, with a version-only `msxml3r.dll` beside it (`harnesses/msxml3r-standin/`;
+without it DllMain throws E_FAIL). Microsoft:
+- `Microsoft.XMLDOM` {2933BF90}/{2933BF91} keep a valid declaration anywhere as an "xml" PI with version/encoding/standalone attributes,
+  and fail an invalid one as a declaration (UNEXPECTED_ATTRIBUTE).
+- `Msxml2.DOMDocument` {F6D90F11}, `Msxml2.FreeThreadedDOMDocument` {F6D90F12}, DOMDocument30 and both SAX readers reject it:
+  XML_E_BAD_XMLDECL 0xC00CE557.
+- In every class, a non-lowercase target is BADXMLCASE and a bare `<?xml?>` is XMLDECLSYNTAX.
+
+Wine rejected every case with PIDECLSYNTAX. The SAX reader now applies those rules. A Wine-private property
+(`http://winehq.org/sax/properties/embedded-xml-declarations`), set by the DOM loader for MSXML_DEFAULT documents, keeps them; the DOM
+stores them as attributes. factory.c: {F6D90F12} MSXML_DEFAULT -> MSXML2, which also fixes leading white space before a declaration.
+MEASURED (`harnesses/msxml3-embedded-xmldecl.c`, 16 inputs x 6 DOM classes + 2 SAX readers): 143 matched Microsoft in 37/105 cases;
+patched, 105/105. Wine's own msxml3 domdoc+saxreader tests (cross-built): the same 25 domdoc failures as 143, none new. Gate
+`NEUTRON_MSXML_EMBEDDED_XMLDECL=0`: output byte-identical to 143. ⚠️ wine-staging's mshtml-adobe tests expect loadXML to succeed on
+Msxml2.DOMDocument, which Microsoft rejects (still failing, correctly). DOMDocument26 is unmeasured (Windows 11 no longer creates it). No
+Neutron symptom known. Lab runtime `/var/tmp/neutron-i19/rt143xml`. NOT YET SHIPPED.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winegstreamer-big-endian-pcm.mypatch` (2026-10-22) — clips with big-endian PCM audio failed to open (GitHub Neutron Discussion #34)
+QuickTime/MP4 uncompressed audio is big-endian: 'twos' (Sony XAVC S), 'in24', 'in32', 'fl32', 'fl64'. GStreamer gives S16BE/S24BE/...
+These have no wg_format, so `mf_media_type_from_wg_format_audio` failed ("Unknown audio format 0") and the WHOLE media source failed: the
+source reader returned MF_E_UNEXPECTED and WinRT MediaPlayer raised MediaFailed, video included. Windows' MPEG-4 source maps 'twos' to PCM
+and converts to little-endian (Microsoft Learn, "MPEG-4 File Source"). wg_parser now reports such a stream as its little-endian twin
+(`stream_format_from_caps`, current and codec format only); the audioconvert in front of our sink converts once that format is requested.
+wg_format_from_caps and ACCEPT_CAPS are untouched, so big-endian buffers are never accepted as little-endian. The 24/32/float codes are
+converted too, a superset of Windows (its MPEG-4 source leaves them to a decoder it does not ship).
+MEASURED (`harnesses/mf-audio-endian.c` source reader + 440 Hz sine check; `harnesses/winrt-mediaplayer-clip.c` muted MediaPlayer, the
+path LrC help videos use; clips `/var/tmp/phials-inspect/media`):
+- 143: all 6 big-endian clips failed.
+- Patched: all decode as the sine and play.
+- 'sowt'/AAC controls unchanged. Gate `NEUTRON_BIG_ENDIAN_PCM=0` restores the failure.
+
+Who reads files through MF: `PlatformAudioCodecs.dll` and Premiere 2026's exe. He shoots Sony and has never had camera-audio problems
+in Premiere, so Premiere does not route LPCM through MF. LrC library video is DLMS ImporterMPEG. So this is Windows parity; no known
+Neutron symptom. winedmo (Proton's fix lives there) is not used by default and still gets the 'twos' subtype with no decoder. Lab runtime
+`/var/tmp/neutron-i19/rt143xml`. NOT YET SHIPPED.

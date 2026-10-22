@@ -1,0 +1,94 @@
+winegstreamer: Open clips whose audio is big-endian PCM, as little-endian PCM.
+
+QuickTime and MP4 store uncompressed audio big-endian: 'twos' (16-bit; Sony XAVC S records it), 'in24',
+'in32', 'fl32', 'fl64'. GStreamer's demuxers hand these out as S16BE/S24BE/S32BE/F32BE/F64BE, which have
+no wg_format, so mf_media_type_from_wg_format_audio failed ("Unknown audio format 0") and the WHOLE
+media source failed to build: the source reader returned MF_E_UNEXPECTED and WinRT MediaPlayer raised
+MediaFailed, video included.
+
+Windows' MPEG-4 file source maps 'twos' to MFAudioFormat_PCM and "converts the audio data to
+little-endian format" (Microsoft Learn, MPEG-4 File Source). The parser now describes such a stream as
+its little-endian twin; the media source then requests that format and the audioconvert already in front
+of our sink does the conversion. Only the reported stream format changes: wg_format_from_caps and the
+sink's ACCEPT_CAPS comparison are untouched, so big-endian buffers are never passed off as little-endian.
+'in24'/'in32'/'fl32'/'fl64' are converted too (Windows' MPEG-4 source leaves those to a decoder it does
+not ship; converting them is a superset that plays them with sound).
+
+Tested with harnesses/mf-audio-endian.c (source reader, 440 Hz sine check) and
+harnesses/winrt-mediaplayer-clip.c (muted WinRT MediaPlayer, the path Lightroom Classic's help videos use):
+11.10-143 failed all 6 big-endian clips; now all decode as the sine and play. 'sowt' and AAC controls
+unchanged. Gate: NEUTRON_BIG_ENDIAN_PCM=0 restores the old behavior.
+
+Found while comparing PhialsBasement/wine-adobe-installers (GitHub Neutron Discussion #34). Proton (Valve
+063a29bc) and that fork convert in winedmo, which Neutron does not use by default.
+
+--- a/dlls/winegstreamer/wg_parser.c
++++ b/dlls/winegstreamer/wg_parser.c
+@@ -29,6 +29,7 @@
+ #include <assert.h>
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ 
+ #include <gst/gst.h>
+ #include <gst/video/video.h>
+@@ -225,13 +226,49 @@
+     return S_OK;
+ }
+ 
++/* Big-endian PCM (QuickTime and MP4 'twos', 'in24', 'in32', 'fl32', 'fl64'; Sony XAVC S records 'twos') has no
++ * wg_format, so the whole source failed to open. Windows' MPEG-4 source hands 'twos' out as little-endian PCM
++ * ("The MPEG-4 file source converts the audio data to little-endian format"); describe the stream as its
++ * little-endian twin, which the audioconvert in front of our sink produces once that format is requested. */
++static void stream_format_from_caps(struct wg_format *format, const GstCaps *caps)
++{
++    static int gate = -1;
++    GstAudioFormat little;
++    GstAudioInfo info;
++    GstCaps *copy;
++
++    wg_format_from_caps(format, caps);
++    if (format->major_type != WG_MAJOR_TYPE_AUDIO || format->u.audio.format != WG_AUDIO_FORMAT_UNKNOWN)
++        return;
++    if (gate < 0) { const char *e = getenv("NEUTRON_BIG_ENDIAN_PCM"); gate = (e && e[0] == '0') ? 0 : 1; }
++    if (!gate || !gst_audio_info_from_caps(&info, caps))
++        return;
++
++    switch (GST_AUDIO_INFO_FORMAT(&info))
++    {
++        case GST_AUDIO_FORMAT_S16BE: little = GST_AUDIO_FORMAT_S16LE; break;
++        case GST_AUDIO_FORMAT_S24BE: little = GST_AUDIO_FORMAT_S24LE; break;
++        case GST_AUDIO_FORMAT_S32BE: little = GST_AUDIO_FORMAT_S32LE; break;
++        case GST_AUDIO_FORMAT_F32BE: little = GST_AUDIO_FORMAT_F32LE; break;
++        case GST_AUDIO_FORMAT_F64BE: little = GST_AUDIO_FORMAT_F64LE; break;
++        default: return;
++    }
++
++    if (!(copy = gst_caps_copy(caps)))
++        return;
++    gst_caps_set_simple(copy, "format", G_TYPE_STRING, gst_audio_format_to_string(little), NULL);
++    GST_INFO("Describing big-endian stream caps %" GST_PTR_FORMAT " as %s.", caps, gst_audio_format_to_string(little));
++    wg_format_from_caps(format, copy);
++    gst_caps_unref(copy);
++}
++
+ static NTSTATUS wg_parser_stream_get_current_format(void *args)
+ {
+     const struct wg_parser_stream_get_current_format_params *params = args;
+     struct wg_parser_stream *stream = get_stream(params->stream);
+ 
+     if (stream->current_caps)
+-        wg_format_from_caps(params->format, stream->current_caps);
++        stream_format_from_caps(params->format, stream->current_caps);
+     else
+         memset(params->format, 0, sizeof(*params->format));
+ 
+@@ -246,7 +283,7 @@
+     if (caps_is_compressed(stream->codec_caps))
+         wg_format_from_caps(params->format, stream->codec_caps);
+     else if (stream->current_caps)
+-        wg_format_from_caps(params->format, stream->current_caps);
++        stream_format_from_caps(params->format, stream->current_caps);
+     else
+         memset(params->format, 0, sizeof(*params->format));
+ 
