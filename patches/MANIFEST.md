@@ -1287,7 +1287,7 @@ MEASURED (`harnesses/msxml3-embedded-xmldecl.c`, 16 inputs x 6 DOM classes + 2 S
 patched, 105/105. Wine's own msxml3 domdoc+saxreader tests (cross-built): the same 25 domdoc failures as 143, none new. Gate
 `NEUTRON_MSXML_EMBEDDED_XMLDECL=0`: output byte-identical to 143. ⚠️ wine-staging's mshtml-adobe tests expect loadXML to succeed on
 Msxml2.DOMDocument, which Microsoft rejects (still failing, correctly). DOMDocument26 is unmeasured (Windows 11 no longer creates it). No
-Neutron symptom known. Lab runtime `/var/tmp/neutron-i19/rt143xml`. NOT YET SHIPPED.
+Neutron symptom known. Lab runtime `/var/tmp/neutron-i19/rt143xml`. SHIPPED in 11.10-144 (package: 105/105 vs Microsoft; Wine msxml3 tests same 25 failures as 143).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winegstreamer-big-endian-pcm.mypatch` (2026-10-22) — clips with big-endian PCM audio failed to open (GitHub Neutron Discussion #34)
 QuickTime/MP4 uncompressed audio is big-endian: 'twos' (Sony XAVC S), 'in24', 'in32', 'fl32', 'fl64'. GStreamer gives S16BE/S24BE/...
@@ -1306,4 +1306,4 @@ path LrC help videos use; clips `/var/tmp/phials-inspect/media`):
 Who reads files through MF: `PlatformAudioCodecs.dll` and Premiere 2026's exe. He shoots Sony and has never had camera-audio problems
 in Premiere, so Premiere does not route LPCM through MF. LrC library video is DLMS ImporterMPEG. So this is Windows parity; no known
 Neutron symptom. winedmo (Proton's fix lives there) is not used by default and still gets the 'twos' subtype with no decoder. Lab runtime
-`/var/tmp/neutron-i19/rt143xml`. NOT YET SHIPPED.
+`/var/tmp/neutron-i19/rt143xml`. SHIPPED in 11.10-144 (package winegstreamer.so x86_64 = the lab build, same build ID; package clips 7/7 decode, 6/6 play).
