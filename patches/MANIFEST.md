@@ -1307,3 +1307,22 @@ Who reads files through MF: `PlatformAudioCodecs.dll` and Premiere 2026's exe. H
 in Premiere, so Premiere does not route LPCM through MF. LrC library video is DLMS ImporterMPEG. So this is Windows parity; no known
 Neutron symptom. winedmo (Proton's fix lives there) is not used by default and still gets the 'twos' subtype with no decoder. Lab runtime
 `/var/tmp/neutron-i19/rt143xml`. SHIPPED in 11.10-144 (package winegstreamer.so x86_64 = the lab build, same build ID; package clips 7/7 decode, 6/6 play).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-caption-settext.mypatch` (2026-10-22) — Premiere's title bar flashed blank on in/out points
+His words (10-20): *"the title bar flickers when setting in and out points on clips in premiere"*. Premiere 2025 retitles its main
+window with UNCHANGED text on every in/out point (+win: one `set_window_text` per I/O key, 5-15 ms later).
+DefWindowProc(WM_SETTEXT) repainted the WHOLE non-client area. Our flat border (`neutron-frame-border-palette`) starts that by
+filling all of it with the border colour, caption band included, and other threads of the process flush the window surface. So a
+flush in between presented a blank caption. KWin ScreenShot2 capture at ~700 fps on the nested desk: blank caption (no icon, no
+title) for ~10 ms after 16 of 110 in/out points on 11.10-144.
+Windows' DefWindowProc(WM_SETTEXT) repaints only the caption (ReactOS: UserPaintCaption DC_TEXT; DWM draws it). `paint_caption()`
+does that, in nc_paint's caption rectangle (same frame insets). `draw_nc_caption_buffered()` composes the caption in a memory DC
+and copies it with one BitBlt (also used inside nc_paint).
+MEASURED (lab Premiere 2025, LrcRelease prefix, test project FlickerTest with generated clips):
+- 0 flashes in 80 in/out points (4 runs, each with a title set per press).
+- Premiere's steady caption is pixel-identical to 144.
+- `harnesses/caption-settext.c`: SetWindowText caption == full frame repaint for 6 frame styles, active and inactive.
+- Tool windows lose a 1-px overdraw of the close button below the caption.
+- `NEUTRON_CAPTION_BUFFERED=0` restores the old behaviour.
+
+Lab runtime `/var/tmp/neutron-i19/rt144cap`. NOT YET SHIPPED.
