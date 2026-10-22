@@ -1,0 +1,210 @@
+msxml3: Handle an XML declaration that is not at the start of the document as Windows does.
+
+Measured against Microsoft's msxml3 8.110.26100.8328 (Windows 11), loadXML and the SAX readers on 16
+inputs (harness preserved-fixes/harnesses/msxml3-embedded-xmldecl.c):
+
+- Microsoft.XMLDOM ({2933BF90}) and its free-threaded twin ({2933BF91}) keep a valid declaration
+  anywhere in the document as a processing instruction named "xml" (attributes version/encoding/
+  standalone, like the leading one); an invalid one fails as a declaration would
+  (XML_E_UNEXPECTED_ATTRIBUTE).
+- Msxml2.DOMDocument, Msxml2.FreeThreadedDOMDocument, DOMDocument30 and both SAX readers reject it
+  with XML_E_BAD_XMLDECL (0xC00CE557).
+- In every class a target that is not lowercase fails with XML_E_BADXMLCASE and a bare "<?xml?>"
+  with XML_E_XMLDECLSYNTAX.
+
+Wine rejected all of them with XML_E_PIDECLSYNTAX. The DOM loader now tells its SAX reader (private
+property http://winehq.org/sax/properties/embedded-xml-declarations) to keep such declarations for
+MSXML_DEFAULT documents, and stores them as attributes.
+
+Msxml2.FreeThreadedDOMDocument ({F6D90F12}) was mapped to MSXML_DEFAULT; Microsoft treats it like
+Msxml2.DOMDocument here and for leading white space before a declaration, so it is MSXML2 now.
+
+Result: 105 of 105 measured cases match Microsoft (11.10-143: 37). Wine's msxml3 domdoc/saxreader
+tests: same 25 failures as before, none new. Gate: NEUTRON_MSXML_EMBEDDED_XMLDECL=0 restores the
+old behavior (output byte-identical to 143).
+
+Found while comparing PhialsBasement/wine-adobe-installers (GitHub Neutron Discussion #34). His CDATA
+wrapping matches neither Microsoft result, and wine-staging's mshtml-adobe tests expect loadXML to
+succeed on Msxml2.DOMDocument, which Microsoft rejects.
+
+--- a/dlls/msxml3/factory.c
++++ b/dlls/msxml3/factory.c
+@@ -22,6 +22,7 @@
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ #include <libxml/parser.h>
+ #include <libxml/xmlerror.h>
+ 
+@@ -73,7 +74,8 @@
+     { &CLSID_DOMDocument60, MSXML6  },
+ 
+     { &CLSID_DOMFreeThreadedDocument,   MSXML_DEFAULT },
+-    { &CLSID_FreeThreadedDOMDocument,   MSXML_DEFAULT },
++    /* Msxml2.FreeThreadedDOMDocument, like its sibling Msxml2.DOMDocument (measured against Microsoft's msxml3 8.110). */
++    { &CLSID_FreeThreadedDOMDocument,   MSXML2  },
+     { &CLSID_FreeThreadedDOMDocument26, MSXML26 },
+     { &CLSID_FreeThreadedDOMDocument30, MSXML3  },
+     { &CLSID_FreeThreadedDOMDocument40, MSXML4  },
+@@ -107,6 +109,12 @@
+ {
+     unsigned int i;
+ 
++    if (IsEqualGUID(clsid, &CLSID_FreeThreadedDOMDocument))
++    {
++        const char *e = getenv("NEUTRON_MSXML_EMBEDDED_XMLDECL");
++        if (e && e[0] == '0') return MSXML_DEFAULT;
++    }
++
+     for (i = 0; i < ARRAY_SIZE(clsid_versions_table); i++)
+         if (IsEqualGUID(clsid, clsid_versions_table[i].clsid))
+             return clsid_versions_table[i].version;
+--- a/dlls/msxml3/node.c
++++ b/dlls/msxml3/node.c
+@@ -3895,7 +3895,18 @@
+     parse_context_create_text_node(c, NODE_TEXT);
+     parse_context_node_create(c, NODE_PROCESSING_INSTRUCTION, target, target_len, NULL, 0, c->root, &pi);
+     parse_context_append_child(c, c->node, pi);
+-    parse_context_node_put_data(c, pi, data, data_len);
++
++    /* An XML declaration past the start of the document, which only the version-independent DOMDocument keeps:
++       store it like the leading one, as attributes. */
++    if (target_len == 3 && !wcsncmp(target, L"xml", 3) && c->status == S_OK)
++    {
++        BSTR text = SysAllocStringLen(data, data_len);
++
++        c->status = text ? parse_xml_decl(pi, text) : E_OUTOFMEMORY;
++        SysFreeString(text);
++    }
++    else
++        parse_context_node_put_data(c, pi, data, data_len);
+ 
+     return c->status;
+ }
+@@ -4145,6 +4156,16 @@
+     ISAXXMLReader_putFeature(c->reader, L"prohibit-dtd", properties->prohibit_dtd ? VARIANT_TRUE : VARIANT_FALSE);
+     ISAXXMLReader_putFeature(c->reader, L"normalize-attribute-values", VARIANT_FALSE);
+ 
++    /* Windows keeps an XML declaration that is not at the start of the document only in documents created as the
++       version-independent DOMDocument (Microsoft.XMLDOM, Msxml2.DOMDocument); DOMDocument30 and the SAX readers
++       reject it with XML_E_BAD_XMLDECL. */
++    if (properties->version == MSXML_DEFAULT)
++    {
++        V_VT(&v) = VT_BOOL;
++        V_BOOL(&v) = VARIANT_TRUE;
++        ISAXXMLReader_putProperty(c->reader, L"http://winehq.org/sax/properties/embedded-xml-declarations", v);
++    }
++
+     domnode_create(NODE_DOCUMENT, NULL, 0, NULL, 0, NULL, &c->root);
+     c->root->properties = domdoc_create_properties(MSXML_DEFAULT);
+     c->root->properties->preserving = properties->preserving;
+--- a/dlls/msxml3/saxreader.c
++++ b/dlls/msxml3/saxreader.c
+@@ -22,6 +22,7 @@
+ #define COBJMACROS
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
+@@ -469,6 +470,7 @@
+     int max_element_depth;
+     BSTR empty_bstr;
+     MSXML_VERSION version;
++    bool embedded_xmldecl;
+ };
+ 
+ static HRESULT saxreader_put_handler(struct saxreader *reader, enum saxhandler_type type, void *ptr, bool vb)
+@@ -4386,11 +4388,19 @@
+ 
+ /* [16] PI ::= '<?' PITarget (S (Char* - (Char* '?>' Char*)))? '?>'
+    [17] PITarget ::= Name - (('X' | 'x') ('M' | 'm') ('L' | 'l')) */
++static int neutron_embedded_xmldecl(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_MSXML_EMBEDDED_XMLDECL"); v = (e && e[0] == '0') ? 0 : 1; }
++    return v;
++}
++
+ static void saxreader_parse_pi(struct saxlocator *locator)
+ {
+     struct string_buffer buffer = { 0 };
+     struct text_position position;
+     BSTR target, chars;
++    bool xmldecl = false;
+     WCHAR ch;
+ 
+     /* Skip '<?' */
+@@ -4399,8 +4409,29 @@
+ 
+     if (saxreader_is_xml_pi(target))
+     {
+-        SysFreeString(target);
+-        return saxreader_set_error(locator, E_SAX_PIDECLSYNTAX);
++        HRESULT hr = E_SAX_PIDECLSYNTAX;
++
++        /* An XML declaration that is not at the start of the document. Windows reports a name that is not
++           lowercase, then a missing space, then rejects it; only the version-independent DOMDocument keeps it, as
++           a processing instruction, if it is a valid declaration. */
++        if (neutron_embedded_xmldecl())
++        {
++            if (wcscmp(target, L"xml"))
++                hr = E_SAX_BADXMLCASE;
++            else if (!saxreader_is_space(*saxreader_get_ptr_noread(locator)))
++                hr = E_SAX_XMLDECLSYNTAX;
++            else if (!locator->saxreader->embedded_xmldecl)
++                hr = E_SAX_BAD_XMLDECL;
++            else
++                hr = S_OK;
++        }
++
++        if (hr != S_OK)
++        {
++            SysFreeString(target);
++            return saxreader_set_error(locator, hr);
++        }
++        xmldecl = true;
+     }
+ 
+     saxreader_skipspaces(locator);
+@@ -4413,6 +4444,22 @@
+         {
+             chars = saxreader_string_to_bstr(locator, &buffer);
+ 
++            if (xmldecl)
++            {
++                BSTR version, encoding, standalone;
++                HRESULT hr = parse_xml_decl_body(chars, &version, &encoding, &standalone);
++
++                SysFreeString(version);
++                SysFreeString(encoding);
++                SysFreeString(standalone);
++                if (FAILED(hr))
++                {
++                    SysFreeString(target);
++                    SysFreeString(chars);
++                    return saxreader_set_error(locator, hr);
++                }
++            }
++
+             saxlocator_pi(locator, &position, target, chars);
+ 
+             SysFreeString(target);
+@@ -6317,6 +6364,15 @@
+     if (!wcscmp(prop, L"http://winehq.org/sax/properties/extension-handler"))
+         return saxreader_put_handler_from_variant(reader, SAXExtensionHandler, v, vbInterface);
+ 
++    /* Wine-internal, set by the DOM loader: keep an XML declaration that is not at the start of the document. */
++    if (!wcscmp(prop, L"http://winehq.org/sax/properties/embedded-xml-declarations"))
++    {
++        if (V_VT(v) != VT_BOOL)
++            return E_INVALIDARG;
++        reader->embedded_xmldecl = V_BOOL(v) == VARIANT_TRUE;
++        return S_OK;
++    }
++
+     if (!wcscmp(prop, L"max-xml-size"))
+     {
+         int size;
