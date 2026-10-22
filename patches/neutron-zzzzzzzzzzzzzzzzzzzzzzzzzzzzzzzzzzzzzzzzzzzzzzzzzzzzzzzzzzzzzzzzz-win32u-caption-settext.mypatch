@@ -1,0 +1,135 @@
+win32u: Repaint only the caption on WM_SETTEXT, composed off-screen.
+
+His words (2026-10-20): "the title bar flickers when setting in and out points on clips in premiere".
+Premiere Pro retitles its main window with UNCHANGED text on every in/out point (+win: one
+set_window_text per I/O key, 5-15 ms after it). DefWindowProc(WM_SETTEXT) then repainted the whole
+non-client area, and our flat border (neutron-frame-border-palette) begins that by filling all of it,
+caption band included, with the border colour; the window surface is flushed by other threads of the
+process (window_surface_flush from a thread other than the one painting), so a flush in between
+presented a blank title bar. Captured on the nested desk with KWin ScreenShot2 at ~700 frames/s:
+blank caption (no icon, no title) for ~10 ms after 16 of 110 in/out points on 11.10-144.
+
+Windows' DefWindowProc(WM_SETTEXT) repaints only the caption (ReactOS: UserPaintCaption DC_TEXT; with
+DWM the compositor draws it). paint_caption() does that, in the rectangle nc_paint uses (same frame
+insets), and draw_nc_caption_buffered() composes the caption in a memory DC and copies it with one
+BitBlt (one locked surface operation), also inside nc_paint.
+
+Measured: 0 flashes in 80 in/out points (4 runs, each with a title set per press); Premiere's steady
+caption pixel-identical to 144. harnesses/caption-settext.c: after SetWindowText the caption equals a
+full frame repaint for 6 frame styles, active and inactive. Tool windows lose a 1-px overdraw of the
+close button below the caption (the blit copies the caption rectangle only). Gate:
+NEUTRON_CAPTION_BUFFERED=0 restores the direct drawing and the full repaint.
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -1605,6 +1605,47 @@
+     }
+ }
+ 
++/* NEUTRON: compose the caption off-screen and copy it to the window in one blit. On Windows the desktop compositor
++ * draws a window's caption, so an app that sets its title again (Premiere Pro does it on every in/out point, with the
++ * same text) never shows a half-drawn caption. Here the app thread repaints it, background first, and a flush of the
++ * window surface from another thread of the process can present it in between: the title bar flashed blank for one
++ * frame on ~25% of in/out points (harnesses/kwin-nested capture). A BitBlt is a single locked surface operation.
++ * The bitmap uses window coordinates from the window origin, because the caption buttons place themselves from the
++ * window rectangle. NEUTRON_CAPTION_BUFFERED=0 draws straight to the window, and WM_SETTEXT repaints the whole
++ * non-client area again, as before (see paint_caption). */
++static BOOL neutron_caption_buffered(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_CAPTION_BUFFERED" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static void draw_nc_caption_buffered( HDC hdc, RECT *rect, HWND hwnd, DWORD style, DWORD ex_style, BOOL active )
++{
++    HBITMAP bitmap, old_bitmap;
++    HDC mem;
++
++    if (!neutron_caption_buffered() || (ex_style & WS_EX_LAYOUTRTL) || rect->right <= 0 || rect->bottom <= 0 ||
++        !(mem = NtGdiCreateCompatibleDC( hdc )))
++    {
++        draw_nc_caption( hdc, rect, hwnd, style, ex_style, active );
++        return;
++    }
++    if (!(bitmap = NtGdiCreateCompatibleBitmap( hdc, rect->right, rect->bottom )))
++    {
++        NtGdiDeleteObjectApp( mem );
++        draw_nc_caption( hdc, rect, hwnd, style, ex_style, active );
++        return;
++    }
++    old_bitmap = NtGdiSelectBitmap( mem, bitmap );
++    draw_nc_caption( mem, rect, hwnd, style, ex_style, active );
++    NtGdiBitBlt( hdc, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
++                 mem, rect->left, rect->top, SRCCOPY, 0, 0 );
++    NtGdiSelectBitmap( mem, old_bitmap );
++    NtGdiDeleteObjectApp( bitmap );
++    NtGdiDeleteObjectApp( mem );
++}
++
+ /***********************************************************************
+  *           NtUserDrawCaptionTemp   (win32u.@)
+  */
+@@ -1771,7 +1812,7 @@
+         }
+ 
+         if (intersect_rect( &rfuzz, &r, &clip_rect ))
+-            draw_nc_caption( hdc, &r, hwnd, style, ex_style, active );
++            draw_nc_caption_buffered( hdc, &r, hwnd, style, ex_style, active );
+     }
+ 
+     if (has_menu( hwnd, style ))
+@@ -1811,6 +1852,43 @@
+     NtUserReleaseDC( hwnd, hdc );
+ }
+ 
++/* NEUTRON: repaint the caption alone, composed off-screen, as Windows' DefWindowProc(WM_SETTEXT) repaints only the
++ * caption (ReactOS: UserPaintCaption with DC_TEXT; with DWM the compositor draws it). Wine repainted the whole
++ * non-client area, and our flat border (neutron-frame-border-palette) starts that by filling all of it with the border
++ * colour, caption band included, so a flush from another thread in between showed a blank title bar: Premiere Pro
++ * retitles its window with unchanged text on every in/out point, and the title bar flashed blank on ~25% of them.
++ * The rectangle is the one nc_paint draws the caption in (same frame insets). */
++static void paint_caption( HWND hwnd )
++{
++    DWORD style = get_window_long( hwnd, GWL_STYLE ), ex_style = get_window_long( hwnd, GWL_EXSTYLE );
++    RECT rect, r;
++    BOOL active;
++    WND *win;
++    HDC hdc;
++
++    if (!(style & WS_VISIBLE) || (style & WS_CAPTION) != WS_CAPTION) return;
++    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
++    active = win->flags & WIN_NCACTIVATED;
++    release_win_ptr( win );
++
++    get_window_rect_rel( hwnd, COORDS_WINDOW, &rect, get_thread_dpi() );
++    if (has_static_outer_frame( ex_style ) || has_big_frame( style, ex_style )) InflateRect( &rect, -1, -1 );
++    if (style & WS_THICKFRAME)
++        InflateRect( &rect, -(get_system_metrics( SM_CXFRAME ) - get_system_metrics( SM_CXDLGFRAME )),
++                     -(get_system_metrics( SM_CYFRAME ) - get_system_metrics( SM_CYDLGFRAME )) );
++    InflateRect( &rect, -(get_system_metrics( SM_CXDLGFRAME ) - get_system_metrics( SM_CXEDGE )),
++                 -(get_system_metrics( SM_CYDLGFRAME ) - get_system_metrics( SM_CYEDGE )) );  /* WS_CAPTION has WS_BORDER */
++    r = rect;
++    r.bottom = rect.top + get_system_metrics( (ex_style & WS_EX_TOOLWINDOW) ? SM_CYSMCAPTION : SM_CYCAPTION );
++
++    if (!(hdc = NtUserGetDCEx( hwnd, 0, DCX_USESTYLE | DCX_WINDOW ))) return;
++    draw_nc_caption_buffered( hdc, &r, hwnd, style, ex_style, active );
++    NtUserReleaseDC( hwnd, hdc );
++
++    if (NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window())
++        NtUserPostMessage( get_desktop_window(), WM_PARENTNOTIFY, WM_NCPAINT, (LPARAM)hwnd );
++}
++
+ static LRESULT handle_nc_paint( HWND hwnd , HRGN clip )
+ {
+     HWND parent = NtUserGetAncestor( hwnd, GA_PARENT );
+@@ -2649,7 +2727,8 @@
+              * the title bar kept the previous module until the next change. Remember it, and draw it when
+              * WS_VISIBLE comes back (neutron_redraw_stale_caption) or at the next caption paint. */
+             if (!(get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE)) win_set_flags( hwnd, WIN_CAPTION_STALE, 0 );
+-            handle_nc_paint( hwnd , (HRGN)1 );  /* repaint caption */
++            if (neutron_caption_buffered()) paint_caption( hwnd );
++            else handle_nc_paint( hwnd , (HRGN)1 );  /* repaint caption */
+         }
+         break;
+ 
