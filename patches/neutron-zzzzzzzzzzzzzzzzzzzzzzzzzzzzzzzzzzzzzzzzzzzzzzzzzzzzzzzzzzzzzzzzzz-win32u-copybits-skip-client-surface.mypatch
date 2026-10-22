@@ -1,0 +1,157 @@
+win32u: Don't copy the bits under an on-screen client surface when a window moves.
+
+His words (2026-07-30, still live 2026-10-20): "the image of another thumbnail would flicker over the place of
+another thumbnail for a split second" (Premiere Pro media bin, hovering over clips).
+
+On each hover change Premiere creates a "SubWindow" (WS_CHILD, a D3D swapchain), shows it over the hovered tile for
+~10 ms, then moves it, still visible and without SWP_NOCOPYBITS, to a parking spot and hides it (+win, lab Premiere
+2025). The move ran move_window_bits, which copied the window's "bits" inside the main window's surface. For a window
+whose client area is an on-screen client surface (a Wayland subsurface) those bits are what the parent last drew there,
+the tile's thumbnail, never the window's content. The copy was flushed at once, and the parent repainted the spot only
+after the hide, so the thumbnail showed at the parking spot for several ms. Every rogue frame of a 25 s capture lies
+within +-7 ms of such a copy (move_window_bits copying (357,137)-(628,291) -> (30,119)-(301,273)).
+
+On Windows the swapchain is not in the window's bits either, but Premiere's UI is DirectComposition content composed
+above those bits, so the copy is never seen; our dcomp bridge draws that content into the window surface itself.
+get_client_surfaces_region() returns the client visible region (server get_visible_region, empty when hidden) of every
+on-screen client surface in the moved window's subtree, and move_window_bits leaves it out of the copy. An offscreen
+client surface is copied into the window surface on every present, so its pixels still move. Imperfect: a GDI parent
+on Windows would show the copied pixels until it repaints; here it keeps its own.
+
+Measured on the nested desk, same layout and capture (KWin ScreenShot2 ~110 captures/s), two 25 s hover sweeps each:
+stock 11.10-145 34 rogue frames for 136 parking moves, with this patch 5 for 133. The 5 left are the preview's own
+first frame shown at the parking spot by its subsurface between the move and the hide (~0.4 ms), not a copy.
+harnesses/copybits-gpu-child.c: a D3D11 child moved over another colour and hidden leaves the parent's pixels (stock:
+the pixels from under it were copied there); a GDI child's bits are still copied. Gate: NEUTRON_COPY_SKIP_GPU=0
+restores the copy (harness FAILs like stock).
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -2081,9 +2081,9 @@
+  *
+  * Move the window bits when a window is resized, or moved within a parent window.
+  */
+-/* NEUTRON copy-visible-bits-only: hwnd's visible region (window area, siblings clipped as its style says,
+- * children not clipped), in screen coordinates, as the server computes it for a DC. 0 on failure. */
+-HRGN get_window_visible_region( HWND hwnd )
++/* NEUTRON copy-visible-bits-only: hwnd's visible region for a DC with these DCX_ flags, in screen coordinates, as
++ * the server computes it (empty when hwnd or an ancestor is hidden). 0 on failure. */
++static HRGN get_visible_region_flags( HWND hwnd, UINT flags )
+ {
+     HRGN rgn = 0;
+     NTSTATUS status;
+@@ -2096,7 +2096,7 @@
+         SERVER_START_REQ( get_visible_region )
+         {
+             req->window = wine_server_user_handle( hwnd );
+-            req->flags  = DCX_WINDOW;
++            req->flags  = flags;
+             wine_server_set_reply( req, data->Buffer, size );
+             if (!(status = wine_server_call( req )))
+             {
+@@ -2115,6 +2115,18 @@
+     return rgn;
+ }
+ 
++/* NEUTRON copy-visible-bits-only: the window area (siblings clipped as its style says, children not clipped) */
++HRGN get_window_visible_region( HWND hwnd )
++{
++    return get_visible_region_flags( hwnd, DCX_WINDOW );
++}
++
++/* NEUTRON copybits-skip-gpu: the client area (siblings and children not clipped) */
++HRGN get_client_visible_region( HWND hwnd )
++{
++    return get_visible_region_flags( hwnd, 0 );
++}
++
+ /* vis_before: when not 0, the window's visible region from just before the move, already offset to the new
+  * position (screen coordinates); only pixels inside it are copied (see apply_window_pos). Not consumed. */
+ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects, HRGN vis_before )
+@@ -2126,6 +2138,7 @@
+     {
+         UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
+         HRGN rgn = get_update_region( hwnd, &flags, NULL );
++        HRGN gpu = get_client_surfaces_region( hwnd );  /* NEUTRON copybits-skip-gpu: never copied, see there */
+         HDC hdc;
+ 
+         if (vis_before)
+@@ -2140,9 +2153,20 @@
+                 NtGdiCombineRgn( clip, clip, rgn, RGN_DIFF );
+                 NtGdiDeleteObjectApp( rgn );
+             }
++            if (gpu) NtGdiCombineRgn( clip, clip, gpu, RGN_DIFF );
+             hdc = NtUserGetDCEx( hwnd, clip, DCX_CACHE | DCX_WINDOW | DCX_INTERSECTRGN );
+         }
+-        else hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
++        else
++        {
++            if (gpu && rgn) NtGdiCombineRgn( rgn, rgn, gpu, RGN_OR );
++            else if (gpu)
++            {
++                rgn = gpu;
++                gpu = 0;
++            }
++            hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
++        }
++        if (gpu) NtGdiDeleteObjectApp( gpu );
+ 
+         TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
+         OffsetRect( &src, -rects->window.left, -rects->window.top );
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -52,6 +52,8 @@
+ extern void flush_window_surfaces( BOOL idle );
+ extern void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *valid_rects, HRGN vis_before );
+ extern HRGN get_window_visible_region( HWND hwnd );
++extern HRGN get_client_visible_region( HWND hwnd );
++extern HRGN get_client_surfaces_region( HWND hwnd );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                       const RECT *old_visible_rect, const RECT *valid_rects );
+ extern void register_window_surface( struct window_surface *old,
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -341,6 +341,43 @@
+     pthread_mutex_unlock( &surfaces_lock );
+ }
+ 
++/* NEUTRON copybits-skip-gpu (2026-10-22): the part of `hwnd` and its descendants that an on-screen client surface
++ * shows (Vulkan or OpenGL presented straight to the display, a Wayland subsurface), in screen coordinates, or 0.
++ * The window surface under such a window holds what its parent last drew there, never the window's own content, so
++ * move_window_bits must not copy it: when the window then hides, those pixels would show at its new place until the
++ * parent repaints. Premiere Pro shows a GPU preview window over a media bin tile for ~10 ms, moves it, still visible,
++ * to a parking spot and hides it; the copy put the tile's thumbnail there, flushed, for ~8 ms on every hover change.
++ * On Windows the swapchain is not in the window's bits either, but Premiere's UI is DirectComposition content above
++ * those bits, so the copy is never seen; our dcomp bridge draws that content into the window surface itself. A GDI
++ * parent on Windows would show the copied pixels; here it keeps its own until it repaints. An offscreen client surface
++ * is copied into the window surface on every present, so its pixels are content and still move.
++ * Kill switch NEUTRON_COPY_SKIP_GPU=0. Harness preserved-fixes/harnesses/copybits-gpu-child.c. */
++HRGN get_client_surfaces_region( HWND hwnd )
++{
++    static int on = -1;
++    struct client_surface *surface;
++    HRGN region = 0, rgn;
++
++    if (on < 0) { const char *e = getenv( "NEUTRON_COPY_SKIP_GPU" ); on = !(e && e[0] == '0'); }
++    if (!on) return 0;
++
++    pthread_mutex_lock( &surfaces_lock );
++    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
++    {
++        if (!surface->hwnd || surface->offscreen) continue;
++        if (surface->hwnd != hwnd && !is_child( hwnd, surface->hwnd )) continue;
++        if (!(rgn = get_client_visible_region( surface->hwnd ))) continue;
++        if (!region) region = rgn;
++        else
++        {
++            NtGdiCombineRgn( region, region, rgn, RGN_OR );
++            NtGdiDeleteObjectApp( rgn );
++        }
++    }
++    pthread_mutex_unlock( &surfaces_lock );
++    return region;
++}
++
+ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd )
+ {
+     struct client_surface *surface;

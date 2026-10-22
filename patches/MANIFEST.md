@@ -1326,3 +1326,25 @@ MEASURED (lab Premiere 2025, LrcRelease prefix, test project FlickerTest with ge
 - `NEUTRON_CAPTION_BUFFERED=0` restores the old behaviour.
 
 Lab runtime `/var/tmp/neutron-i19/rt144cap`. SHIPPED in 11.10-145 (package win32u.so x86_64 = the lab build, same build ID; caption-settext PASS on the package with the gate on and off).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-copybits-skip-client-surface.mypatch` (2026-10-22) — Premiere media bin: a thumbnail flickered at the wrong place on hover
+His words (07-30, still live 10-20): *"the image of another thumbnail would flicker over the place of another thumbnail for a
+split second"*. On each hover change Premiere 2025 creates a "SubWindow" (WS_CHILD, D3D swapchain) and shows it over the hovered tile
+for ~10 ms. It then moves the window, still visible and without SWP_NOCOPYBITS, to a parking spot (30,119) and hides it.
+`move_window_bits` copied the window's bits inside the main window's surface. Under an on-screen client surface (Wayland
+subsurface) those bits are the parent's thumbnail, not the window's content. The copy was flushed at once; the parent repainted the
+spot only after the hide. All 35 rogue frames of the first capture are within ±7 ms of such a copy.
+Windows: the swapchain is not in the window's bits either, but Premiere's UI is DirectComposition content above them, so a copy there
+is never seen. Our dcomp bridge draws that content into the window surface.
+`get_client_surfaces_region()` returns the client visible region of every on-screen client surface in the moved subtree (server
+`get_visible_region`, which is empty when hidden), and `move_window_bits` leaves it out of the copy. Offscreen client surfaces are
+copied into the window surface on every present, so their pixels still move. Imperfect: a GDI parent on Windows would show the copied
+pixels until it repaints; here it keeps its own. Kill switch `NEUTRON_COPY_SKIP_GPU=0`.
+MEASURED (lab Premiere 2025, LrcRelease on 145, FlickerTest with the k1-k8 clips, nested desk, KWin ScreenShot2 ~110 captures/s,
+`kwin-nested/hover-run3.sh` + `rogue-detect.py`, two 25 s sweeps per arm, same layout):
+- stock 145: 34 rogue frames for 136 parking moves (22 + 12).
+- patched: 5 for 133. The 5 left are the preview's own first frame shown at the parking spot by its subsurface, in the ~0.4 ms
+  between Premiere's move and hide (the parent commit per SetWindowPos). They are not a copy: no surface flush follows it.
+- `harnesses/copybits-gpu-child.c`: a D3D11 child moved over another colour and hidden leaves the parent's pixels (stock: copied
+  there, FAIL; gate off: FAIL). A GDI child's bits are still copied (PASS in every arm).
+Lab runtime `/var/tmp/neutron-i19/rt145cb`. NOT YET SHIPPED.
