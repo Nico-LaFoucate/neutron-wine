@@ -1325,4 +1325,4 @@ MEASURED (lab Premiere 2025, LrcRelease prefix, test project FlickerTest with ge
 - Tool windows lose a 1-px overdraw of the close button below the caption.
 - `NEUTRON_CAPTION_BUFFERED=0` restores the old behaviour.
 
-Lab runtime `/var/tmp/neutron-i19/rt144cap`. NOT YET SHIPPED.
+Lab runtime `/var/tmp/neutron-i19/rt144cap`. SHIPPED in 11.10-145 (package win32u.so x86_64 = the lab build, same build ID; caption-settext PASS on the package with the gate on and off).
