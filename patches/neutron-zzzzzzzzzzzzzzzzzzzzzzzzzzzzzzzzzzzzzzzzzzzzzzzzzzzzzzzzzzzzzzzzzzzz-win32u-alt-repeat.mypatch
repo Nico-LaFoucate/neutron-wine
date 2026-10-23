@@ -1,0 +1,59 @@
+win32u: Ignore Alt's key repeats when deciding whether Alt was pressed alone.
+
+GitHub Neutron#35 (Premiere Pro): "on Premiere it doesn't get triggered when you hold Alt to zoom with the scroll
+wheel. However it does happen if you hold it for a short moment, even if you scrolled."
+
+DefWindowProc toggled menu_sys_key ("Alt pressed alone") on every WM_SYSKEYDOWN of Alt, the key repeats of a held
+Alt included, so whether its release opened the menu bar depended on how many repeats came before it: opened after
+0, 2 or 8 repeats, not after 1 or 3. A repeat (KEYDATA_PREVSTATE) is not a new press; it now leaves the state as it
+is. ReactOS skips repeats here too. Alt+F4 still acts on repeats.
+
+Measured on Windows 11 build 26200 with harnesses/alt-repeat-menu.c, through DefWindowProc directly and through
+SendInput: Alt released after 0, 1, 2, 3 or 8 repeats opens the menu once every time, with nothing else pressed,
+after a wheel notch or after a mouse move; a click cancels it. Wine with this patch gives the same table.
+
+Alone, this makes a held Alt+wheel in Premiere open the menu every time (it was shut by the toggling); the next
+patch (the menu does not start while a window holds the capture) is what keeps it shut, as on Windows. Gate:
+NEUTRON_ALT_REPEAT=0 restores the toggling.
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -40,6 +40,14 @@
+ static short f10_key = 0;
+ static short menu_sys_key = 0;
+ 
++/* NEUTRON alt-repeat: see WM_SYSKEYDOWN */
++static BOOL neutron_alt_repeat(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_ALT_REPEAT" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ static BOOL has_dialog_frame( UINT style, UINT ex_style )
+ {
+     return (ex_style & WS_EX_DLGMODALFRAME) || ((style & WS_DLGFRAME) && !(style & WS_THICKFRAME));
+@@ -2859,10 +2867,19 @@
+     case WM_SYSKEYDOWN:
+         if (HIWORD( lparam ) & KEYDATA_ALT)
+         {
+-            if ((wparam == VK_MENU || wparam == VK_LMENU || wparam == VK_RMENU) && !menu_sys_key)
+-                menu_sys_key = 1;
+-            else
+-                menu_sys_key = 0;
++            /* NEUTRON alt-repeat (GitHub Neutron#35): a key held down repeats; the repeats (KEYDATA_PREVSTATE) are not new
++             * presses and leave the "Alt pressed alone" state as it is. Toggling it on each of them made the menu depend
++             * on how many repeats came before the release. Measured on Windows 11 build 26200 (harnesses/alt-repeat-menu.exe,
++             * DefWindowProc and SendInput): Alt released after 0, 1, 2, 3 or 8 repeats opens the menu once every time; here
++             * it opened after 0, 2 and 8 and not after 1 or 3. ReactOS skips repeats here too. Alt+F4 below still acts on
++             * repeats. Kill switch NEUTRON_ALT_REPEAT=0. */
++            if (!(HIWORD( lparam ) & KEYDATA_PREVSTATE) || !neutron_alt_repeat())
++            {
++                if ((wparam == VK_MENU || wparam == VK_LMENU || wparam == VK_RMENU) && !menu_sys_key)
++                    menu_sys_key = 1;
++                else
++                    menu_sys_key = 0;
++            }
+ 
+             f10_key = 0;
+ 

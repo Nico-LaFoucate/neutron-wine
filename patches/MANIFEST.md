@@ -1326,6 +1326,9 @@ MEASURED (lab Premiere 2025, LrcRelease prefix, test project FlickerTest with ge
 - `NEUTRON_CAPTION_BUFFERED=0` restores the old behaviour.
 
 Lab runtime `/var/tmp/neutron-i19/rt144cap`. SHIPPED in 11.10-145 (package win32u.so x86_64 = the lab build, same build ID; caption-settext PASS on the package with the gate on and off).
+**REGRESSION (found 10-23 on 146):** `paint_caption` drew through a whole-window DC without leaving out the client area, so an
+app whose client covers the caption band got the title painted over its own title bar: Photoshop 2026's menu bar was hidden
+under the document title after every retitle (new document, each zoom step). Fixed by patch 70 (`win32u-caption-clip`).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-copybits-skip-client-surface.mypatch` (2026-10-22) — Premiere media bin: a thumbnail flickered at the wrong place on hover
 His words (07-30, still live 10-20): *"the image of another thumbnail would flicker over the place of another thumbnail for a
@@ -1391,3 +1394,46 @@ with DXGI Desktop Duplication, 100 cycles per test):**
   (child seen at its first spot in 93 frames). Windows shows this flash too, rarely. The 146 residual is the same per-frame
   behavior.
 REMOVED: not Windows behavior, and it regresses Photoshop.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-alt-repeat.mypatch` (2026-10-23) — a held Alt's key repeats toggled the menu bar (GitHub Neutron#35)
+Reporter (Premiere 2026): *"on Premiere it doesn't get triggered when you hold Alt to zoom with the scroll wheel. However it does
+happen if you hold it for a short moment, even if you scrolled."* DefWindowProc toggled `menu_sys_key` ("Alt pressed alone") on every
+WM_SYSKEYDOWN of Alt, repeats included, so whether the release opened the menu depended on the repeat count (0, 2, 8: opened; 1, 3:
+not). A repeat (KEYDATA_PREVSTATE) is not a new press and now leaves the state alone (ReactOS too). Alt+F4 still acts on repeats.
+MEASURED on Windows 11 build 26200 (`harnesses/alt-repeat-menu.c`, DefWindowProc and SendInput): Alt released after 0/1/2/3/8 repeats
+opens the menu once every time, after nothing, a wheel notch or a mouse move; a click cancels. Wine with this patch: the same table.
+Alone it makes a held Alt+wheel in Premiere open the menu every time (the toggling had kept it shut); patch 69 keeps it shut, as on
+Windows. Ships together with 69. Kill switch `NEUTRON_ALT_REPEAT=0`. Lab runtimes `/var/tmp/neutron-i19/rt146alt`, `rt146cap`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-capture-keymenu.mypatch` (2026-10-23) — Premiere: Alt+wheel zoom opened the menu bar (GitHub Neutron#35)
+Premiere's timeline takes the mouse capture on every Alt+wheel zoom and still holds it at the Alt release; on a tap it holds none.
+Same on Windows 11 and here (`harnesses/premiere-alt-zoom.c` v2, GetGUIThreadInfo before the release). Windows Premiere: tap 4/4,
+Alt+wheel 0/4, held 0/4 menus. Windows rule, measured on build 26200:
+- `harnesses/capture-alt-menu.c`: SC_KEYMENU still arrives, but while a child holds the capture no menu loop starts (no
+  WM_ENTERMENULOOP) and the capture stays. Taken and released before the release: the menu opens.
+- `harnesses/capture-menu-scope.c`: the same for Alt+letter, F10, Alt+Space and a program-sent SC_KEYMENU; TrackPopupMenu still
+  opens.
+Before this, Wine opened every one of them. Ruled out on the way, each measured on Windows: key injection by Premiere (lab diag in
+NtUserSendInput: none), the key-message route (`syskey-route.c`: identical), wheel routing (`wheel-route.c`: identical).
+`track_keyboard_menu_bar` returns at once when `get_capture()` is set. Both harnesses give the Windows table; gate off and 146: all open.
+MEASURED (lab Premiere 2025, LrcRelease, nested desk, 146 + 68 + 69):
+- compositor input (`kwin-nested/lab-alt-cases.sh`, `PAT=trace:menu:init_tracking`, +menu): tap 3/3, quick Alt+scroll 0/4, held 0/6.
+  The check refused exactly those 10.
+- SendInput (`premiere-alt-zoom.exe`): tap 4/4, quick 0/4, held 0/4 = Windows.
+- known-bad, same build, `NEUTRON_CAPTURE_KEYMENU=0`: tap 3/3, quick 4/4, held 6/6.
+- Photoshop 2026: Alt tap still shows its own menu bar (OWL, not a Win32 menu loop; nothing refused).
+Kill switch `NEUTRON_CAPTURE_KEYMENU=0`. Lab runtime `/var/tmp/neutron-i19/rt146cap`.
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-caption-clip.mypatch` (2026-10-23) — Photoshop 2026's menu bar hidden under the document title (regression from patch 65)
+Found in the lab on 146 while checking patch 69: Photoshop's menu bar showed only while Alt was down; the document title
+("Untitled-1 @ 100% (RGB/8)") sat in its place. Photoshop keeps WS_CAPTION but its client area covers the caption band
+(WM_NCCALCSIZE) and it draws its own title bar there. Patch 65's `paint_caption` drew the caption through a whole-window DC without
+leaving out the client area; nc_paint (WM_SETTEXT's path before 65) excludes the client rect (`DCX_EXCLUDERGN`). Now `paint_caption`
+does too. Every 145/146 user with Photoshop 2026 sees it after each retitle (new document, each zoom step).
+MEASURED:
+- `harnesses/caption-client-overlap.c` (client from the window's top edge, magenta, 3 SetWindowText): 0 caption pixels on the client
+  with the patch; 15392 on 146 and with `NEUTRON_CAPTION_CLIP=0`.
+- `caption-settext.c` (patch 65's check): PASS. `caption-cache.c`: caption shows BRAVO.
+- lab Photoshop 2026 (AE2026 prefix): menu bar visible after a new document and after zooming to 50%; without the patch the title
+  covered it; with `NEUTRON_CAPTION_BUFFERED=0` it showed too.
+Kill switch `NEUTRON_CAPTION_CLIP=0`. Lab runtime `/var/tmp/neutron-i19/rt146clip` (146 + 68 + 69 + 70).

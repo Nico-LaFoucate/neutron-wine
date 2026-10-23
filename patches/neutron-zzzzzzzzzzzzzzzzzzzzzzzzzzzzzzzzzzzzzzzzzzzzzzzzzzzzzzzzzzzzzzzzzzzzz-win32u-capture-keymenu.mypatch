@@ -1,0 +1,66 @@
+win32u: Don't start a keyboard menu while a window of the thread holds the mouse capture.
+
+GitHub Neutron#35 (Premiere Pro): "on Premiere it doesn't get triggered when you hold Alt to zoom with the scroll
+wheel. However it does happen if you hold it for a short moment, even if you scrolled."
+
+Premiere's timeline takes the mouse capture on every Alt+wheel zoom and still holds it when Alt comes up; on an Alt
+tap it holds none. Measured the same way on Windows 11 build 26200 and here (harnesses/premiere-alt-zoom.c v2,
+GetGUIThreadInfo just before the release). On Windows the menu bar then stays shut (tap 4/4, Alt+wheel 0/4, held
+Alt+wheel 0/4); here it opened.
+
+Windows rule, measured on Windows 11 build 26200:
+- harnesses/capture-alt-menu.c: an Alt release still sends WM_SYSCOMMAND SC_KEYMENU, but while a child holds the
+  capture (taken before Alt, while Alt is held, or on a wheel notch under Alt) no menu loop starts (no
+  WM_ENTERMENULOOP) and the capture stays where it is. A capture taken and released before the release does not
+  matter.
+- harnesses/capture-menu-scope.c: the same for Alt+letter, F10, Alt+Space and an SC_KEYMENU the program sends
+  itself. TrackPopupMenu still opens.
+track_keyboard_menu_bar (the SC_KEYMENU path) now returns at once when get_capture() is set. Both harnesses give
+the Windows table with this patch; with NEUTRON_CAPTURE_KEYMENU=0, and on 11.10-146, every case opens.
+
+Lab Premiere Pro 2025 (clean-room LrcRelease, nested desk, runtime 11.10-146 + this patch + the Alt-repeat patch):
+- compositor input (kwin-nested/lab-alt-cases.sh, menu starts counted from +menu): Alt tap 3/3, quick Alt+scroll
+  0/4, Alt held ~1 s while scrolling 0/6; the check refused exactly those 10 keyboard menus.
+- SendInput (premiere-alt-zoom.exe): tap 4/4, quick Alt+wheel 0/4, held Alt+wheel 0/4, the Windows result.
+- known-bad, same build, NEUTRON_CAPTURE_KEYMENU=0: Alt tap 3/3, quick 4/4, held 6/6.
+Kill switch NEUTRON_CAPTURE_KEYMENU=0.
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -4566,6 +4566,14 @@
+     }
+ }
+ 
++/* NEUTRON capture-keymenu: see track_keyboard_menu_bar */
++static BOOL neutron_capture_keymenu(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_CAPTURE_KEYMENU" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ void track_keyboard_menu_bar( HWND hwnd, UINT wparam, WCHAR ch )
+ {
+     UINT flags = TPM_LEFTALIGN | TPM_LEFTBUTTON;
+@@ -4574,6 +4582,21 @@
+ 
+     TRACE( "hwnd %p wparam 0x%04x ch 0x%04x\n", hwnd, wparam, ch );
+ 
++    /* NEUTRON capture-keymenu (GitHub Neutron#35): Windows starts no keyboard menu while a window of the thread holds
++     * the mouse capture. WM_SYSCOMMAND SC_KEYMENU still arrives; no menu loop starts (no WM_ENTERMENULOOP) and the
++     * capture stays where it is. Measured on Windows 11 build 26200: Alt released while a child holds the capture --
++     * taken before Alt, while Alt was held, or on a wheel notch under Alt -- opens nothing; a capture taken and released
++     * before the Alt release does not matter (harnesses/capture-alt-menu.exe). The same for Alt+letter, F10, Alt+Space
++     * and an SC_KEYMENU the program sends itself; TrackPopupMenu still opens (capture-menu-scope.exe). With this check
++     * every case gives the Windows result. Premiere Pro's timeline takes the capture on every Alt+wheel zoom and still
++     * holds it when Alt comes up, on Windows as here, so there its menu bar stays shut; here it opened.
++     * Kill switch NEUTRON_CAPTURE_KEYMENU=0. */
++    if (get_capture() && neutron_capture_keymenu())
++    {
++        TRACE( "capture %p held, no keyboard menu\n", get_capture() );
++        return;
++    }
++
+     /* find window that has a menu */
+     while (is_win_menu_disallowed( hwnd ))
+         if (!(hwnd = NtUserGetAncestor( hwnd, GA_PARENT ))) return;
