@@ -1347,4 +1347,4 @@ MEASURED (lab Premiere 2025, LrcRelease on 145, FlickerTest with the k1-k8 clips
   between Premiere's move and hide (the parent commit per SetWindowPos). They are not a copy: no surface flush follows it.
 - `harnesses/copybits-gpu-child.c`: a D3D11 child moved over another colour and hidden leaves the parent's pixels (stock: copied
   there, FAIL; gate off: FAIL). A GDI child's bits are still copied (PASS in every arm).
-Lab runtime `/var/tmp/neutron-i19/rt145cb`. NOT YET SHIPPED.
+Lab runtime `/var/tmp/neutron-i19/rt145cb`. SHIPPED in 11.10-146 (package win32u.so x86_64 = the lab build, same build ID; package: copybits PASS / gate off FAIL, rowcascade 1/1, caption PASS, What's New clip 9/9 phases; lab Premiere on the package, 2 sessions each with only win32u.so differing: 10 rogue frames in 4 sweeps vs 46 on stock 145, input kept in all 8 sweeps).
