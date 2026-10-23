@@ -1349,7 +1349,7 @@ MEASURED (lab Premiere 2025, LrcRelease on 145, FlickerTest with the k1-k8 clips
   there, FAIL; gate off: FAIL). A GDI child's bits are still copied (PASS in every arm).
 Lab runtime `/var/tmp/neutron-i19/rt145cb`. SHIPPED in 11.10-146 (package win32u.so x86_64 = the lab build, same build ID; package: copybits PASS / gate off FAIL, rowcascade 1/1, caption PASS, What's New clip 9/9 phases; lab Premiere on the package, 2 sessions each with only win32u.so differing: 10 rogue frames in 4 sweeps vs 46 on stock 145, input kept in all 8 sweeps).
 
-### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-client-geometry-with-flush.mypatch` (2026-10-22) — the rest of Premiere's media-bin hover flash
+### ~~`neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-client-geometry-with-flush.mypatch`~~ (REMOVED 2026-10-23, never shipped — Windows does not do this; history `aaf309f`) — the rest of Premiere's media-bin hover flash
 After patch 66 (11.10-146) a rarer flash was left. Premiere moves its hover preview, still visible, to a parking spot and hides it
 ~0.5 ms later. The driver committed every window-management change of a client subsurface at once (one parent commit per
 SetWindowPos), so the compositor showed the preview's first frame at the parking spot until the hide. Lab experiment, commit left
@@ -1382,3 +1382,12 @@ App checks (10-23, lab, 146 vs patched, same steps, KWin ScreenShot2):
 Lab runtime `/var/tmp/neutron-i19/rt146batch`. **HELD, NOT SHIPPED (10-23): regresses Photoshop.** The Premiere residual it
 removes is a move-then-hide ~0.5 ms apart. Under DWM's per-frame model Windows would show it at about the same rate
 (INFERRED). Release or drop is his call.
+**Windows measurement (10-23, his Windows 11 machine, build 26200, `harnesses/dwm-movehide.exe`: every DWM-composed frame read back
+with DXGI Desktop Duplication, 100 cycles per test):**
+- Grow a GPU child, present its new frame 30 ms later: the new area showed the OLD frame stretched in all 96 composed frames of
+  the gap, the parent background in 0. Windows applies a child's new geometry at once, as 146 does. Holding it back (this patch)
+  is what showed Photoshop's white.
+- Show, present, move while visible, hide at once (Premiere's pattern): the moved child reached the screen in 1 of 100 cycles
+  (child seen at its first spot in 93 frames). Windows shows this flash too, rarely. The 146 residual is the same per-frame
+  behavior.
+REMOVED: not Windows behavior, and it regresses Photoshop.
