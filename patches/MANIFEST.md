@@ -1371,4 +1371,14 @@ kept in every sweep):
 - copybits, rowcascade, caption-settext: unchanged.
 - Premiere Source monitor playing during a 200 px divider drag and back: same as 146 (0 off-aspect/torn/missing frames; 62 vs 60
   moving frames, largest step 13 vs 18 px).
-Lab runtime `/var/tmp/neutron-i19/rt146batch`. NOT YET SHIPPED.
+App checks (10-23, lab, 146 vs patched, same steps, KWin ScreenShot2):
+- After Effects 2026 viewer maximize x4: same as 146 (settled 2 layouts, 5 vs 4 transient frames; maximized screenshot
+  pixel-identical).
+- Lightroom Classic Develop Tab x4: same kinds and rates of transient frames (146 9/65, 8/48; patched 11/92, 11/93).
+- **Photoshop 2026, new document, Tab x4: REGRESSION.** A new transient on every run (14, 15, 17 frames at ~350
+  captures/s, ~30 ms per toggle; 0 in 3 runs on 146). White covers the document and the area where the panels were.
+  The canvas child's new size waits for Photoshop's next present or idle flush (~30 ms of relayout), and meanwhile the
+  window background under it shows. DWM applies a child's new geometry at its next frame (what 146 does).
+Lab runtime `/var/tmp/neutron-i19/rt146batch`. **HELD, NOT SHIPPED (10-23): regresses Photoshop.** The Premiere residual it
+removes is a move-then-hide ~0.5 ms apart. Under DWM's per-frame model Windows would show it at about the same rate
+(INFERRED). Release or drop is his call.
