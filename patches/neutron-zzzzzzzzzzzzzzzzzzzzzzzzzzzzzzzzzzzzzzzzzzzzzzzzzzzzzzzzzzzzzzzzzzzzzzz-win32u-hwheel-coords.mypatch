@@ -1,0 +1,55 @@
+win32u: Give WM_MOUSEHWHEEL screen coordinates and never turn it into a non-client message.
+
+GitHub Neutron#31 (ThinkPad touchpad, Premiere Pro 2026): "horizontal scrolling events trigger really slow and
+generates a lot of jankyness while vertical scrolling works quite well." Their video (42 s, 60 fps, clip edge tracked
+per frame): the timeline moves only in whole 34 px steps and, during sideways swipes, steps forward and back every 1-3
+frames.
+
+Both wheel messages carry the pointer in screen coordinates and there is no non-client wheel message (MSDN). Wine's
+process_mouse_message exempted only WM_MOUSEWHEEL from the client-coordinate / non-client conversion, so
+WM_MOUSEHWHEEL arrived with client coordinates over the client area and, over the frame, as message 0xae with the
+hit-test code for wParam. Premiere ignored it: its timeline moved only through the small up/down part of a sideways
+swipe, which flips sign constantly.
+
+Measured:
+- harnesses/hwheel-coords.c (a window, SendInput one vertical and one horizontal notch in the client area and over the
+  caption): with this patch both messages carry the screen position; on 11.10-147 and with NEUTRON_HWHEEL_COORDS=0,
+  WM_MOUSEHWHEEL came at the client position (150,120 for 355,320) and as message 0xae over the caption.
+- Windows 11 build 26200, Premiere Pro 2025 (harnesses/premiere-hwheel.c v3, Desktop Duplication): WM_MOUSEHWHEEL +120 x3
+  scrolls the timeline sideways 202 px, -120 x3 back the other way, exactly as Shift+wheel x3.
+- Lab Premiere 2026 on 11.10-147 (kwin-nested/scroll-measure.sh + ruler-shift.py, fake smooth scrolling): horizontal
+  0 px in both directions (two sessions); with this patch horizontal 120 units = 8 steps of 34 px each way, as vertical.
+Kill switch NEUTRON_HWHEEL_COORDS=0.
+
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -2605,6 +2605,14 @@
+     return pointer_flags;
+ }
+ 
++/* NEUTRON hwheel-coords: see process_mouse_message */
++static BOOL neutron_hwheel_coords(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_HWHEEL_COORDS" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ /***********************************************************************
+  *          process_mouse_message
+  *
+@@ -2722,7 +2730,13 @@
+     message = msg->message;
+     wparam = msg->wParam;
+     /* Note: windows has no concept of a non-client wheel message */
+-    if (message != WM_MOUSEWHEEL)
++    /* NEUTRON hwheel-coords (GitHub Neutron#31): WM_MOUSEHWHEEL is a wheel message too -- screen coordinates in lParam,
++     * the delta in wParam, never a non-client message (MSDN). Exempting only WM_MOUSEWHEEL gave WM_MOUSEHWHEEL client
++     * coordinates over the client area, and over the frame turned it into message 0xae with the hit-test code for wParam
++     * (harnesses/hwheel-coords.c). Premiere Pro's timeline scrolls sideways on WM_MOUSEHWHEEL on Windows 11
++     * (harnesses/premiere-hwheel.exe: 3 notches = 202 px, as Shift+wheel) and ignored it here, so a touchpad's sideways
++     * swipe moved it only through the swipe's small up/down part, back and forth. Kill switch NEUTRON_HWHEEL_COORDS=0. */
++    if (message != WM_MOUSEWHEEL && (message != WM_MOUSEHWHEEL || !neutron_hwheel_coords()))
+     {
+         if (hittest != HTCLIENT)
+         {
