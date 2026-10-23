@@ -1,0 +1,56 @@
+server: Merge queued WM_MOUSEHWHEEL messages as WM_MOUSEWHEEL ones are.
+
+GitHub Neutron#31 (ThinkPad touchpad, Premiere Pro 2026), on 11.10-148: "it's still way too easy to overwhelm the
+scrolling if you move too fast, and this gets even worse if you're running on power saving mode. It feels like if the
+inputs are processed so slowly that they queue up to the point that you're left waiting for it to settle."
+
+merge_message merged a queued wheel message into the previous one (same window, same pointer position) only for
+WM_MOUSEWHEEL. Windows does it for WM_MOUSEHWHEEL too. Premiere scrolls its timeline one step per wheel message, so when
+it fell behind a fast sideways swipe every queued message became a step of its own, played back after the swipe.
+
+Measured on Windows 11 build 26200 (his machine):
+- harnesses/wheel-merge.c (10 wheel events through SendInput while the app does not read its queue): vertical notches
+  1 message (-1200), horizontal notches 1 message (+1200), small steps of 15 one message each axis (-150 / +150).
+- harnesses/touchpad-wheel.c with a real trackpad: an app spending 100 ms per message gets merged messages on both axes
+  (up to +14880 horizontal, +7680 vertical).
+Wine before this patch: vertical merged, horizontal 10 messages. With it: the Windows table (gate off: as before).
+
+Lab Premiere 2026 (clean-room AE2026, 11.10-148, fake smooth scrolling, Premiere's process paused while 30 sideways
+events arrive, then resumed): 148 played back 30 steps (1800 px); with this patch one move, the view lands about a
+screen further (0-20 s -> 20-40 s), as a vertical swipe already did. Ordinary sideways scrolling unchanged (8 steps
+of 34 px each way for 120 units).
+Kill switch NEUTRON_HWHEEL_MERGE=0 (read by wineserver).
+
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -856,7 +856,15 @@
+     return prev;
+ }
+ 
+-/* try to merge a WM_MOUSEWHEEL message with the last in the list; return 1 if successful */
++/* NEUTRON hwheel-merge: see merge_message */
++static int neutron_hwheel_merge(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_HWHEEL_MERGE" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++/* try to merge a WM_MOUSEWHEEL or WM_MOUSEHWHEEL message with the last in the list; return 1 if successful */
+ static int merge_mousewheel( struct thread_input *input, const struct message *msg )
+ {
+     struct message *prev;
+@@ -937,6 +945,13 @@
+ static int merge_message( struct thread_input *input, const struct message *msg )
+ {
+     if (msg->msg == WM_MOUSEWHEEL) return merge_mousewheel( input, msg );
++    /* NEUTRON hwheel-merge (GitHub Neutron#31): Windows merges queued WM_MOUSEHWHEEL messages the same way. Measured on
++     * Windows 11 build 26200 (harnesses/wheel-merge.c): 10 horizontal notches sent while the app is busy arrive as one
++     * message of +1200 (10 small steps of 15: one of +150), as the vertical ones do; a real trackpad's stream reaches a
++     * slow app merged on both axes (touchpad-wheel.c: up to +14880 in one message). Here they arrived one by one, and
++     * Premiere Pro, which scrolls one step per wheel message, kept scrolling long after a fast sideways swipe ("they queue
++     * up to the point that you're left waiting for it to settle"). Kill switch NEUTRON_HWHEEL_MERGE=0. */
++    if (msg->msg == WM_MOUSEHWHEEL && neutron_hwheel_merge()) return merge_mousewheel( input, msg );
+     if (msg->msg == WM_MOUSEMOVE) return merge_mousemove( input, msg );
+     if (msg->msg == WM_WINE_CLIPCURSOR) return merge_unique_message( input, WM_WINE_CLIPCURSOR, msg );
+     if (msg->msg == WM_WINE_SETCURSOR) return merge_unique_message( input, WM_WINE_SETCURSOR, msg );
