@@ -1465,4 +1465,5 @@ messages on both axes (up to +14880). Wine 148: horizontal 10 messages; with the
 Lab Premiere 2026 (`kwin-nested/stall-measure.sh`: Premiere's process paused while 30 sideways events arrive): 148 played back 30 steps
 (1800 px); patched one move, the view lands about a screen further (0-20 s -> 20-40 s), as vertical already did. Ordinary sideways scrolling
 unchanged (8 x 34 px per 120 units). Kill switch `NEUTRON_HWHEEL_MERGE=0` (wineserver). Lab runtime `/var/tmp/neutron-i19/rt148mw`
-(148 + this wineserver).
+(148 + this wineserver). SHIPPED in 11.10-149 (package wineserver = the lab build, same build ID; package: wheel-merge = the Windows table, gate off
+as 148; lab Premiere 2026 on the package: stalled sideways swipe one move, ordinary scrolling unchanged).
