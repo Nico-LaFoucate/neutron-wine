@@ -1452,4 +1452,4 @@ MEASURED:
   back, exactly as Shift+wheel x3. (v1 GDI capture was blind to Premiere's timeline; v2 measured sideways only.)
 - Lab Premiere 2026 (AE2026 prefix, `kwin-nested/scroll-measure.sh` + `ruler-shift.py`): 147 horizontal 0 px both ways (2 sessions); with the
   patch horizontal 120 units = 8 steps of 34 px each way, same as vertical, no steps back.
-Kill switch `NEUTRON_HWHEEL_COORDS=0`. Lab runtime `/var/tmp/neutron-i19/rt147hw` (147 + 71).
+Kill switch `NEUTRON_HWHEEL_COORDS=0`. Lab runtime `/var/tmp/neutron-i19/rt147hw` (147 + 71). SHIPPED in 11.10-148 (package win32u.so x86_64 = the lab build, same build ID; package: hwheel-coords PASS / gate off FAIL; lab Premiere 2026 on the package 8 steps each way, horizontal and vertical; Photoshop sideways scrolling identical to 147).
