@@ -1453,3 +1453,16 @@ MEASURED:
 - Lab Premiere 2026 (AE2026 prefix, `kwin-nested/scroll-measure.sh` + `ruler-shift.py`): 147 horizontal 0 px both ways (2 sessions); with the
   patch horizontal 120 units = 8 steps of 34 px each way, same as vertical, no steps back.
 Kill switch `NEUTRON_HWHEEL_COORDS=0`. Lab runtime `/var/tmp/neutron-i19/rt147hw` (147 + 71). SHIPPED in 11.10-148 (package win32u.so x86_64 = the lab build, same build ID; package: hwheel-coords PASS / gate off FAIL; lab Premiere 2026 on the package 8 steps each way, horizontal and vertical; Photoshop sideways scrolling identical to 147).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-server-hwheel-merge.mypatch` (2026-10-23) — fast sideways touchpad swipes queued up in Premiere (GitHub Neutron#31, after 148)
+Reporter on 148: *"it's still way too easy to overwhelm the scrolling if you move too fast, and this gets even worse if you're running on
+power saving mode. It feels like if the inputs are processed so slowly that they queue up to the point that you're left waiting for it to
+settle."* The wine server merged a queued wheel message into the previous one (same window and pointer position) only for WM_MOUSEWHEEL;
+Premiere scrolls one step per message, so when it fell behind, every queued WM_MOUSEHWHEEL became a step of its own after the swipe.
+MEASURED on Windows 11 build 26200 (his machine): `harnesses/wheel-merge.c` (10 events while the app does not read its queue): vertical AND
+horizontal arrive as ONE message (+-1200; small steps +-150). `harnesses/touchpad-wheel.c` with a real trackpad: a slow app gets merged
+messages on both axes (up to +14880). Wine 148: horizontal 10 messages; with the patch the Windows table; gate off as 148.
+Lab Premiere 2026 (`kwin-nested/stall-measure.sh`: Premiere's process paused while 30 sideways events arrive): 148 played back 30 steps
+(1800 px); patched one move, the view lands about a screen further (0-20 s -> 20-40 s), as vertical already did. Ordinary sideways scrolling
+unchanged (8 x 34 px per 120 units). Kill switch `NEUTRON_HWHEEL_MERGE=0` (wineserver). Lab runtime `/var/tmp/neutron-i19/rt148mw`
+(148 + this wineserver).
