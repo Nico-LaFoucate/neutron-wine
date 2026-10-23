@@ -1403,7 +1403,7 @@ not). A repeat (KEYDATA_PREVSTATE) is not a new press and now leaves the state a
 MEASURED on Windows 11 build 26200 (`harnesses/alt-repeat-menu.c`, DefWindowProc and SendInput): Alt released after 0/1/2/3/8 repeats
 opens the menu once every time, after nothing, a wheel notch or a mouse move; a click cancels. Wine with this patch: the same table.
 Alone it makes a held Alt+wheel in Premiere open the menu every time (the toggling had kept it shut); patch 69 keeps it shut, as on
-Windows. Ships together with 69. Kill switch `NEUTRON_ALT_REPEAT=0`. Lab runtimes `/var/tmp/neutron-i19/rt146alt`, `rt146cap`.
+Windows. Ships together with 69. Kill switch `NEUTRON_ALT_REPEAT=0`. Lab runtimes `/var/tmp/neutron-i19/rt146alt`, `rt146cap`. SHIPPED in 11.10-147 (package: alt-repeat-menu PASS, 146 FAIL).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-capture-keymenu.mypatch` (2026-10-23) — Premiere: Alt+wheel zoom opened the menu bar (GitHub Neutron#35)
 Premiere's timeline takes the mouse capture on every Alt+wheel zoom and still holds it at the Alt release; on a tap it holds none.
@@ -1422,7 +1422,7 @@ MEASURED (lab Premiere 2025, LrcRelease, nested desk, 146 + 68 + 69):
 - SendInput (`premiere-alt-zoom.exe`): tap 4/4, quick 0/4, held 0/4 = Windows.
 - known-bad, same build, `NEUTRON_CAPTURE_KEYMENU=0`: tap 3/3, quick 4/4, held 6/6.
 - Photoshop 2026: Alt tap still shows its own menu bar (OWL, not a Win32 menu loop; nothing refused).
-Kill switch `NEUTRON_CAPTURE_KEYMENU=0`. Lab runtime `/var/tmp/neutron-i19/rt146cap`.
+Kill switch `NEUTRON_CAPTURE_KEYMENU=0`. Lab runtime `/var/tmp/neutron-i19/rt146cap`. SHIPPED in 11.10-147 (package: capture-alt-menu / capture-menu-scope = the Windows tables; lab Premiere on the package: tap 3/3 + 4/4, quick 0/4 + 0/4, held 0/6 + 0/4).
 
 ### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-caption-clip.mypatch` (2026-10-23) — Photoshop 2026's menu bar hidden under the document title (regression from patch 65)
 Found in the lab on 146 while checking patch 69: Photoshop's menu bar showed only while Alt was down; the document title
@@ -1436,4 +1436,4 @@ MEASURED:
 - `caption-settext.c` (patch 65's check): PASS. `caption-cache.c`: caption shows BRAVO.
 - lab Photoshop 2026 (AE2026 prefix): menu bar visible after a new document and after zooming to 50%; without the patch the title
   covered it; with `NEUTRON_CAPTION_BUFFERED=0` it showed too.
-Kill switch `NEUTRON_CAPTION_CLIP=0`. Lab runtime `/var/tmp/neutron-i19/rt146clip` (146 + 68 + 69 + 70).
+Kill switch `NEUTRON_CAPTION_CLIP=0`. Lab runtime `/var/tmp/neutron-i19/rt146clip` (146 + 68 + 69 + 70). SHIPPED in 11.10-147 (package win32u.so x86_64 = the lab build, same build ID; caption-client-overlap PASS / clip off FAIL, caption-settext PASS; lab Photoshop menu bar visible after a new document and a zoom to 50%).
