@@ -1,0 +1,68 @@
+win32u: Leave the client area out when WM_SETTEXT repaints the caption.
+
+Regression from neutron-...-win32u-caption-settext (patch 65, 11.10-145): Photoshop 2026's menu bar was hidden
+under the document title ("Untitled-1 @ 100% (RGB/8)") and showed only while Alt was down; every retitle (a new
+document, each zoom step) drew it again. Found in the lab on 11.10-146 (clean-room AE2026 prefix, nested desk).
+
+Photoshop keeps WS_CAPTION but moves its client area over the caption band (WM_NCCALCSIZE) and draws its own title
+bar there, menu bar included. paint_caption drew the standard caption rectangle through a whole-window DC
+(DCX_WINDOW) without leaving out the client area; the caption is non-client paint, and nc_paint, which WM_SETTEXT
+used before patch 65, excludes the client rectangle (DCX_EXCLUDERGN). paint_caption now asks for its DC the same way.
+
+Measured:
+- harnesses/caption-client-overlap.c (WS_OVERLAPPEDWINDOW, client from the window's top edge, filled magenta, three
+  SetWindowText calls): 0 caption pixels on the client with this patch; 15392 on 11.10-146 and with
+  NEUTRON_CAPTION_CLIP=0.
+- harnesses/caption-settext.c (patch 65's check, the caption after SetWindowText equals a full frame repaint): PASS.
+  harnesses/caption-cache.c (Lightroom Classic's lagging title): the caption shows BRAVO.
+- Lab Photoshop 2026: with this patch the menu bar shows after a new document and after zooming to 50%; on the same
+  build without it, the title covered it. With NEUTRON_CAPTION_BUFFERED=0 (patch 65 off) the menu bar showed too.
+Kill switch NEUTRON_CAPTION_CLIP=0.
+
+--- a/dlls/win32u/defwnd.c
++++ b/dlls/win32u/defwnd.c
+@@ -1866,12 +1866,20 @@
+  * colour, caption band included, so a flush from another thread in between showed a blank title bar: Premiere Pro
+  * retitles its window with unchanged text on every in/out point, and the title bar flashed blank on ~25% of them.
+  * The rectangle is the one nc_paint draws the caption in (same frame insets). */
++static BOOL neutron_caption_clip(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_CAPTION_CLIP" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ static void paint_caption( HWND hwnd )
+ {
+     DWORD style = get_window_long( hwnd, GWL_STYLE ), ex_style = get_window_long( hwnd, GWL_EXSTYLE );
+-    RECT rect, r;
++    RECT rect, r, client;
+     BOOL active;
+     WND *win;
++    HRGN rgn;
+     HDC hdc;
+ 
+     if (!(style & WS_VISIBLE) || (style & WS_CAPTION) != WS_CAPTION) return;
+@@ -1889,7 +1897,21 @@
+     r = rect;
+     r.bottom = rect.top + get_system_metrics( (ex_style & WS_EX_TOOLWINDOW) ? SM_CYSMCAPTION : SM_CYCAPTION );
+ 
+-    if (!(hdc = NtUserGetDCEx( hwnd, 0, DCX_USESTYLE | DCX_WINDOW ))) return;
++    /* NEUTRON caption-clip: the caption is non-client paint, so leave the client area out, as nc_paint does. An app
++     * that keeps WS_CAPTION but moves its client area over the caption band (WM_NCCALCSIZE) draws its own title bar
++     * there: Photoshop 2026 has its menu bar in it, and every retitle (a new document, each zoom step, "@ 66.7%") drew
++     * our caption text over the menu bar until something repainted it. NEUTRON_CAPTION_CLIP=0 draws unclipped. */
++    if (neutron_caption_clip())
++    {
++        get_client_rect_rel( hwnd, COORDS_SCREEN, &client, get_thread_dpi() );
++        rgn = NtGdiCreateRectRgn( client.left, client.top, client.right, client.bottom );
++        if (!(hdc = NtUserGetDCEx( hwnd, rgn, DCX_USESTYLE | DCX_WINDOW | DCX_EXCLUDERGN )))
++        {
++            NtGdiDeleteObjectApp( rgn );
++            return;
++        }
++    }
++    else if (!(hdc = NtUserGetDCEx( hwnd, 0, DCX_USESTYLE | DCX_WINDOW ))) return;
+     draw_nc_caption_buffered( hdc, &r, hwnd, style, ex_style, active );
+     NtUserReleaseDC( hwnd, hdc );
+ 
