@@ -1,0 +1,254 @@
+winewayland, win32u: Publish a GPU child window's new geometry with the window's next flush.
+
+His words (2026-07-30, still live 2026-10-20): "the image of another thumbnail would flicker over the place of another
+thumbnail for a split second" (Premiere Pro media bin, hovering over clips). 11.10-146 removed the main cause (a GDI copy
+of the bits under the preview, patch 66); this is what was left.
+
+On each hover change Premiere shows its new preview window (WS_CHILD, a D3D swapchain) over the tile, then moves it,
+still visible, to a parking spot and hides it ~0.5 ms later. The driver committed every window-management change of a
+client subsurface at once (one parent commit per SetWindowPos), so the compositor showed the preview's first frame at
+the parking spot until the hide. Leaving that commit out removed it (lab experiment: 0 rogue frames in 4 hover sweeps,
+272 parking moves, against 10 on 146).
+
+Wine already publishes a window's GDI content in batches, when the thread goes idle (flush_window_surfaces). Now a
+client subsurface's position and crop from window management go out with that same commit, so the compositor sees a
+window and its children together, as DWM composes a window's surface and its child visuals in one frame:
+- winewayland: wayland_client_surface_attach_rect leaves window-management changes pending (geom_pending) when the
+  toplevel publishes window surface contents; a present still commits at once. set_window_surface_contents commits
+  pending crops synchronized with the toplevel's commit, so crop and position land together (the 2026-10-13 What's New
+  rule: a paused video must not keep a stale crop).
+- win32u: after a SetWindowPos that updated on-screen client surfaces, the toplevel's window surface is queued
+  (publish_client_geometry -> window_surface_publish_geometry) and marked dirty only when flush_window_surfaces really
+  flushes (at idle, or after 50 ms on a thread that never idles). Marking it at once let a flush in the middle of the
+  app's own move-and-hide (a DC released while the thread had been idle a moment before) publish the move: 7 rogue
+  frames in 4 sweeps with that version.
+Gate: NEUTRON_CLIENT_GEOM_BATCH=0 (both modules) restores the per-call commit.
+
+Measured (lab Premiere 2025 on the 11.10-146 package + these two modules, nested desk, KWin ScreenShot2 ~110
+captures/s, two 25 s hover sweeps per session, input kept in every sweep):
+- with the patch: 0 rogue frames in 6 sweeps (408 parking moves); 146: 10 in 4; NEUTRON_CLIENT_GEOM_BATCH=0: 4 in 2.
+- harnesses/clipped-gpu-child (Lightroom Classic's What's New): 9/9 phases, gate on and off. The leave-it-out
+  experiment FAILS 4 of them (a stopped video vanishes, a scrolled one spills), so the check tells them apart.
+- copybits-gpu-child, rowcascade (plain/nested), caption-settext: unchanged (PASS / 1 / 1 / PASS).
+- Premiere's Source monitor playing while the Source/Program divider is dragged 200 px and back: same as 146 (no
+  frame off 16:9, none torn, none missing; the picture moved in 62 vs 60 captured frames, largest step 13 vs 18 px).
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -1047,9 +1047,32 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON client-geom-batch: window surfaces whose client surfaces' geometry changed (publish_client_geometry in
++ * window.c). Marked dirty only when flush_window_surfaces really flushes -- at idle, or after 50 ms on a thread that
++ * never idles -- so a flush made in the middle of the app's own sequence (a DC released while the thread was idle a
++ * moment ago) does not publish a move the app undoes or hides right after. */
++static struct window_surface *geometry_pending[16];
++static UINT geometry_pending_count;
++
++void window_surface_publish_geometry( struct window_surface *surface )
++{
++    UINT i;
++
++    pthread_mutex_lock( &surfaces_lock );
++    for (i = 0; i < geometry_pending_count; i++) if (geometry_pending[i] == surface) break;
++    if (i == geometry_pending_count && i < ARRAY_SIZE(geometry_pending))
++    {
++        window_surface_add_ref( surface );
++        geometry_pending[geometry_pending_count++] = surface;
++    }
++    pthread_mutex_unlock( &surfaces_lock );
++}
++
+ void flush_window_surfaces( BOOL idle )
+ {
+     static DWORD last_idle;
++    struct window_surface *pending[ARRAY_SIZE(geometry_pending)];
++    UINT i, npending = 0;
+     DWORD now;
+     struct window_surface *surface;
+ 
+@@ -1059,10 +1082,22 @@
+     /* if not idle, we only flush if there's evidence that the app never goes idle */
+     else if ((int)(now - last_idle) < 50) goto done;
+ 
++    /* NEUTRON client-geom-batch: one pixel is enough for the flush to commit the window, and the commit carries its
++     * client surfaces' new geometry */
++    for (i = 0; i < geometry_pending_count; i++)
++    {
++        window_surface_lock( geometry_pending[i] );
++        if (IsRectEmpty( &geometry_pending[i]->bounds )) SetRect( &geometry_pending[i]->bounds, 0, 0, 1, 1 );
++        window_surface_unlock( geometry_pending[i] );
++        pending[npending++] = geometry_pending[i];
++    }
++    geometry_pending_count = 0;
++
+     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
+         window_surface_flush( surface );
+ done:
+     pthread_mutex_unlock( &surfaces_lock );
++    for (i = 0; i < npending; i++) window_surface_release( pending[i] );
+ }
+ 
+ /***********************************************************************
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -54,6 +54,7 @@
+ extern HRGN get_window_visible_region( HWND hwnd );
+ extern HRGN get_client_visible_region( HWND hwnd );
+ extern HRGN get_client_surfaces_region( HWND hwnd );
++extern void window_surface_publish_geometry( struct window_surface *surface );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+                                       const RECT *old_visible_rect, const RECT *valid_rects );
+ extern void register_window_surface( struct window_surface *old,
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -378,6 +378,42 @@
+     return region;
+ }
+ 
++/* NEUTRON client-geom-batch (see winewayland's neutron_client_geom_batch): the driver leaves a client surface's new
++ * geometry for the window's next commit, the window surface flush. After a SetWindowPos that updated on-screen client
++ * surfaces (`moved` and its subtree, or every one of the toplevel's when `moved` is 0, as update_client_surfaces), queue
++ * the toplevel's window surface so the next real flush (window_surface_publish_geometry, dce.c) makes that commit even
++ * when nothing was painted. Kill switch NEUTRON_CLIENT_GEOM_BATCH=0. */
++static void publish_client_geometry( HWND toplevel, HWND moved )
++{
++    static int on = -1;
++    struct client_surface *surface;
++    struct window_surface *window_surface = NULL;
++    BOOL found = FALSE;
++    WND *win;
++
++    if (on < 0) { const char *e = getenv( "NEUTRON_CLIENT_GEOM_BATCH" ); on = !(e && e[0] == '0'); }
++    if (!on || !toplevel) return;
++
++    pthread_mutex_lock( &surfaces_lock );
++    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
++    {
++        if (!surface->hwnd || surface->offscreen) continue;
++        if (NtUserGetAncestor( surface->hwnd, GA_ROOT ) != toplevel) continue;
++        if (moved && surface->hwnd != moved && !is_child( moved, surface->hwnd )) continue;
++        found = TRUE;
++        break;
++    }
++    pthread_mutex_unlock( &surfaces_lock );
++    if (!found) return;
++
++    if (!(win = get_win_ptr( toplevel )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
++    if ((window_surface = win->surface)) window_surface_add_ref( window_surface );
++    release_win_ptr( win );
++    if (!window_surface) return;
++    window_surface_publish_geometry( window_surface );
++    window_surface_release( window_surface );
++}
++
+ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd )
+ {
+     struct client_surface *surface;
+@@ -3086,6 +3122,8 @@
+          * toplevel; anything else only moves `hwnd`'s own subtree. */
+         update_client_surfaces( toplevel, (swp_flags & SWP_NOZORDER) &&
+                                           !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ? hwnd : 0 );
++        publish_client_geometry( toplevel, (swp_flags & SWP_NOZORDER) &&
++                                           !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ? hwnd : 0 );
+ 
+         /* NEUTRON: if this move took a per-monitor-DPI-aware top-level window onto a monitor with a
+          * different dpi, tell it so it re-renders its UI at the new dpi. Wine has no WM_DPICHANGED
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -371,7 +371,11 @@
+     wl_fixed_t vp_src[4];
+     int vp_dst_w, vp_dst_h;
+     LONG vp_dirty;
++    /* NEUTRON client-geom-batch: window management changed the position or crop and left it for the toplevel's next
++     * commit (see neutron_client_geom_batch) */
++    BOOL geom_pending;
+ };
++BOOL neutron_client_geom_batch(void);
+ 
+ struct wayland_shm_buffer
+ {
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -3895,6 +3895,26 @@
+     return NULL;
+ }
+ 
++/* NEUTRON client-geom-batch (2026-10-22, Premiere Pro media bin: "the image of another thumbnail would flicker over the
++ * place of another thumbnail for a split second"). A GPU child window's new position or crop from window management
++ * (SetWindowPos, a container scrolling) used to be committed to the compositor at once, one parent commit per call. An
++ * app that moves a window and hides it straight after then shows the move: Premiere moves its hover preview, still
++ * visible, to a parking spot and hides it ~0.5 ms later, and the preview's frame flashed there (5 frames in 133 such
++ * moves on the nested desk, 0 with the commit left out). Wine already publishes a window's GDI content in batches, when
++ * the thread goes idle (flush_window_surfaces); this publishes child geometry with that same commit, so the
++ * compositor sees the window and its children together, as DWM composes a window's surface and its child visuals in
++ * one frame. win32u marks the window surface dirty after such a change (publish_client_geometry), so the commit comes
++ * at the latest with the next idle flush (50 ms on a thread that never idles); a present to any of the window's client
++ * surfaces commits it sooner. A crop change is committed synchronized with that commit
++ * (set_window_surface_contents), keeping crop and position together. Kill switch NEUTRON_CLIENT_GEOM_BATCH=0 (read by
++ * win32u too). */
++BOOL neutron_client_geom_batch(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_CLIENT_GEOM_BATCH", TRUE);
++    return on;
++}
++
+ /* NEUTRON round-34 lock-order fix: variant taking a PRE-COMPUTED client rect so
+  * the vkQueuePresent-thread caller (wayland_client_surface_update) can perform
+  * all user-lock queries BEFORE taking win_data_mutex. rect==NULL keeps the
+@@ -3980,6 +4000,15 @@
+ 
+     wayland_surface_reconfigure_client(surface, client, &client_rect, clip);
+ 
++    /* NEUTRON client-geom-batch: window management (not a present) leaves the new position and crop for the
++     * toplevel's next commit, see neutron_client_geom_batch(). Only when the toplevel publishes window surface contents:
++     * without them no flush would ever make that commit. */
++    if (neutron_client_geom_batch() && !client->client.present_busy && toplevel_data->window_contents)
++    {
++        client->geom_pending = TRUE;
++        return;
++    }
++
+     /* NEUTRON: a viewport change (crop/size) is CLIENT-surface state and shows only when that surface commits; the
+      * position is parent state and shows with the commit below. Left to the app's next present, a container
+      * scrolling a video moved it at once but cropped it a frame late (flicker at the clip edge), and a paused
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -2451,8 +2451,35 @@
+     {
+         if (wayland_surface_reconfigure(wayland_surface))
+         {
++            /* NEUTRON client-geom-batch: this commit applies the positions window management left pending for this
++             * window's client subsurfaces; their pending crops go out synchronized with it. Same sequence as
++             * wayland_client_surface_attach_rect's, never inside a present (present_busy). */
++            struct wayland_client_surface *synced[32];
++            struct wayland_win_data *d;
++            UINT i, nsynced = 0;
++
++            RB_FOR_EACH_ENTRY(d, &win_data_rb, struct wayland_win_data, entry)
++            {
++                struct wayland_client_surface *c = d->client_surface;
++
++                if (!c || !c->geom_pending || c->toplevel_wl_surface != wayland_surface->wl_surface) continue;
++                c->geom_pending = FALSE;
++                if (nsynced < ARRAY_SIZE(synced) && c->vp_dirty && c->client.buffer_width && c->wl_subsurface &&
++                    !InterlockedCompareExchange(&c->client.present_busy, 1, 0))
++                {
++                    wl_subsurface_set_sync(c->wl_subsurface);
++                    wl_surface_commit(c->wl_surface);
++                    synced[nsynced++] = c;
++                }
++            }
+             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
+             wl_surface_commit(wayland_surface->wl_surface);
++            for (i = 0; i < nsynced; i++)
++            {
++                wl_subsurface_set_desync(synced[i]->wl_subsurface);
++                InterlockedExchange(&synced[i]->vp_dirty, 0);
++                InterlockedExchange(&synced[i]->client.present_busy, 0);
++            }
+             committed = TRUE;
+         }
+         else

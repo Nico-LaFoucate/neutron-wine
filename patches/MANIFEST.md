@@ -1348,3 +1348,27 @@ MEASURED (lab Premiere 2025, LrcRelease on 145, FlickerTest with the k1-k8 clips
 - `harnesses/copybits-gpu-child.c`: a D3D11 child moved over another colour and hidden leaves the parent's pixels (stock: copied
   there, FAIL; gate off: FAIL). A GDI child's bits are still copied (PASS in every arm).
 Lab runtime `/var/tmp/neutron-i19/rt145cb`. SHIPPED in 11.10-146 (package win32u.so x86_64 = the lab build, same build ID; package: copybits PASS / gate off FAIL, rowcascade 1/1, caption PASS, What's New clip 9/9 phases; lab Premiere on the package, 2 sessions each with only win32u.so differing: 10 rogue frames in 4 sweeps vs 46 on stock 145, input kept in all 8 sweeps).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-winewayland-client-geometry-with-flush.mypatch` (2026-10-22) — the rest of Premiere's media-bin hover flash
+After patch 66 (11.10-146) a rarer flash was left. Premiere moves its hover preview, still visible, to a parking spot and hides it
+~0.5 ms later. The driver committed every window-management change of a client subsurface at once (one parent commit per
+SetWindowPos), so the compositor showed the preview's first frame at the parking spot until the hide. Lab experiment, commit left
+out: 0 rogue frames in 4 sweeps (272 parking moves), against 10 on 146.
+Wine already publishes GDI content in batches at idle (flush_window_surfaces). A client subsurface's position and crop from window
+management now go out with that same commit, as DWM composes a window's surface and its child visuals in one frame:
+- winewayland: attach_rect leaves window-management changes pending (`geom_pending`) when the toplevel publishes window surface
+  contents; a present still commits at once. `set_window_surface_contents` commits pending crops synchronized with the toplevel's
+  commit (What's New rule: a paused video must not keep a stale crop).
+- win32u: `publish_client_geometry` queues the toplevel's window surface (`window_surface_publish_geometry`, dce.c). It is marked
+  dirty only when `flush_window_surfaces` really flushes (idle, or 50 ms without idle). Marking it at once let a mid-sequence
+  flush publish the move (7 rogue frames in 4 sweeps with that version).
+Kill switch `NEUTRON_CLIENT_GEOM_BATCH=0` (both modules).
+MEASURED (lab Premiere 2025 on the 146 package + both modules, nested desk, ~110 captures/s, two 25 s sweeps per session; input
+kept in every sweep):
+- patched: 0 rogue frames in 6 sweeps (408 parking moves). 146: 10 in 4. Switch off: 4 in 2.
+- `clipped-gpu-child` (LrC What's New): 9/9 phases, switch on and off. The leave-it-out experiment FAILS 4, so the check
+  discriminates.
+- copybits, rowcascade, caption-settext: unchanged.
+- Premiere Source monitor playing during a 200 px divider drag and back: same as 146 (0 off-aspect/torn/missing frames; 62 vs 60
+  moving frames, largest step 13 vs 18 px).
+Lab runtime `/var/tmp/neutron-i19/rt146batch`. NOT YET SHIPPED.
