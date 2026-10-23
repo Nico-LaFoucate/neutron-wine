@@ -1437,3 +1437,19 @@ MEASURED:
 - lab Photoshop 2026 (AE2026 prefix): menu bar visible after a new document and after zooming to 50%; without the patch the title
   covered it; with `NEUTRON_CAPTION_BUFFERED=0` it showed too.
 Kill switch `NEUTRON_CAPTION_CLIP=0`. Lab runtime `/var/tmp/neutron-i19/rt146clip` (146 + 68 + 69 + 70). SHIPPED in 11.10-147 (package win32u.so x86_64 = the lab build, same build ID; caption-client-overlap PASS / clip off FAIL, caption-settext PASS; lab Photoshop menu bar visible after a new document and a zoom to 50%).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-win32u-hwheel-coords.mypatch` (2026-10-23) — touchpad sideways scrolling in Premiere slow and janky (GitHub Neutron#31)
+Reporter (ThinkPad, Premiere 2026, after 143's smooth-scroll fix): *"horizontal scrolling events trigger really slow and generates a lot of
+jankyness while vertical scrolling works quite well."* Their video (his OK to download; 60 fps, clip edge tracked per frame): the timeline
+moves only in whole 34 px steps and, during sideways swipes, steps forward and back every 1-3 frames.
+`process_mouse_message` exempted only WM_MOUSEWHEEL from the client-coordinate / non-client conversion. WM_MOUSEHWHEEL got CLIENT coordinates
+over the client area and, over the frame, became message 0xae with the hit-test code in wParam. Both wheel messages carry SCREEN coordinates
+and there is no non-client wheel message (MSDN). Premiere ignored the misplaced message, so only the swipe's small up/down part (which flips
+sign) moved the timeline.
+MEASURED:
+- `harnesses/hwheel-coords.c`: PASS with the patch; 147 and `NEUTRON_HWHEEL_COORDS=0`: HWHEEL at 150,120 for screen 355,320, 0xae over the caption.
+- Windows 11 build 26200, Premiere 2025 (`harnesses/premiere-hwheel.c` v3, Desktop Duplication): HWHEEL +120 x3 = sideways 202 px, -120 x3
+  back, exactly as Shift+wheel x3. (v1 GDI capture was blind to Premiere's timeline; v2 measured sideways only.)
+- Lab Premiere 2026 (AE2026 prefix, `kwin-nested/scroll-measure.sh` + `ruler-shift.py`): 147 horizontal 0 px both ways (2 sessions); with the
+  patch horizontal 120 units = 8 steps of 34 px each way, same as vertical, no steps back.
+Kill switch `NEUTRON_HWHEEL_COORDS=0`. Lab runtime `/var/tmp/neutron-i19/rt147hw` (147 + 71).
