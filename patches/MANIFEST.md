@@ -1467,3 +1467,21 @@ Lab Premiere 2026 (`kwin-nested/stall-measure.sh`: Premiere's process paused whi
 unchanged (8 x 34 px per 120 units). Kill switch `NEUTRON_HWHEEL_MERGE=0` (wineserver). Lab runtime `/var/tmp/neutron-i19/rt148mw`
 (148 + this wineserver). SHIPPED in 11.10-149 (package wineserver = the lab build, same build ID; package: wheel-merge = the Windows table, gate off
 as 148; lab Premiere 2026 on the package: stalled sideways swipe one move, ordinary scrolling unchanged).
+
+### `neutron-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-d2d1-flush-hold.mypatch` (2026-10-23) — black strip under the tab row of a maximized After Effects panel
+Seen in lab After Effects 2026 (146 to 149): Composition panel maximized (backtick) -> a full-width black strip where the restored panel shows
+its "Comp 1" button, until something else repaints the panel. After Effects paints the panel in one BeginDraw..EndDraw and calls
+ID2D1DeviceContext::Flush twice in the middle; the navigator row is drawn after the first Flush. Flush calls the present hook (as upstream
+Wine does); under DC-direct that present blitted back and RELEASED the frame DC taken at BeginDraw, so the second Flush and EndDraw blitted
+nothing. Content drawn after a first Flush arrived only on the next paint, from the retained bitmap; after a resize the bitmap is new, so
+the row stayed black. Measured with a lab-only op trace (temporary d2d1 build, never emitted): the row's draws are identical in the first
+frame after the resize and in a forced repaint (`harnesses/redraw.c`); only their delivery differed.
+Fix: a Flush does not present a DC-direct HwndRenderTarget; EndDraw blits the region drawn since BeginDraw (the union already accumulates
+from BeginDraw) and releases the DC. D2D API: Flush executes pending commands, an HwndRenderTarget presents in EndDraw (documented, not
+measured on Windows). `harnesses/d2d-flush-present.c` (child window, BeginDraw / top red / Flush / bottom blue / Flush / EndDraw,
+NEUTRON_D2D_DCDIRECT=1): 149 bottom half black FAIL; patched PASS; kill switch off FAIL; no Flush or no DC-direct PASS either way.
+Lab After Effects 2026 on 149 + this d2d1: row shown (band mean 30,30,30, "Comp 1" button) 2 of 2 maximizes; 149 black (0,0,0) every time.
+Lab Premiere 2026 makes NO Flush calls (0 with every d2d FIXME logged): unchanged; four maximized panels render normally.
+Lab Media Encoder 2026 DOES call Flush (140 at startup): patched vs kill switch off pixel-identical in two matched states (Queue maximized,
+presets expanded). Audition (also DC-direct) not installed in the lab: untested.
+Kill switch `NEUTRON_D2D_FLUSH_HOLD=0`. Lab runtime `/var/tmp/neutron-i19/rt149fh` (149 + this d2d1, x86_64 and i386).

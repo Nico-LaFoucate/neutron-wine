@@ -1,0 +1,115 @@
+d2d1: Present DC-direct HwndRenderTargets at EndDraw only, not on Flush.
+
+Lab After Effects 2026 (clean-room AE2026, 11.10-146 to 149): with the Composition panel maximized (backtick), a black
+strip spans the full width under the panel's tab row, where the restored panel shows its "Comp 1" button. It stays
+until something else repaints the panel.
+
+After Effects paints the panel in one BeginDraw..EndDraw and calls ID2D1DeviceContext::Flush twice in the middle. The
+navigator row (a full-width 3834x70 fill, the "Comp 1" button, its text, the border line) is drawn after the first
+Flush. Flush calls the present hook, as in upstream Wine. Under DC-direct (NEUTRON_D2D_DCDIRECT=1: After Effects,
+Premiere, Media Encoder, Audition) that present blitted the drawn region back into the window and released the frame
+DC taken at BeginDraw, so the second Flush and EndDraw had no DC and blitted nothing. Whatever the app drew after its
+first Flush reached the window only on the panel's next paint, from the retained bitmap. After a resize the bitmap is
+new, so the row stayed black (all zeros), and After Effects asks for no further paint.
+
+In the D2D API, Flush executes the pending commands and an HwndRenderTarget presents in EndDraw (documented behavior,
+not measured on Windows). Now a Flush does not present a DC-direct HwndRenderTarget: EndDraw blits the region drawn
+since BeginDraw (the union already accumulates from BeginDraw) and releases the frame DC.
+
+harnesses/d2d-flush-present.c (child window, HwndRenderTarget with RETAIN_CONTENTS | IMMEDIATELY: BeginDraw, top half
+red, Flush, bottom half blue, Flush, EndDraw, then GetDC readback), NEUTRON_D2D_DCDIRECT=1: 149 leaves the bottom half
+black (FAIL); with this patch both halves show (PASS); kill switch off: FAIL. Without Flush, or without DC-direct: PASS
+either way.
+Lab After Effects 2026 (149 + this d2d1): the maximized panel shows its row (band mean 30,30,30 and the "Comp 1"
+button), 2 of 2 maximizes; 149: black (0,0,0) every time. A lab-only op trace showed the row's draws are identical in
+the first frame after the resize and in a forced repaint; only their delivery differed.
+Lab Premiere 2026 makes no Flush calls (0 in a session with every d2d FIXME logged), so its drawing is unchanged; four
+maximized panels render normally. Lab Media Encoder 2026 does (140 at startup): with the patch and with the kill switch
+off its window is pixel-identical in two matched states (Queue panel maximized; preset list expanded).
+Kill switch NEUTRON_D2D_FLUSH_HOLD=0.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -107,6 +107,10 @@
+  * into hdc at the same position. Returns FALSE if unavailable (caller falls back to GetDC). */
+ BOOL neutron_dc_readback_blit(ID2D1RenderTarget *rt, HDC hdc, const RECT *rect);
+ void neutron_dc_readback_release(ID2D1RenderTarget *rt);
++
++/* NEUTRON D2D FLUSH-HOLD: TRUE while ID2D1DeviceContext::Flush is calling the present hook. Defined in
++ * device.c. */
++BOOL neutron_dr_in_flush(ID2D1RenderTarget *rt);
+ void neutron_dr_get_draw_stats(ID2D1RenderTarget *rt, unsigned *prims, unsigned *draws,
+         LONGLONG *in_d2d, LONGLONG *worst_prim);
+ 
+@@ -236,6 +240,22 @@
+     return v;
+ }
+ 
++/* NEUTRON D2D FLUSH-HOLD (default ON, env NEUTRON_D2D_FLUSH_HOLD=0 restores presenting on Flush): a DC-direct
++ * HwndRenderTarget presents at EndDraw only, as on Windows, where Flush executes the pending commands and an
++ * HwndRenderTarget presents in EndDraw. Presenting on Flush released the frame DC, so everything the app drew
++ * after its first Flush never reached the window: After Effects draws a maximized panel's navigator row after
++ * two mid-frame Flushes, and the row stayed black (harnesses/d2d-flush-present.c). */
++static inline BOOL neutron_flush_hold(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        v = (GetEnvironmentVariableA("NEUTRON_D2D_FLUSH_HOLD", buf, sizeof(buf)) && buf[0] == '0') ? 0 : 1;
++    }
++    return v;
++}
++
+ static inline BOOL neutron_maskrects(void)
+ {
+     static int v = -1;
+@@ -776,6 +796,7 @@
+     unsigned nb_ops;
+     unsigned neutron_draw_ops;   /* NEUTRON: always-on drawing-call count since BeginDraw */
+     unsigned neutron_clear_first; /* NEUTRON: this frame's first op was a Clear */
++    BOOL neutron_in_flush;        /* NEUTRON FLUSH-HOLD: Flush is calling the present hook */
+     /* NEUTRON op-trace: did the app CLEAR this frame, and over what clip? A frame that
+      * clears the panel and then draws almost nothing is the app wiping its own content --
+      * not us erasing it. Reset with the unions at BeginDraw. */
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -1255,6 +1255,12 @@
+     }
+ }
+ 
++/* NEUTRON FLUSH-HOLD: is this present coming from Flush rather than EndDraw? */
++BOOL neutron_dr_in_flush(ID2D1RenderTarget *rt)
++{
++    return impl_from_ID2D1DeviceContext((ID2D1DeviceContext6 *)rt)->neutron_in_flush;
++}
++
+ /* NEUTRON op-trace: this frame's op count, clear count and the clear's bounds. */
+ void neutron_dr_get_frame_stats(ID2D1RenderTarget *rt, unsigned *ops, unsigned *clears, RECT *clear_rect)
+ {
+@@ -3541,7 +3547,11 @@
+     d2d_device_context_release_state(context);
+ 
+     if (context->ops && context->ops->device_context_present)
++    {
++        context->neutron_in_flush = TRUE;
+         context->ops->device_context_present(context->outer_unknown);
++        context->neutron_in_flush = FALSE;
++    }
+ 
+     return S_OK;
+ }
+--- a/dlls/d2d1/hwnd_render_target.c
++++ b/dlls/d2d1/hwnd_render_target.c
+@@ -301,6 +301,11 @@
+     {
+         RECT u = {0}; BOOL uv = FALSE;
+ 
++        /* NEUTRON FLUSH-HOLD: a Flush inside BeginDraw..EndDraw does not present. EndDraw blits the
++         * union drawn since BeginDraw, and releases the frame DC taken there. */
++        if (neutron_flush_hold() && neutron_dr_in_flush(render_target->dxgi_target))
++            return S_OK;
++
+         /* Present-rate probe: a window presenting at hundreds/s is spinning, not drawing. */
+         if (!render_target->pres_tick0)
+             render_target->pres_tick0 = GetTickCount() | 1;
