@@ -1484,4 +1484,6 @@ Lab After Effects 2026 on 149 + this d2d1: row shown (band mean 30,30,30, "Comp 
 Lab Premiere 2026 makes NO Flush calls (0 with every d2d FIXME logged): unchanged; four maximized panels render normally.
 Lab Media Encoder 2026 DOES call Flush (140 at startup): patched vs kill switch off pixel-identical in two matched states (Queue maximized,
 presets expanded). Audition (also DC-direct) not installed in the lab: untested.
-Kill switch `NEUTRON_D2D_FLUSH_HOLD=0`. Lab runtime `/var/tmp/neutron-i19/rt149fh` (149 + this d2d1, x86_64 and i386).
+Kill switch `NEUTRON_D2D_FLUSH_HOLD=0`. Lab runtime `/var/tmp/neutron-i19/rt149fh` (149 + this d2d1, x86_64 and i386). SHIPPED in 11.10-150
+(package d2d1.dll .text == the lab build, both arches; package: d2d-flush-present PASS, gate off FAIL, every other harness as 149;
+lab After Effects 2026 on the package: the row shown 2 of 2 maximizes).
