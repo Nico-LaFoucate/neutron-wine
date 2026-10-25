@@ -53,7 +53,10 @@ development. `test-vkenc.sh` tests the encoder on its own;
   it (Photoshop, Lightroom Classic, After Effects) set in their launch profiles. `0002`
   (11.10-122) exports shared committed buffers the way vkd3d-proton already exports shared
   committed textures, so CreateSharedHandle returns a real handle for them (kill switch
-  `NEUTRON_VKD3D_SHARED_BUFFERS=0`).
+  `NEUTRON_VKD3D_SHARED_BUFFERS=0`). `0003` (11.10-151) keeps a command allocator alive while a
+  closed command list recorded into it still exists, so a list executed after its allocator was
+  released (Illustrator's Image Trace) no longer submits freed command buffers (kill switch
+  `NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0`).
 - **nvcuda** (`patches/nvcuda/`): `cuGraphicsD3D11RegisterResource` and the D3D11/CUDA interop
   that After Effects needs to render compositions. `0002` (11.10-122) imports D3D12 heaps,
   resources and fences (and D3D11 resources and fences) through their D3DKMT objects: Premiere

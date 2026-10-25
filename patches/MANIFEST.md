@@ -1487,3 +1487,18 @@ presets expanded). Audition (also DC-direct) not installed in the lab: untested.
 Kill switch `NEUTRON_D2D_FLUSH_HOLD=0`. Lab runtime `/var/tmp/neutron-i19/rt149fh` (149 + this d2d1, x86_64 and i386). SHIPPED in 11.10-150
 (package d2d1.dll .text == the lab build, both arches; package: d2d-flush-present PASS, gate off FAIL, every other harness as 149;
 lab After Effects 2026 on the package: the row shown 2 of 2 maximizes).
+
+### external: vkd3d-proton `0003-neutron-closed-list-keeps-allocator` (Neutron#36, Illustrator Image Trace crash)
+GitHub Neutron#36: Illustrator 2026 Image Trace (Enhanced Presets on) ends in an MSVC "Assertion failed!" dialog from
+`winevulkan.dll`, `loader_thunks.c` line 7124, `!status && "vkQueueSubmit2"` (reporter on AMD/Mesa; lab NVIDIA, 5 of 5).
+`+seh`: a page fault inside the vkQueueSubmit2 unix call, in win32u `queue_submit`, reading a client command buffer whose
+`unix_handle` is NULL (freed). The faulting thread is a `vkd3d_queue` submission thread. Lab-only logging builds of
+winevulkan/win32u and d3d12core (never emitted) showed the app sequence on one worker thread: `list->Reset(A)`, `Close()`,
+`A->Release()` (last reference: vkd3d-proton destroyed A's VkCommandPool and so its command buffers), then ~0.7 s later
+`ExecuteCommandLists(list)`. A closed vkd3d-proton list keeps only a raw `submit_allocator` pointer. Microsoft's spec says
+command-list APIs hold no references, but Windows runs this list (Adobe ships the feature).
+Fix: Close() takes an internal reference on the allocator, dropped when the list is reset or destroyed; those references are
+counted in `list_refcount` so `ID3D12CommandAllocator::Reset()` still waits only for executions, and the "pending command
+lists" message only counts executions. Lab (150 + this d3d12core): Image Trace 2 of 2 fresh runs plus a second trace
+(16 Colors), no assertion; lab Premiere 2026 playback on D3D12: 0 faults, 0 vkd3d errors. Kill switch
+`NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0`; build marker added to `build-external.sh`.
