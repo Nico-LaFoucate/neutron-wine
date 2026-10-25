@@ -1501,4 +1501,6 @@ Fix: Close() takes an internal reference on the allocator, dropped when the list
 counted in `list_refcount` so `ID3D12CommandAllocator::Reset()` still waits only for executions, and the "pending command
 lists" message only counts executions. Lab (150 + this d3d12core): Image Trace 2 of 2 fresh runs plus a second trace
 (16 Colors), no assertion; lab Premiere 2026 playback on D3D12: 0 faults, 0 vkd3d errors. Kill switch
-`NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0`; build marker added to `build-external.sh`.
+`NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0`; build marker added to `build-external.sh`. SHIPPED in 11.10-151 (release-151;
+package: real differences vs 150 = the x86_64 d3d12core.dll only; lab Illustrator Image Trace on the package 2 of 2 no assertion,
+kill switch off: the assertion returns; lab Premiere 2026 playback on the package: 0 faults, 0 vkd3d errors).
