@@ -1,0 +1,144 @@
+# Neutron#36 (11.10-151): a closed command list keeps the allocator its commands were recorded into alive until
+# the list is reset or destroyed. Illustrator's Image Trace (Enhanced Presets) resets a list on a new allocator,
+# closes it, releases the allocator and only then calls ExecuteCommandLists(). Windows runs that list; here the
+# release destroyed the VkCommandPool and the queue's submission thread submitted the freed command buffers, so
+# winevulkan's vkQueueSubmit2 thunk asserted ("!status && vkQueueSubmit2", loader_thunks.c). The closed list's
+# references are also counted in list_refcount so that ID3D12CommandAllocator::Reset() still waits only for
+# executions. Kill switch NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0. Applies after 0001-neutron.patch and
+# 0002-neutron-shared-committed-buffers.patch.
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index ad9dcf2b..212471b5 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -3048,7 +3048,7 @@ static ULONG STDMETHODCALLTYPE d3d12_command_allocator_Release(ID3D12CommandAllo
+ {
+     struct d3d12_command_allocator *allocator = impl_from_ID3D12CommandAllocator(iface);
+     unsigned int refcount = InterlockedDecrement(&allocator->refcount);
+-    unsigned int pending;
++    unsigned int pending, list_refs;
+ 
+     TRACE("%p decreasing refcount to %u.\n", allocator, refcount);
+ 
+@@ -3057,13 +3057,15 @@ static ULONG STDMETHODCALLTYPE d3d12_command_allocator_Release(ID3D12CommandAllo
+         struct d3d12_device *device = allocator->device;
+ 
+         d3d_destruction_notifier_notify(&allocator->destruction_notifier);
++        /* NEUTRON (Neutron#36): closed command lists hold references too; they are not in flight. */
++        list_refs = vkd3d_atomic_uint32_load_explicit((uint32_t *)&allocator->list_refcount, vkd3d_memory_order_acquire);
+         pending = d3d12_command_allocator_dec_ref(allocator);
+ 
+         /* If this does not go to zero, it means that there are still command lists in flight. */
+-        if (pending != 0)
++        if (pending > list_refs)
+         {
+             ERR("Released all public references, but there are still %u pending command lists "
+-                "awaiting execution from command allocator iface %p! Deferring release.\n", pending, iface);
++                "awaiting execution from command allocator iface %p! Deferring release.\n", pending - list_refs, iface);
+         }
+ 
+         d3d12_device_release(device);
+@@ -3135,8 +3137,11 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
+         TRACE("Resetting command list %p.\n", list);
+     }
+ 
+-    /* We only expect there to be only one internal ref live, the public refcount. */
+-    if ((internal_refs = vkd3d_atomic_uint32_load_explicit(&allocator->internal_refcount, vkd3d_memory_order_acquire)) > 1)
++    /* We only expect there to be only one internal ref live, the public refcount.
++     * NEUTRON (Neutron#36): plus one per closed command list, which does not block a reset. */
++    internal_refs = vkd3d_atomic_uint32_load_explicit(&allocator->internal_refcount, vkd3d_memory_order_acquire);
++    internal_refs -= vkd3d_atomic_uint32_load_explicit((uint32_t *)&allocator->list_refcount, vkd3d_memory_order_acquire);
++    if (internal_refs > 1)
+     {
+         /* HACK: There are currently command lists waiting to be submitted to the queue in the submission threads.
+          * Buggy application, but work around this by not resetting the command pool this time.
+@@ -6789,6 +6794,50 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_AddRef(d3d12_command_list_iface *ifac
+     return refcount;
+ }
+ 
++/* NEUTRON (Neutron#36): a closed command list keeps the allocator its commands live in until the list is
++ * reset or destroyed. Illustrator's Image Trace resets a list on a new allocator, closes it, releases the
++ * allocator and only then calls ExecuteCommandLists(); Windows runs that list, but here the release destroyed
++ * the VkCommandPool and the submission thread submitted freed command buffers (an assertion in winevulkan).
++ * These references are also counted in list_refcount so that ID3D12CommandAllocator::Reset() keeps waiting
++ * for executions only. */
++static bool neutron_list_keeps_allocator(void)
++{
++    /* Kill switch NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0 restores the old lifetime. Read once. */
++    static int v = -1;
++    char e[8];
++
++    if (v < 0)
++    {
++        v = !(vkd3d_get_env_var("NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR", e, sizeof(e)) && e[0] == '0');
++        if (!v) ERR("NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0: closed command lists do not keep their allocator.\n");
++    }
++    return v;
++}
++
++static void d3d12_command_list_hold_submit_allocator(struct d3d12_command_list *list)
++{
++    if (!neutron_list_keeps_allocator())
++        return;
++
++    InterlockedIncrement(&list->submit_allocator->list_refcount);
++    d3d12_command_allocator_inc_ref(list->submit_allocator);
++}
++
++static void d3d12_command_list_drop_submit_allocator(struct d3d12_command_list *list)
++{
++    struct d3d12_command_allocator *allocator = list->submit_allocator;
++
++    if (!allocator)
++        return;
++
++    list->submit_allocator = NULL;
++    if (!neutron_list_keeps_allocator())
++        return;
++
++    InterlockedDecrement(&allocator->list_refcount);
++    d3d12_command_allocator_dec_ref(allocator);
++}
++
+ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *iface)
+ {
+     struct d3d12_command_list *list = impl_from_ID3D12GraphicsCommandList(iface);
+@@ -6804,6 +6853,8 @@ ULONG STDMETHODCALLTYPE d3d12_command_list_Release(d3d12_command_list_iface *ifa
+         d3d_destruction_notifier_free(&list->destruction_notifier);
+         vkd3d_private_store_destroy(&list->private_store);
+ 
++        d3d12_command_list_drop_submit_allocator(list);
++
+         /* When command pool is destroyed, all command buffers are implicitly freed. */
+         if (list->allocator)
+             d3d12_command_allocator_free_command_buffer(list->allocator, list);
+@@ -7090,7 +7141,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_list_Close(d3d12_command_list_ifa
+     if (list->allocator)
+     {
+         d3d12_command_allocator_free_command_buffer(list->allocator, list);
++        d3d12_command_list_drop_submit_allocator(list);
+         list->submit_allocator = list->allocator;
++        d3d12_command_list_hold_submit_allocator(list);
+         list->allocator = NULL;
+     }
+ 
+@@ -7404,7 +7457,7 @@ static void d3d12_command_list_reset_internal_state(struct d3d12_command_list *l
+     list->transfer_batch.tracked_copy_buffer_count = 0;
+     list->wbi_batch.batch_len = 0;
+     list->query_resolve_count = 0;
+-    list->submit_allocator = NULL;
++    d3d12_command_list_drop_submit_allocator(list);
+     list->dgc_batch.draws_count = 0;
+ 
+     for (i = 0; i < list->retained_resources_count; i++)
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -2734,6 +2734,8 @@
+     ID3D12CommandAllocator ID3D12CommandAllocator_iface;
+     LONG refcount;
+     LONG internal_refcount;
++    /* NEUTRON (Neutron#36): the part of internal_refcount held by closed command lists. */
++    LONG list_refcount;
+ 
+     D3D12_COMMAND_LIST_TYPE type;
+ 
