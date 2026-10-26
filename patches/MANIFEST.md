@@ -1533,7 +1533,10 @@ ext-data-control (KWin 6.8 offers only `ext_data_control_manager_v1`; winewaylan
 Lab (153 + this winewayland.so in a reflink runtime copy): KDE-style copy -> Windows sees PNG, CF_DIB, CF_BITMAP, CF_DIBV5,
 CF_DIB pixel-exact; CF_DIB copy -> Linux sees image/bmp + image/png, both decoded pixel-exact at 63x47, 1x1 and 1366x768;
 Photoshop: Linux image -> New Document "Clipboard 80 x 60" -> paste -> Copy -> Linux image/png and image/bmp 80x60,
-pixel-exact; 153 control in the same session unchanged.
+pixel-exact; 153 control in the same session unchanged; GTK 3 both ways and Firefox (throwaway profile) paste exact on the fix, nothing on
+153. SHIPPED in 11.10-154 (release-154 = 153 + `0f2b3ab` + `e00ba29`; package: real differences vs 153 = winewayland.so x86_64 +
+i386 only, x86_64 .text == lab build; package in the lab: same 4 cases; Photoshop 96x72 round trip -> Firefox image/png and Qt
+PNG + BMP exact; fresh HOME `setup --runtime-version 11.10-154` rc 0, tree == tarball; promoted Latest, fresh HOME at Latest = 154).
 
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
