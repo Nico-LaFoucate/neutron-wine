@@ -1551,6 +1551,32 @@ re-stretches and flushes, as for a window without a wrapper. Lab (154 + this win
 2/2, aware and PeekMessage unchanged, idle CPU unchanged (2-4 ticks / 5 s); the stand-in installer's box shows, OK
 installs, the CLI waits for its hand-off child and exits 0. The real aescripts WiX installer showed on 154 already (2/2).
 
+### patch 77 — `…z×77-rtworkq-queue-shutdown` (Media Foundation queue shutdown deadlock / use-after-free) — by le-birnes
+From le-birnes/AdobeWine 0033 + 0041 (LGPL-2.1), offered in Discussions #37/#38; his call 10-26 "Add both".
+Two bugs in rtworkq: unlock_user_queue() and shutdown_system_queues() shut queues down (which waits for running callbacks)
+while holding `queues_section`, which a callback that unlocks a user queue needs (deadlock); and a serial queue unlocked
+while one of its items runs was shut down, zeroed and freed before that item's finalization callback took its lock.
+Fix: shutdown outside `queues_section`; user queues refcounted by each item dispatched with a finalization callback.
+MEASURED (his reproducer `serialexit.c`, scratch prefix): 154 fails 6/6 (EXCEPTION_INVALID_HANDLE in a pool thread 3x,
+hang 1x, crash 2x), patched 3/3 PASS (~240 ms). Photoshop 27.11, repaired lab prefix, Home -> New file -> 5 min -> quit:
+154 2/2 and patched 2/2 clean (no symptom in Photoshop either way; the lasting `queues_section` waits seen earlier were
+all in sessions with the CC "damaged" dialog). Upstream master has the old code. Built in the lab as rtworkq.dll only
+(strings == 154). Files: `~/neutron-review/research/adobewine-candidates/`.
+
+### patch 78 — `…z×78-win32u-font-cache-shared` (fonts another process adds are not found by name) — by le-birnes
+From le-birnes/AdobeWine 0040 + 0043 + 0078 (LGPL-2.1), offered in Discussions #37/#38; his call 10-26 "Add both".
+A non-private AddFontResourceEx is session-wide on Windows; Wine shares it through the volatile `Fonts\Cache` key.
+`load_font_list_from_cache()` named every cache family from the reused query buffer (garbage), so no other process found
+these fonts (0040). Enumeration now also loads families written since this process last looked (0043; removal by
+another process is not tracked). A cache family the process already has is reused, not created twice (0078: a duplicate
+could not enter the name tree and its release removed a node that was not there, so every later process failed).
+MEASURED (`fonttests.sh`, scratch prefix, 64-bit): T1 later process finds it -- 154 no, patched yes; T2 two fonts -- 154
+none, patched both; T3 running process after re-listing (fontlive) -- 154 FAIL, patched PASS; T4 after an add+remove of a
+new style of an installed family, later processes start -- 154 and patched yes; 0040+0043 WITHOUT 0078: every later process
+exits 1 (known-bad; ship all three). NOT covered: selecting the new font by name without listing first (fontsel FAIL on
+both); a cache check on every SelectObject costs 15-25x (fontbench 0.4 -> 6-10 us), so not done. Today our lab prefix's
+cache holds only Wine's bitmap system fonts; Adobe Fonts (CoreSync, running in repaired prefixes) may use it -- not verified.
+
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
 Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now

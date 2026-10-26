@@ -1,0 +1,134 @@
+rtworkq: Shut queues down without holding queues_section, and keep a serial queue alive until its finalization callback ran.
+
+From le-birnes/AdobeWine (patches 0033 and 0041, LGPL-2.1), offered to Neutron in Discussions #37/#38.
+
+Shutting a queue down waits for its running callbacks. unlock_user_queue() and shutdown_system_queues() did that while
+holding queues_section, and a callback that unlocks a user queue (a media source shutting down) needs queues_section:
+a deadlock. And the finalization callback of an item dispatched from a serial queue runs on the target pool after the
+work and takes the serial queue's lock; when the serial queue was unlocked meanwhile, it had already been shut down,
+zeroed and freed, so the callback waited on a zeroed critical section (or faulted on a freed handle) and MFShutdown
+waited for the callback. Queues are now shut down outside queues_section, and user queues carry a refcount held by
+each item dispatched with a finalization callback; the last reference frees the queue.
+
+Measured 2026-10-26 (his reproducer serialexit.c: three serial queues unlocked while an item runs, then MFShutdown):
+11.10-154 fails 6/6 (3x unhandled EXCEPTION_INVALID_HANDLE in a pool thread, 1 hang, 2 crashes), with this patch 3/3
+PASS (MFShutdown ~240 ms). Photoshop 27.11 in a repaired lab prefix quit cleanly 2/2 on each build; upstream Wine
+master has the old code.
+
+--- a/dlls/rtworkq/queue.c
++++ b/dlls/rtworkq/queue.c
+@@ -198,8 +198,18 @@
+     /* Data used for serial queues only. */
+     PTP_SIMPLE_CALLBACK finalization_callback;
+     DWORD target_queue;
++    /* User queues only: the handle's reference plus one per item dispatched with a
++     * finalization callback, which still uses the queue after its work has run. */
++    LONG refcount;
+ };
+ 
++static void release_queue(struct queue *queue)
++{
++    if (InterlockedDecrement(&queue->refcount)) return;
++    DeleteCriticalSection(&queue->cs);
++    free(queue);
++}
++
+ static void shutdown_queue(struct queue *queue);
+ 
+ static HRESULT lock_user_queue(DWORD queue)
+@@ -225,6 +235,7 @@
+ {
+     HRESULT hr = RTWQ_E_INVALID_WORKQUEUE;
+     struct queue_handle *entry;
++    struct queue *obj = NULL;
+ 
+     if (!(queue & RTWQ_CALLBACK_QUEUE_PRIVATE_MASK))
+         return S_OK;
+@@ -236,14 +247,21 @@
+         if (--entry->refcount == 0)
+         {
+             if (shared_mt_queue == queue) shared_mt_queue = 0;
+-            shutdown_queue((struct queue *)entry->obj);
+-            free(entry->obj);
++            obj = entry->obj;
+             entry->obj = next_free_user_queue;
+             next_free_user_queue = entry;
+         }
+         hr = S_OK;
+     }
+     LeaveCriticalSection(&queues_section);
++
++    /* Shutting a queue down waits for its running callbacks, which may themselves
++     * need queues_section, so it is done without holding it. */
++    if (obj)
++    {
++        shutdown_queue(obj);
++        release_queue(obj);
++    }
+     return hr;
+ }
+ 
+@@ -410,7 +428,12 @@
+     /* Worker pool callback will release one reference. Grab one more to keep object alive when
+        we need finalization callback. */
+     if (item->finalization_callback)
++    {
+         IUnknown_AddRef(&item->IUnknown_iface);
++        /* The finalization callback runs on this pool after the work, and may do so after
++         * the serial queue was unlocked: keep the serial queue alive until then. */
++        InterlockedIncrement(&item->queue->refcount);
++    }
+     item->u.work_object = CreateThreadpoolWork(standard_queue_worker, item, (TP_CALLBACK_ENVIRON *)&env);
+     item->type = WORK_ITEM_WORK;
+     SubmitThreadpoolWork(item->u.work_object);
+@@ -455,6 +478,7 @@
+     LeaveCriticalSection(&queue->cs);
+ 
+     IUnknown_Release(&item->IUnknown_iface);
++    release_queue(queue);
+ }
+ 
+ static HRESULT serial_queue_init(const struct queue_desc *desc, struct queue *queue)
+@@ -695,10 +719,15 @@
+     LIST_FOR_EACH_ENTRY_SAFE(item, item2, &queue->pending_items, struct work_item, entry)
+     {
+         list_remove(&item->entry);
++        /* an item still in flight removes itself again in the finalization callback */
++        list_init(&item->entry);
+         IUnknown_Release(&item->IUnknown_iface);
+     }
+     LeaveCriticalSection(&queue->cs);
+ 
++    /* User queues are freed by their last reference (release_queue). */
++    if (queue->refcount) return;
++
+     DeleteCriticalSection(&queue->cs);
+ 
+     memset(queue, 0, sizeof(*queue));
+@@ -976,6 +1005,7 @@
+     if (!(queue = calloc(1, sizeof(*queue))))
+         return E_OUTOFMEMORY;
+ 
++    queue->refcount = 1;
+     init_work_queue(desc, queue);
+ 
+     EnterCriticalSection(&queues_section);
+@@ -1301,13 +1331,16 @@
+     unsigned int i;
+     HRESULT hr;
+ 
+-    EnterCriticalSection(&queues_section);
+-
++    /* Not under queues_section: shutting a queue down waits for its running callbacks,
++     * and a callback that shuts down a media source unlocks its user queue, which takes
++     * queues_section (Photoshop hung on exit in MFShutdown). */
+     for (i = 0; i < ARRAY_SIZE(system_queues); ++i)
+     {
+         shutdown_queue(&system_queues[i]);
+     }
+ 
++    EnterCriticalSection(&queues_section);
++
+     if (FAILED(hr = CoDecrementMTAUsage(mta_cookie)))
+         WARN("Failed to uninitialize MTA, hr %#lx.\n", hr);
+ 
