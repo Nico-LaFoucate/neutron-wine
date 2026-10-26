@@ -1,0 +1,34 @@
+dwrite: Use the system collection for a range without its own when looking for the last resort font.
+
+A text format created without a font collection means the system collection; layout ranges keep that as NULL, and
+layout_map_run_characters() already falls back to layout->system_collection for it. layout_run_get_last_resort_font()
+passed range->collection to create_matching_font() as is, which called FindFamilyName() on NULL whenever a run found
+no font through fallback. Photoshop 2026 crashed there (access violation in create_matching_font, from
+IDWriteTextLayout::GetMetrics through UXP's renderer, dynamic-torqnative.dll) opening the panel of a UXP plugin.
+Upstream Wine master has the same code.
+
+Measured 2026-10-26 (lab, signed-in Photoshop 27.11, UXP plugin Auto-Photoshop-StableDiffusion 1.4.1 in the UXP
+fallback folder, Plugins > ... > Auto-Photoshop-SD): 11.10-155 crashed 3/3 (Adobe crash report: EXCEPTION_ACCESS_VIOLATION,
+DWrite.dll create_matching_font+0x17 <- layout_run_get_last_resort_font <- layout_compute <- GetMetrics), with this
+patch 0/3 and the panel draws.
+
+--- a/dlls/dwrite/layout.c
++++ b/dlls/dwrite/layout.c
+@@ -907,10 +907,16 @@
+ static HRESULT layout_run_get_last_resort_font(const struct dwrite_textlayout *layout, const struct layout_range *range,
+         IDWriteFontFace **fontface, float *size)
+ {
++    IDWriteFontCollection *collection;
+     IDWriteFont *font;
+     HRESULT hr;
+ 
+-    if (FAILED(create_matching_font(range->collection, range->fontfamily, range->weight, range->style,
++    /* NEUTRON: a range without its own collection uses the system one, as everywhere else in the layout
++     * (layout_map_run_characters above). Passing range->collection as is dereferenced NULL here
++     * whenever a run found no font: Photoshop 2026 crashed (access violation in create_matching_font,
++     * from IDWriteTextLayout::GetMetrics) opening a UXP plugin's panel. */
++    collection = range->collection ? range->collection : layout->system_collection;
++    if (FAILED(create_matching_font(collection, range->fontfamily, range->weight, range->style,
+             range->stretch, &IID_IDWriteFont3, (void **)&font)))
+     {
+         if (FAILED(hr = create_matching_font(layout->system_collection, L"Tahoma", range->weight, range->style,
