@@ -519,7 +519,7 @@ index ce21d18..5b9f23d 100644
 +    {
 +        CUresult _r = pcuMemAlloc_v2(dptr, bytesize);
 +    neutron_capture(_r, dptr, bytesize);
-+        ERR("neutron-alloc: size=%zu (%.2f MB) ptr=%#llx ret=%d\n", bytesize,
++        TRACE("neutron-alloc: size=%zu (%.2f MB) ptr=%#llx ret=%d\n", bytesize,
 +            (double)bytesize / 1048576.0, (unsigned long long)(dptr ? *dptr : 0), _r);
 +        return _r;
 +    }
@@ -534,7 +534,7 @@ index ce21d18..5b9f23d 100644
 +{
 +    if (!pCopy) return;
 +    if (pCopy->Height >= 64 && pCopy->Height <= 2400 && pCopy->WidthInBytes >= 1024)
-+        ERR("neutron-2d: dst=%#llx WInB=%zu H=%zu dstPitch=%zu dstMemTy=%d\n",
++        TRACE("neutron-2d: dst=%#llx WInB=%zu H=%zu dstPitch=%zu dstMemTy=%d\n",
 +            (unsigned long long)pCopy->dstDevice, (size_t)pCopy->WidthInBytes,
 +            (size_t)pCopy->Height, (size_t)pCopy->dstPitch, (int)pCopy->dstMemoryType);
 +}
@@ -605,7 +605,7 @@ index ce21d18..5b9f23d 100644
 +    {
 +        memcpy(luid, &g_neutron_adapter_luid, sizeof(LUID));
 +        if (deviceNodeMask) *deviceNodeMask = 1;
-+        ERR("neutron-luid: cuDeviceGetLuid dev=%d -> forced adapter LUID %08x:%08x\n",
++        TRACE("neutron-luid: cuDeviceGetLuid dev=%d -> forced adapter LUID %08x:%08x\n",
 +            dev, (unsigned)g_neutron_adapter_luid.HighPart, (unsigned)g_neutron_adapter_luid.LowPart);
 +        return CUDA_SUCCESS;
 +    }

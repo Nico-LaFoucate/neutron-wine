@@ -1517,3 +1517,9 @@ window at 2 s; set: no window over the whole 18 s provision, 2 of 2, provision o
 window; set: no window, prefix created. SHIPPED in 11.10-152 (package: wineboot.exe x86_64 + i386 the only real
 difference vs 151; E2E with the release files: Mud Hut 0.3.7 Animate install into a new prefix + CLI beta.26 = 0 windows in 101
 captures; published beta.25 provision on 152 = window at 2 s).
+
+### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
+The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
+Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now
+(`WINEDEBUG=+nvcuda` still shows them); logic unchanged. One-time messages, the playback experiment's own lines (only with
+it armed) and real failures stay ERR. Patches 0001 + 0002 apply to the pinned commit 772b344 unchanged otherwise.
