@@ -1577,6 +1577,18 @@ exits 1 (known-bad; ship all three). NOT covered: selecting the new font by name
 both); a cache check on every SelectObject costs 15-25x (fontbench 0.4 -> 6-10 us), so not done. Today our lab prefix's
 cache holds only Wine's bitmap system fonts; Adobe Fonts (CoreSync, running in repaired prefixes) may use it -- not verified.
 
+### patch 79 — `…z×79-dwrite-last-resort-collection` (Photoshop crashed opening a UXP plugin's panel)
+Found 10-26 testing UXP plugins (his "What's stopping you from testing UXP plugins" / "find a free one online").
+`layout_run_get_last_resort_font()` passed `range->collection` to `create_matching_font()` as is; a range keeps NULL
+for "the system collection" (`layout_map_run_characters()` already substitutes `layout->system_collection`), so a run
+that found no font through fallback called FindFamilyName on NULL. Adobe's crash report: EXCEPTION_ACCESS_VIOLATION,
+DWrite.dll `create_matching_font+0x17` <- `layout_run_get_last_resort_font` <- `layout_compute` <-
+`dwritetextlayout_GetMetrics`, called from UXP's renderer (dynamic-torqnative.dll). Upstream master has the same code.
+MEASURED (lab, signed-in Photoshop 27.11, UXP plugin Auto-Photoshop-StableDiffusion 1.4.1 (MIT, GitHub release .ccx)
+in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto-Photoshop-SD): 155 crashed 3/3
+(Adobe's "Error Report" dialog), with the fix 0/4 and the panel draws (tabs, prompts, sliders), also when installed by
+`neutron plugins install` (CLI `2ff3ec8`).
+
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
 Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now
