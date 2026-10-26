@@ -1522,4 +1522,6 @@ captures; published beta.25 provision on 152 = window at 2 s).
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
 Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now
 (`WINEDEBUG=+nvcuda` still shows them); logic unchanged. One-time messages, the playback experiment's own lines (only with
-it armed) and real failures stay ERR. Patches 0001 + 0002 apply to the pinned commit 772b344 unchanged otherwise.
+it armed) and real failures stay ERR. Patches 0001 + 0002 apply to the pinned commit 772b344 unchanged otherwise. SHIPPED in 11.10-153
+(package: nvcuda.dll the only real difference vs 152; lab Premiere 2026 playback to the end on the package: err:nvcuda 530+ -> 5
+one-time lines, 0 faults).
