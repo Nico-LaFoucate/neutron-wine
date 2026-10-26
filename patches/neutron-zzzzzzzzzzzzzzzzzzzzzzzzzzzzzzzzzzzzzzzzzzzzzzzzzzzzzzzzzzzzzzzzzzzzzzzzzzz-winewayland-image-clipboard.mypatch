@@ -1,0 +1,369 @@
+winewayland: Copy images between Windows and Linux applications (CF_DIB <-> image/bmp, CF_DIB -> image/png).
+
+Windows applications put images on the clipboard as CF_DIB/CF_BITMAP (Photoshop's Copy offers those and
+no PNG), and many read only those. winewayland mapped neither, so an image copied in Photoshop reached no
+Linux application (the offer carried only Wine's own tag), and an image/bmp offer from a KDE or GTK
+application reached no CF_DIB reader. winex11 has mapped CF_DIB <-> image/bmp for years.
+
+CF_DIB is now offered as image/bmp and image/png (browsers and Electron applications read only PNG), and
+image/bmp is imported as CF_DIB. Conversions go through Wine's GDI, as winex11's do, so any DIB or BMP
+layout is accepted; the PNG is opaque RGB (CF_DIB carries no alpha) written with stored deflate blocks,
+so no zlib is needed. An application's own "PNG" format still wins over the converted one, and a PNG-only
+offer still arrives as "PNG" only.
+
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -279,6 +279,253 @@
+     return data;
+ }
+ 
++/* NEUTRON (image clipboard): CF_DIB <-> image/bmp, and CF_DIB -> image/png.
++ *
++ * Windows applications put images on the clipboard as CF_DIB/CF_BITMAP (Photoshop's Copy offers those
++ * and no PNG), and many read only those. Linux applications offer and read image/png and image/bmp.
++ * winex11 has mapped CF_DIB <-> image/bmp for years; winewayland mapped neither, so an image copied in
++ * Photoshop reached no Linux application, and an image/bmp offer reached no CF_DIB reader. image/png
++ * is added on export because browsers and Electron applications read only that.
++ *
++ * Both directions go through Wine's own GDI, as winex11 does: whatever DIB or BMP layout arrives
++ * (palettes, 16 bit, bitfields, RLE, core headers, top-down), it is drawn into a bitmap and read back
++ * in one layout. CF_DIB carries no alpha on Windows, so the PNG is opaque RGB. */
++
++/* The size of a packed DIB's header, masks and color table (winex11.drv bitmap_info_size). */
++static size_t dib_info_size(const BITMAPINFO *info)
++{
++    unsigned int colors, masks = 0;
++    size_t size;
++
++    if (info->bmiHeader.biSize == sizeof(BITMAPCOREHEADER))
++    {
++        const BITMAPCOREHEADER *core = (const BITMAPCOREHEADER *)info;
++        colors = (core->bcBitCount <= 8) ? 1 << core->bcBitCount : 0;
++        return sizeof(BITMAPCOREHEADER) + colors * sizeof(RGBTRIPLE);
++    }
++    colors = info->bmiHeader.biClrUsed;
++    if (!colors && info->bmiHeader.biBitCount <= 8) colors = 1 << info->bmiHeader.biBitCount;
++    if (info->bmiHeader.biCompression == BI_BITFIELDS) masks = 3;
++    size = max(info->bmiHeader.biSize, sizeof(BITMAPINFOHEADER) + masks * sizeof(DWORD));
++    return size + colors * sizeof(RGBQUAD);
++}
++
++/* A packed DIB's pixels as top-down 32-bit BGRX rows, through GDI; NULL if it is not a usable DIB.
++ * `bits` is NULL when they follow the color table (a packed DIB), else where a BMP file put them. */
++static DWORD *dib_to_bgrx(const void *data, size_t size, const void *bits, int *width, int *height)
++{
++    const BITMAPINFO *info = data;
++    BITMAPINFO out = {{0}};
++    size_t avail, stride;
++    HBITMAP bitmap;
++    DWORD *pixels = NULL;
++    int w, h, bpp;
++    HDC hdc;
++
++    if (size < sizeof(BITMAPCOREHEADER) || info->bmiHeader.biSize > size) return NULL;
++    if (info->bmiHeader.biSize == sizeof(BITMAPCOREHEADER))
++    {
++        const BITMAPCOREHEADER *core = data;
++        w = core->bcWidth;
++        h = core->bcHeight;
++        bpp = core->bcBitCount;
++    }
++    else if (info->bmiHeader.biSize >= sizeof(BITMAPINFOHEADER))
++    {
++        if (info->bmiHeader.biCompression == BI_JPEG || info->bmiHeader.biCompression == BI_PNG) return NULL;
++        w = info->bmiHeader.biWidth;
++        h = abs(info->bmiHeader.biHeight);
++        bpp = info->bmiHeader.biBitCount;
++    }
++    else return NULL;
++    if (w <= 0 || h <= 0 || (size_t)w * h > (1u << 28) || !bpp) return NULL;
++    if (!bits) bits = (const char *)data + dib_info_size(info);
++    if ((const char *)bits >= (const char *)data + size) return NULL;
++
++    /* GDI is given no size for the bits, so check they are all there. */
++    avail = (const char *)data + size - (const char *)bits;
++    stride = (((size_t)w * bpp + 31) / 32) * 4;
++    if (info->bmiHeader.biSize == sizeof(BITMAPCOREHEADER) || info->bmiHeader.biCompression == BI_RGB ||
++        info->bmiHeader.biCompression == BI_BITFIELDS)
++    {
++        if (avail < stride * h) return NULL;
++    }
++    else if (!info->bmiHeader.biSizeImage || info->bmiHeader.biSizeImage > avail) return NULL;
++
++    out.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++    out.bmiHeader.biWidth = w;
++    out.bmiHeader.biHeight = -h;                       /* top-down */
++    out.bmiHeader.biPlanes = 1;
++    out.bmiHeader.biBitCount = 32;
++    out.bmiHeader.biCompression = BI_RGB;
++
++    hdc = NtUserGetDC(0);
++    if ((bitmap = NtGdiCreateDIBitmapInternal(hdc, w, h, CBM_INIT, bits, info, DIB_RGB_COLORS,
++                                              0, 0, 0, 0)))
++    {
++        if ((pixels = malloc((size_t)w * h * 4)) &&
++            NtGdiGetDIBitsInternal(hdc, bitmap, 0, h, pixels, &out, DIB_RGB_COLORS, 0, 0) != h)
++        {
++            free(pixels);
++            pixels = NULL;
++        }
++        NtGdiDeleteObjectApp(bitmap);
++    }
++    NtUserReleaseDC(0, hdc);
++    *width = w;
++    *height = h;
++    return pixels;
++}
++
++/* A packed CF_DIB (BITMAPINFOHEADER, 32 bpp, bottom-up) from top-down BGRX rows. */
++static void *bgrx_to_dib(const DWORD *pixels, int w, int h, size_t *ret_size)
++{
++    BITMAPINFOHEADER *header;
++    int y;
++
++    *ret_size = sizeof(*header) + (size_t)w * h * 4;
++    if (!(header = calloc(1, *ret_size))) return NULL;
++    header->biSize = sizeof(*header);
++    header->biWidth = w;
++    header->biHeight = h;
++    header->biPlanes = 1;
++    header->biBitCount = 32;
++    header->biCompression = BI_RGB;
++    header->biSizeImage = w * h * 4;
++    for (y = 0; y < h; y++)
++        memcpy((char *)(header + 1) + (size_t)(h - 1 - y) * w * 4, pixels + (size_t)y * w, (size_t)w * 4);
++    return header;
++}
++
++/* image/bmp -> CF_DIB. Any BMP layout, normalized to 32 bpp. */
++static void *import_image_bmp(void *data, size_t size, size_t *ret_size)
++{
++    const BITMAPFILEHEADER *file = data;
++    DWORD *pixels;
++    void *ret = NULL;
++    int w, h;
++
++    if (size < sizeof(*file) + sizeof(BITMAPCOREHEADER) || file->bfType != 0x4d42 /* "BM" */ ||
++        file->bfOffBits >= size)
++        return NULL;
++    if ((pixels = dib_to_bgrx(file + 1, size - sizeof(*file), (const char *)data + file->bfOffBits, &w, &h)))
++    {
++        ret = bgrx_to_dib(pixels, w, h, ret_size);
++        free(pixels);
++    }
++    return ret;
++}
++
++/* CF_DIB -> image/bmp: the packed DIB behind a BITMAPFILEHEADER (winex11.drv export_image_bmp). */
++static void *export_image_bmp(void *data, size_t size, size_t *ret_size)
++{
++    BITMAPFILEHEADER *file;
++    size_t info_size;
++
++    if (size < sizeof(BITMAPINFOHEADER) || (info_size = dib_info_size(data)) > size) return NULL;
++    *ret_size = sizeof(*file) + size;
++    if (!(file = malloc(*ret_size))) return NULL;
++    file->bfType = 0x4d42; /* "BM" */
++    file->bfSize = *ret_size;
++    file->bfReserved1 = file->bfReserved2 = 0;
++    file->bfOffBits = sizeof(*file) + info_size;
++    memcpy(file + 1, data, size);
++    return file;
++}
++
++/* A minimal PNG writer: 8-bit RGB, no filtering, deflate "stored" blocks (no compression), so it needs
++ * no zlib. The data only travels through a local pipe; size is not the concern, correctness is. */
++static unsigned int png_crc(unsigned int crc, const unsigned char *p, size_t n)
++{
++    static unsigned int table[256];
++    unsigned int c, k, i;
++
++    if (!table[1])
++        for (i = 0; i < 256; i++)
++        {
++            for (c = i, k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >> 1) : c >> 1;
++            table[i] = c;
++        }
++    crc = ~crc;
++    while (n--) crc = table[(crc ^ *p++) & 0xff] ^ (crc >> 8);
++    return ~crc;
++}
++
++static unsigned char *png_put32(unsigned char *p, unsigned int v)
++{
++    p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
++    return p + 4;
++}
++
++/* Writes a chunk whose data the caller has already placed at p + 8; returns the end of the chunk. */
++static unsigned char *png_chunk(unsigned char *p, const char *type, size_t len)
++{
++    png_put32(p, len);
++    memcpy(p + 4, type, 4);
++    return png_put32(p + 8 + len, png_crc(0, p + 4, len + 4));
++}
++
++/* CF_DIB -> image/png. */
++static void *export_dib_png(void *data, size_t size, size_t *ret_size)
++{
++    size_t row, raw, blocks, idat, i, done, y = 0;
++    unsigned int a = 1, b = 0;
++    unsigned char *png, *p, *z;
++    DWORD *pixels;
++    int w, h;
++
++    if (!(pixels = dib_to_bgrx(data, size, NULL, &w, &h))) return NULL;
++    row = 1 + (size_t)w * 3;
++    raw = row * h;
++    blocks = (raw + 65534) / 65535;
++    idat = 2 + raw + blocks * 5 + 4;                   /* zlib header, stored blocks, adler32 */
++    *ret_size = 8 + (12 + 13) + (12 + idat) + 12;
++    if (!(png = malloc(*ret_size)))
++    {
++        free(pixels);
++        return NULL;
++    }
++
++    memcpy(png, "\x89PNG\r\n\x1a\n", 8);
++    p = png + 8;
++    png_put32(p + 8, w);
++    png_put32(p + 12, h);
++    memcpy(p + 16, "\x08\x02\x00\x00\x00", 5);         /* 8 bit, RGB, deflate, no filter, no interlace */
++    p = png_chunk(p, "IHDR", 13);
++
++    z = p + 8;
++    *z++ = 0x78;
++    *z++ = 0x01;
++    for (done = 0; done < raw; )
++    {
++        size_t n = min(raw - done, 65535);
++
++        *z++ = (done + n == raw);                      /* BFINAL, BTYPE 00 (stored) */
++        *z++ = n & 0xff; *z++ = n >> 8;
++        *z++ = ~n & 0xff; *z++ = (~n >> 8) & 0xff;
++        for (i = 0; i < n; i++, done++)
++        {
++            size_t col = done % row;
++            unsigned char c;
++
++            if (!col)
++            {
++                y = done / row;
++                c = 0;                                 /* the row's filter type: none */
++            }
++            else c = pixels[y * w + (col - 1) / 3] >> (16 - 8 * ((col - 1) % 3)); /* R, G, B */
++            *z++ = c;
++            a = (a + c) % 65521;
++            b = (b + a) % 65521;
++        }
++    }
++    png_put32(z, (b << 16) | a);
++    p = png_chunk(p, "IDAT", idat);
++    png_chunk(p, "IEND", 0);
++    free(pixels);
++    return png;
++}
++
+ /* Order is important. When selecting a mime-type for a clipboard format we
+  * will choose the first entry that matches the specified clipboard format. */
+ /* NEUTRON (drag & drop): text/uri-list -> CF_HDROP.
+@@ -419,6 +666,10 @@
+     {"text/rtf", 0, rich_text_formatW, export_data, import_data},
+     {"image/tiff", CF_TIFF, NULL, export_data, import_data},
+     {"image/png", 0, pngW, export_data, import_data},
++    /* NEUTRON (image clipboard): after the app's own PNG, so that one wins when both exist. The
++     * image/png entry is export-only (import NULL): a PNG offer still arrives as "PNG". */
++    {"image/bmp", CF_DIB, NULL, export_image_bmp, import_image_bmp},
++    {"image/png", CF_DIB, NULL, export_dib_png, NULL},
+     {"image/jpeg", 0, jfifW, export_data, import_data},
+     {"image/gif", 0, gifW, export_data, import_data},
+     {"image/svg+xml", 0, image_svg_xmlW, export_data, import_data},
+@@ -445,8 +696,9 @@
+ 
+     for (format = supported_formats; format->mime_type; ++format)
+     {
++        /* NEUTRON (image clipboard): with `types` this picks what to IMPORT, so skip export-only entries. */
+         if (format->clipboard_format == clipboard_format &&
+-            (!types || string_array_contains(types, format->mime_type)))
++            (!types || (format->import && string_array_contains(types, format->mime_type))))
+         {
+             return format;
+         }
+@@ -461,12 +713,30 @@
+ 
+     for (format = supported_formats; format->mime_type; ++format)
+     {
+-        if (!strcmp(mime, format->mime_type)) return format;
++        /* NEUTRON (image clipboard): this picks what to import; export-only entries never match. */
++        if (format->import && !strcmp(mime, format->mime_type)) return format;
+     }
+ 
+     return NULL;
+ }
+ 
++/* NEUTRON (image clipboard): what to render when another client asks for `mime`. Several clipboard
++ * formats can produce one mime type (image/png from "PNG" or from CF_DIB), so take the first entry
++ * whose format the clipboard holds now. */
++static struct data_device_format *data_device_format_for_export(const char *mime)
++{
++    struct data_device_format *format, *first = NULL;
++
++    for (format = supported_formats; format->mime_type; ++format)
++    {
++        if (!format->export || strcmp(mime, format->mime_type)) continue;
++        if (!first) first = format;
++        if (NtUserIsClipboardFormatAvailable(format->clipboard_format)) return format;
++    }
++
++    return first;
++}
++
+ static ATOM register_clipboard_format(const WCHAR *name)
+ {
+     UNICODE_STRING name_str;
+@@ -521,7 +791,7 @@
+     const char *normalized;
+ 
+     if ((normalized = normalize_mime_type(mime_type)) &&
+-        (format = data_device_format_for_mime_type(normalized)))
++        (format = data_device_format_for_export(normalized)))
+     {
+         wayland_data_source_export(format, fd);
+     }
+@@ -835,7 +1105,7 @@
+     const char *normalized;
+ 
+     if ((normalized = normalize_mime_type(mime_type)) &&
+-        (format = data_device_format_for_mime_type(normalized)))
++        (format = data_device_format_for_export(normalized)))
+     {
+         wayland_data_source_export(format, fd);
+     }
+@@ -1518,12 +1788,24 @@
+         return;
+     }
+ 
++    /* NEUTRON (image clipboard): offer EVERY mime type a format can produce (CF_DIB gives image/bmp and
++     * image/png), each mime type once (image/png can come from "PNG" too). */
+     for (i = 0; i < formats_size; ++i)
+     {
+-        struct data_device_format *format =
+-            data_device_format_for_clipboard_format(formats[i], NULL);
+-        if (format)
++        struct data_device_format *format, *other;
++
++        for (format = supported_formats; format->mime_type; ++format)
+         {
++            if (format->clipboard_format != formats[i] || !format->export) continue;
++            for (other = supported_formats; other != format; ++other)
++            {
++                UINT j;
++
++                if (!other->export || strcmp(other->mime_type, format->mime_type)) continue;
++                for (j = 0; j < formats_size; ++j) if (formats[j] == other->clipboard_format) break;
++                if (j < formats_size) break;           /* an earlier entry already offers this type */
++            }
++            if (other != format) continue;
+             TRACE("offering mime=%s for format=%u\n", format->mime_type, formats[i]);
+             if (wl_source) wl_data_source_offer(wl_source, format->mime_type);
+             else zwlr_data_control_source_v1_offer(zwlr_source, format->mime_type);
