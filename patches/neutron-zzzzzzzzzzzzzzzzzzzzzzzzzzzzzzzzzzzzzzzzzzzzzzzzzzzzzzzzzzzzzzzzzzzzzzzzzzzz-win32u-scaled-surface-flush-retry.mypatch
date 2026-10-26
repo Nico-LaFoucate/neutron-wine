@@ -1,0 +1,39 @@
+win32u: Report a DPI-scaled window's flush as failed when its target surface refused it.
+
+A driver flush returns FALSE to mean "not yet: keep the bounds dirty and flush again" (winewayland does
+this until a window's first xdg configure). For a DPI-scaled window that FALSE landed on the target
+surface, which win32u never flushes by itself (only the wrapper is registered), while the wrapper
+reported TRUE and dropped its own bounds. A window that painted before its configure and then waited
+in GetMessage was never flushed again and never appeared. An installer's MessageBox is exactly that:
+at 175% a DPI-unaware OK/Cancel box never showed, so the installer waited forever for an answer.
+
+The wrapper now returns FALSE while the target still holds dirty bounds, so the next pass stretches
+and flushes again, as it does for a window without a wrapper.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -216,7 +216,23 @@
+     }
+ 
+     window_surface_flush( surface->target_surface );
+-    return TRUE;
++
++    /* NEUTRON: report the target's refusal. A driver flush returns FALSE to say "not yet, keep the bounds
++     * dirty and flush again" (winewayland: the window has no xdg configure yet). For a DPI-scaled window
++     * that FALSE landed on the target surface, which win32u never flushes by itself (only this wrapper is
++     * registered), while this wrapper reported TRUE and dropped its own bounds. An application that painted
++     * before the configure and then waited in GetMessage was never flushed again, so its window never
++     * appeared: measured with a DPI-unaware test window at 175% (never shown, 2/2) against the same window
++     * per-monitor aware (shown, 2/2). Returning FALSE keeps this wrapper's bounds dirty, so the next pass
++     * stretches and flushes again, as it does for a window without a wrapper. */
++    {
++        BOOL flushed;
++
++        window_surface_lock( surface->target_surface );
++        flushed = IsRectEmpty( &surface->target_surface->bounds );
++        window_surface_unlock( surface->target_surface );
++        return flushed;
++    }
+ }
+ 
+ static void scaled_surface_destroy( struct window_surface *window_surface )

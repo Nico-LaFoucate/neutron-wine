@@ -1538,6 +1538,19 @@ pixel-exact; 153 control in the same session unchanged; GTK 3 both ways and Fire
 i386 only, x86_64 .text == lab build; package in the lab: same 4 cases; Photoshop 96x72 round trip -> Firefox image/png and Qt
 PNG + BMP exact; fresh HOME `setup --runtime-version 11.10-154` rc 0, tree == tarball; promoted Latest, fresh HOME at Latest = 154).
 
+### patch 76 — `…z×76-win32u-scaled-surface-flush-retry` (an idle installer's dialog never appeared)
+Found 10-26 starting #2 (plugins). A DPI-unaware window that paints before its first xdg configure and then waits in
+GetMessage never appears at a scaled desktop: win32u draws it through `scaled_surface` (the only surface it registers),
+whose flush always returned TRUE even when the target (winewayland) surface refused with FALSE ("not configured yet",
+bounds kept dirty). Nothing ever flushed the target again. Upstream win32u has the same wrapper; upstream winewayland
+also returns FALSE before the configure. MEASURED (nested KWin, 175%, runtime 154): `acttool.exe getmessage` DPI-unaware
+never shown 4/4, per-monitor aware shown 2/2, PeekMessage loop shown; `NEUTRON_ROLELESS_CONSUME=0` changes nothing; a
+stand-in installer (MessageBox OK/Cancel) run through `neutron plugins install` never showed its box 2/2, so the
+install waited forever. Fix: the wrapper returns FALSE while the target still holds dirty bounds, so the next pass
+re-stretches and flushes, as for a window without a wrapper. Lab (154 + this win32u.so): DPI-unaware idle window shown
+2/2, aware and PeekMessage unchanged, idle CPU unchanged (2-4 ticks / 5 s); the stand-in installer's box shows, OK
+installs, the CLI waits for its hand-off child and exits 0. The real aescripts WiX installer showed on 154 already (2/2).
+
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
 Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now
