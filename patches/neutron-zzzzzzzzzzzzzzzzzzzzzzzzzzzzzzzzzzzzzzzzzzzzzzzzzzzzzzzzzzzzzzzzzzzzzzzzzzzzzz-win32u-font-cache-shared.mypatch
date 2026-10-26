@@ -1,0 +1,158 @@
+win32u: Fonts that another process adds are found by name, also while this process runs.
+
+From le-birnes/AdobeWine (patches 0040, 0043 and 0078, LGPL-2.1), offered to Neutron in Discussions #37/#38.
+
+A font added with AddFontResourceEx (not FR_PRIVATE) is visible to every process of the session on Windows; Wine shares
+such fonts through the volatile HKCU\Software\Wine\Fonts\Cache key. load_font_list_from_cache() passed the reused
+query buffer to create_family() as the family name, so every family read from the cache got a garbage name and no
+other process could find these fonts by name (0040). Font enumeration now also picks up families written to the cache
+since this process last looked (0043; removal by another process is not tracked). A cache family that this process
+already has (it loaded a host font of that name, or added the face itself) is reused instead of created a second time:
+a duplicate could not enter the family name tree, and releasing it removed a node that was not there, so every process
+started afterwards failed (0078; Creative Cloud's Adobe Fonts sync leaves such empty family keys).
+
+Measured 2026-10-26 (fonttests.sh): a font another process added is found by a process started after it -- 154 no,
+patched yes; two such fonts -- 154 neither, patched both; a running process sees it after re-listing (fontlive) --
+154 FAIL, patched PASS; after another process adds and removes a new style of an installed family, later processes
+start and list it -- both builds yes, but with 0040+0043 and without 0078 every later process exits 1 (so the three
+ship together). NOT covered: a running process that selects the new font by name without listing fonts first still
+does not get it; checking the cache on every font selection costs 15-25x per SelectObject (0.4 -> 6-10 us).
+
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -1270,7 +1270,7 @@
+ };
+ 
+ static void load_face_from_cache( HKEY hkey_family, struct gdi_font_family *family,
+-                                  void *buffer, DWORD buffer_size, BOOL scalable )
++                                  void *buffer, DWORD buffer_size, BOOL scalable, BOOL skip_known )
+ {
+     KEY_VALUE_FULL_INFORMATION *info = (KEY_VALUE_FULL_INFORMATION *)buffer;
+     KEY_NODE_INFORMATION *node_info = (KEY_NODE_INFORMATION *)buffer;
+@@ -1287,6 +1287,7 @@
+         if (info->Type == REG_BINARY && info->DataLength > sizeof(*cached))
+         {
+             ((DWORD *)cached)[info->DataLength / sizeof(DWORD)] = 0;
++            if (skip_known && find_face_from_full_name( cached->full_name )) continue;
+             if ((face = create_face( family, name, cached->full_name,
+                                      cached->full_name + lstrlenW(cached->full_name) + 1,
+                                      NULL, 0, cached->index, cached->fs, cached->ntmflags, cached->weight,
+@@ -1315,13 +1316,16 @@
+     {
+         if ((hkey_strike = reg_open_key( hkey_family, node_info->Name, node_info->NameLength )))
+         {
+-            load_face_from_cache( hkey_strike, family, buffer, buffer_size, FALSE );
++            load_face_from_cache( hkey_strike, family, buffer, buffer_size, FALSE, skip_known );
+             NtClose( hkey_strike );
+         }
+     }
+ }
+ 
+-static void load_font_list_from_cache(void)
++/* write time of the cache key when this process last looked at it */
++static LARGE_INTEGER cache_seen_time;
++
++static void load_font_list_from_cache( const LARGE_INTEGER *newer_than )
+ {
+     WCHAR buffer[4096];
+     KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+@@ -1330,26 +1334,67 @@
+     struct gdi_font_family *family;
+     HKEY hkey_family;
+     WCHAR *second_name = (WCHAR *)info->Data;
++    WCHAR family_name[LF_FACESIZE];
++    DWORD len;
+ 
+     while (!NtEnumerateKey( wine_fonts_cache_key, family_index++, KeyNodeInformation, enum_info,
+                             sizeof(buffer), &total_size ))
+     {
++        if (newer_than && enum_info->LastWriteTime.QuadPart <= newer_than->QuadPart) continue;
+         if (!(hkey_family = reg_open_key( wine_fonts_cache_key, enum_info->Name,
+                                           enum_info->NameLength )))
+             continue;
+         TRACE( "opened family key %s\n", debugstr_wn(enum_info->Name, enum_info->NameLength / sizeof(WCHAR)) );
++        /* the key name lives in buffer, which the value query below overwrites */
++        len = min( enum_info->NameLength / sizeof(WCHAR), ARRAY_SIZE(family_name) - 1 );
++        memcpy( family_name, enum_info->Name, len * sizeof(WCHAR) );
++        family_name[len] = 0;
+         if (!query_reg_value( hkey_family, NULL, info, sizeof(buffer) ))
+             second_name[0] = 0;
+ 
+-        family = create_family( buffer, second_name );
++        /* The family may already exist: this process added the face itself (refresh), or it
++         * loaded a host font of that name before reading the cache (fonts that another process
++         * added and removed again leave empty family keys behind, such as Adobe Fonts synced by
++         * Creative Cloud). A second family of that name would not enter the name tree, and
++         * releasing it would remove a node that isn't there and corrupt the tree. */
++        if ((family = find_family_from_name( family_name ))) family->refcount++;
++        else family = create_family( family_name, second_name );
+ 
+-        load_face_from_cache( hkey_family, family, buffer, sizeof(buffer), TRUE );
++        load_face_from_cache( hkey_family, family, buffer, sizeof(buffer), TRUE, newer_than != NULL );
+ 
+         NtClose( hkey_family );
+         release_family( family );
+     }
+ }
+ 
++static LARGE_INTEGER get_cache_write_time(void)
++{
++    KEY_BASIC_INFORMATION info;
++    LARGE_INTEGER time = {{0}};
++    DWORD size;
++    NTSTATUS status;
++
++    status = NtQueryKey( wine_fonts_cache_key, KeyBasicInformation, &info, sizeof(info), &size );
++    if (!status || status == STATUS_BUFFER_OVERFLOW) time = info.LastWriteTime;
++    return time;
++}
++
++/* Fonts that another process adds with AddFontResource (not FR_PRIVATE) go to the cache key;
++ * on Windows they are visible to every process at once, so pick up families written since
++ * this process last looked. Called with font_lock held. */
++static void refresh_font_list_from_cache(void)
++{
++    LARGE_INTEGER time, seen;
++
++    if (!wine_fonts_cache_key) return;
++    time = get_cache_write_time();
++    if (time.QuadPart <= cache_seen_time.QuadPart) return;
++    seen = cache_seen_time;
++    cache_seen_time = time;
++    load_font_list_from_cache( &seen );
++    reorder_font_list();
++}
++
+ static void add_face_to_cache( struct gdi_font_face *face )
+ {
+     HKEY hkey_family, hkey_face;
+@@ -1395,6 +1440,10 @@
+ 
+     if (hkey_face != hkey_family) NtClose( hkey_face );
+     NtClose( hkey_family );
++
++    /* A value written to an existing family key does not change the cache key's own write
++     * time, which other processes check (refresh_font_list_from_cache): touch it. */
++    set_reg_ascii_value( wine_fonts_cache_key, "Changed", "" );
+ }
+ 
+ static void remove_face_from_cache( struct gdi_font_face *face )
+@@ -3443,6 +3492,7 @@
+     count = create_enum_charset_list( charset, enum_charsets );
+ 
+     pthread_mutex_lock( &font_lock );
++    refresh_font_list_from_cache();
+ 
+     if (lf && lf->lfFaceName[0])
+     {
+@@ -6783,8 +6833,9 @@
+     if (disposition != REG_CREATED_NEW_KEY)
+     {
+         load_registry_fonts();
+-        load_font_list_from_cache();
++        load_font_list_from_cache( NULL );
+     }
++    if (wine_fonts_cache_key) cache_seen_time = get_cache_write_time();
+ 
+     reorder_font_list();
+     load_gdi_font_subst();
