@@ -1518,6 +1518,23 @@ window; set: no window, prefix created. SHIPPED in 11.10-152 (package: wineboot.
 difference vs 151; E2E with the release files: Mud Hut 0.3.7 Animate install into a new prefix + CLI beta.26 = 0 windows in 101
 captures; published beta.25 provision on 152 = window at 2 s).
 
+### patch 75 — `…z×75-winewayland-image-clipboard` (copying images between Windows and Linux applications)
+His ask 10-26 (research §2 #7: "Image copy/paste (CF_DIB <-> image/png) missing in winewayland — untested, untracked").
+MEASURED on 153 in the lab (nested KWin 6.8, Qt stand-ins for Linux apps, `cliptool.exe`, signed-in Photoshop 2026 copy):
+a KDE-style image copy reached Windows apps as PNG/JFIF/TIFF but no CF_DIB; a CF_DIB copied in a Windows app reached Linux
+as Wine's tag only; Photoshop's Copy offers CF_DIB/CF_BITMAP (+ its private formats, no PNG), so a Photoshop copy reached no
+Linux application. (Linux -> Photoshop already worked: Photoshop reads "PNG".) winex11 maps CF_DIB <-> image/bmp; upstream
+winewayland (master, 10-26) maps neither. Fix: CF_DIB is offered as image/bmp and image/png, image/bmp is imported as CF_DIB;
+both directions through Wine's GDI (any DIB/BMP layout), PNG = opaque RGB with stored deflate blocks (no zlib). The table
+lookups now skip export-only entries for imports, export picks the entry whose format the clipboard holds (an app's own "PNG"
+wins), and an update offers every mime type once. NOT changed: a PNG-only offer (Chromium, Electron) still arrives as "PNG"
+only, and an app that copies while it is NOT focused (on deactivation) still cannot set the Wayland selection — that needs
+ext-data-control (KWin 6.8 offers only `ext_data_control_manager_v1`; winewayland knows only the wlr one).
+Lab (153 + this winewayland.so in a reflink runtime copy): KDE-style copy -> Windows sees PNG, CF_DIB, CF_BITMAP, CF_DIBV5,
+CF_DIB pixel-exact; CF_DIB copy -> Linux sees image/bmp + image/png, both decoded pixel-exact at 63x47, 1x1 and 1366x768;
+Photoshop: Linux image -> New Document "Clipboard 80 x 60" -> paste -> Copy -> Linux image/png and image/bmp 80x60,
+pixel-exact; 153 control in the same session unchanged.
+
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
 Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now
