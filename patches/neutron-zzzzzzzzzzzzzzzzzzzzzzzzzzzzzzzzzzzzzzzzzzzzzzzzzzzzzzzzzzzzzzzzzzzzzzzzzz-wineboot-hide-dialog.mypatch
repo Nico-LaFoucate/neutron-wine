@@ -1,0 +1,22 @@
+wineboot: Don't show the "configuration is being updated" window when WINEBOOT_HIDE_DIALOG is set.
+
+Every `neutron prefix provision` runs `wineboot -u`, which always shows Wine's "The Wine
+configuration in ... is being updated, please wait..." window, and so does creating a prefix.
+Mud Hut provisions after every install and update, so the window appeared on the desktop
+during each one; Windows has nothing like it and Collider shows its own progress. The same
+variable as Proton: set and not "0" = no window. Unset, wineboot behaves as before.
+
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1662,7 +1662,10 @@
+ 
+         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
+         {
+-            HWND hwnd = show_wait_window();
++            /* NEUTRON: WINEBOOT_HIDE_DIALOG set (as in Proton) = no "is being updated" window; the
++             * tool that started the update shows its own progress. */
++            const WCHAR *hide = _wgetenv( L"WINEBOOT_HIDE_DIALOG" );
++            HWND hwnd = (hide && *hide && wcscmp( hide, L"0" )) ? NULL : show_wait_window();
+             for (;;)
+             {
+                 if (process)

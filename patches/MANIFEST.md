@@ -1504,3 +1504,14 @@ lists" message only counts executions. Lab (150 + this d3d12core): Image Trace 2
 `NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR=0`; build marker added to `build-external.sh`. SHIPPED in 11.10-151 (release-151;
 package: real differences vs 150 = the x86_64 d3d12core.dll only; lab Illustrator Image Trace on the package 2 of 2 no assertion,
 kill switch off: the assertion returns; lab Premiere 2026 playback on the package: 0 faults, 0 vkd3d errors).
+
+### patch 74 — `…z×74-wineboot-hide-dialog` (Wine's "configuration is being updated" window during installs)
+Seen 10-24 in the lab during a Mud Hut update from Collider; measured 10-25: every `neutron prefix provision` runs
+`wineboot -u` (forced update), which always shows Wine's "The Wine configuration in <prefix> is being updated, please
+wait..." window (screenshot at ~2 s into a provision of an existing prefix); creating a prefix shows it too. Mud Hut
+provisions at the end of every install and update, and `neutron update` provisions every prefix, so users saw a
+Wine-branded window during each. Fix: wineboot skips the window when `WINEBOOT_HIDE_DIALOG` is set and not "0" (Proton's
+variable); the CLI and Mud Hut set it for their own Wine runs. Unset = upstream behavior, so the variable is its own
+switch. Lab (runtime 150 + this wineboot.exe, nested desk, screenshot every 2 s): provision of an existing prefix — unset:
+window at 2 s; set: no window over the whole 18 s provision, 2 of 2, provision ok; new prefix (`wineboot --init`) — unset:
+window; set: no window, prefix created.
