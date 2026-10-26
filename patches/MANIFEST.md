@@ -1514,4 +1514,6 @@ Wine-branded window during each. Fix: wineboot skips the window when `WINEBOOT_H
 variable); the CLI and Mud Hut set it for their own Wine runs. Unset = upstream behavior, so the variable is its own
 switch. Lab (runtime 150 + this wineboot.exe, nested desk, screenshot every 2 s): provision of an existing prefix — unset:
 window at 2 s; set: no window over the whole 18 s provision, 2 of 2, provision ok; new prefix (`wineboot --init`) — unset:
-window; set: no window, prefix created.
+window; set: no window, prefix created. SHIPPED in 11.10-152 (package: wineboot.exe x86_64 + i386 the only real
+difference vs 151; E2E with the release files: Mud Hut 0.3.7 Animate install into a new prefix + CLI beta.26 = 0 windows in 101
+captures; published beta.25 provision on 152 = window at 2 s).
