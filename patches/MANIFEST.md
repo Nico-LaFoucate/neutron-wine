@@ -1550,6 +1550,7 @@ install waited forever. Fix: the wrapper returns FALSE while the target still ho
 re-stretches and flushes, as for a window without a wrapper. Lab (154 + this win32u.so): DPI-unaware idle window shown
 2/2, aware and PeekMessage unchanged, idle CPU unchanged (2-4 ticks / 5 s); the stand-in installer's box shows, OK
 installs, the CLI waits for its hand-off child and exits 0. The real aescripts WiX installer showed on 154 already (2/2).
+SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
 ### patch 77 — `…z×77-rtworkq-queue-shutdown` (Media Foundation queue shutdown deadlock / use-after-free) — by le-birnes
 From le-birnes/AdobeWine 0033 + 0041 (LGPL-2.1), offered in Discussions #37/#38; his call 10-26 "Add both".
@@ -1562,6 +1563,7 @@ hang 1x, crash 2x), patched 3/3 PASS (~240 ms). Photoshop 27.11, repaired lab pr
 154 2/2 and patched 2/2 clean (no symptom in Photoshop either way; the lasting `queues_section` waits seen earlier were
 all in sessions with the CC "damaged" dialog). Upstream master has the old code. Built in the lab as rtworkq.dll only
 (strings == 154). Files: `~/neutron-review/research/adobewine-candidates/`.
+SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
 ### patch 78 — `…z×78-win32u-font-cache-shared` (fonts another process adds are not found by name) — by le-birnes
 From le-birnes/AdobeWine 0040 + 0043 + 0078 (LGPL-2.1), offered in Discussions #37/#38; his call 10-26 "Add both".
@@ -1576,6 +1578,7 @@ new style of an installed family, later processes start -- 154 and patched yes; 
 exits 1 (known-bad; ship all three). NOT covered: selecting the new font by name without listing first (fontsel FAIL on
 both); a cache check on every SelectObject costs 15-25x (fontbench 0.4 -> 6-10 us), so not done. Today our lab prefix's
 cache holds only Wine's bitmap system fonts; Adobe Fonts (CoreSync, running in repaired prefixes) may use it -- not verified.
+SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
 ### patch 79 — `…z×79-dwrite-last-resort-collection` (Photoshop crashed opening a UXP plugin's panel)
 Found 10-26 testing UXP plugins (his "What's stopping you from testing UXP plugins" / "find a free one online").
@@ -1588,6 +1591,7 @@ MEASURED (lab, signed-in Photoshop 27.11, UXP plugin Auto-Photoshop-StableDiffus
 in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto-Photoshop-SD): 155 crashed 3/3
 (Adobe's "Error Report" dialog), with the fix 0/4 and the panel draws (tabs, prompts, sliders), also when installed by
 `neutron plugins install` (CLI `2ff3ec8`).
+SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
