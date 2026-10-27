@@ -1601,7 +1601,8 @@ default Notepad to Consolas, Regular, 11 points: the default is now that, sized 
 read), FIXED_PITCH | FF_MODERN so a prefix without Consolas gets GDI's fixed-pitch fallback (Courier New, then Liberation
 Mono). Settings Notepad already saved are kept (Format > Font changes them). Upstream master has the old default.
 A size-only change (9 points at the DPI, still "System") was tried first: saved 90 but drew the SAME pixels (diff = the
-caret only), which is how the bitmap face was found.
+caret only), which is how the bitmap face was found. BUILT in 11.10-156 (release-156 = 155 + `827b665` + `9097c92`; package real diffs vs 155 = notepad.exe x86_64 + i386;
+lab on the package: 64-bit 2/2, 32-bit 1/1), NOT published yet.
 MEASURED (lab, 155 vs 155 with the patched notepad.exe, 168 dpi, nested KWin, no saved settings, readme stand-in, WM_CLOSE):
 provisioned prefix (core fonts): 155 saved 51 / "System", bitmap text (2/2); patched saved 111 / "Consolas", Courier New
 at 11 points (2/2). Bare prefix: patched drew Liberation Mono at 11 points. (111: the saved value is converted back from
