@@ -10,8 +10,8 @@ that, applied and built, produce the Wine that Neutron's engine runs.
 
 The runtime built from this repo also carries the graphics and NVIDIA translation layers the apps run
 on (DXVK, vkd3d-proton, the NVIDIA wrappers) and a ucrtbase shim. They are built from upstream source
-at pinned commits, with our patches, from [`external/`](external/). The current version is
-**11.10-99** ([`build/VERSION`](build/VERSION)).
+at pinned commits, with our patches, from [`external/`](external/). The current version is in
+[`build/VERSION`](build/VERSION) and on the [releases page](https://github.com/Nico-LaFoucate/neutron-wine/releases/latest).
 
 ## Upstream base
 
@@ -91,8 +91,10 @@ separate LGPL-2.1-or-later repo; Collider (the GUI) and Mud Hut (the installer) 
 
 ## Status
 
-Beta. Tested on three machines, all CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs. AMD and Intel
-GPUs, other distributions and other desktops aren't validated yet.
+Beta. Developed and tested on CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs. Users also run it on
+Fedora, Ubuntu, Bazzite, Nobara and Arch, under GNOME and Hyprland. On AMD GPUs, Photoshop 2026 and
+Premiere Pro 2026 use the GPU and Illustrator 2026 runs; a user reports Premiere Pro and Photoshop
+working on Intel Iris Xe. Each app's status is on the [status board](https://neutronproject.org/#status).
 
 ## Reporting bugs
 
