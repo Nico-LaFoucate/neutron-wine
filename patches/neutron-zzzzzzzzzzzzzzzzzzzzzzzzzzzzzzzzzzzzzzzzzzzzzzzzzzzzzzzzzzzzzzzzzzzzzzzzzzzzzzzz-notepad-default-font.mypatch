@@ -1,0 +1,44 @@
+notepad: Default to Consolas 11 points at the screen's DPI, as Windows does.
+
+Notepad's default font was "System" at a fixed lfHeight of -12, which is 9 points only at 96 dpi. "System" is a bitmap
+font, so it comes in fixed pixel sizes and does not grow with the DPI: at 168 dpi (175%) the text was about 5 points,
+and closing Notepad saved iPointSize 51 with lfFaceName "System", so every later run showed the same tiny text. Vendor
+installers that open a readme in Notepad when they finish (FabFilter, seen 2026-10-26) all showed it.
+
+Windows 8 and later default Notepad to Consolas, Regular, 11 points. The default is now that, sized with the DPI the
+way a stored iPointSize is already read, with FIXED_PITCH | FF_MODERN so a prefix without Consolas gets GDI's fixed-pitch
+fallback (Courier New, then Liberation Mono). A setting Notepad already saved is kept.
+
+Measured 2026-10-27 (lab, runtime 11.10-155 and the same runtime with this notepad.exe, 168 dpi, nested KWin, no
+saved settings, readme stand-in opened, closed with WM_CLOSE): provisioned prefix with core fonts: 155 saved
+iPointSize 51 / "System" and drew the bitmap font (2/2); patched saved 111 / "Consolas" and drew Courier New at
+11 points (2/2). Bare prefix: patched drew Liberation Mono at 11 points. 111, not 110: the saved value is converted
+back from the pixel height (26 px at 168 dpi), as before; it reads back as the same 26 px.
+
+--- a/programs/notepad/main.c
++++ b/programs/notepad/main.c
+@@ -196,7 +196,12 @@
+     Globals.iMarginRight = 2000;
+     Globals.bStatusBar = TRUE;
+     
+-    Globals.lfFont.lfHeight         = -12;
++    /* NEUTRON: Windows' default, Consolas 11 points, sized for the screen's DPI the way a stored iPointSize
++     * is read below. The old default was the "System" bitmap font at a fixed -12 (9 points only at 96 dpi):
++     * a bitmap font comes in fixed pixel sizes, so at 168 dpi (175%) the text was about 5 points, and
++     * closing Notepad saved iPointSize 51, so every later run, and every installer that opens a readme,
++     * showed the same tiny text. Without Consolas, the fixed-pitch fallback (Courier New) is used. */
++    Globals.lfFont.lfHeight         = -MulDiv(110, GetDpiForWindow(GetDesktopWindow()), 720);
+     Globals.lfFont.lfWidth          = 0;
+     Globals.lfFont.lfEscapement     = 0;
+     Globals.lfFont.lfOrientation    = 0;
+@@ -208,8 +213,8 @@
+     Globals.lfFont.lfOutPrecision   = OUT_DEFAULT_PRECIS;
+     Globals.lfFont.lfClipPrecision  = CLIP_DEFAULT_PRECIS;
+     Globals.lfFont.lfQuality        = DEFAULT_QUALITY;
+-    Globals.lfFont.lfPitchAndFamily = FIXED_PITCH | FF_DONTCARE;
+-    lstrcpyW(Globals.lfFont.lfFaceName, L"System");
++    Globals.lfFont.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
++    lstrcpyW(Globals.lfFont.lfFaceName, L"Consolas");
+ 
+     LoadStringW(Globals.hInstance, STRING_PAGESETUP_HEADERVALUE,
+                 Globals.szHeader, ARRAY_SIZE(Globals.szHeader));

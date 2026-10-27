@@ -1593,6 +1593,20 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 80 — `…z×80-notepad-default-font` (installer readmes in tiny text)
+Seen 10-26: FabFilter's installer opened its readme in Notepad at about 5 points (his 175% screen, 168 dpi). Notepad's
+default font was "System" at a fixed lfHeight -12 (9 points only at 96 dpi); "System" is a bitmap font, so it does not
+grow with the DPI, and closing Notepad saved iPointSize 51 + "System", so every later run kept it. Windows 8 and later
+default Notepad to Consolas, Regular, 11 points: the default is now that, sized with the DPI (as a stored iPointSize is
+read), FIXED_PITCH | FF_MODERN so a prefix without Consolas gets GDI's fixed-pitch fallback (Courier New, then Liberation
+Mono). Settings Notepad already saved are kept (Format > Font changes them). Upstream master has the old default.
+A size-only change (9 points at the DPI, still "System") was tried first: saved 90 but drew the SAME pixels (diff = the
+caret only), which is how the bitmap face was found.
+MEASURED (lab, 155 vs 155 with the patched notepad.exe, 168 dpi, nested KWin, no saved settings, readme stand-in, WM_CLOSE):
+provisioned prefix (core fonts): 155 saved 51 / "System", bitmap text (2/2); patched saved 111 / "Consolas", Courier New
+at 11 points (2/2). Bare prefix: patched drew Liberation Mono at 11 points. (111: the saved value is converted back from
+26 px, as before; it reads back as 26 px.)
+
 ### external: nvcuda `0001-neutron.patch` — per-call diagnostics moved to TRACE (2026-10-25)
 The shipped nvcuda printed three diagnostics with ERR on every call: `neutron-luid` per cuDeviceGetLuid (521 lines in a 12 s
 Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per large 2D copy. They are TRACE now
