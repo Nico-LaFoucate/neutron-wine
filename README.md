@@ -91,10 +91,10 @@ separate LGPL-2.1-or-later repo; Collider (the GUI) and Mud Hut (the installer) 
 
 ## Status
 
-Beta. Developed and tested on CachyOS with KDE Plasma (Wayland) and NVIDIA GPUs. Users also run it on
-Fedora, Ubuntu, Bazzite, Nobara and Arch, under GNOME and Hyprland. On AMD GPUs, Photoshop 2026 and
-Premiere Pro 2026 use the GPU and Illustrator 2026 runs; a user reports Premiere Pro and Photoshop
-working on Intel Iris Xe. Each app's status is on the [status board](https://neutronproject.org/#status).
+Beta. Runs on NVIDIA, AMD and Intel GPUs. Developed on CachyOS with KDE Plasma (Wayland); users also run
+it on Fedora, Ubuntu, Bazzite, Nobara and Arch, under GNOME and Hyprland. On AMD, Photoshop 2026 and
+Premiere Pro 2026 use the GPU and Illustrator 2026 runs; on Intel, Premiere Pro runs very well and
+Photoshop works on Iris Xe graphics. Each app's status is on the [status board](https://neutronproject.org/#status).
 
 ## Reporting bugs
 
