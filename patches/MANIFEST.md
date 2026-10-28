@@ -1610,7 +1610,12 @@ could carry a configure ack ahead of its buffer -- the remaining gap: a toplevel
 Kill switch NEUTRON_CLICKTHROUGH_LIVE=0. Same gap in upstream winewayland.
 MEASURED (lab, fresh reflink copies of the signed-in AeSignin prefix, same steps: open a photo, the tip appears, click "Got it"):
 157 FAIL 2/2 (press -> main window surface, tip stays); 157 + this winewayland.so PASS 1/1 (pointer_handle_enter on the tip's
-surface, press there, tip closes on the first click); same .so with NEUTRON_CLICKTHROUGH_LIVE=0 FAIL 1/1. NOT YET BUILT.
+surface, press there, tip closes on the first click); same .so with NEUTRON_CLICKTHROUGH_LIVE=0 FAIL 1/1.
+SHIPPED in 11.10-158 (release-158 = 157 + `d254eae` + `04d5f74`; Latest 10-28). Build: 0 patch/hunk failures, marker in
+winewayland.so. Package real diffs vs 157: winewayland.so x2 + recipe/stamp files + the ucrtbase shim (ImageBase only).
+On the PACKAGE (lab, fresh signed-in copies): the tip closes on the first click (press on the tip's surface), 0 faults;
+Premiere 2026 opens a project and plays (00;00;04;09 after ~4 s), 0 faults. Clean room: beta.33 `setup --runtime-version
+11.10-158` rc 0, tree == tarball; downloads == dist.
 
 ### patch 82 — `…z×82-comctl32-listview-doublebuffer-background` (stale Add/Remove inside Lightroom's preset list)
 With patch 81 in place, restoring then maximizing Lightroom's Export dialog left a copy of the preset pane's Add/Remove
