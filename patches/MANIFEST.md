@@ -1608,7 +1608,8 @@ lines): PS 2026 home > New docks, 2nd document docks, a photo opened as a 3rd do
 home > New and a 2nd document dock; Illustrator 2nd document draws Properties (1/1). Lab-rig only, on BOTH builds (not this patch):
 a dark 842x606 dialog on Ctrl+O, and a dark 500x1000 tip box after opening a 3rd document. On his desktop Ctrl+O opens the file
 picker normally and he has seen no broken tooltip in months (10-28); the lab prefix's Documents folder is a real directory, so
-not that. Not chased. No kill switch. NOT YET BUILT.
+not that. Not chased.
+PRE-RELEASED in 11.10-159 (10-28; release-159 = 158 + `75d7d54` + `04fac4c`), Latest stays 158 until his desktop check. No kill switch. NOT YET BUILT.
 
 ### patch 83 — `…z×83-winewayland-clickthrough-live` (Photoshop's "Try Adjustments presets" tip could not be dismissed)
 Found 10-28 while taking press screenshots (lab Photoshop 2026, 11.10-157, nested KWin 175%): the coach mark's "Got it" and
