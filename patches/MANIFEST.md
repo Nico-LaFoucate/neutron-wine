@@ -1606,7 +1606,9 @@ WM_ERASEBKGND returns TRUE (the todo_wine is removed from the test). A CLR_NONE 
 MEASURED: harness `lvstale.exe` (double-buffered list over a magenta parent, subclass eats WM_ERASEBKGND, grown 100->160 px,
 pixels read back in-process): 156 FAIL 18000 magenta px, erase answer 0 (2/2); patched PASS 0 px, answer 1 (2/2);
 `lvstale.exe transparent` PASS on both (parent shows through). Lightroom (156 + patches 81/82 in a runtime copy): restore ->
-maximize leaves one Add (2/2); Plug-in Manager list draws normally. NOT YET BUILT into a release.
+maximize leaves one Add (2/2); Plug-in Manager list draws normally.
+SHIPPED in 11.10-157 (package real diffs vs 156: winewayland.so x2, comctl32.dll x2, comctl32_v6.dll x2 + recipe/stamp files;
+lvstale 64-bit + 32-bit PASS on the package, 156 32-bit FAIL; LrC, Photoshop 2026, Premiere 2026 launch clean on it).
 
 ### patch 81 — `…z×81-winewayland-maximized-short` (Lightroom's maximized Export dialog kept a stale frame)
 Seen 10-27 in the #41 lab run, measured 10-28 (lab LrC 15.6, 11.10-156, nested KWin 175% + 32 px top panel): Export dialog
@@ -1622,8 +1624,8 @@ passes 2200x1201, 2200x1198). Only windows that were never committed before take
 MEASURED (lab, 156 + this winewayland.so in a runtime copy, same prefix and steps): dialog opened maximized draws completely
 (2/2 sessions), restore + maximize draws, Cancel at its maximized position closes it, REJECTED 0 and "ran outside" 0 per
 session (156: 42000+); `maxstyle.exe overlapped` still (-4,28) 2202x1210 with no maxshort line. Strings vs 156: only the two new
-messages. Residual, not this patch: after restore -> maximize, a copy of the preset list's Add button stays drawn inside the
-list's frame (2/2); RedrawWindow does not clear it, so Lightroom does not paint that spot. NOT YET BUILT into a release.
+messages. The stale Add left after restore -> maximize (2/2) was a separate comctl32 bug: patch 82.
+SHIPPED in 11.10-157 (release-157 = 156 + `2c265a8` + `d2464cc` + `acfd456`; Latest 10-28).
 
 ### patch 80 — `…z×80-notepad-default-font` (installer readmes in tiny text)
 Seen 10-26: FabFilter's installer opened its readme in Notepad at about 5 points (his 175% screen, 168 dpi). Notepad's
