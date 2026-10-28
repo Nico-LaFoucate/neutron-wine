@@ -1605,9 +1605,10 @@ Found 10-28 chasing Illustrator's blank right dock (his "Chase this"): the walk 
 (OWL.Palette, "revealed 7 window(s)") over the selected one at the second document. A/B with a test switch (lab 158):
 walk on blank 3/3, off draws 2/2. With all of it removed (lab 158 + this win32u.so, fresh signed-in copies, 0 walk/welcome log
 lines): PS 2026 home > New docks, 2nd document docks, a photo opened as a 3rd document docks; PS 2025 (26.11.8, lab install)
-home > New and a 2nd document dock; Illustrator 2nd document draws Properties (1/1). Seen on BOTH builds (not this patch): a
-dark 842x606 dialog on Ctrl+O in PS 2025 and 2026; a dark 500x1000 coach-mark box top-left after opening a 3rd document in
-PS 2026 (the July "tooltip black box" family). No kill switch. NOT YET BUILT.
+home > New and a 2nd document dock; Illustrator 2nd document draws Properties (1/1). Lab-rig only, on BOTH builds (not this patch):
+a dark 842x606 dialog on Ctrl+O, and a dark 500x1000 tip box after opening a 3rd document. On his desktop Ctrl+O opens the file
+picker normally and he has seen no broken tooltip in months (10-28); the lab prefix's Documents folder is a real directory, so
+not that. Not chased. No kill switch. NOT YET BUILT.
 
 ### patch 83 — `…z×83-winewayland-clickthrough-live` (Photoshop's "Try Adjustments presets" tip could not be dismissed)
 Found 10-28 while taking press screenshots (lab Photoshop 2026, 11.10-157, nested KWin 175%): the coach mark's "Got it" and
