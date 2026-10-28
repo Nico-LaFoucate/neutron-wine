@@ -1,0 +1,59 @@
+comctl32/listview: a double-buffered list with a solid background paints that background
+
+Lightroom Classic's Export dialog, restored then maximized, kept its preset pane's old Add/Remove
+buttons drawn inside the grown preset list (a report SysListView32 with LVS_EX_DOUBLEBUFFER,
+background 0x2b2b2b, whose subclass eats WM_ERASEBKGND), through every repaint. With no erase
+pending, LISTVIEW_Refresh copied the old window contents into its back buffer, so whatever lay
+under a newly exposed part of the list stayed.
+
+Native answers WM_ERASEBKGND with TRUE for a double-buffered list (tests/listview.c, was
+todo_wine), so its paint never has an erase pending and it paints the background itself. Do the
+same: the refresh fills the back buffer with the background color, and WM_ERASEBKGND returns
+TRUE. A CLR_NONE list keeps the copy, since there the parent's background must show through.
+
+--- a/dlls/comctl32/listview.c
++++ b/dlls/comctl32/listview.c
+@@ -5350,10 +5350,19 @@
+ 
+     if (prcErase) {
+         LISTVIEW_FillBkgnd(infoPtr, hdc, prcErase);
++    } else if ((infoPtr->dwLvExStyle & LVS_EX_DOUBLEBUFFER) && infoPtr->clrBk != CLR_NONE) {
++        /* NEUTRON: a double-buffered list with a solid background paints that background in WM_PAINT, as
++         * native does: native answers WM_ERASEBKGND with TRUE without erasing (tests/listview.c), so its
++         * paint never has an erase pending and the buffer is the whole picture. Copying the old window
++         * contents in here instead kept whatever lay there before: Lightroom Classic's Export dialog
++         * (its subclass also eats WM_ERASEBKGND), restored then maximized, showed its preset pane's old
++         * Add/Remove buttons inside the grown preset list, through every repaint (2026-10-28). */
++        LISTVIEW_FillBkgnd(infoPtr, hdc, &infoPtr->rcList);
+     } else if (infoPtr->dwLvExStyle & LVS_EX_DOUBLEBUFFER) {
+         /* If no erasing was done (usually because RedrawWindow was called
+          * with RDW_INVALIDATE only) we need to copy the old contents into
+-         * the backbuffer before continuing. */
++         * the backbuffer before continuing. NEUTRON: only for CLR_NONE now, where what lies beneath is
++         * the parent's background (forwarded erase) and must show through. */
+         BitBlt(hdc, infoPtr->rcList.left, infoPtr->rcList.top,
+                infoPtr->rcList.right - infoPtr->rcList.left,
+                infoPtr->rcList.bottom - infoPtr->rcList.top,
+@@ -9870,8 +9879,9 @@
+         return TRUE;
+     }
+ 
+-    /* for double buffered controls we need to do this during refresh */
+-    if (infoPtr->dwLvExStyle & LVS_EX_DOUBLEBUFFER) return FALSE;
++    /* for double buffered controls we need to do this during refresh. NEUTRON: and say it is done, as
++     * native does (tests/listview.c, was todo_wine): LISTVIEW_Refresh() paints the background itself. */
++    if (infoPtr->dwLvExStyle & LVS_EX_DOUBLEBUFFER) return TRUE;
+ 
+     return LISTVIEW_FillBkgnd(infoPtr, hdc, &rc);
+ }
+--- a/dlls/comctl32/tests/listview.c
++++ b/dlls/comctl32/tests/listview.c
+@@ -2114,7 +2114,7 @@
+ 
+     flush_sequences(sequences, NUM_MSG_SEQUENCES);
+     r = SendMessageA(hwnd, WM_ERASEBKGND, (WPARAM)hdc, 0);
+-    todo_wine expect(1, r);
++    expect(1, r);
+     ok_sequence(sequences, PARENT_FULL_SEQ_INDEX, empty_seq,
+                 "don't forward WM_ERASEBKGND on non-CLR_NONE", FALSE);
+ 

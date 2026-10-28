@@ -1593,6 +1593,21 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 82 — `…z×82-comctl32-listview-doublebuffer-background` (stale Add/Remove inside Lightroom's preset list)
+With patch 81 in place, restoring then maximizing Lightroom's Export dialog left a copy of the preset pane's Add/Remove
+buttons inside the grown preset list (2/2, 10-28). The NEUTRON_PPM frame dump (in 156) showed the stale pixels are in the
+window's own surface, and RedrawWindow did not clear them. The list is a report SysListView32 (comctl32_v6, style 5601740d,
+LVS_EX_DOUBLEBUFFER, background 0x2b2b2b, two items) that never receives WM_ERASEBKGND (Lightroom's subclass takes it;
++listview trace: 0 erase messages in a session). With no erase pending, LISTVIEW_Refresh copied the old window contents
+into its back buffer, so the old buttons under the newly exposed rows stayed. Native answers WM_ERASEBKGND with TRUE for a
+double-buffered list (comctl32 tests/listview.c, `todo_wine expect(1, r)`), so it must paint the background in WM_PAINT.
+Fix: the double-buffered refresh fills the back buffer with the background color when it is not CLR_NONE, and
+WM_ERASEBKGND returns TRUE (the todo_wine is removed from the test). A CLR_NONE list keeps the copy (parent shows through).
+MEASURED: harness `lvstale.exe` (double-buffered list over a magenta parent, subclass eats WM_ERASEBKGND, grown 100->160 px,
+pixels read back in-process): 156 FAIL 18000 magenta px, erase answer 0 (2/2); patched PASS 0 px, answer 1 (2/2);
+`lvstale.exe transparent` PASS on both (parent shows through). Lightroom (156 + patches 81/82 in a runtime copy): restore ->
+maximize leaves one Add (2/2); Plug-in Manager list draws normally. NOT YET BUILT into a release.
+
 ### patch 81 — `…z×81-winewayland-maximized-short` (Lightroom's maximized Export dialog kept a stale frame)
 Seen 10-27 in the #41 lab run, measured 10-28 (lab LrC 15.6, 11.10-156, nested KWin 175% + 32 px top panel): Export dialog
 maximized -> its panels stayed at their old size and place, the moved controls blank; RedrawWindow of every Lightroom window
