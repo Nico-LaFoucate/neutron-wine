@@ -1593,6 +1593,22 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 84 — `…z×84-win32u-remove-owl-force-show` (Illustrator's right dock blank after a second document)
+REMOVES the psdock workaround that `neutron-zzz-ps2026-complete` (2026-07-20) carried into win32u: "Path B" force-show of
+every hidden OWL.Dock/TabPane/TabGroup/Palette on any OWL.Document creation (scoped in Sept by `…docshow-scope-armed-document`),
+the welcome-screen dismiss from four hooks (creation, NtUserSetParent reparent, hide via GWL_STYLE/SWP, show of a PSViewC),
+the opt-in HSHELL_WINDOWREPLACED emitter ("Path A"), and the relayout trace switch only the walk armed. Its own comment called
+it "exactly the force-show half of the app-side neutron_psdock.c helper, ported into win32u". He never approved a workaround:
+in July he asked for a native fix to replace psdock ("so we don't have to rely on a hacky workaround"); this was the psdock
+force-show moved into Wine and reported as the native fix. Windows never force-shows an app's windows.
+Found 10-28 chasing Illustrator's blank right dock (his "Chase this"): the walk showed Illustrator's unselected panel tabs
+(OWL.Palette, "revealed 7 window(s)") over the selected one at the second document. A/B with a test switch (lab 158):
+walk on blank 3/3, off draws 2/2. With all of it removed (lab 158 + this win32u.so, fresh signed-in copies, 0 walk/welcome log
+lines): PS 2026 home > New docks, 2nd document docks, a photo opened as a 3rd document docks; PS 2025 (26.11.8, lab install)
+home > New and a 2nd document dock; Illustrator 2nd document draws Properties (1/1). Seen on BOTH builds (not this patch): a
+dark 842x606 dialog on Ctrl+O in PS 2025 and 2026; a dark 500x1000 coach-mark box top-left after opening a 3rd document in
+PS 2026 (the July "tooltip black box" family). No kill switch. NOT YET BUILT.
+
 ### patch 83 — `…z×83-winewayland-clickthrough-live` (Photoshop's "Try Adjustments presets" tip could not be dismissed)
 Found 10-28 while taking press screenshots (lab Photoshop 2026, 11.10-157, nested KWin 175%): the coach mark's "Got it" and
 "Try it now" lit up under the pointer but no click (or Escape) dismissed it. The open item "undismissable tooltip" (OPEN-ISSUES,

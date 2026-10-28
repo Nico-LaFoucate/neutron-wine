@@ -1,0 +1,481 @@
+win32u: remove the Photoshop dock force-show and welcome-dismiss code (the psdock workaround in Wine)
+
+In July the app-side psdock helper's force-show was ported into win32u ("Path B", plus a welcome-screen
+dismiss from four hooks and an opt-in HSHELL_WINDOWREPLACED emitter, "Path A"). On any OWL.Document
+creation it showed every hidden OWL.Dock/TabPane/TabGroup/Palette under the root window. Windows never
+force-shows an app's windows. Illustrator is OWL too: at its second document the walk showed the
+unselected panel tabs over the selected one and the right dock went blank (walk on 3/3; off 2/2).
+
+Without any of it on 11.10-158 (lab, fresh signed-in copies): Photoshop 2026 home > New docks, a second
+document docks, a photo opened as a third document docks; Photoshop 2025 home > New and a second
+document dock; Illustrator's second document draws its Properties panel. Removed: the creation,
+reparent, hide and show hooks, the walk, the welcome dismiss, Path A, and the relayout trace switch only
+the walk could arm. No kill switch: there is nothing to turn back on.
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -638,11 +638,6 @@
+     __asm__ __volatile__( "" : : "r"(hwnd) : "memory" );
+ }
+ 
+-/* NEUTRON (PS 2025 universal dock): armed from NtUserSetParent when OWL inserts a doc-host TabPane
+-   into the frame dock that holds the visible home screen -- the universal pre-decision hook covering
+-   all doc-open paths (File>New/Open/recovery), both PS versions. Defined near neutron_on_window_created. */
+-static void neutron_predecision_on_reparent( HWND child, HWND parent );
+-
+ /* NEUTRON: SetParent() must not make a HIDDEN window the foreground window.
+  *
+  * NtUserSetParent() hides the window, relinks it, and then repositions it with
+@@ -863,8 +858,6 @@
+ 
+     if (was_visible) NtUserShowWindow( hwnd, SW_SHOW );
+ 
+-    neutron_predecision_on_reparent( hwnd, parent );  /* NEUTRON: universal PS-dock pre-decision hook */
+-
+     set_thread_dpi_awareness_context( context );
+     return old_parent;
+ }
+@@ -1686,7 +1679,6 @@
+     return ret;
+ }
+ 
+-static void neutron_on_window_hidden( HWND hwnd );  /* NEUTRON: defined later, used by hide paths */
+ static void neutron_log_shown( HWND hwnd, const char *via );  /* NEUTRON diag: log window shows */
+ static void neutron_geom_log( const char *tag, HWND hwnd, const RECT *win, const RECT *client );  /* NEUTRON avenue-3 */
+ static void neutron_class_ascii( HWND hwnd, char *out /* [64] */ );  /* NEUTRON: defined later */
+@@ -1869,8 +1861,6 @@
+         user_driver->pSetWindowStyle( hwnd, offset, &style );
+         if (made_visible || layered) update_window_state( hwnd );
+         send_message( hwnd, WM_STYLECHANGED, offset, (LPARAM)&style );
+-        if (offset == GWL_STYLE && (style.styleOld & WS_VISIBLE) && !(style.styleNew & WS_VISIBLE))
+-            neutron_on_window_hidden( hwnd );  /* NEUTRON: window hidden via GWL_STYLE clear */
+         if (offset == GWL_STYLE && !(style.styleOld & WS_VISIBLE) && (style.styleNew & WS_VISIBLE))
+         {
+             neutron_log_shown( hwnd, "STYLE" );  /* NEUTRON diag: shown via GWL_STYLE set */
+@@ -2852,7 +2842,6 @@
+     is_layered = new_surface && new_surface->alpha_mask;
+     is_child = toplevel && toplevel != hwnd;
+ 
+-    if (swp_flags & SWP_HIDEWINDOW) neutron_on_window_hidden( hwnd );  /* NEUTRON: window hidden via SetWindowPos */
+     if (swp_flags & SWP_SHOWWINDOW) neutron_log_shown( hwnd, "SWP" );  /* NEUTRON diag */
+ 
+     /* NEUTRON: the monitor override deliberately does NOT drive per-monitor DPI here (same reason as in
+@@ -5637,45 +5626,6 @@
+  *
+  * Implementation of ShowWindow and ShowWindowAsync.
+  */
+-/* === NEUTRON: dismiss the OWL home/welcome screen when a document canvas appears. ========
+-   Root cause of the Photoshop File->New "wedge": under Wine the UXP home (window class
+-   "OWL.WelcomeScreenView") never receives its self-hide signal on doc-create, so its
+-   WS_VISIBLE style bit stays set. Photoshop's home-visible check reads exactly
+-   that bit (GetWindowLongPtr GWL_STYLE, bit 28), so the home is reported visible forever
+-   and the new document never activates/shows. When a sized document canvas (class
+-   "PSViewC") becomes visible we clear the welcome's WS_VISIBLE, matching what Windows does
+-   internally. Keyed on the OWL class so it is version-proof and a no-op in apps that have
+-   no such window (e.g. Premiere). */
+-static const WCHAR neutron_welcome_class[] =
+-    {'O','W','L','.','W','e','l','c','o','m','e','S','c','r','e','e','n','V','i','e','w',0};
+-static const WCHAR neutron_psview_class[] = {'P','S','V','i','e','w','C',0};
+-static const WCHAR neutron_docwindow_class[] =
+-    {'O','W','L','.','D','o','c','u','m','e','n','t','W','i','n','d','o','w',0};
+-/* PS 2026 uses the SHORT class "OWL.Document" for the new document window (PS 2025 used
+-   "OWL.DocumentWindow"). Path A keyed only on the long name -> silently no-op'd on PS 2026. */
+-static const WCHAR neutron_document_class[] =
+-    {'O','W','L','.','D','o','c','u','m','e','n','t',0};
+-static BOOL neutron_class_is( HWND hwnd, const WCHAR *want )
+-{
+-    WCHAR bufW[64];
+-    UNICODE_STRING name;
+-    int len;
+-    name.Buffer = bufW;
+-    name.MaximumLength = sizeof(bufW);
+-    name.Length = 0;
+-    len = NtUserGetClassName( hwnd, FALSE, &name );
+-    if (len <= 0 || len >= 64) return FALSE;
+-    bufW[len] = 0;
+-    return !wcscmp( bufW, want );
+-}
+-
+-/* === NEUTRON Path B: native force-show of the deferred OWL workspace docks. ===================
+-   On File>New the OWL document + its dock hierarchy (Dock->TabPane->TabGroup->Document + panels)
+-   are built and reparented under the "Photoshop" frame, but under winewayland PS leaves their
+-   WS_VISIBLE clear (deferred to ~make-8) so the canvas never renders. We reveal them ONCE, in
+-   show_window's safe context, top-down (ancestors first so children can map). This is exactly the
+-   force-show half of the app-side neutron_psdock.c helper, ported into win32u WITHOUT its
+-   frame-jitter/2px-nudge and WITHOUT its decaying 10s repaint timer -> no canvas perturbation. */
+ static void neutron_class_ascii( HWND hwnd, char *out /* [64] */ )
+ {
+     WCHAR bufW[64];
+@@ -5697,137 +5647,12 @@
+     }
+     return FALSE;
+ }
+-/* The workspace dock classes to reveal (mirrors neutron_psdock.c want_show()). */
+-static BOOL neutron_want_show( const char *c )
+-{
+-    return neutron_ascii_has( c, "OWL.Dock" )    || neutron_ascii_has( c, "OWL.TabPane" )
+-        || neutron_ascii_has( c, "OWL.TabGroup" )|| neutron_ascii_has( c, "OWL.Palette" )
+-        || neutron_ascii_has( c, "OWL.Document" )|| neutron_ascii_has( c, "OWL.WindowGroup" )
+-        || neutron_ascii_has( c, "OWL.ResizeGripper" ) || neutron_ascii_has( c, "PSViewC" );
+-}
+-/* Home screen + floating popups are hidden on purpose: never show them, never descend into them. */
+-static BOOL neutron_skip_subtree( const char *c )
+-{
+-    return neutron_ascii_has( c, "WelcomeScreen" ) || neutron_ascii_has( c, "PSFloat" );
+-}
+-/* === NEUTRON: SCOPE THE WALK TO THE DOCUMENT IT WAS ARMED ON. ===============================
+- *
+- * THE BUG THIS FIXES (build tester, 2026-09-09, reproduced 4+ times, root-caused in
+- * photoshop-20260909-145009.log): with three documents open, the canvas stopped responding to
+- * clicks. Menus, panels and tabs kept working; clicking document 1's tab restored it.
+- *
+- * It was ours. neutron_want_show() matches "OWL.Document" by SUBSTRING and the walk runs from
+- * GA_ROOT, so it reveals EVERY hidden document window in the frame -- not just the one whose
+- * creation armed it. Photoshop keeps exactly one document window visible and hides the rest
+- * (that is how tabs work). By the third document there is a hidden one to find:
+- *
+- *   12662  OWL document 0x311f8 created            <- doc 1
+- *   17613  OWL document 0xa0fee created            <- doc 2, walk reveals 0xa0fee only (doc 1
+- *                                                     still visible, nothing to "rescue")
+- *   18464  doc 1 hidden as the tester switched tabs
+- *   25764  OWL document 0x514ca created            <- doc 3
+- *   25769  force-show -> revealed 2 window(s)      <- 0x514ca AND 0x311f8
+- *   25771  force-show -> revealed 1 window(s)      <- 0x311f8 again, PS re-hid it
+- *   25773  force-show -> revealed 1 window(s)      <- 0x311f8 again; our last write wins
+- *
+- * Doc 1's window is then WS_VISIBLE and stacked over the canvas region, so a canvas click
+- * resolves (via window_from_point) to IT, not the active document. That window's procedure
+- * throws a C++ exception on the WM_MOUSEACTIVATE and handles it itself -- which is why
+- * the app stays healthy and the click merely evaporates. Every reported property follows:
+- * canvas-only, third document, blank-vs-file irrelevant, and clicking doc 1's tab recovers it
+- * (that is PS showing the window legitimately, reconciling the state we forced).
+- *
+- * THE FIX: the walk exists to reveal the dock hierarchy of the document that was JUST CREATED,
+- * whose WS_VISIBLE winewayland leaves deferred. Any OTHER document window's visibility is
+- * Photoshop's business -- it hid it on purpose. Skip those, subtree and all, exactly as we
+- * already skip WelcomeScreen and PSFloat. Docks, tab panes, palettes and grippers are unchanged;
+- * they are ancestors of the documents, not descendants, so nothing the walk is FOR is lost.
+- *
+- * KILL SWITCH: NEUTRON_DOCSHOW_SCOPE=0 restores the pre-patch blanket walk exactly, so the
+- * 0-vs-N A/B can be run on one shipped build in a single session -- the tester can reproduce
+- * this on demand at the third document. */
+-static BOOL neutron_docshow_scope(void)
+-{
+-    static int on = -1;
+-
+-    if (on < 0)
+-    {
+-        const char *e = getenv( "NEUTRON_DOCSHOW_SCOPE" );
+-        on = e ? (e[0] != '0') : 1;
+-        ERR( "neutron-gateresolved: NEUTRON_DOCSHOW_SCOPE = %d (%s)\n", on, e ? "environment" : "default" );
+-    }
+-    return on;
+-}
+-
+-/* The document window whose creation armed the current force-show budget. Written in
+- * neutron_on_window_created, read by the walk. A plain volatile pointer: it is written on the
+- * one thread that creates OWL windows and only ever compared for identity. */
+-static HWND volatile neutron_dockshow_hwnd;
+-
+-/* TRUE for a document window that is not the one we were armed on -- PS owns its visibility. */
+-static BOOL neutron_foreign_document( HWND hwnd, const char *c )
+-{
+-    if (!neutron_ascii_has( c, "OWL.Document" )) return FALSE;
+-    return hwnd != neutron_dockshow_hwnd;
+-}
+-
+-static int neutron_force_show_docks( HWND parent, int depth )
+-{
+-    HWND *list;
+-    char cb[64];
+-    int i, n = 0;
+-    if (depth > 14) return 0;
+-    if (!(list = list_window_children( parent ))) return 0;
+-    for (i = 0; list[i]; i++)
+-    {
+-        neutron_class_ascii( list[i], cb );
+-        if (neutron_skip_subtree( cb )) continue;                 /* leave home/float as PS put it */
+-        if (neutron_docshow_scope() && neutron_foreign_document( list[i], cb ))
+-        {
+-            /* Log ONLY the ones we would have wrongly revealed, so the line count stays at the
+-               bug's own rate and the A/B against NEUTRON_DOCSHOW_SCOPE=0 is readable in the log. */
+-            if (!(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
+-                ERR( "neutron: force-show skipping foreign document %p (armed on %p) -- PS hid it on purpose\n",
+-                     list[i], neutron_dockshow_hwnd );
+-            continue;
+-        }
+-        if (neutron_want_show( cb ) && !(get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
+-        {
+-            RECT rc = {0, 0, 0, 0};
+-            get_client_rect( list[i], &rc, get_thread_dpi() );
+-            if (rc.right - rc.left > 1 && rc.bottom - rc.top > 1)  /* real geometry, not a placeholder */
+-            {
+-                NtUserShowWindow( list[i], SW_SHOWNA );
+-                NtUserRedrawWindow( list[i], NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW );
+-                n++;
+-            }
+-        }
+-        n += neutron_force_show_docks( list[i], depth + 1 );
+-    }
+-    free( list );
+-    return n;
+-}
+-
+ /* === NEUTRON avenue-3: capture the OWL relayout's geometry INPUT (rect reads) and OUTPUT (resize
+    issues) for the canvas ancestor chain during the doc-create window, to localize the query that
+    returns a placeholder (484x484 / 100x500-style) rect vs the real document area. */
+ static LONG neutron_relayout_trace;    /* 1 while tracing the doc-create relayout */
+ static LONG neutron_relayout_budget;   /* remaining log lines (hard cap on volume) */
+ 
+-/* NEUTRON 2026-08-03: env gate, OFF BY DEFAULT (NEUTRON_RELAYOUT_TRACE=1 to arm).
+- *
+- * This probe used to arm ITSELF on every OWL document creation with a 20,000-line budget, so a
+- * SHIPPED runtime wrote 20,000 `neutron-geom:` lines into Photoshop's log on an ordinary launch.
+- * The bounded budget stopped it flooding the whole session, which is why it went unnoticed --
+- * a cap is not a gate. Found by the 11.10-22 full-suite smoke test.
+- *
+- * Matches neutron_mask_trace_on() directly below: a diagnostic must be inert in production. */
+-static int neutron_relayout_trace_on( void )
+-{
+-    static int v = -1;
+-    if (v < 0) { const char *e = getenv( "NEUTRON_RELAYOUT_TRACE" ); v = (e && e[0] == '1') ? 1 : 0; }
+-    return v;
+-}
+ static BOOL neutron_is_relayout_win( HWND hwnd, const char *c )
+ {
+     if (neutron_ascii_has( c, "OWL.Dock" ) || neutron_ascii_has( c, "OWL.TabPane" )
+@@ -5928,144 +5753,6 @@
+          via, hwnd, buf, (long)(rc.right - rc.left), (long)(rc.bottom - rc.top), root );
+ }
+ 
+-/* Walk the window tree under 'parent' for visible OWL.WelcomeScreenView windows. If do_hide,
+-   clear their WS_VISIBLE. Returns the count of visible welcomes found. */
+-static int neutron_walk_welcomes( HWND parent, int depth, BOOL do_hide )
+-{
+-    HWND *list;
+-    int i, n = 0;
+-    if (depth > 12) return 0;
+-    if (!(list = list_window_children( parent ))) return 0;
+-    for (i = 0; list[i]; i++)
+-    {
+-        if (neutron_class_is( list[i], neutron_welcome_class )
+-            && (get_window_long( list[i], GWL_STYLE ) & WS_VISIBLE))
+-        {
+-            if (do_hide)
+-            {
+-                ERR( "neutron: hiding welcome screen %p\n", list[i] );
+-                NtUserShowWindow( list[i], SW_HIDE );
+-            }
+-            n++;
+-        }
+-        n += neutron_walk_welcomes( list[i], depth + 1, do_hide );
+-    }
+-    free( list );
+-    return n;
+-}
+-
+-/* THE TRIGGER: on a wedged make the doc canvas is never created/shown, but PS performs the
+-   OWL workspace switch by HIDING the start-workspace windows (SWP_HIDEWINDOW / GWL_STYLE
+-   clear). When a substantial window is hidden while an OWL.WelcomeScreenView is still visible
+-   in the same top-level, the start workspace is going away -> dismiss the welcome too so its
+-   WS_VISIBLE clears, which is what makes File->New dock on the first try. */
+-static void neutron_on_window_hidden( HWND hwnd )
+-{
+-    RECT rc;
+-    HWND root;
+-    if (neutron_class_is( hwnd, neutron_welcome_class )) return;  /* don't recurse on our own hide */
+-    rc.left = rc.top = rc.right = rc.bottom = 0;
+-    get_client_rect( hwnd, &rc, get_thread_dpi() );
+-    /* ⚠️ Gate the LOG ONLY. This function also dismisses the welcome window so Photoshop's
+-     * File->New docks on the first try -- an early return here would silently disable that. */
+-    {
+-        static int hide_on = -1;
+-        if (hide_on < 0) { const char *e = getenv( "NEUTRON_SHOW_TRACE" ); hide_on = (e && e[0] == '1') ? 1 : 0; }
+-        if (hide_on)
+-            ERR( "neutron-diag: HIDE hwnd=%p size=%ldx%ld\n", hwnd,
+-                 (long)(rc.right - rc.left), (long)(rc.bottom - rc.top) );
+-    }
+-    if (rc.right - rc.left < 400 || rc.bottom - rc.top < 300) return;  /* substantial workspace window */
+-    root = NtUserGetAncestor( hwnd, GA_ROOT );
+-    if (!root) return;
+-    if (neutron_walk_welcomes( root, 0, FALSE ) > 0)
+-    {
+-        ERR( "neutron: workspace window %p (%ldx%ld) hidden -> dismissing welcome\n", hwnd,
+-             (long)(rc.right - rc.left), (long)(rc.bottom - rc.top) );
+-        neutron_walk_welcomes( root, 0, TRUE );
+-    }
+-}
+-
+-static void neutron_maybe_dismiss_welcome( HWND shown )
+-{
+-    RECT rc;
+-    HWND root;
+-    /* Post-decision safety net (gated on an actual doc canvas, so no Cancel wart): the pre-decision
+-       hide is handled universally by neutron_predecision_on_reparent (TabPane->Dock insert). */
+-    if (!neutron_class_is( shown, neutron_psview_class )) return;
+-    rc.left = rc.top = rc.right = rc.bottom = 0;
+-    get_client_rect( shown, &rc, get_thread_dpi() );
+-    if (rc.right - rc.left < 800 || rc.bottom - rc.top < 600) return;  /* doc canvas, not a panel */
+-    root = NtUserGetAncestor( shown, GA_ROOT );
+-    if (root) neutron_walk_welcomes( root, 0, TRUE );
+-}
+-
+-/* NEUTRON: THE TRIGGER. An OWL.DocumentWindow is created exactly when a document is created
+-   (verified: 0 at startup, 1 per make) -> a doc now exists, so dismiss the welcome/home screen
+-   (clear its WS_VISIBLE) and File->New docks on the first try. Search the whole desktop for the
+-   welcome because it lives under a different top-level than the new document window. Keyed on the
+-   OWL class -> version-proof, and a no-op in apps without it (e.g. Premiere). */
+-/* Set when an OWL.DocumentWindow is created; the actual welcome dismiss is DEFERRED to
+-   show_window. Doing window ops here (mid-NtUserCreateWindowEx) crashes via re-entrancy. */
+-static LONG neutron_dismiss_pending;
+-/* NEUTRON Path A (kept as an opt-in debug lever only, NEUTRON_SHELL_FIX=1): emit
+-   HSHELL_WINDOWREPLACED on the doc-create transition. Proven INSUFFICIENT alone (PS still hides the
+-   docks), so Path B (force-show below) is the default. */
+-static LONG neutron_shell_emit_pending;
+-/* NEUTRON Path B: set on the doc-create transition; consumed once in show_window to force-show the
+-   deferred OWL workspace docks. */
+-static LONG neutron_dockshow_pending;
+-static void neutron_on_window_created( HWND hwnd )
+-{
+-    /* Match BOTH the PS 2026 short class "OWL.Document" and the PS 2025 "OWL.DocumentWindow". */
+-    if (neutron_class_is( hwnd, neutron_document_class ) || neutron_class_is( hwnd, neutron_docwindow_class ))
+-    {
+-        ERR( "neutron: OWL document %p created -> welcome dismiss + dock force-show armed\n", hwnd );
+-        /* NEUTRON: scope the walk to THIS document (see neutron_docshow_scope). Set before the
+-           budget so the walk can never run against a stale target. */
+-        neutron_dockshow_hwnd = hwnd;
+-        InterlockedExchange( &neutron_dismiss_pending, 1 );
+-        InterlockedExchange( &neutron_shell_emit_pending, 1 );
+-        /* NEUTRON avenue-3: arm the geometry trace for the doc-create relayout window. Bounded line
+-           budget auto-disarms it (see neutron_geom_log) so it can't flood the whole session.
+-           ⚠️ ENV-GATED OFF BY DEFAULT since 2026-08-03 — the budget bounds the volume but never
+-           stopped it running, so a shipped runtime wrote 20,000 lines per Photoshop launch. */
+-        if (neutron_relayout_trace_on())
+-        {
+-            InterlockedExchange( &neutron_relayout_budget, 20000 );
+-            InterlockedExchange( &neutron_relayout_trace, 1 );
+-        }
+-        /* Bounded pass budget (NOT a timer/hammer): a few workspace/doc window ops follow doc-create;
+-           run the force-show on the first few so a dock whose geometry lands a beat late still gets
+-           revealed. Capped hard at NEUTRON_DOCKSHOW_PASSES; each pass is idempotent (shows only
+-           still-hidden windows) and it stops for good once the budget is spent. */
+-        InterlockedExchange( &neutron_dockshow_pending, 3 );
+-    }
+-}
+-
+-/* NEUTRON (PS 2025 universal dock): every doc-open -- File>New, File>Open, AND recovered-doc-on-
+-   launch, in BOTH PS 2025 (OWL.DocumentWindow) and PS 2026 (OWL.Document) -- is immediately preceded
+-   by OWL reparenting a fresh OWL.TabPane into the frame's OWL.Dock; when the home is up, that Dock is
+-   the welcome's own parent. This insert fires exactly once per doc-open-while-home-is-visible and
+-   NEVER at pure startup (all startup TabPane inserts complete before the welcome first shows), so it
+-   is the universal pre-decision signal that the PSFloatC New-Doc-dialog trigger (dialog paths only)
+-   missed. Arm the existing deferred welcome dismiss -- consumed at the top of show_window by PS's own
+-   imminent ShowWindow calls, still several window-ops before the OWL.Document* float-vs-dock decision.
+-   Re-entrancy safe: reads class names + walks the tree + sets a flag; performs NO window ops here. */
+-static void neutron_predecision_on_reparent( HWND child, HWND parent )
+-{
+-    char cb[64], pb[64];
+-    neutron_class_ascii( child, cb );
+-    if (!neutron_ascii_has( cb, "OWL.TabPane" )) return;
+-    neutron_class_ascii( parent, pb );
+-    if (!neutron_ascii_has( pb, "OWL.Dock" )) return;
+-    if (neutron_walk_welcomes( parent, 0, FALSE ) > 0)   /* a VISIBLE welcome in this dock = home is up */
+-    {
+-        ERR( "neutron: arming pre-decision dismiss (OWL.TabPane -> home's OWL.Dock)\n" );
+-        InterlockedExchange( &neutron_dismiss_pending, 1 );
+-    }
+-}
+-
+ static BOOL show_window( HWND hwnd, INT cmd )
+ {
+     WND *win;
+@@ -6095,35 +5782,6 @@
+ 
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
+ 
+-    /* NEUTRON: deferred welcome dismiss. An OWL.DocumentWindow was created (a doc now exists);
+-       do the dismiss here in show_window's safe context, not mid-NtUserCreateWindowEx. */
+-    if (InterlockedExchange( &neutron_dismiss_pending, 0 ))
+-    {
+-        ERR( "neutron: deferred welcome dismiss (doc window was created)\n" );
+-        neutron_walk_welcomes( 0, 0, TRUE );
+-    }
+-
+-    /* NEUTRON Path B: an OWL document was created and its dock hierarchy is now built + reparented
+-       under the frame, but WS_VISIBLE is deferred so the canvas never renders. On the first few
+-       workspace/doc window ops after doc-create (the dock tree is assembled by then), reveal the
+-       whole workspace dock tree. Runs BEFORE the switch below, so the entry-captured was_visible
+-       protects our freshly-shown windows from this call's own hide. Bounded (budget from
+-       neutron_dockshow_pending), no jitter, no timer, no decaying repaint. */
+-    if (neutron_dockshow_pending > 0)
+-    {
+-        char neutron_cb[64];
+-        neutron_class_ascii( hwnd, neutron_cb );
+-        if (neutron_want_show( neutron_cb ) && InterlockedDecrement( &neutron_dockshow_pending ) >= 0)
+-        {
+-            HWND neutron_root = NtUserGetAncestor( hwnd, GA_ROOT );
+-            int neutron_shown = neutron_force_show_docks( neutron_root ? neutron_root : 0, 0 );
+-            ERR( "neutron: Path B force-show docks (via %s, budget->%d, root=%p) -> revealed %d window(s)\n",
+-                 neutron_cb, (int)neutron_dockshow_pending, neutron_root, neutron_shown );
+-        }
+-        else if (neutron_dockshow_pending < 0)
+-            InterlockedExchange( &neutron_dockshow_pending, 0 );  /* clamp if a race drove it negative */
+-    }
+-
+     if ((!(style & (WS_POPUP | WS_CHILD))
+          || ((style & (WS_POPUP | WS_CHILD | WS_CAPTION)) == (WS_POPUP | WS_CAPTION)))
+         && !get_window_relative( hwnd, GW_OWNER )
+@@ -6316,45 +5974,9 @@
+             send_message( hwnd, WM_ACTIVATE, WA_ACTIVE, 0 );
+     }
+ 
+-    /* NEUTRON: a window just became visible via a show command -> if it's a sized document
+-       canvas, dismiss the OWL home/welcome screen so File->New isn't wedged. Cheap no-op
+-       for everything except a large PSViewC (see neutron_maybe_dismiss_welcome). */
+     if (cmd != SW_HIDE && cmd != SW_MINIMIZE && cmd != SW_FORCEMINIMIZE
+         && (get_window_long( hwnd, GWL_STYLE ) & WS_VISIBLE))
+-    {
+         neutron_log_shown( hwnd, "SHOW" );  /* NEUTRON diag */
+-        neutron_maybe_dismiss_welcome( hwnd );
+-
+-        /* NEUTRON Path A: OWL's ghost/dock WH_SHELL hook keys on HSHELL_WINDOWREPLACED (0xd) to
+-           re-evaluate document docking; Wine never emits it, so the workspace docks stay deferred
+-           (WS_VISIBLE unset) until ~make-8. Emit it ONCE, tightly scoped to the doc-create
+-           transition (an OWL.DocumentWindow was just created -> neutron_shell_emit_pending), for
+-           the shown window's root top-level, so OWL re-runs its dock/show logic on the FIRST
+-           File>New. This replaces the earlier "broad first cut" that emitted for every top-level
+-           show (a stability risk in other apps); NEUTRON_SHELL_FIX=1 keeps that broad mode as an
+-           opt-in debug override only. */
+-        {
+-            static int neutron_shell_broad = -1;
+-            BOOL neutron_emit = FALSE;
+-            if (neutron_shell_broad < 0)
+-            {
+-                const char *e = getenv( "NEUTRON_SHELL_FIX" );
+-                neutron_shell_broad = (e && e[0] == '1') ? 1 : 0;
+-            }
+-            InterlockedExchange( &neutron_shell_emit_pending, 0 );       /* Path A OFF by default (proven insufficient) */
+-            if (neutron_shell_broad && !(get_window_long( hwnd, GWL_STYLE ) & WS_CHILD))
+-                neutron_emit = TRUE;                                     /* opt-in debug override (NEUTRON_SHELL_FIX=1) */
+-            if (neutron_emit)
+-            {
+-                HWND neutron_root = NtUserGetAncestor( hwnd, GA_ROOT );
+-                if (neutron_root)
+-                {
+-                    ERR( "neutron-shell: EMIT HSHELL_WINDOWREPLACED root=%p (doc-create)\n", neutron_root );
+-                    call_hooks( WH_SHELL, HSHELL_WINDOWREPLACED, (WPARAM)neutron_root, 0, 0 );
+-                }
+-            }
+-        }
+-    }
+ 
+ done:
+     set_thread_dpi_awareness_context( context );
+@@ -7168,7 +6790,6 @@
+                                       cs.hInstance, ansi, style, ex_style )))
+         return 0;
+     hwnd = win->handle;
+-    neutron_on_window_created( hwnd );  /* NEUTRON: dismiss welcome when OWL.DocumentWindow is created */
+ 
+     /* Fill the window structure */
+ 
