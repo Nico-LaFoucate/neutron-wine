@@ -1,0 +1,237 @@
+winewayland: show a maximized window that is shorter than the compositor's configure
+
+Lightroom Classic 15.6's Export dialog, maximized, kept the frame from before the maximize: its
+panels at their old size and place, the moved controls blank (lab, 11.10-156, nested KWin at 175%).
+Lightroom sizes its own maximized dialog to (-3,29) 2194x1199 on a (0,32) 2194x1202 work area;
+config_is_compatible() refused every commit of a maximized surface smaller than the configure
+(40000+ "REJECTED maximized config" in one session), so nothing was presented.
+
+A maximized window short of the configure is now accepted. xdg-shell requires a maximized
+surface's geometry to equal the configure, so the geometry keeps the configured size from where
+the window meets the work area, and a 1x1 transparent, click-through subsurface at its far corner
+makes the surface tree that large. The window draws at its own size; the gap is empty, as on
+Windows. Also for a window wider but shorter (Lightroom passes 2200x1201 and 2200x1198 on its way).
+Only windows that were never committed before take the new path. Kill switch NEUTRON_MAX_SHORT=0.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -466,6 +466,12 @@
+      * re-shown" from "brand new, never painted". This one is never cleared. */
+     BOOL ever_had_content;
+     int neutron_diag_buf_w, neutron_diag_buf_h; /* NEUTRON diag: last buffer size logged by neutron-attach */
++    /* NEUTRON maxshort: a 1x1 transparent, click-through subsurface that lets a maximized window SHORTER than the
++     * compositor's configure keep the configured window geometry (wayland_surface_short_filler). */
++    struct wl_surface *short_filler;
++    struct wl_subsurface *short_filler_sub;
++    struct wayland_shm_buffer *short_filler_buf;
++    int short_logged;   /* NEUTRON maxshort: the short size last logged (one line per new size) */
+     HCURSOR hcursor;
+ };
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -472,6 +472,23 @@
+         surface->wp_viewport = NULL;
+     }
+ 
++    /* NEUTRON maxshort: the filler subsurface goes before its parent wl_surface. */
++    if (surface->short_filler_sub)
++    {
++        wl_subsurface_destroy(surface->short_filler_sub);
++        surface->short_filler_sub = NULL;
++    }
++    if (surface->short_filler)
++    {
++        wl_surface_destroy(surface->short_filler);
++        surface->short_filler = NULL;
++    }
++    if (surface->short_filler_buf)
++    {
++        wayland_shm_buffer_unref(surface->short_filler_buf);
++        surface->short_filler_buf = NULL;
++    }
++
+     if (surface->wl_surface)
+     {
+         wl_surface_destroy(surface->wl_surface);
+@@ -1196,6 +1213,80 @@
+ }
+ 
+ /**********************************************************************
++ *          neutron_max_short   (NEUTRON_MAX_SHORT=0 disables)
++ *
++ * A maximized window SHORTER than the compositor's configure is shown at its own size.
++ *
++ * Windows lets an app size its own maximized window: Lightroom Classic 15.6's Export dialog
++ * (WS_POPUP|WS_CAPTION|WS_THICKFRAME|WS_MAXIMIZEBOX, owned) maximizes to the work area plus its
++ * frame like any window, then sets itself to (-3,29) 2194x1199 on a (0,32) 2194x1202 work area
++ * (measured 2026-10-28, lab, 11.10-156; maxstyle.exe shows a window with the same styles keeps the
++ * normal (-4,28) 2202x1210, and Lightroom sets no WM_GETMINMAXINFO fields). On Windows that is a
++ * maximized dialog a few pixels short of the work area, with what is behind it showing in the gap.
++ *
++ * Here config_is_compatible() refused every commit of a maximized surface smaller than the
++ * configure (2194x1199 against 2194x1202, 40000+ rejections in one session), so the dialog kept
++ * the frame from before the maximize: its panels at their old size and place, the moved controls
++ * blank. xdg-shell requires a maximized surface's window geometry to equal the configure, so the
++ * window cannot simply commit smaller. Instead the geometry keeps the configured size, starting
++ * where the window meets the work area, and a 1x1 transparent subsurface at its far corner makes
++ * the surface tree that large (the geometry is clamped to the tree's bounds). The window draws at
++ * its own size; the gap is empty, as on Windows.
++ */
++static BOOL neutron_max_short(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_MAX_SHORT", TRUE);
++    return on;
++}
++
++/**********************************************************************
++ *          wayland_surface_short_filler
++ *
++ * NEUTRON maxshort: place the 1x1 transparent filler at the bottom-right pixel of `geometry`
++ * (surface-local), creating it on first use; with NULL, park it at (0,0), inside the surface,
++ * where it changes nothing. It takes no input (empty input region) and sits below the window's
++ * own content. Takes effect with the parent's next commit (subsurface position is parent state).
++ */
++static void wayland_surface_short_filler(struct wayland_surface *surface, const RECT *geometry)
++{
++    if (!geometry)
++    {
++        if (surface->short_filler_sub) wl_subsurface_set_position(surface->short_filler_sub, 0, 0);
++        return;
++    }
++    if (!surface->short_filler)
++    {
++        struct wl_region *empty;
++
++        if (!process_wayland.wl_subcompositor ||
++            !(surface->short_filler = wl_compositor_create_surface(process_wayland.wl_compositor)))
++        {
++            ERR("neutron-maxshort: hwnd=%p cannot create the filler surface\n", surface->hwnd);
++            return;
++        }
++        if ((empty = wl_compositor_create_region(process_wayland.wl_compositor)))
++        {
++            wl_surface_set_input_region(surface->short_filler, empty);
++            wl_region_destroy(empty);
++        }
++        surface->short_filler_sub = wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
++                                                                    surface->short_filler,
++                                                                    surface->wl_surface);
++        wl_subsurface_set_desync(surface->short_filler_sub);
++        wl_subsurface_place_below(surface->short_filler_sub, surface->wl_surface);
++        if ((surface->short_filler_buf = wayland_shm_buffer_create(1, 1, WL_SHM_FORMAT_ARGB8888)))
++        {
++            memset(surface->short_filler_buf->map_data, 0, surface->short_filler_buf->map_size);
++            wl_surface_attach(surface->short_filler, surface->short_filler_buf->wl_buffer, 0, 0);
++            wl_surface_damage_buffer(surface->short_filler, 0, 0, 1, 1);
++        }
++        wl_surface_commit(surface->short_filler);
++    }
++    wl_subsurface_set_position(surface->short_filler_sub, geometry->right - 1, geometry->bottom - 1);
++}
++
++/**********************************************************************
+  *          wayland_surface_config_is_compatible
+  *
+  * Checks whether a wayland_surface_config object is compatible with the
+@@ -1214,6 +1305,14 @@
+     /* The maximized state requires the configured size. During surface
+      * reconfiguration we can use surface geometry to provide smaller areas
+      * from larger sizes, so only smaller sizes are incompatible. */
++    /* NEUTRON maxshort: a window Win32 has maximized at a size of its own is shown at that size
++     * (neutron_max_short); wayland_surface_reconfigure_geometry() keeps the configured geometry. */
++    if ((conf->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++        (width < conf->width || height < conf->height) &&
++        neutron_max_short() && width > 0 && height > 0 &&
++        !(conf->state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN))
++        return TRUE;
++
+     if ((conf->state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+         (width < conf->width || height < conf->height))
+     {
+@@ -1545,6 +1644,7 @@
+                                                  const RECT *content)
+ {
+     RECT rect;
++    BOOL short_fill = FALSE;
+ 
+     /* If the window size is bigger than the current state accepts, use the
+      * largest visible (from Windows' perspective) subregion of the window. */
+@@ -1628,9 +1728,20 @@
+                                                (int *)&rect.right, (int *)&rect.bottom);
+         }
+ 
++        /* NEUTRON maxshort: wider than the configure but SHORTER in the other dimension (Lightroom's
++         * Export dialog passes 2200x1201 and 2200x1198 against 2194x1202 on its way to 2194x1195): keep the
++         * configured geometry from where the window meets the work area, and let the filler cover the
++         * part the surface does not reach, as for a window short in both (neutron_max_short). */
++        if (neutron_max_short() && maximized &&
++            (width < surface->current.width || height < surface->current.height))
++        {
++            rect.right = rect.left + surface->current.width;
++            rect.bottom = rect.top + surface->current.height;
++            short_fill = TRUE;
++        }
+         /* If the window rect in the monitor is smaller than required,
+          * fall back to an appropriately sized rect at the top-left. */
+-        if ((surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++        else if ((surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
+             (rect.right - rect.left < surface->current.width ||
+              rect.bottom - rect.top < surface->current.height))
+         {
+@@ -1651,7 +1762,7 @@
+          * not fit. With #1 and #2 in place this should never fire; if the ERR
+          * below ever appears, the surface/window mapping is wrong somewhere
+          * else and THAT is the bug to chase. */
+-        if (fix && width > 0 && height > 0 &&
++        if (fix && !short_fill && width > 0 && height > 0 &&
+             (rect.left < 0 || rect.top < 0 ||
+              rect.right > width || rect.bottom > height))
+         {
+@@ -1675,6 +1786,28 @@
+ 
+         TRACE("Window is too large for Wayland state, using subregion\n");
+     }
++    else if (neutron_max_short() &&
++             (surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_MAXIMIZED) &&
++             !(surface->current.state & WAYLAND_SURFACE_CONFIG_STATE_FULLSCREEN) &&
++             width > 0 && height > 0 &&
++             (width < surface->current.width || height < surface->current.height))
++    {
++        /* NEUTRON maxshort: the window is maximized but shorter than the configure (an app sized
++         * its own maximized window; see neutron_max_short). The geometry keeps the configured size,
++         * from where the window meets the work area -- its frame overhang stays outside, as with
++         * the larger windows above -- and the filler makes the surface tree cover it. */
++        RECT vis;
++        double s = surface->window.scale > 0.0 ? surface->window.scale : 1.0;
++
++        wayland_surface_get_rect_in_monitor(surface, &vis, TRUE);
++        if (content) OffsetRect(&vis, -content->left, -content->top);
++        if (IsRectEmpty(&vis)) SetRectEmpty(&vis);
++        rect.left = (LONG)ceil(vis.left / s);
++        rect.top = (LONG)ceil(vis.top / s);
++        rect.right = rect.left + surface->current.width;
++        rect.bottom = rect.top + surface->current.height;
++        short_fill = TRUE;
++    }
+     else
+     {
+         SetRect(&rect, 0, 0, width, height);
+@@ -1682,6 +1815,16 @@
+ 
+     TRACE("hwnd=%p geometry=%s\n", surface->hwnd, wine_dbgstr_rect(&rect));
+ 
++    if (short_fill && (neutron_wl_surf_diag() || surface->short_logged != width * 65536 + height))
++    {
++        ERR("neutron-maxshort: hwnd=%p maximized %dx%d is short of the configured %dx%d;"
++            " geometry %s with the filler at %d,%d\n", surface->hwnd, width, height,
++            surface->current.width, surface->current.height, wine_dbgstr_rect(&rect),
++            (int)rect.right - 1, (int)rect.bottom - 1);
++        surface->short_logged = width * 65536 + height;
++    }
++    wayland_surface_short_filler(surface, short_fill ? &rect : NULL);
++
+     if (!IsRectEmpty(&rect))
+     {
+         xdg_surface_set_window_geometry(surface->xdg_surface,

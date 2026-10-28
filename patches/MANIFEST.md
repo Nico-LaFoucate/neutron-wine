@@ -1593,6 +1593,23 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 81 — `…z×81-winewayland-maximized-short` (Lightroom's maximized Export dialog kept a stale frame)
+Seen 10-27 in the #41 lab run, measured 10-28 (lab LrC 15.6, 11.10-156, nested KWin 175% + 32 px top panel): Export dialog
+maximized -> its panels stayed at their old size and place, the moved controls blank; RedrawWindow of every Lightroom window
+changed nothing. The dialog (96cd0000 = WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_MAXIMIZEBOX|clip, ex 101, owned)
+maximizes like any window (harness `maxstyle.exe`: same styles -> (-4,28) 2202x1210) and Lightroom then sizes itself to (-3,29)
+2194x1199 on a (0,32) 2194x1202 work area (no WM_GETMINMAXINFO fields set, `minmax.exe`). config_is_compatible() refused every
+commit of a maximized surface smaller than the configure: 42000+ "REJECTED maximized config" in one session, nothing presented.
+Fix: a maximized window short of the configure is accepted; the xdg geometry keeps the configured size (xdg-shell requires it)
+from where the window meets the work area, and a 1x1 transparent, click-through subsurface at its far corner makes the surface
+tree that large. The window draws at its own size and the gap is empty, as on Windows. Also the wider-but-shorter case (Lightroom
+passes 2200x1201, 2200x1198). Only windows that were never committed before take the new path. Kill switch NEUTRON_MAX_SHORT=0.
+MEASURED (lab, 156 + this winewayland.so in a runtime copy, same prefix and steps): dialog opened maximized draws completely
+(2/2 sessions), restore + maximize draws, Cancel at its maximized position closes it, REJECTED 0 and "ran outside" 0 per
+session (156: 42000+); `maxstyle.exe overlapped` still (-4,28) 2202x1210 with no maxshort line. Strings vs 156: only the two new
+messages. Residual, not this patch: after restore -> maximize, a copy of the preset list's Add button stays drawn inside the
+list's frame (2/2); RedrawWindow does not clear it, so Lightroom does not paint that spot. NOT YET BUILT into a release.
+
 ### patch 80 — `…z×80-notepad-default-font` (installer readmes in tiny text)
 Seen 10-26: FabFilter's installer opened its readme in Notepad at about 5 points (his 175% screen, 168 dpi). Notepad's
 default font was "System" at a fixed lfHeight -12 (9 points only at 96 dpi); "System" is a bitmap font, so it does not
