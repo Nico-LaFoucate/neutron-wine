@@ -1692,3 +1692,35 @@ Premiere 2026 playback), `neutron-alloc` per cuMemAlloc_v2 and `neutron-2d` per 
 it armed) and real failures stay ERR. Patches 0001 + 0002 apply to the pinned commit 772b344 unchanged otherwise. SHIPPED in 11.10-153
 (package: nvcuda.dll the only real difference vs 152; lab Premiere 2026 playback to the end on the package: err:nvcuda 530+ -> 5
 one-time lines, 0 faults).
+
+### patch 85 — `…z×85-rpcss-drop-classes-of-exited-servers` (COM to a restarted Photoshop fails until rpcss restarts) — by le-birnes
+From le-birnes/AdobeWine 0086 (LGPL-2.1), offered in Discussion #37. A COM server that is killed or crashes never calls
+CoRevokeClassObject, so rpcss kept handing out its class object; CoCreateInstance of a restarted Photoshop then failed with
+RPC_S_SERVER_UNAVAILABLE (0x800706ba) because the object's pipe was gone. Windows forgets the registration when the process
+dies. rpcss now keeps a handle to the registering process (I_RpcBindingInqLocalClientPID) and skips and drops its entries
+once it has exited. Upstream master has the old code.
+MEASURED (his reproducer `wine/tests/rpcss/exitclass.c`: a server registers a class with a fresh CLSID, is killed, the class
+is created again; v11.10-158 runtime, Xvfb, scratch prefix, only rpcss.exe swapped, built from the 11.10-158 tree): shipped
+FAIL (0x800706ba), control build without the patch FAIL, patched PASS (REGDB_E_CLASSNOTREG, as Windows). Real app in
+AdobeWine (Wine 11.18): Photoshop 27.11 -> COM -> kill -9 -> start -> COM: 0x800706ba before, "27.11.0" after. Not yet
+checked in Photoshop under Neutron.
+
+### patch 86 — `…z×86-oleaut32-save-typelib-empty-strings` (InDesign cannot be scripted from other programs) — by le-birnes
+From le-birnes/AdobeWine 0088 (LGPL-2.1). ICreateTypeLib2::SaveAllChanges failed with E_UNEXPECTED, and wrote nothing, as
+soon as the library held an empty string (WMSFT_compile_strings took WideCharToMultiByte's 0 for a zero-length string as an
+error). InDesign's "Support for Visual Basic" plug-in builds `Resources for Visual Basic.tlb` with hundreds of empty doc
+strings, so the file was never written and InDesign's COM object answered GetIDsOfNames("DoScript") with
+DISP_E_UNKNOWNNAME. An empty string is now stored with length 0. Upstream master has the old code.
+MEASURED (his `wine/tests/typelib/emptydoc.c`, same method as patch 85, only oleaut32.dll swapped): shipped and control
+SaveAllChanges 0x8000ffff / LoadTypeLibEx 0x80029c4a FAIL, patched PASS (saved, loaded, empty doc string read back). Real
+app in AdobeWine: InDesign 2026 scripted over COM (DoScript) in its 219-function run. Not yet checked under Neutron.
+
+### patch 87 — `…z×87-winhttp-queue-async-receive-response` (async WinHttpReceiveResponse waits for the server) — by le-birnes
+From le-birnes/AdobeWine 0046 (LGPL-2.1). With WINHTTP_FLAG_ASYNC Windows returns from WinHttpReceiveResponse at once and
+reports HEADERS_AVAILABLE later; Wine read the reply inside the call when the request had been sent, i.e. in the usual call
+from the SENDREQUEST_COMPLETE callback, so the caller waited for the server. Photoshop calls it holding its own lock, which
+its main thread needs at exit. The read is queued only when the call comes from one of the request's own task callbacks;
+app-thread calls still read inline (keeps winhttp:notification at 0 failures).
+MEASURED (his `wine/tests/winhttp/asyncrecv.c` + `asyncflow.c` with the local test server, same method, only winhttp.dll
+swapped): asyncrecv shipped FAIL (hang), control FAIL (3001 ms), patched PASS (0 ms); asyncflow PASS on all three. Every
+other test of his suite unchanged. Not yet checked in Photoshop under Neutron.

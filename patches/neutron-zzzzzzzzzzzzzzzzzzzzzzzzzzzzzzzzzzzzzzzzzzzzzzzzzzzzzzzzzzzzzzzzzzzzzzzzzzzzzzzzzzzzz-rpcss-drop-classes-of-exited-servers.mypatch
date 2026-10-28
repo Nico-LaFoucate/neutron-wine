@@ -1,0 +1,78 @@
+rpcss: Drop the registered classes of server processes that have exited.
+
+A COM server that is killed or crashes never calls CoRevokeClassObject, so rpcss kept handing its class
+object to clients: CoCreateInstance of a restarted Photoshop failed with RPC_S_SERVER_UNAVAILABLE
+(0x800706ba) because the object's pipe was gone, until rpcss itself was restarted. Windows forgets the
+registration when the process dies. Keep a handle to the registering process and skip (and drop) its
+entries once it has exited.
+
+From le-birnes/AdobeWine 0086 (LGPL-2.1-or-later; DCO sign-off on the commit), generated against neutron-wine 11.10-158
+(staging-applied base plus every earlier .mypatch).
+
+MEASURED on the shipped neutron-wine v11.10-158 runtime, Xvfb, scratch prefix, AdobeWine's wine/tests/regress.sh:
+only rpcss.exe, oleaut32.dll and winhttp.dll swapped, built from the 11.10-158 tree with and without this patch.
+  exitclass (server registers a class, is killed, the class is created again): shipped FAIL, control build (same tree, no patch) FAIL, with this patch PASS;
+  every other test in the suite unchanged (no regression).
+Real app (AdobeWine, Wine 11.18, not yet under Neutron): Photoshop 27.11 started, scripted over COM (tools/comjs), kill -9, started again: CoCreateInstance("Photoshop.Application") 0x800706ba before, "27.11.0" after, same rpcss across the cycle.
+
+--- a/programs/rpcss/rpcss_main.c
++++ b/programs/rpcss/rpcss_main.c
+@@ -45,6 +45,7 @@ struct registered_class
+     GUID clsid;
+     unsigned int cookie;
+     PMInterfacePointer object;
++    HANDLE process;                     /* the registering process, to drop its classes once it is gone */
+     unsigned int single_use : 1;
+ };
+ 
+@@ -56,6 +57,7 @@ HRESULT __cdecl irpcss_server_register(handle_t h, const GUID *clsid, unsigned i
+ {
+     struct registered_class *entry;
+     static LONG next_cookie;
++    ULONG pid;
+ 
+     if (!(entry = calloc(1, sizeof(*entry))))
+         return E_OUTOFMEMORY;
+@@ -70,6 +72,8 @@ HRESULT __cdecl irpcss_server_register(handle_t h, const GUID *clsid, unsigned i
+     entry->object->ulCntData = object->ulCntData;
+     memcpy(&entry->object->abData, object->abData, object->ulCntData);
+     *cookie = entry->cookie = InterlockedIncrement(&next_cookie);
++    if (!I_RpcBindingInqLocalClientPID(NULL, &pid))
++        entry->process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+ 
+     EnterCriticalSection(&registered_classes_cs);
+     list_add_tail(&registered_classes, &entry->entry);
+@@ -81,6 +85,7 @@ HRESULT __cdecl irpcss_server_register(handle_t h, const GUID *clsid, unsigned i
+ static void scm_revoke_class(struct registered_class *_class)
+ {
+     list_remove(&_class->entry);
++    if (_class->process) CloseHandle(_class->process);
+     free(_class->object);
+     free(_class);
+ }
+@@ -108,16 +113,23 @@ HRESULT __cdecl irpcss_server_revoke(handle_t h, unsigned int cookie)
+ HRESULT __cdecl irpcss_get_class_object(handle_t h, const GUID *clsid,
+         PMInterfacePointer *object)
+ {
+-    struct registered_class *cur;
++    struct registered_class *cur, *next;
+ 
+     *object = NULL;
+ 
+     EnterCriticalSection(&registered_classes_cs);
+ 
+-    LIST_FOR_EACH_ENTRY(cur, &registered_classes, struct registered_class, entry)
++    LIST_FOR_EACH_ENTRY_SAFE(cur, next, &registered_classes, struct registered_class, entry)
+     {
+         if (!memcmp(clsid, &cur->clsid, sizeof(*clsid)))
+         {
++            /* A server that was killed or crashed never revoked its class; its object can't be reached. */
++            if (cur->process && !WaitForSingleObject(cur->process, 0))
++            {
++                TRACE("dropping class %s of an exited process\n", debugstr_guid(clsid));
++                scm_revoke_class(cur);
++                continue;
++            }
+             *object = MIDL_user_allocate(FIELD_OFFSET(MInterfacePointer, abData[cur->object->ulCntData]));
+             if (*object)
+             {

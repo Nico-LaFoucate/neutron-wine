@@ -1,0 +1,39 @@
+oleaut32: Save type libraries with empty strings (empty doc strings).
+
+ICreateTypeLib2::SaveAllChanges failed with E_UNEXPECTED, and wrote nothing, as soon as the library held an empty
+string: WMSFT_compile_strings took WideCharToMultiByte's 0 for a zero-length string as an error. InDesign's
+"Support for Visual Basic" plug-in builds its scripting type library (Resources for Visual Basic.tlb, 3.2 MB) with
+CreateTypeLib2 and sets hundreds of empty function doc strings, so the file was never written: InDesign's COM object
+then answered GetIDsOfNames("DoScript") with DISP_E_UNKNOWNNAME and could not be scripted from other programs.
+An empty string is now stored with length 0, like any other. Test: tests/typelib/emptydoc.c (save, load back,
+read the empty doc string).
+
+From le-birnes/AdobeWine 0088 (LGPL-2.1-or-later; DCO sign-off on the commit), generated against neutron-wine 11.10-158
+(staging-applied base plus every earlier .mypatch).
+
+MEASURED on the shipped neutron-wine v11.10-158 runtime, Xvfb, scratch prefix, AdobeWine's wine/tests/regress.sh:
+only rpcss.exe, oleaut32.dll and winhttp.dll swapped, built from the 11.10-158 tree with and without this patch.
+  emptydoc (SaveAllChanges and LoadTypeLibEx of a library with empty doc strings): shipped FAIL, control build (same tree, no patch) FAIL, with this patch PASS;
+  every other test in the suite unchanged (no regression).
+Real app (AdobeWine, Wine 11.18, not yet under Neutron): InDesign 2026's "Resources for Visual Basic.tlb" is written and DoScript resolves; InDesign scripted over COM in the 219-function run.
+
+--- a/dlls/oleaut32/typelib.c
++++ b/dlls/oleaut32/typelib.c
+@@ -9150,7 +9150,7 @@ static HRESULT WMSFT_compile_strings(ITypeLibImpl *This,
+         int size;
+ 
+         size = WideCharToMultiByte(CP_ACP, 0, str->str, lstrlenW(str->str), NULL, 0, NULL, NULL);
+-        if (size == 0)
++        if (size == 0 && *str->str)     /* an empty string (an empty doc string) is stored with length 0 */
+             return E_UNEXPECTED;
+ 
+         size += sizeof(INT16);
+@@ -9174,7 +9174,7 @@ static HRESULT WMSFT_compile_strings(ITypeLibImpl *This,
+ 
+         size = WideCharToMultiByte(CP_ACP, 0, str->str, lstrlenW(str->str),
+                 data + sizeof(INT16), file->string_seg.len - last_offs - sizeof(INT16), NULL, NULL);
+-        if (size == 0) {
++        if (size == 0 && *str->str) {
+             free(file->string_seg.data);
+             file->string_seg.data = NULL;
+             return E_UNEXPECTED;
