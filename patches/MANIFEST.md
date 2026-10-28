@@ -1593,6 +1593,25 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 83 — `…z×83-winewayland-clickthrough-live` (Photoshop's "Try Adjustments presets" tip could not be dismissed)
+Found 10-28 while taking press screenshots (lab Photoshop 2026, 11.10-157, nested KWin 175%): the coach mark's "Got it" and
+"Try it now" lit up under the pointer but no click (or Escape) dismissed it. The open item "undismissable tooltip" (OPEN-ISSUES,
+escalated since July; seen once in person on the build tester's machine 09-09) is this. The tip is an owned `#32770`
+(94000004, ex 90000 = WS_EX_LAYERED|WS_EX_CONTROLPARENT) made an owned SUBSURFACE, 500x1000 logical, content in a
+WS_EX_NOACTIVATE DroverLord child; `hitprobe.exe`: WindowFromPoint at the button = the tip's child, no capture, NCHITTEST
+client. +win,+hook,+waylanddrv trace: pointer_handle_button went to the MAIN window's surface, window_from_point(scope main)
+returned PSViewC (the document view), and the pointer never entered the tip's surface. Photoshop fades the tip in by setting
+WS_EX_TRANSPARENT (ex 90020) around each of 20 SetLayeredWindowAttributes steps -- win32u's update_window_state after each one
+re-ran wayland_win_data_create_wayland_surface, which gave the surface an EMPTY input region (layered + transparent) -- and
+clearing it after with SetWindowLong alone, which WAYLAND_SetWindowStyle ignored. Windows evaluates the bits at click time.
+Fix: WAYLAND_SetWindowStyle updates the input region when WS_EX_LAYERED or WS_EX_TRANSPARENT changes (shared helper with the
+create path); a subsurface (desync) commits it at once, a toplevel or popup takes it with its next commit (committing one there
+could carry a configure ack ahead of its buffer -- the remaining gap: a toplevel that clears the bit and never repaints).
+Kill switch NEUTRON_CLICKTHROUGH_LIVE=0. Same gap in upstream winewayland.
+MEASURED (lab, fresh reflink copies of the signed-in AeSignin prefix, same steps: open a photo, the tip appears, click "Got it"):
+157 FAIL 2/2 (press -> main window surface, tip stays); 157 + this winewayland.so PASS 1/1 (pointer_handle_enter on the tip's
+surface, press there, tip closes on the first click); same .so with NEUTRON_CLICKTHROUGH_LIVE=0 FAIL 1/1. NOT YET BUILT.
+
 ### patch 82 — `…z×82-comctl32-listview-doublebuffer-background` (stale Add/Remove inside Lightroom's preset list)
 With patch 81 in place, restoring then maximizing Lightroom's Export dialog left a copy of the preset pane's Add/Remove
 buttons inside the grown preset list (2/2, 10-28). The NEUTRON_PPM frame dump (in 156) showed the stale pixels are in the

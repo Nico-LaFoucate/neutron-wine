@@ -1,0 +1,96 @@
+winewayland: a layered window that stops being WS_EX_TRANSPARENT takes clicks again
+
+Windows decides whether a layered window lets clicks through (WS_EX_LAYERED|WS_EX_TRANSPARENT) when the
+click happens. winewayland set the surface's input region only when the surface was created or updated,
+so a window that cleared WS_EX_TRANSPARENT with SetWindowLong alone stayed click-through.
+
+Photoshop 2026's coach marks ("Try Adjustments presets") fade in by setting WS_EX_TRANSPARENT around each
+SetLayeredWindowAttributes step, which updates the surface while it is set, and clearing it after. The last
+step left an empty input region: the pointer never entered the tip's surface, every click reached the
+document under it, and neither "Got it" nor "Try it now" could dismiss it.
+
+WAYLAND_SetWindowStyle now updates the input region when WS_EX_LAYERED or WS_EX_TRANSPARENT changes. A
+subsurface (desync) commits it at once; a toplevel or popup takes it with its next commit, because
+committing one there could carry a configure ack ahead of the buffer made for it.
+Kill switch NEUTRON_CLICKTHROUGH_LIVE=0.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -613,6 +613,35 @@
+     return ret;
+ }
+ 
++/* Pass through mouse events for layered, transparent windows, to match
++ * Windows behavior. */
++static void wayland_surface_update_input_region(struct wayland_surface *surface, DWORD exstyle)
++{
++    struct wl_region *input_region;
++
++    input_region = ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED)) ?
++                   wl_compositor_create_region(process_wayland.wl_compositor) :
++                   NULL;
++    wl_surface_set_input_region(surface->wl_surface, input_region);
++    if (input_region) wl_region_destroy(input_region);
++}
++
++/* NEUTRON clickthrough-live (NEUTRON_CLICKTHROUGH_LIVE=0 disables): Windows decides whether a layered
++ * window lets clicks through (WS_EX_LAYERED|WS_EX_TRANSPARENT) when the click happens. The input region
++ * above was only set when the Wayland surface was created or updated, so a window that cleared
++ * WS_EX_TRANSPARENT with SetWindowLong alone stayed click-through. Photoshop 2026's coach marks ("Try
++ * Adjustments presets") fade in by setting WS_EX_TRANSPARENT around each SetLayeredWindowAttributes step
++ * -- which updates the surface while it is set -- and clearing it after; the last step left an empty input
++ * region, every click reached the document under the tip, and neither of its buttons could dismiss it
++ * (measured 2026-10-28, lab, 11.10-157: pointer_handle_button went to the main window, window_from_point
++ * returned PSViewC). WAYLAND_SetWindowStyle now updates the region when either bit changes. */
++static BOOL neutron_clickthrough_live(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_CLICKTHROUGH_LIVE", TRUE);
++    return on;
++}
++
+ static BOOL wayland_win_data_create_wayland_surface(struct wayland_win_data *data,
+                                                     struct wayland_surface *toplevel_surface,
+                                                     struct wayland_surface *owner_surface,
+@@ -624,7 +653,6 @@
+     BOOL visible, server_decor = FALSE;
+     DWORD exstyle = NtUserGetWindowLongW(data->hwnd, GWL_EXSTYLE);
+     DWORD style = NtUserGetWindowLongW(data->hwnd, GWL_STYLE);
+-    struct wl_region *input_region;
+ 
+     TRACE("hwnd=%p\n", data->hwnd);
+ 
+@@ -679,13 +707,7 @@
+ 
+     if (!(surface = data->wayland_surface) && !(surface = wayland_surface_create(data->hwnd))) return FALSE;
+ 
+-    /* Pass through mouse events for layered, transparent windows, to match
+-     * Windows behavior. */
+-    input_region = ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED)) ?
+-                   wl_compositor_create_region(process_wayland.wl_compositor) :
+-                   NULL;
+-    wl_surface_set_input_region(surface->wl_surface, input_region);
+-    if (input_region) wl_region_destroy(input_region);
++    wayland_surface_update_input_region(surface, exstyle);
+ 
+     /* win32u shrinks the visible (surface-backed) rect below the full window rect
+      * exactly when the driver advertises it manages the frame (GetWindowStyleMasks);
+@@ -2264,6 +2286,18 @@
+     if (offset == GWL_EXSTYLE && (changed & WS_EX_LAYERED))
+         data->layered_attribs_set = FALSE;
+ 
++    /* NEUTRON clickthrough-live: see neutron_clickthrough_live(). A subsurface is desync, so its own
++     * commit applies the region now. A toplevel or popup takes it with its next commit (its next paint):
++     * committing one here could carry a configure ack ahead of the buffer made for it. */
++    if (offset == GWL_EXSTYLE && (changed & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) &&
++        data->wayland_surface && data->wayland_surface->wl_surface && neutron_clickthrough_live())
++    {
++        wayland_surface_update_input_region(data->wayland_surface, style->styleNew);
++        if (data->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE)
++            wl_surface_commit(data->wayland_surface->wl_surface);
++        wl_display_flush(process_wayland.wl_display);
++    }
++
+     wayland_win_data_release(data);
+ }
+ 
