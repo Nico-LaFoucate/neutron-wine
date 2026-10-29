@@ -1,0 +1,129 @@
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3577,6 +3577,38 @@
+     return rect;
+ }
+ 
++/* NEUTRON: the primary monitor's work area in the given DPI. Windows computes SM_C[XY]FULLSCREEN and SM_C[XY]MAXIMIZED
++ * from it; upstream used the whole screen (and two caption heights), so on a desktop with a panel those metrics were
++ * taller than the screen and Camera Raw (Photoshop's Camera Raw Filter) opened with its title bar above the top edge.
++ * Kill switch NEUTRON_SM_WORKAREA=0 restores the upstream formulas. */
++static BOOL get_primary_work_rect( UINT dpi, RECT *rect )
++{
++    static int on = -1;
++    MONITORINFO info = {.cbSize = sizeof(info)};
++    struct monitor *monitor;
++    BOOL ret = FALSE;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SM_WORKAREA" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_SM_WORKAREA = 0 (environment)\n" );
++    }
++    if (!on || !lock_display_devices( FALSE )) return FALSE;
++
++    LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
++    {
++        if (!is_monitor_primary( monitor )) continue;
++        monitor_get_info( monitor, &info, dpi );
++        *rect = info.rcWork;
++        ret = TRUE;
++        break;
++    }
++
++    unlock_display_devices();
++    return ret;
++}
++
+ RECT get_primary_monitor_rect( UINT dpi )
+ {
+     struct monitor *monitor;
+@@ -7193,9 +7225,14 @@
+         NtUserSystemParametersInfo( SPI_GETNONCLIENTMETRICS, 0, &ncm, 0 );
+         return ncm.iMenuHeight + 1;
+     case SM_CXFULLSCREEN:
++        /* NEUTRON: as Windows, the primary work area's width (see get_primary_work_rect) */
++        if (get_primary_work_rect( get_thread_dpi(), &rect )) return rect.right - rect.left;
+         /* see the remark for SM_CXMAXIMIZED, at least this formulation is correct */
+         return get_system_metrics( SM_CXMAXIMIZED ) - 2 * get_system_metrics( SM_CXFRAME );
+     case SM_CYFULLSCREEN:
++        /* NEUTRON: as Windows, the primary work area's height less a caption (see get_primary_work_rect) */
++        if (get_primary_work_rect( get_thread_dpi(), &rect ))
++            return rect.bottom - rect.top - get_system_metrics( SM_CYCAPTION );
+         /* see the remark for SM_CYMAXIMIZED, at least this formulation is
+          * correct */
+         return get_system_metrics( SM_CYMAXIMIZED ) - get_system_metrics( SM_CYMIN );
+@@ -7317,9 +7354,14 @@
+     case SM_CYMAXTRACK:
+         return get_system_metrics( SM_CYVIRTUALSCREEN ) + 4 + 2 * get_system_metrics( SM_CYFRAME );
+     case SM_CXMAXIMIZED:
++        /* NEUTRON: as Windows, the primary work area plus the sizing frame on both sides (see get_primary_work_rect) */
++        if (get_primary_work_rect( get_thread_dpi(), &rect ))
++            return rect.right - rect.left + 2 * (get_system_metrics( SM_CXFRAME ) + get_system_metrics( SM_CXPADDEDBORDER ));
+         /* FIXME: subtract the width of any vertical application toolbars*/
+         return get_system_metrics( SM_CXSCREEN ) + 2 * get_system_metrics( SM_CXFRAME );
+     case SM_CYMAXIMIZED:
++        if (get_primary_work_rect( get_thread_dpi(), &rect ))
++            return rect.bottom - rect.top + 2 * (get_system_metrics( SM_CYFRAME ) + get_system_metrics( SM_CXPADDEDBORDER ));
+         /* FIXME: subtract the width of any horizontal application toolbars*/
+         return get_system_metrics( SM_CYSCREEN ) + 2 * get_system_metrics( SM_CYCAPTION );
+     case SM_NETWORK:
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -155,9 +155,21 @@
+ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+ {
+     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
++    /* NEUTRON: a swap to a window Wayland isn't showing must not wait for Wayland. With a swap interval the EGL
++     * driver waits for the frame callback of the previous swap, and a hidden window's surface is detached
++     * (wayland_client_surface_update), so it never gets one: the second swap blocked forever. Illustrator 2026
++     * 30.6 (OpenGL renderer, GPU Performance on) draws a new document while its window is still hidden, as it
++     * does on Windows, and froze there. Windows never holds a present to a hidden window, so such swaps go out
++     * with interval 0 and the window's interval is restored after. Kill switch NEUTRON_GL_HIDDEN_NOWAIT=0. */
++    static int nowait = -1;
++    BOOL hidden;
+ 
++    if (nowait < 0) nowait = neutron_gate("NEUTRON_GL_HIDDEN_NOWAIT", TRUE);
+     client_surface_present(base->client);
++    hidden = nowait && base->interval && !wayland_client_surface_is_attached(base->client);
++    if (hidden) funcs->p_eglSwapInterval(egl->display, 0);
+     funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
++    if (hidden) funcs->p_eglSwapInterval(egl->display, abs(base->interval));
+ 
+     return TRUE;
+ }
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -585,6 +585,7 @@
+ void wayland_clamp_rounding_overshoot(POINT *screen, const RECT *window_rect);
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
++BOOL wayland_client_surface_is_attached(struct client_surface *client);
+ /* NEUTRON round-36 temporal suppression: record GDI damage flushed into a
+  * toplevel's window surface (coords = toplevel window-rect space). */
+ void neutron_gdi_damage_record(HWND toplevel, const RECT *rect);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -3943,6 +3943,21 @@
+     set_client_surface(hwnd, surface);
+ }
+ 
++/* NEUTRON: whether the window's client surface is in Wayland right now, as a subsurface of its toplevel (kept mapped
++ * below it counts). wayland_client_surface_update detaches a hidden window's surface, and a detached surface gets no
++ * frame callbacks. Takes win_data_mutex only: no user-lock calls inside. */
++BOOL wayland_client_surface_is_attached(struct client_surface *client)
++{
++    struct wayland_client_surface *surface = impl_from_client_surface(client);
++    struct wayland_win_data *data;
++    BOOL attached;
++
++    if (!(data = wayland_win_data_get(client->hwnd))) return FALSE;
++    attached = surface->wl_subsurface != NULL;
++    wayland_win_data_release(data);
++    return attached;
++}
++
+ static const struct client_surface_funcs wayland_client_surface_funcs =
+ {
+     .destroy = wayland_client_surface_destroy,

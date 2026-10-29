@@ -1593,6 +1593,15 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 91 — `…z×91-win32u-sm-maximized-fullscreen-workarea` (Windows parity: SM_C[XY]MAXIMIZED / SM_C[XY]FULLSCREEN)
+Found chasing his *"Camera raw opened too high up on screen and can't be moved"* (10-29). Upstream computed these from the whole
+screen (FIXME "subtract ... application toolbars"), and SM_CYMAXIMIZED added TWO caption heights: at 3840x2160 175% with a 56 px top
+panel Wine said CYMAXIMIZED 2250 and CYFULLSCREEN 2195, taller than the screen. Windows: work area + 2 x (frame + padded border), and
+work area height - caption. Now: 2114 / 2059 (crprobe). Wine's own maximize code does not read them; only apps do. Kill switch
+NEUTRON_SM_WORKAREA=0. **Did NOT fix Camera Raw** (still y=-44 with it; lab copy 11.10-162sm). Shipped for parity (his rule). NOT YET BUILT.
+Also seen, not fixed: SPI_GETWORKAREA caches its first answer in the FIRST caller's DPI (physical here) and gives it to DPI-unaware
+callers too (crprobe unaware thread: (0,56)-(3840,2160) instead of (0,32)-(2194,1234)).
+
 ### patch 90 — `…z×90-winewayland-gl-hidden-swap-nowait` (Illustrator 2026 froze on New Document with GPU Performance on)
 His words (10-29): *"GPU performance was already turned off. Turning it on causes Illustrator to freeze when making a new doc"*.
 His Illustrator 2026 is 30.6, whose GPU check picks the OPENGL renderer (AISniffer `OpenGLRenderer`); 30.8.2 picks DirectX 12, which is
