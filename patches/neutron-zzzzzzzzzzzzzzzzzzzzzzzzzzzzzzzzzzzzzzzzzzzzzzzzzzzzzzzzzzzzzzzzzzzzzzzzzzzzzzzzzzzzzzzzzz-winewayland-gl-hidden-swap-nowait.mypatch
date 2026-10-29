@@ -1,0 +1,58 @@
+--- a/dlls/winewayland.drv/opengl.c
++++ b/dlls/winewayland.drv/opengl.c
+@@ -155,9 +155,21 @@
+ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
+ {
+     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
++    /* NEUTRON: a swap to a window Wayland isn't showing must not wait for Wayland. With a swap interval the EGL
++     * driver waits for the frame callback of the previous swap, and a hidden window's surface is detached
++     * (wayland_client_surface_update), so it never gets one: the second swap blocked forever. Illustrator 2026
++     * 30.6 (OpenGL renderer, GPU Performance on) draws a new document while its window is still hidden, as it
++     * does on Windows, and froze there. Windows never holds a present to a hidden window, so such swaps go out
++     * with interval 0 and the window's interval is restored after. Kill switch NEUTRON_GL_HIDDEN_NOWAIT=0. */
++    static int nowait = -1;
++    BOOL hidden;
+ 
++    if (nowait < 0) nowait = neutron_gate("NEUTRON_GL_HIDDEN_NOWAIT", TRUE);
+     client_surface_present(base->client);
++    hidden = nowait && base->interval && !wayland_client_surface_is_attached(base->client);
++    if (hidden) funcs->p_eglSwapInterval(egl->display, 0);
+     funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
++    if (hidden) funcs->p_eglSwapInterval(egl->display, abs(base->interval));
+ 
+     return TRUE;
+ }
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -585,6 +585,7 @@
+ void wayland_clamp_rounding_overshoot(POINT *screen, const RECT *window_rect);
+ struct wayland_client_surface *wayland_client_surface_create(HWND hwnd);
+ void wayland_client_surface_attach(struct wayland_client_surface *client, HWND toplevel);
++BOOL wayland_client_surface_is_attached(struct client_surface *client);
+ /* NEUTRON round-36 temporal suppression: record GDI damage flushed into a
+  * toplevel's window surface (coords = toplevel window-rect space). */
+ void neutron_gdi_damage_record(HWND toplevel, const RECT *rect);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -3943,6 +3943,21 @@
+     set_client_surface(hwnd, surface);
+ }
+ 
++/* NEUTRON: whether the window's client surface is in Wayland right now, as a subsurface of its toplevel (kept mapped
++ * below it counts). wayland_client_surface_update detaches a hidden window's surface, and a detached surface gets no
++ * frame callbacks. Takes win_data_mutex only: no user-lock calls inside. */
++BOOL wayland_client_surface_is_attached(struct client_surface *client)
++{
++    struct wayland_client_surface *surface = impl_from_client_surface(client);
++    struct wayland_win_data *data;
++    BOOL attached;
++
++    if (!(data = wayland_win_data_get(client->hwnd))) return FALSE;
++    attached = surface->wl_subsurface != NULL;
++    wayland_win_data_release(data);
++    return attached;
++}
++
+ static const struct client_surface_funcs wayland_client_surface_funcs =
+ {
+     .destroy = wayland_client_surface_destroy,

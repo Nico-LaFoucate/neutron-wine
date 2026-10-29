@@ -1593,6 +1593,21 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 90 — `…z×90-winewayland-gl-hidden-swap-nowait` (Illustrator 2026 froze on New Document with GPU Performance on)
+His words (10-29): *"GPU performance was already turned off. Turning it on causes Illustrator to freeze when making a new doc"*.
+His Illustrator 2026 is 30.6, whose GPU check picks the OPENGL renderer (AISniffer `OpenGLRenderer`); 30.8.2 picks DirectX 12, which is
+why the lab (all 30.8.2) never froze. Lab with 30.6 (AE2026 copy, recovery data moved aside, GPU Performance on, 161): Create ->
+title stuck at the first fit (46.13 %), home screen stays, menus dead; every thread asleep; main thread in an infinite single-fd
+ppoll. `+wgl` trace: the main thread's SECOND wglSwapBuffers on the new document's GL child (style 56000000, created vis=0) never
+returns (the first did). Cause: a hidden window's client surface is detached (wayland_client_surface_update), so it gets no frame
+callbacks, and with a swap interval EGL waits for the previous swap's frame callback -> forever. Illustrator draws the document while
+its window is still hidden, as on Windows (thrwatch: document hidden for ~0.6 s), where a present to a hidden window never blocks.
+Upstream master has the same swap code. FIX: wayland_drawable_swap asks `wayland_client_surface_is_attached()` (new, win_data_mutex
+only) and swaps a detached window with eglSwapInterval 0, restoring the window's interval after. Kill switch NEUTRON_GL_HIDDEN_NOWAIT=0.
+LAB (lab runtime copy 11.10-161gl = packaged 161 + this winewayland.so x86_64): fix ON 2/2 -- document at 92.69 % within 3 s, a
+rectangle draws, View menu offers "View using CPU" (= drawing on the GPU), File > Exit clean; fix OFF on the SAME binary 1/1 frozen
+(plus 161 stock 2/2 frozen). NOT YET BUILT. Not paced: a hidden GL window that renders nonstop now runs unthrottled until shown.
+
 ### patch 89 — `…z×89-ntdll-tls-one-call` (every app's startup + Illustrator's first document: TLS for loaded DLLs)
 Loading a DLL with a TLS directory, Wine's alloc_tls_slot() opened every thread (NtGetNextThread), asked the server for its TEB
 (NtQueryInformationThread) and closed it: 3 round trips per thread per DLL; Illustrator (~300 threads) ~19k requests on its first
