@@ -1602,7 +1602,7 @@ winternl.h, `virtual_set_tls_info()` walks the TEBs in-process under virtual_mut
 lock. Any failure (wow64 thunk, OOM, NEUTRON_TLS_ONECALL=0) falls back to the old loop with nothing changed. tlstest (40 TLS DLLs,
 64/300 threads, vectors grow past 32): all pass on/off/plain 160; loads 35 vs 74 ms (64 thr), 39-66 vs 205-224 ms (300 thr).
 Illustrator 2025 doc 1, same binary on vs off: main thread voluntary switches 41,242 vs 60,328; docs 2/3 unchanged.
-Kill switch NEUTRON_TLS_ONECALL=0. NOT YET BUILT (lab runtime copy 11.10-160p4 = 86-89).
+Kill switch NEUTRON_TLS_ONECALL=0. BUILT in 11.10-161 (release-161, local; 0 patch/hunk failures, markers in ntdll.so/win32u.so both arches, protocol 949; packaged harnesses pass). Not published. Lab copy 11.10-160p4 = 86-89.
 
 ### patch 88 — `…z×88-win32u-server-prop-cache` (Illustrator slow to make a new document: GetProp round trips)
 Same report as 86. Illustrator's main thread made 27,858 get_window_property round trips while making one document (doc 1; 3,824
@@ -1613,13 +1613,13 @@ win32u keeps a copy of its own windows' properties (WND `props`) and answers Get
 the one its last own change returned (another process's change: server again; our next change drops the copy for that window).
 '#' names and names that could match a by-number string atom go to the server. proptest.exe (21 checks, cross-process included)
 identical on/off/plain 160; trace: get_window_property 27,858 -> 4 (doc 1), 3,824 -> 7 (doc 2). Protocol 949.
-Kill switch NEUTRON_PROP_CACHE=0. NOT YET BUILT (lab runtime copy 11.10-160p3).
+Kill switch NEUTRON_PROP_CACHE=0. BUILT in 11.10-161 (release-161, local; 0 patch/hunk failures, markers in ntdll.so/win32u.so both arches, protocol 949; packaged harnesses pass). Not published. Lab copy 11.10-160p3.
 
 ### patch 87 — `…z×87-win32u-tree-shm-other-process` (Illustrator slow to make a new document: window-tree round trips)
 Same report as 86. GetParent, GetAncestor(GA_PARENT) and GetWindow(GW_OWNER) of ANOTHER process's window still asked the server
 (get_window_tree) although window-tree-shm publishes every window's parent and owner. Illustrator's main thread: 16,896 requests
 (doc 1; 3,459 doc 2), all for 33 windows of Adobe's panel processes (CEPHtmlEngine). Now read from shared memory; trace of the
-patched build: 0. Kill switch NEUTRON_TREE_SHM_OTHER=0 (NEUTRON_TREE_SHM=0 turns off all of window-tree-shm). NOT YET BUILT.
+patched build: 0. Kill switch NEUTRON_TREE_SHM_OTHER=0 (NEUTRON_TREE_SHM=0 turns off all of window-tree-shm). BUILT in 11.10-161 (release-161, local; 0 patch/hunk failures, markers in ntdll.so/win32u.so both arches, protocol 949; packaged harnesses pass). Not published.
 
 ### patch 86 — `…z×86-ntdll-server-sync-fd-with-create` (Illustrator slow to make a new document: semaphore round trips)
 His words (10-29, 160 on his desktop): *"It's still just as slow to make a new document. On Windows the artboard is where it should
@@ -1633,7 +1633,7 @@ access as get_inproc_sync_fd) and the client caches it under fd_cache_mutex (`ca
 ntdll.so builds and the wineserver change together). Lab A/B (Illustrator 2025, same binary, NEUTRON_OWNER_GROUP=0 in both arms,
 3 A4 documents each): coordinator voluntary switches 112-114k vs 134-138k per document; artboard centered +2.40/+1.62/+1.71 s vs
 +2.59/+1.74/+1.84 s (capture resolution ~0.13 s). Imperfect: create and close stay one round trip each (Windows: none).
-Kill switch NEUTRON_SYNC_FD_ON_CREATE=0. NOT YET BUILT (lab runtime copies 11.10-160sf, 11.10-160p3). Trace of the patched
+Kill switch NEUTRON_SYNC_FD_ON_CREATE=0. BUILT in 11.10-161 (release-161, local; 0 patch/hunk failures, markers in ntdll.so/win32u.so both arches, protocol 949; packaged harnesses pass). Not published. Protocol-version hunk fixed in ec52f48 (946->947 at apply time; the first 161 build failed on it). Lab copies 11.10-160sf, 11.10-160p3. Trace of the patched
 build: get_inproc_sync_fd ~23k -> 3/0. 86+87+88 together, same binary on vs off (Illustrator 2025, 3 docs): main thread
 60.3k/15.2k/15.3k vs 92.8k/19.4k/19.3k voluntary switches, artboard centered +2.34/+1.71/+1.77 vs +2.69/+1.78/+1.89 s;
 Illustrator's wineserver requests 174k -> 115k (doc 1), 96k -> 66k (doc 2).
