@@ -1,0 +1,411 @@
+ntdll, server: send a new event/mutex/semaphore's in-process sync fd with the create reply
+
+On Windows, creating an event, mutex or semaphore never leaves the kernel. Here the handle comes from the wineserver, and the
+client then fetched the object's ntsync fd with a second request (get_inproc_sync_fd) the first time it waited on or signaled
+it. Illustrator makes a new document with Adobe Color Engine's thread pool, whose coordinator thread creates ~23k semaphores
+per document: 3 wineserver round trips each (create, fetch, close), ~69k blocking requests on the path the main thread waits
+for (lab trace, 2025 and 2026). The create request now asks for the fd and the reply carries it, so it is cached at once.
+Measured (Illustrator 2025, lab, same binary, NEUTRON_SYNC_FD_ON_CREATE on vs off, 3 docs each): the coordinator's
+voluntary switches 112-114k vs 134-138k per document, the artboard centered 0.12-0.19 s earlier. Protocol 948.
+What stays: create and close are still one round trip each; Windows needs none.
+Kill switch NEUTRON_SYNC_FD_ON_CREATE=0 (the fd is fetched on first use, as before).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -773,6 +773,34 @@
+     }
+ }
+ 
++/* NEUTRON: ask the server to send a new event/mutex/semaphore's in-process sync fd with the create reply and cache it at
++ * once, instead of fetching it with a second request (get_inproc_sync_fd) on first use. On Windows, creating these never
++ * leaves the kernel; Illustrator's color engine creates ~23k semaphores per new document, so the second round trip per
++ * object was on the critical path. NEUTRON_SYNC_FD_ON_CREATE=0 restores the fetch on first use. */
++static BOOL neutron_sync_fd_on_create(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_SYNC_FD_ON_CREATE" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++/* caller must hold fd_cache_mutex: the fd was sent with the create reply and is next on the fd socket */
++static void cache_new_inproc_sync( HANDLE handle, int type, unsigned int access )
++{
++    struct inproc_sync stack, *sync;
++    obj_handle_t fd_handle;
++
++    stack.fd = wine_server_receive_fd( &fd_handle );
++    assert( wine_server_ptr_handle(fd_handle) == handle );
++    stack.refcount = 1;
++    stack.access = access;
++    stack.type = type;
++    stack.closed = 0;
++    /* drop the caller's reference: the cache keeps the handle's, or the fd is closed if it could not be cached */
++    sync = cache_inproc_sync( handle, &stack );
++    release_inproc_sync( sync );
++}
++
+ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
+ {
+     struct inproc_sync stack, *sync;
+@@ -968,6 +996,8 @@
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL send_fd = inproc_device_fd >= 0 && neutron_sync_fd_on_create();
++    sigset_t sigset;
+ 
+     TRACE( "access %#x, name %s, initial %d, max %d\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", initial, max );
+@@ -976,16 +1006,20 @@
+     if (max <= 0 || initial < 0 || initial > max) return STATUS_INVALID_PARAMETER;
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
++    if (send_fd) server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+     SERVER_START_REQ( create_semaphore )
+     {
+         req->access  = access;
+         req->initial = initial;
+         req->max     = max;
+         wine_server_add_data( req, objattr, len );
++        req->send_inproc_fd = send_fd;
+         ret = wine_server_call( req );
+         *handle = wine_server_ptr_handle( reply->handle );
++        if (reply->inproc_type) cache_new_inproc_sync( *handle, reply->inproc_type, reply->inproc_access );
+     }
+     SERVER_END_REQ;
++    if (send_fd) server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     free( objattr );
+     return ret;
+@@ -1094,6 +1128,8 @@
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL send_fd = inproc_device_fd >= 0 && neutron_sync_fd_on_create();
++    sigset_t sigset;
+ 
+     TRACE( "access %#x, name %s, type %u, state %u\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", type, state );
+@@ -1102,16 +1138,20 @@
+     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
++    if (send_fd) server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+     SERVER_START_REQ( create_event )
+     {
+         req->access = access;
+         req->manual_reset = (type == NotificationEvent);
+         req->initial_state = state;
+         wine_server_add_data( req, objattr, len );
++        req->send_inproc_fd = send_fd;
+         ret = wine_server_call( req );
+         *handle = wine_server_ptr_handle( reply->handle );
++        if (reply->inproc_type) cache_new_inproc_sync( *handle, reply->inproc_type, reply->inproc_access );
+     }
+     SERVER_END_REQ;
++    if (send_fd) server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     free( objattr );
+     return ret;
+@@ -1285,6 +1325,8 @@
+     unsigned int ret;
+     data_size_t len;
+     struct object_attributes *objattr;
++    BOOL send_fd = inproc_device_fd >= 0 && neutron_sync_fd_on_create();
++    sigset_t sigset;
+ 
+     TRACE( "access %#x, name %s, owned %u\n", access,
+            attr ? debugstr_us(attr->ObjectName) : "(null)", owned );
+@@ -1292,15 +1334,19 @@
+     *handle = 0;
+     if ((ret = alloc_object_attributes( attr, &objattr, &len ))) return ret;
+ 
++    if (send_fd) server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+     SERVER_START_REQ( create_mutex )
+     {
+         req->access  = access;
+         req->owned   = owned;
+         wine_server_add_data( req, objattr, len );
++        req->send_inproc_fd = send_fd;
+         ret = wine_server_call( req );
+         *handle = wine_server_ptr_handle( reply->handle );
++        if (reply->inproc_type) cache_new_inproc_sync( *handle, reply->inproc_type, reply->inproc_access );
+     }
+     SERVER_END_REQ;
++    if (send_fd) server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     free( objattr );
+     return ret;
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1663,13 +1663,17 @@
+     unsigned int access;
+     int          manual_reset;
+     int          initial_state;
++    int          send_inproc_fd;
+     /* VARARG(objattr,object_attributes); */
++    char __pad_28[4];
+ };
+ struct create_event_reply
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    int          inproc_type;
++    unsigned int inproc_access;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -1754,14 +1758,16 @@
+     struct request_header __header;
+     unsigned int access;
+     int          owned;
++    int          send_inproc_fd;
+     /* VARARG(objattr,object_attributes); */
+-    char __pad_20[4];
+ };
+ struct create_mutex_reply
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    int          inproc_type;
++    unsigned int inproc_access;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -1819,13 +1825,17 @@
+     unsigned int access;
+     unsigned int initial;
+     unsigned int max;
++    int          send_inproc_fd;
+     /* VARARG(objattr,object_attributes); */
++    char __pad_28[4];
+ };
+ struct create_semaphore_reply
+ {
+     struct reply_header __header;
+     obj_handle_t handle;
+-    char __pad_12[4];
++    int          inproc_type;
++    unsigned int inproc_access;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -7152,6 +7162,6 @@
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 947
++#define SERVER_PROTOCOL_VERSION 948
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/event.c
++++ b/server/event.c
+@@ -392,6 +392,8 @@
+         else
+             reply->handle = alloc_handle_no_access_check( current->process, event,
+                                                           req->access, objattr->attributes );
++        if (req->send_inproc_fd && reply->handle)  /* NEUTRON: see send_new_inproc_sync_fd() */
++            reply->inproc_type = send_new_inproc_sync_fd( &event->obj, reply->handle, &reply->inproc_access );
+         release_object( event );
+     }
+ 
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -290,6 +290,21 @@
+ 
+ #endif /* NTSYNC_IOC_EVENT_READ */
+ 
++/* NEUTRON: send a just-created object's in-process sync fd along with the create reply and return its type (0 if it
++ * has none). On Windows, creating an event, mutex or semaphore never leaves the kernel; here the handle comes from the
++ * server, and the client then fetched the fd with a second request (get_inproc_sync_fd) on first use. Illustrator's
++ * color engine creates ~23k semaphores per new document, so that second round trip per object showed up on the critical
++ * path. Same fd and access as get_inproc_sync_fd would report. */
++int send_new_inproc_sync_fd( struct object *obj, obj_handle_t handle, unsigned int *access )
++{
++    int type = 0, fd;
++
++    if (!handle || (fd = get_obj_inproc_sync( obj, &type )) < 0) return 0;
++    *access = get_handle_access( current->process, handle );
++    send_client_fd( current->process, fd, handle );
++    return type;
++}
++
+ DECL_HANDLER(get_inproc_sync_fd)
+ {
+     struct object *obj;
+--- a/server/mutex.c
++++ b/server/mutex.c
+@@ -295,6 +295,8 @@
+         else
+             reply->handle = alloc_handle_no_access_check( current->process, mutex,
+                                                           req->access, objattr->attributes );
++        if (req->send_inproc_fd && reply->handle)  /* NEUTRON: see send_new_inproc_sync_fd() */
++            reply->inproc_type = send_new_inproc_sync_fd( &mutex->obj, reply->handle, &reply->inproc_access );
+         release_object( mutex );
+     }
+ 
+--- a/server/object.h
++++ b/server/object.h
+@@ -251,6 +251,7 @@
+ struct inproc_sync;
+ extern int get_inproc_device_fd(void);
+ extern int get_inproc_sync_fd( struct inproc_sync *sync );
++extern int send_new_inproc_sync_fd( struct object *obj, obj_handle_t handle, unsigned int *access );
+ extern struct inproc_sync *create_inproc_internal_sync( int manual, int signaled );
+ extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
+ extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1493,9 +1493,12 @@
+     unsigned int access;        /* wanted access rights */
+     int          manual_reset;  /* manual reset event */
+     int          initial_state; /* initial state of the event */
++    int          send_inproc_fd; /* send the in-process sync fd with the reply (NEUTRON) */
+     VARARG(objattr,object_attributes); /* object attributes */
+ @REPLY
+     obj_handle_t handle;        /* handle to the event */
++    int          inproc_type;   /* inproc sync type of the fd sent with the reply, 0 if none (NEUTRON) */
++    unsigned int inproc_access; /* handle access rights, for caching that fd */
+ @END
+ 
+ /* Event operation */
+@@ -1548,9 +1551,12 @@
+ @REQ(create_mutex)
+     unsigned int access;        /* wanted access rights */
+     int          owned;         /* initially owned? */
++    int          send_inproc_fd; /* send the in-process sync fd with the reply (NEUTRON) */
+     VARARG(objattr,object_attributes); /* object attributes */
+ @REPLY
+     obj_handle_t handle;        /* handle to the mutex */
++    int          inproc_type;   /* inproc sync type of the fd sent with the reply, 0 if none (NEUTRON) */
++    unsigned int inproc_access; /* handle access rights, for caching that fd */
+ @END
+ 
+ 
+@@ -1588,9 +1594,12 @@
+     unsigned int access;        /* wanted access rights */
+     unsigned int initial;       /* initial count */
+     unsigned int max;           /* maximum count */
++    int          send_inproc_fd; /* send the in-process sync fd with the reply (NEUTRON) */
+     VARARG(objattr,object_attributes); /* object attributes */
+ @REPLY
+     obj_handle_t handle;        /* handle to the semaphore */
++    int          inproc_type;   /* inproc sync type of the fd sent with the reply, 0 if none (NEUTRON) */
++    unsigned int inproc_access; /* handle access rights, for caching that fd */
+ @END
+ 
+ 
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -894,9 +894,12 @@
+ C_ASSERT( offsetof(struct create_event_request, access) == 12 );
+ C_ASSERT( offsetof(struct create_event_request, manual_reset) == 16 );
+ C_ASSERT( offsetof(struct create_event_request, initial_state) == 20 );
+-C_ASSERT( sizeof(struct create_event_request) == 24 );
++C_ASSERT( offsetof(struct create_event_request, send_inproc_fd) == 24 );
++C_ASSERT( sizeof(struct create_event_request) == 32 );
+ C_ASSERT( offsetof(struct create_event_reply, handle) == 8 );
+-C_ASSERT( sizeof(struct create_event_reply) == 16 );
++C_ASSERT( offsetof(struct create_event_reply, inproc_type) == 12 );
++C_ASSERT( offsetof(struct create_event_reply, inproc_access) == 16 );
++C_ASSERT( sizeof(struct create_event_reply) == 24 );
+ C_ASSERT( offsetof(struct event_op_request, handle) == 12 );
+ C_ASSERT( offsetof(struct event_op_request, op) == 16 );
+ C_ASSERT( sizeof(struct event_op_request) == 24 );
+@@ -925,9 +928,12 @@
+ C_ASSERT( sizeof(struct open_keyed_event_reply) == 16 );
+ C_ASSERT( offsetof(struct create_mutex_request, access) == 12 );
+ C_ASSERT( offsetof(struct create_mutex_request, owned) == 16 );
++C_ASSERT( offsetof(struct create_mutex_request, send_inproc_fd) == 20 );
+ C_ASSERT( sizeof(struct create_mutex_request) == 24 );
+ C_ASSERT( offsetof(struct create_mutex_reply, handle) == 8 );
+-C_ASSERT( sizeof(struct create_mutex_reply) == 16 );
++C_ASSERT( offsetof(struct create_mutex_reply, inproc_type) == 12 );
++C_ASSERT( offsetof(struct create_mutex_reply, inproc_access) == 16 );
++C_ASSERT( sizeof(struct create_mutex_reply) == 24 );
+ C_ASSERT( offsetof(struct release_mutex_request, handle) == 12 );
+ C_ASSERT( sizeof(struct release_mutex_request) == 16 );
+ C_ASSERT( offsetof(struct release_mutex_reply, prev_count) == 8 );
+@@ -947,9 +953,12 @@
+ C_ASSERT( offsetof(struct create_semaphore_request, access) == 12 );
+ C_ASSERT( offsetof(struct create_semaphore_request, initial) == 16 );
+ C_ASSERT( offsetof(struct create_semaphore_request, max) == 20 );
+-C_ASSERT( sizeof(struct create_semaphore_request) == 24 );
++C_ASSERT( offsetof(struct create_semaphore_request, send_inproc_fd) == 24 );
++C_ASSERT( sizeof(struct create_semaphore_request) == 32 );
+ C_ASSERT( offsetof(struct create_semaphore_reply, handle) == 8 );
+-C_ASSERT( sizeof(struct create_semaphore_reply) == 16 );
++C_ASSERT( offsetof(struct create_semaphore_reply, inproc_type) == 12 );
++C_ASSERT( offsetof(struct create_semaphore_reply, inproc_access) == 16 );
++C_ASSERT( sizeof(struct create_semaphore_reply) == 24 );
+ C_ASSERT( offsetof(struct release_semaphore_request, handle) == 12 );
+ C_ASSERT( offsetof(struct release_semaphore_request, count) == 16 );
+ C_ASSERT( sizeof(struct release_semaphore_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -460,12 +460,15 @@
+     fprintf( stderr, " access=%08x", req->access );
+     fprintf( stderr, ", manual_reset=%d", req->manual_reset );
+     fprintf( stderr, ", initial_state=%d", req->initial_state );
++    fprintf( stderr, ", send_inproc_fd=%d", req->send_inproc_fd );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+ }
+ 
+ static void dump_create_event_reply( const struct create_event_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", inproc_type=%d", req->inproc_type );
++    fprintf( stderr, ", inproc_access=%08x", req->inproc_access );
+ }
+ 
+ static void dump_event_op_request( const struct event_op_request *req )
+@@ -531,12 +534,15 @@
+ {
+     fprintf( stderr, " access=%08x", req->access );
+     fprintf( stderr, ", owned=%d", req->owned );
++    fprintf( stderr, ", send_inproc_fd=%d", req->send_inproc_fd );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+ }
+ 
+ static void dump_create_mutex_reply( const struct create_mutex_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", inproc_type=%d", req->inproc_type );
++    fprintf( stderr, ", inproc_access=%08x", req->inproc_access );
+ }
+ 
+ static void dump_release_mutex_request( const struct release_mutex_request *req )
+@@ -579,12 +585,15 @@
+     fprintf( stderr, " access=%08x", req->access );
+     fprintf( stderr, ", initial=%08x", req->initial );
+     fprintf( stderr, ", max=%08x", req->max );
++    fprintf( stderr, ", send_inproc_fd=%d", req->send_inproc_fd );
+     dump_varargs_object_attributes( ", objattr=", cur_size );
+ }
+ 
+ static void dump_create_semaphore_reply( const struct create_semaphore_reply *req )
+ {
+     fprintf( stderr, " handle=%04x", req->handle );
++    fprintf( stderr, ", inproc_type=%d", req->inproc_type );
++    fprintf( stderr, ", inproc_access=%08x", req->inproc_access );
+ }
+ 
+ static void dump_release_semaphore_request( const struct release_semaphore_request *req )
+--- a/server/semaphore.c
++++ b/server/semaphore.c
+@@ -260,6 +260,8 @@
+         else
+             reply->handle = alloc_handle_no_access_check( current->process, sem,
+                                                           req->access, objattr->attributes );
++        if (req->send_inproc_fd && reply->handle)  /* NEUTRON: see send_new_inproc_sync_fd() */
++            reply->inproc_type = send_new_inproc_sync_fd( &sem->obj, reply->handle, &reply->inproc_access );
+         release_object( sem );
+     }
+ 

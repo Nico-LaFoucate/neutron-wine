@@ -1593,6 +1593,20 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 86 — `…z×86-ntdll-server-sync-fd-with-create` (Illustrator slow to make a new document: semaphore round trips)
+His words (10-29, 160 on his desktop): *"It's still just as slow to make a new document. On Windows the artboard is where it should
+be from the beginning, but in Neutron, it loads in at the top left of the work area before it maximizes and centers itself"*.
+Measured (OPEN-ISSUES, Illustrator entry): making a document, Adobe Color Engine's coordinator thread creates ~23k semaphores and
+needs 3 wineserver round trips per semaphore (create_semaphore, get_inproc_sync_fd on first use, close_handle), ~69k blocking
+requests on the path the main thread waits for; Windows does it without leaving the kernel (semabench on his Windows machine:
+Create+Wait+Release+Close 0.91 us vs 13.6 us here; every other sync call within 10 %). The create requests for events, mutexes
+and semaphores now carry `send_inproc_fd`; the server sends the ntsync fd with the reply (`send_new_inproc_sync_fd()`, same fd and
+access as get_inproc_sync_fd) and the client caches it under fd_cache_mutex (`cache_new_inproc_sync()`). Protocol 948 (both
+ntdll.so builds and the wineserver change together). Lab A/B (Illustrator 2025, same binary, NEUTRON_OWNER_GROUP=0 in both arms,
+3 A4 documents each): coordinator voluntary switches 112-114k vs 134-138k per document; artboard centered +2.40/+1.62/+1.71 s vs
++2.59/+1.74/+1.84 s (capture resolution ~0.13 s). Imperfect: create and close stay one round trip each (Windows: none).
+Kill switch NEUTRON_SYNC_FD_ON_CREATE=0. NOT YET BUILT (lab runtime copy 11.10-160sf only).
+
 ### patch 85 — `…z×85-win32u-ime-owner-and-owner-group` (Illustrator's home screen showing between New Document and the new document)
 His words (10-28, checking 159): *"Illustrator feels a little slow going into a document"*. Same Illustrator version (2025) on his
 Windows machine vs the lab: on Windows the document is built while the New Document dialog is still up and the dialog closes after
@@ -1615,7 +1629,9 @@ ms); NEUTRON_OWNER_GROUP=0 1/1 and NEUTRON_IME_OWNER=0 2/2 dialog first. Illustr
 (waited 1007 ms on the Libraries CEP process); right panel draws. No side effects in PS 2026 (docked, 2 docs, Ctrl+O, flash
 unchanged at Windows parity), Premiere 2026, LrC, AE 2026 (Open dialogs; 0 waits over 50 ms). Imperfect: Windows sends the round
 in the group's new z-order with the window among them; here the window's own message comes first.
-Kill switches NEUTRON_IME_OWNER=0, NEUTRON_OWNER_GROUP=0. NOT YET BUILT.
+Kill switches NEUTRON_IME_OWNER=0, NEUTRON_OWNER_GROUP=0. BUILT in 11.10-160 (10-29; release-160 = 159 + `8e26bfd` +
+`df40e5a`; 0 patch/hunk failures, `neutron-ownergroup` string in win32u.so). Lab runs of the packaged 160 inconclusive (lab
+handling, not evidence either way). Installed on his desktop from the local build for his test; NOT published.
 
 ### patch 84 — `…z×84-win32u-remove-owl-force-show` (Illustrator's right dock blank after a second document)
 REMOVES the psdock workaround that `neutron-zzz-ps2026-complete` (2026-07-20) carried into win32u: "Path B" force-show of
@@ -1633,7 +1649,7 @@ home > New and a 2nd document dock; Illustrator 2nd document draws Properties (1
 a dark 842x606 dialog on Ctrl+O, and a dark 500x1000 tip box after opening a 3rd document. On his desktop Ctrl+O opens the file
 picker normally and he has seen no broken tooltip in months (10-28); the lab prefix's Documents folder is a real directory, so
 not that. Not chased.
-PRE-RELEASED in 11.10-159 (10-28; release-159 = 158 + `75d7d54` + `04fac4c`), Latest stays 158 until his desktop check. No kill switch. NOT YET BUILT.
+PRE-RELEASED in 11.10-159 (10-28; release-159 = 158 + `75d7d54` + `04fac4c`), Latest stays 158 until his desktop check. No kill switch.
 
 ### patch 83 — `…z×83-winewayland-clickthrough-live` (Photoshop's "Try Adjustments presets" tip could not be dismissed)
 Found 10-28 while taking press screenshots (lab Photoshop 2026, 11.10-157, nested KWin 175%): the coach mark's "Got it" and
