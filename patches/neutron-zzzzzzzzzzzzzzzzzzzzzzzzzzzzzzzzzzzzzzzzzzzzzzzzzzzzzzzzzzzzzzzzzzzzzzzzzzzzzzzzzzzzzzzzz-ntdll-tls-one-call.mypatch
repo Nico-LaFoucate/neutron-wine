@@ -1,0 +1,246 @@
+ntdll: give every thread a new DLL's TLS in one NtSetInformationProcess(ProcessTlsInformation) call, as Windows does
+
+Loading a DLL with a TLS directory must give every running thread a block for the new slot (and a longer vector when the
+slot array grows). Wine's alloc_tls_slot() opened each thread with NtGetNextThread, asked the server for its TEB
+(NtQueryInformationThread) and closed it: 3 wineserver round trips per thread per DLL. Illustrator has ~300 threads; its
+first new document (plugin loads) made ~19k such requests (lab wineserver trace, Illustrator 2025), and every app pays it
+at startup. Windows' loader allocates the blocks and makes ONE NtSetInformationProcess(ProcessTlsInformation) call
+(ProcessTlsReplaceVector, then ProcessTlsReplaceIndex) that installs them in all threads. That is now what happens: the
+structures go in winternl.h, the unix side walks the process's TEBs in-process under virtual_mutex (like
+virtual_clear_tls_index), the loader keeps its lock so the set of threads with a TLS vector cannot change in between.
+Any failure (32-bit callers through the wow64 thunk, out of memory, NEUTRON_TLS_ONECALL=0) leaves the slot untouched and
+the old per-thread loop runs.
+Verified: harnesses/tlstest (40 TLS DLLs loaded while 64/300 threads run, past the initial 32 slots so vectors grow;
+every thread, 8 threads started later and the main thread check their own initialized copy): all pass on/off/plain 160;
+loads 35 vs 74 ms (64 threads), 39-66 vs 205-224 ms (300 threads).
+Kill switch NEUTRON_TLS_ONECALL=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1328,6 +1328,79 @@
+ }
+ 
+ /*************************************************************************
++ *		set_tls_all_threads
++ *
++ * NEUTRON tls-onecall: give every running thread its block for new TLS slot SLOT (and, when the slot array grew from
++ * OLD_COUNT, a longer vector) the way Windows' loader does: allocate the blocks here, then one
++ * NtSetInformationProcess(ProcessTlsInformation) call per operation installs them in all threads, instead of opening
++ * each thread and asking the server for its TEB (3 round trips per thread per DLL). FALSE: nothing was installed for the
++ * slot (unsupported, 32-bit thunk, out of memory): the caller walks the threads itself.
++ * The loader_section must be locked while calling this function.
++ */
++static BOOL set_tls_all_threads( ULONG slot, const IMAGE_TLS_DIRECTORY *dir, ULONG size, UINT old_count )
++{
++    PROCESS_TLS_INFORMATION probe, *info;
++    ULONG count, j, len;
++    NTSTATUS status;
++
++    memset( &probe, 0, sizeof(probe) );
++    probe.OperationType = ProcessTlsReplaceIndex;
++    status = NtSetInformationProcess( GetCurrentProcess(), ProcessTlsInformation, &probe, sizeof(probe) );
++    if (status == STATUS_SUCCESS) return TRUE;  /* no thread has a TLS vector yet */
++    if (status != STATUS_INFO_LENGTH_MISMATCH) return FALSE;
++    count = probe.ThreadDataCount;
++
++    len = FIELD_OFFSET( PROCESS_TLS_INFORMATION, ThreadData ) + count * sizeof(THREAD_TLS_INFORMATION);
++    if (!(info = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY, len ))) return FALSE;
++    info->ThreadDataCount = count;
++
++    if (old_count < tls_module_count)
++    {
++        info->OperationType = ProcessTlsReplaceVector;
++        info->TlsVectorLength = old_count;
++        for (j = 0; j < count; j++)
++            if (!(info->ThreadData[j].NewTlsData = RtlAllocateHeap( GetProcessHeap(), HEAP_ZERO_MEMORY,
++                                                                    tls_module_count * sizeof(void *) )))
++                break;
++        if (j < count || NtSetInformationProcess( GetCurrentProcess(), ProcessTlsInformation, info, len ))
++        {
++            for (j = 0; j < count; j++) RtlFreeHeap( GetProcessHeap(), 0, info->ThreadData[j].NewTlsData );
++            RtlFreeHeap( GetProcessHeap(), 0, info );
++            return FALSE;
++        }
++        /* the old vectors are not freed: their threads may still be reading through them (FIXME, as below) */
++        for (j = 0; j < count; j++)
++            if (!info->ThreadData[j].Flags) RtlFreeHeap( GetProcessHeap(), 0, info->ThreadData[j].NewTlsData );
++        memset( info->ThreadData, 0, count * sizeof(THREAD_TLS_INFORMATION) );
++        info->ThreadDataCount = count;
++    }
++
++    info->OperationType = ProcessTlsReplaceIndex;
++    info->TlsIndex = slot;
++    for (j = 0; j < count; j++)
++    {
++        if (!(info->ThreadData[j].NewTlsData = RtlAllocateHeap( GetProcessHeap(), 0, size + dir->SizeOfZeroFill ))) break;
++        memcpy( info->ThreadData[j].NewTlsData, (void *)dir->StartAddressOfRawData, size );
++        memset( (char *)info->ThreadData[j].NewTlsData + size, 0, dir->SizeOfZeroFill );
++    }
++    if (j < count || NtSetInformationProcess( GetCurrentProcess(), ProcessTlsInformation, info, len ))
++    {
++        for (j = 0; j < count; j++) RtlFreeHeap( GetProcessHeap(), 0, info->ThreadData[j].NewTlsData );
++        RtlFreeHeap( GetProcessHeap(), 0, info );
++        return FALSE;
++    }
++    for (j = 0; j < count; j++)
++    {
++        if (info->ThreadData[j].Flags) RtlFreeHeap( GetProcessHeap(), 0, info->ThreadData[j].OldTlsData );
++        else RtlFreeHeap( GetProcessHeap(), 0, info->ThreadData[j].NewTlsData );
++    }
++    TRACE( "slot %lu: installed in %lu threads in one call\n", slot, count );
++    RtlFreeHeap( GetProcessHeap(), 0, info );
++    return TRUE;
++}
++
++
++/*************************************************************************
+  *		alloc_tls_slot
+  *
+  * Allocate a TLS slot for a newly-loaded module.
+@@ -1370,6 +1443,12 @@
+     }
+ 
+     /* allocate the data block in all running threads */
++    if (set_tls_all_threads( i, dir, size, old_module_count ))
++    {
++        *(DWORD *)dir->AddressOfIndex = i;
++        tls_dirs[i] = *dir;
++        return TRUE;
++    }
+     while (!NtGetNextThread( GetCurrentProcess(), thread, THREAD_QUERY_LIMITED_INFORMATION, 0, 0, &next ))
+     {
+         THREAD_BASIC_INFORMATION tbi;
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -1690,6 +1690,10 @@
+         process_error_mode = *(UINT *)info;
+         break;
+ 
++    case ProcessTlsInformation:  /* NEUTRON tls-onecall, see virtual_set_tls_info() */
++        if (handle != GetCurrentProcess()) return STATUS_INVALID_PARAMETER;
++        return virtual_set_tls_info( info, size );
++
+     case ProcessAffinityMask:
+     {
+         const ULONG_PTR system_mask = get_system_affinity_mask();
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -314,6 +314,7 @@
+ struct thread_data *virtual_alloc_thread_data(void);
+ extern void virtual_free_thread_data( struct thread_data *data );
+ extern NTSTATUS virtual_clear_tls_index( ULONG index );
++extern NTSTATUS virtual_set_tls_info( PROCESS_TLS_INFORMATION *info, ULONG size );
+ extern NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                             SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page );
+ extern void virtual_map_user_shared_data(void);
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4365,6 +4365,67 @@
+ 
+ 
+ /***********************************************************************
++ *           virtual_set_tls_info
++ *
++ * NEUTRON tls-onecall: NtSetInformationProcess(ProcessTlsInformation). Loading a DLL with a TLS directory must give every
++ * running thread a block for the new slot (and a longer vector when the slot array grows). Windows' loader allocates
++ * the blocks and makes ONE NtSetInformationProcess(ProcessTlsInformation) call that installs them in every thread. Wine's
++ * loader opened each thread, asked the server for its TEB and closed it: 3 server round trips per thread per DLL,
++ * ~19k requests while Illustrator (~300 threads) made its first document. Here the TEBs are walked in-process, as
++ * virtual_clear_tls_index does. The loader holds its lock (so no thread gains or drops its TLS vector meanwhile); only
++ * threads whose vector is set are counted and changed, in teb_list order. If ThreadDataCount is too small, nothing is
++ * changed: the count needed is written back and STATUS_INFO_LENGTH_MISMATCH returned. Used entries get Flags = 1,
++ * OldTlsData and ThreadId. NEUTRON_TLS_ONECALL=0 returns STATUS_NOT_SUPPORTED (the loader then walks the threads itself).
++ */
++NTSTATUS virtual_set_tls_info( PROCESS_TLS_INFORMATION *info, ULONG size )
++{
++    static int on = -1;
++    struct thread_data *data;
++    sigset_t sigset;
++    ULONG count = 0, j = 0;
++
++    if (on < 0) { const char *e = getenv( "NEUTRON_TLS_ONECALL" ); on = !(e && e[0] == '0'); }
++    if (!on) return STATUS_NOT_SUPPORTED;
++    if (size < offsetof( PROCESS_TLS_INFORMATION, ThreadData )) return STATUS_INFO_LENGTH_MISMATCH;
++    if (info->OperationType != ProcessTlsReplaceIndex && info->OperationType != ProcessTlsReplaceVector)
++        return STATUS_INVALID_PARAMETER;
++    if (size < offsetof( PROCESS_TLS_INFORMATION, ThreadData ) + (SIZE_T)info->ThreadDataCount * sizeof(THREAD_TLS_INFORMATION))
++        return STATUS_INFO_LENGTH_MISMATCH;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    LIST_FOR_EACH_ENTRY( data, &teb_list, struct thread_data, entry )
++        if (data->teb->ThreadLocalStoragePointer) count++;
++    if (count > info->ThreadDataCount)
++    {
++        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        info->ThreadDataCount = count;
++        return STATUS_INFO_LENGTH_MISMATCH;
++    }
++    LIST_FOR_EACH_ENTRY( data, &teb_list, struct thread_data, entry )
++    {
++        TEB *teb = data->teb;
++        void **vector = teb->ThreadLocalStoragePointer;
++        THREAD_TLS_INFORMATION *td;
++
++        if (!vector) continue;
++        td = &info->ThreadData[j++];
++        if (info->OperationType == ProcessTlsReplaceVector)
++        {
++            memcpy( td->NewTlsData, vector, info->TlsVectorLength * sizeof(*vector) );
++            teb->ThreadLocalStoragePointer = td->NewTlsData;
++            td->OldTlsData = vector;
++        }
++        else td->OldTlsData = InterlockedExchangePointer( vector + info->TlsIndex, td->NewTlsData );
++        td->ThreadId = teb->ClientId.UniqueThread;
++        td->Flags = 1;
++    }
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    for (; j < info->ThreadDataCount; j++) info->ThreadData[j].Flags = 0;
++    return STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
+  *           virtual_clear_tls_index
+  */
+ NTSTATUS virtual_clear_tls_index( ULONG index )
+--- a/include/winternl.h
++++ b/include/winternl.h
+@@ -2788,6 +2788,36 @@
+     UINT64    InheritedFromUniqueProcessId;
+ } PROCESS_BASIC_INFORMATION64;
+ 
++/* ProcessTlsInformation (NtSetInformationProcess): how the loader gives every thread of the process a new module TLS
++ * vector or slot in one call */
++typedef struct _THREAD_TLS_INFORMATION
++{
++    ULONG  Flags;
++    PVOID  NewTlsData;
++    PVOID  OldTlsData;
++    HANDLE ThreadId;
++} THREAD_TLS_INFORMATION, *PTHREAD_TLS_INFORMATION;
++
++typedef enum _PROCESS_TLS_INFORMATION_TYPE
++{
++    ProcessTlsReplaceIndex,
++    ProcessTlsReplaceVector,
++    MaxProcessTlsOperation
++} PROCESS_TLS_INFORMATION_TYPE, *PPROCESS_TLS_INFORMATION_TYPE;
++
++typedef struct _PROCESS_TLS_INFORMATION
++{
++    ULONG Flags;
++    ULONG OperationType;
++    ULONG ThreadDataCount;
++    union
++    {
++        ULONG TlsIndex;
++        ULONG TlsVectorLength;
++    } DUMMYUNIONNAME;
++    THREAD_TLS_INFORMATION ThreadData[1];
++} PROCESS_TLS_INFORMATION, *PPROCESS_TLS_INFORMATION;
++
+ #define PROCESS_PRIOCLASS_IDLE          1
+ #define PROCESS_PRIOCLASS_NORMAL        2
+ #define PROCESS_PRIOCLASS_HIGH          3
