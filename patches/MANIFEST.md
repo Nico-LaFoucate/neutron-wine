@@ -1606,7 +1606,7 @@ Upstream master has the same swap code. FIX: wayland_drawable_swap asks `wayland
 only) and swaps a detached window with eglSwapInterval 0, restoring the window's interval after. Kill switch NEUTRON_GL_HIDDEN_NOWAIT=0.
 LAB (lab runtime copy 11.10-161gl = packaged 161 + this winewayland.so x86_64): fix ON 2/2 -- document at 92.69 % within 3 s, a
 rectangle draws, View menu offers "View using CPU" (= drawing on the GPU), File > Exit clean; fix OFF on the SAME binary 1/1 frozen
-(plus 161 stock 2/2 frozen). BUILT in 11.10-162 (release-162, local; package lab: New Document OK, rectangle draws). Not published. Not paced: a hidden GL window that renders nonstop now runs unthrottled until shown.
+(plus 161 stock 2/2 frozen). BUILT in 11.10-162 (release-162, local; package lab: New Document OK, rectangle draws). Not published. HIS DESKTOP 10-29: "illustrator fix works. New doc opens without freezing on GPU". Not paced: a hidden GL window that renders nonstop now runs unthrottled until shown.
 
 ### patch 89 — `…z×89-ntdll-tls-one-call` (every app's startup + Illustrator's first document: TLS for loaded DLLs)
 Loading a DLL with a TLS directory, Wine's alloc_tls_slot() opened every thread (NtGetNextThread), asked the server for its TEB
