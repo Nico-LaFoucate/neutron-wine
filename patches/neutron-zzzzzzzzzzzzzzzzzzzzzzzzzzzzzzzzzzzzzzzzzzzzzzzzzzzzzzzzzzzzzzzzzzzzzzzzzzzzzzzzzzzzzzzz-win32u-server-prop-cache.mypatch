@@ -1,0 +1,450 @@
+win32u, server: answer GetProp on this process's own windows from a copy kept in step through shared memory
+
+On Windows, GetProp reads the window's property list from the desktop heap without leaving the process. Wine asked the
+server every time. Making a new document, Illustrator's main thread made 27,858 get_window_property round trips (doc 1;
+3,824 on doc 2), all on its own windows, almost all for two names (lab wineserver trace, Illustrator 2025).
+The server now publishes a per-window prop_serial in the window's shared memory (the former __pad2 slot, so the layout does
+not change), bumps it on every change, and returns it (and the property's atom) from set/remove_window_property. win32u
+keeps a copy of the properties of this process's windows, updated by its own SetProp/RemoveProp, and answers GetProp from
+it only while the shared serial equals the one its last own change returned. A change made by another process moves the
+serial: GetProp asks the server again, and our next change finds the gap and drops the copy for that window for good.
+Names starting with '#' and names that could be the atom of a property set by number go to the server.
+Verified: harnesses/proptest.exe (21 checks incl. case-insensitive names, atom-number <-> name, remove, cross-process
+set/replace/remove) identical with NEUTRON_PROP_CACHE on, off, and on plain 11.10-160; server trace of the patched build:
+get_window_property 27,858 -> 4 (doc 1), 3,824 -> 7 (doc 2). Protocol 949.
+Kill switch NEUTRON_PROP_CACHE=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -40,6 +40,14 @@
+ 
+ #define OBJ_OTHER_PROCESS ((void *)1)  /* returned by get_user_handle_ptr on unknown handles */
+ 
++/* NEUTRON prop-cache: one entry of a window's copy of its properties */
++struct neutron_prop
++{
++    ATOM       atom;   /* the property's atom, as the server reported it */
++    WCHAR     *name;   /* the name it was set by, or NULL if set by atom number */
++    ULONG_PTR  data;
++};
++
+ typedef struct tagWND
+ {
+     HWND               handle;        /* window full handle */
+@@ -80,6 +88,10 @@
+     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
+     unsigned int       cbWndExtra;    /* class cbWndExtra at window creation */
+     DWORD_PTR          userdata;      /* User private data */
++    struct neutron_prop *props;       /* NEUTRON prop-cache: copy of this process's window's properties */
++    unsigned int       prop_count;    /* entries in props */
++    unsigned int       prop_serial;   /* the server's prop_serial that the copy matches */
++    BOOL               prop_invalid;  /* the copy is incomplete: always ask the server */
+     DWORD              wExtra[1];     /* Window extra bytes */
+ } WND;
+ 
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2044,6 +2044,104 @@
+     return ret;
+ }
+ 
++/* NEUTRON prop-cache: GetProp on this process's own windows reads its copy of their properties instead of asking the
++ * server, the way Windows reads the property list from the desktop heap. Illustrator's main thread made 27,858
++ * get_window_property round trips while making one new document (all its own windows, two names). The copy is updated
++ * by this process's SetProp/RemoveProp and is trusted only while the window's prop_serial in shared memory still equals
++ * the serial our last own change returned; a change by anyone else moves it and GetProp asks the server again (and our
++ * next own change finds the gap and drops the copy for good). NEUTRON_PROP_CACHE=0 always asks the server. */
++static BOOL neutron_prop_cache(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_PROP_CACHE" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static BOOL get_shared_prop_serial( HWND hwnd, unsigned int *serial )
++{
++    struct object_lock lock = OBJECT_LOCK_INIT;
++    const window_shm_t *window_shm = NULL;
++    NTSTATUS status;
++
++    *serial = 0;
++    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
++        *serial = window_shm->prop_serial;
++    return !status;
++}
++
++/* 1: found at *idx; 0: certainly not set; -1: can't tell from the copy */
++static int prop_cache_find( const WND *win, const WCHAR *str, unsigned int *idx )
++{
++    BOOL unknown = FALSE;
++    unsigned int i;
++
++    if (!IS_INTRESOURCE(str) && str[0] == '#') return -1;  /* "#123" names an atom number on the server */
++    for (i = 0; i < win->prop_count; i++)
++    {
++        const struct neutron_prop *prop = &win->props[i];
++        if (IS_INTRESOURCE(str))
++        {
++            if (prop->atom == LOWORD(str)) { *idx = i; return 1; }
++        }
++        else if (prop->name)
++        {
++            if (!wcsicmp( prop->name, str )) { *idx = i; return 1; }
++        }
++        else if (prop->atom >= MAXINTATOM) unknown = TRUE;  /* set by a string atom's number: may be this name */
++    }
++    return unknown ? -1 : 0;
++}
++
++static BOOL prop_cache_set( WND *win, const WCHAR *str, ATOM atom, ULONG_PTR data )
++{
++    struct neutron_prop *props;
++    unsigned int i;
++
++    if (!atom || (!IS_INTRESOURCE(str) && str[0] == '#')) return FALSE;
++    for (i = 0; i < win->prop_count; i++)
++    {
++        if (win->props[i].atom != atom) continue;
++        win->props[i].data = data;
++        return TRUE;
++    }
++    if (!(props = realloc( win->props, (win->prop_count + 1) * sizeof(*props) ))) return FALSE;
++    win->props = props;
++    props[i].atom = atom;
++    props[i].data = data;
++    props[i].name = NULL;
++    if (!IS_INTRESOURCE(str))
++    {
++        size_t len = (lstrlenW( str ) + 1) * sizeof(WCHAR);
++        if (!(props[i].name = malloc( len ))) return FALSE;
++        memcpy( props[i].name, str, len );
++    }
++    win->prop_count++;
++    return TRUE;
++}
++
++static void prop_cache_free( WND *win )
++{
++    unsigned int i;
++    for (i = 0; i < win->prop_count; i++) free( win->props[i].name );
++    free( win->props );
++    win->props = NULL;
++    win->prop_count = 0;
++}
++
++/* our own change to the window's properties returned SERIAL: keep the copy only if nobody else changed them meanwhile */
++static BOOL prop_cache_in_step( WND *win, unsigned int serial )
++{
++    unsigned int expect = win->prop_serial + 1;
++    if (!expect) expect = 1;
++    return !win->prop_invalid && serial && serial == expect;
++}
++
++static void prop_cache_drop( WND *win )
++{
++    win->prop_invalid = TRUE;
++    prop_cache_free( win );
++}
++
+ /***********************************************************************
+  *           NtUserGetProp   (win32u.@)
+  *
+@@ -2053,6 +2151,19 @@
+ HANDLE WINAPI NtUserGetProp( HWND hwnd, const WCHAR *str )
+ {
+     ULONG_PTR ret = 0;
++    WND *win;
++
++    if (neutron_prop_cache() && (win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++    {
++        unsigned int serial = 0, idx = 0;
++        int found = -1;
++
++        if (!win->prop_invalid && get_shared_prop_serial( win->handle, &serial ) && serial == win->prop_serial)
++            found = prop_cache_find( win, str, &idx );
++        if (found > 0) ret = win->props[idx].data;
++        release_win_ptr( win );
++        if (found >= 0) return (HANDLE)ret;
++    }
+ 
+     SERVER_START_REQ( get_window_property )
+     {
+@@ -2073,6 +2184,9 @@
+  */
+ BOOL WINAPI NtUserSetProp( HWND hwnd, const WCHAR *str, HANDLE handle )
+ {
++    unsigned int serial = 0;
++    ATOM atom = 0;
++    WND *win;
+     BOOL ret;
+ 
+     SERVER_START_REQ( set_window_property )
+@@ -2082,8 +2196,17 @@
+         if (IS_INTRESOURCE(str)) req->atom = LOWORD(str);
+         else wine_server_add_data( req, str, lstrlenW(str) * sizeof(WCHAR) );
+         ret = !wine_server_call_err( req );
++        serial = reply->prop_serial;
++        atom = reply->atom;
+     }
+     SERVER_END_REQ;
++
++    if (ret && neutron_prop_cache() && (win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++    {
++        if (prop_cache_in_step( win, serial ) && prop_cache_set( win, str, atom, (ULONG_PTR)handle )) win->prop_serial = serial;
++        else prop_cache_drop( win );
++        release_win_ptr( win );
++    }
+     return ret;
+ }
+ 
+@@ -2097,6 +2220,8 @@
+ HANDLE WINAPI NtUserRemoveProp( HWND hwnd, const WCHAR *str )
+ {
+     ULONG_PTR ret = 0;
++    unsigned int serial = 0;
++    WND *win;
+ 
+     SERVER_START_REQ( remove_window_property )
+     {
+@@ -2104,9 +2229,26 @@
+         if (IS_INTRESOURCE(str)) req->atom = LOWORD(str);
+         else wine_server_add_data( req, str, lstrlenW(str) * sizeof(WCHAR) );
+         if (!wine_server_call_err( req )) ret = reply->data;
++        serial = reply->prop_serial;
+     }
+     SERVER_END_REQ;
+ 
++    if (neutron_prop_cache() && (win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++    {
++        unsigned int idx = 0;
++        int found = win->prop_invalid ? -1 : prop_cache_find( win, str, &idx );
++
++        if (!win->prop_invalid && serial && serial == win->prop_serial && found == 0)
++            ;  /* nothing was set and nothing was removed */
++        else if (prop_cache_in_step( win, serial ) && found > 0)
++        {
++            free( win->props[idx].name );
++            win->props[idx] = win->props[--win->prop_count];
++            win->prop_serial = serial;
++        }
++        else prop_cache_drop( win );
++        release_win_ptr( win );
++    }
+     return (HANDLE)ret;
+ }
+ 
+@@ -6446,6 +6588,7 @@
+         user_unlock();
+         free( win->pScroll );
+         free( win->text );
++        prop_cache_free( win );
+         free( win );
+     }
+ }
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1073,7 +1073,7 @@
+     mod_handle_t         instance;
+     lparam_t             user_data;
+     data_size_t          extra_size;
+-    unsigned int         __pad2;
++    unsigned int         prop_serial;
+     char                 extra[];
+ } window_shm_t;
+ 
+@@ -3967,6 +3967,8 @@
+ struct set_window_property_reply
+ {
+     struct reply_header __header;
++    unsigned int   prop_serial;
++    atom_t         atom;
+ };
+ 
+ 
+@@ -3983,6 +3985,8 @@
+ {
+     struct reply_header __header;
+     lparam_t       data;
++    unsigned int   prop_serial;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -7162,6 +7166,6 @@
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 948
++#define SERVER_PROTOCOL_VERSION 949
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1089,7 +1089,7 @@
+     mod_handle_t         instance;         /* creator instance (GWLP_HINSTANCE) */
+     lparam_t             user_data;        /* user-specific data (GWLP_USERDATA) */
+     data_size_t          extra_size;       /* number of extra bytes (cbWndExtra) */
+-    unsigned int         __pad2;
++    unsigned int         prop_serial;      /* NEUTRON prop-cache: bumped on every change to the window's properties */
+     char                 extra[];          /* extra bytes storage (offsets >= 0) */
+ } window_shm_t;
+ 
+@@ -2943,6 +2943,9 @@
+     lparam_t       data;          /* data to store */
+     atom_t         atom;          /* property atom (if no name specified) */
+     VARARG(name,unicode_str);     /* property name */
++@REPLY
++    unsigned int   prop_serial;   /* NEUTRON: the window's prop_serial after this change, 0 if not published */
++    atom_t         atom;          /* NEUTRON: the property's atom */
+ @END
+ 
+ 
+@@ -2953,6 +2956,7 @@
+     VARARG(name,unicode_str);     /* property name */
+ @REPLY
+     lparam_t       data;          /* data stored in property */
++    unsigned int   prop_serial;   /* NEUTRON: the window's prop_serial after this call, 0 if not published */
+ @END
+ 
+ 
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -1652,11 +1652,15 @@
+ C_ASSERT( offsetof(struct set_window_property_request, data) == 16 );
+ C_ASSERT( offsetof(struct set_window_property_request, atom) == 24 );
+ C_ASSERT( sizeof(struct set_window_property_request) == 32 );
++C_ASSERT( offsetof(struct set_window_property_reply, prop_serial) == 8 );
++C_ASSERT( offsetof(struct set_window_property_reply, atom) == 12 );
++C_ASSERT( sizeof(struct set_window_property_reply) == 16 );
+ C_ASSERT( offsetof(struct remove_window_property_request, window) == 12 );
+ C_ASSERT( offsetof(struct remove_window_property_request, atom) == 16 );
+ C_ASSERT( sizeof(struct remove_window_property_request) == 24 );
+ C_ASSERT( offsetof(struct remove_window_property_reply, data) == 8 );
+-C_ASSERT( sizeof(struct remove_window_property_reply) == 16 );
++C_ASSERT( offsetof(struct remove_window_property_reply, prop_serial) == 16 );
++C_ASSERT( sizeof(struct remove_window_property_reply) == 24 );
+ C_ASSERT( offsetof(struct get_window_property_request, window) == 12 );
+ C_ASSERT( offsetof(struct get_window_property_request, atom) == 16 );
+ C_ASSERT( sizeof(struct get_window_property_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -2001,6 +2001,12 @@
+     dump_varargs_unicode_str( ", name=", cur_size );
+ }
+ 
++static void dump_set_window_property_reply( const struct set_window_property_reply *req )
++{
++    fprintf( stderr, " prop_serial=%08x", req->prop_serial );
++    fprintf( stderr, ", atom=%04x", req->atom );
++}
++
+ static void dump_remove_window_property_request( const struct remove_window_property_request *req )
+ {
+     fprintf( stderr, " window=%08x", req->window );
+@@ -2011,6 +2017,7 @@
+ static void dump_remove_window_property_reply( const struct remove_window_property_reply *req )
+ {
+     dump_uint64( " data=", &req->data );
++    fprintf( stderr, ", prop_serial=%08x", req->prop_serial );
+ }
+ 
+ static void dump_get_window_property_request( const struct get_window_property_request *req )
+@@ -4012,7 +4019,7 @@
+     (dump_func)dump_get_update_region_reply,
+     NULL,
+     NULL,
+-    NULL,
++    (dump_func)dump_set_window_property_reply,
+     (dump_func)dump_remove_window_property_reply,
+     (dump_func)dump_get_window_property_reply,
+     (dump_func)dump_get_window_properties_reply,
+--- a/server/window.c
++++ b/server/window.c
+@@ -627,7 +627,7 @@
+ }
+ 
+ /* remove a window property */
+-static lparam_t remove_property( struct window *win, atom_t atom )
++static lparam_t remove_property( struct window *win, atom_t atom, int *removed )
+ {
+     struct atom_table *table = get_global_atom_table();
+     int i;
+@@ -640,6 +640,7 @@
+         {
+             if (prop->type == PROP_TYPE_STRING) release_atom( table, atom );
+             prop->type = PROP_TYPE_FREE;
++            *removed = 1;
+             return prop->data;
+         }
+     }
+@@ -677,6 +678,24 @@
+     free( win->properties );
+ }
+ 
++/* NEUTRON prop-cache: publish that the window's properties changed. A process answers GetProp on its own windows from
++ * its copy of their properties (win32u) while this serial still matches the one its last own change returned, the
++ * way Windows reads the property list from the desktop heap instead of asking the kernel; a change made by any other
++ * process moves the serial and sends that process back to the server. */
++static unsigned int bump_prop_serial( struct window *win )
++{
++    unsigned int serial;
++
++    if (!win->shared) return 0;
++    if (!(serial = win->shared->prop_serial + 1)) serial = 1;
++    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
++    {
++        shared->prop_serial = serial;
++    }
++    SHARED_WRITE_END;
++    return serial;
++}
++
+ /* detach a window from its owner thread but keep the window around */
+ static void detach_window_thread( struct window *win )
+ {
+@@ -808,6 +827,7 @@
+         shared->instance        = win->instance;
+         shared->user_data       = win->user_data;
+         shared->extra_size      = extra_bytes;
++        shared->prop_serial     = 0;  /* NEUTRON prop-cache */
+         memset( (void *)shared->extra, 0, extra_bytes );
+     }
+     SHARED_WRITE_END;
+@@ -3269,10 +3289,23 @@
+         if (atom)
+         {
+             set_property( win, atom, req->data, PROP_TYPE_STRING );
++            if (!get_error() && get_property( win, atom ) == req->data)
++            {
++                reply->atom = atom;
++                reply->prop_serial = bump_prop_serial( win );
++            }
+             release_atom( table, atom );
+         }
+     }
+-    else set_property( win, req->atom, req->data, PROP_TYPE_ATOM );
++    else
++    {
++        set_property( win, req->atom, req->data, PROP_TYPE_ATOM );
++        if (!get_error() && get_property( win, req->atom ) == req->data)
++        {
++            reply->atom = req->atom;
++            reply->prop_serial = bump_prop_serial( win );
++        }
++    }
+ }
+ 
+ 
+@@ -3286,7 +3319,9 @@
+     if (win)
+     {
+         atom_t atom = name.len ? find_atom( table, &name ) : req->atom;
+-        if (atom) reply->data = remove_property( win, atom );
++        int removed = 0;
++        if (atom) reply->data = remove_property( win, atom, &removed );
++        reply->prop_serial = removed ? bump_prop_serial( win ) : (win->shared ? win->shared->prop_serial : 0);
+     }
+ }
+ 

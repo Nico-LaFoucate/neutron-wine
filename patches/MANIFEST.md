@@ -1593,6 +1593,23 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 88 — `…z×88-win32u-server-prop-cache` (Illustrator slow to make a new document: GetProp round trips)
+Same report as 86. Illustrator's main thread made 27,858 get_window_property round trips while making one document (doc 1; 3,824
+on doc 2), all on its own windows, ~all for two names (`hwnd-prop:adobe.owl.win32.widget.messa…` 18,147, `dvaui::ui::OS_Window::property`
+9,556). Windows reads the property list from the desktop heap. The server publishes `prop_serial` in window_shm_t (former `__pad2`,
+no layout change), bumps it on every change (`bump_prop_serial()`), and returns it plus the atom from set/remove_window_property;
+win32u keeps a copy of its own windows' properties (WND `props`) and answers GetProp from it only while the shared serial equals
+the one its last own change returned (another process's change: server again; our next change drops the copy for that window).
+'#' names and names that could match a by-number string atom go to the server. proptest.exe (21 checks, cross-process included)
+identical on/off/plain 160; trace: get_window_property 27,858 -> 4 (doc 1), 3,824 -> 7 (doc 2). Protocol 949.
+Kill switch NEUTRON_PROP_CACHE=0. NOT YET BUILT (lab runtime copy 11.10-160p3).
+
+### patch 87 — `…z×87-win32u-tree-shm-other-process` (Illustrator slow to make a new document: window-tree round trips)
+Same report as 86. GetParent, GetAncestor(GA_PARENT) and GetWindow(GW_OWNER) of ANOTHER process's window still asked the server
+(get_window_tree) although window-tree-shm publishes every window's parent and owner. Illustrator's main thread: 16,896 requests
+(doc 1; 3,459 doc 2), all for 33 windows of Adobe's panel processes (CEPHtmlEngine). Now read from shared memory; trace of the
+patched build: 0. Kill switch NEUTRON_TREE_SHM_OTHER=0 (NEUTRON_TREE_SHM=0 turns off all of window-tree-shm). NOT YET BUILT.
+
 ### patch 86 — `…z×86-ntdll-server-sync-fd-with-create` (Illustrator slow to make a new document: semaphore round trips)
 His words (10-29, 160 on his desktop): *"It's still just as slow to make a new document. On Windows the artboard is where it should
 be from the beginning, but in Neutron, it loads in at the top left of the work area before it maximizes and centers itself"*.
@@ -1605,7 +1622,10 @@ access as get_inproc_sync_fd) and the client caches it under fd_cache_mutex (`ca
 ntdll.so builds and the wineserver change together). Lab A/B (Illustrator 2025, same binary, NEUTRON_OWNER_GROUP=0 in both arms,
 3 A4 documents each): coordinator voluntary switches 112-114k vs 134-138k per document; artboard centered +2.40/+1.62/+1.71 s vs
 +2.59/+1.74/+1.84 s (capture resolution ~0.13 s). Imperfect: create and close stay one round trip each (Windows: none).
-Kill switch NEUTRON_SYNC_FD_ON_CREATE=0. NOT YET BUILT (lab runtime copy 11.10-160sf only).
+Kill switch NEUTRON_SYNC_FD_ON_CREATE=0. NOT YET BUILT (lab runtime copies 11.10-160sf, 11.10-160p3). Trace of the patched
+build: get_inproc_sync_fd ~23k -> 3/0. 86+87+88 together, same binary on vs off (Illustrator 2025, 3 docs): main thread
+60.3k/15.2k/15.3k vs 92.8k/19.4k/19.3k voluntary switches, artboard centered +2.34/+1.71/+1.77 vs +2.69/+1.78/+1.89 s;
+Illustrator's wineserver requests 174k -> 115k (doc 1), 96k -> 66k (doc 2).
 
 ### patch 85 — `…z×85-win32u-ime-owner-and-owner-group` (Illustrator's home screen showing between New Document and the new document)
 His words (10-28, checking 159): *"Illustrator feels a little slow going into a document"*. Same Illustrator version (2025) on his

@@ -1,0 +1,81 @@
+win32u: answer GetParent, GetAncestor(GA_PARENT) and GW_OWNER of other processes' windows from shared memory
+
+Our window-tree-shm publishes every window's parent and owner in session shared memory, and GetWindow's sibling and child
+relations already read it. GetParent, GetAncestor(GA_PARENT) and GetWindow(GW_OWNER) of a window owned by ANOTHER process
+still made a get_window_tree server round trip. Illustrator walks Adobe's panel processes' windows inside its own: making a
+new document, its main thread made 16,896 get_window_tree requests (doc 1; 3,459 on doc 2), all for 33 windows of other
+processes (lab wineserver trace, Illustrator 2025). Windows reads these from the desktop heap without leaving the process.
+Kill switch NEUTRON_TREE_SHM_OTHER=0 (and NEUTRON_TREE_SHM=0 turns off all of window-tree-shm).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -593,6 +593,20 @@
+     return entry.tid;
+ }
+ 
++static BOOL get_shared_window_links( HWND hwnd, user_handle_t links[6] );
++
++/* NEUTRON window-tree-shm, other processes' windows: GetParent, GetAncestor(GA_PARENT) and GetWindow(GW_OWNER) of a window
++ * another process owns still asked the server, although its links are in shared memory like any window's. Illustrator
++ * walks Adobe's panel processes' windows inside its own: ~17k get_window_tree round trips on its main thread while making
++ * a new document (33 windows, all other processes'). Windows reads these from the desktop heap. NEUTRON_TREE_SHM_OTHER=0
++ * asks the server again. */
++static BOOL neutron_tree_shm_other(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_TREE_SHM_OTHER" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ /* see GetParent */
+ HWND get_parent( HWND hwnd )
+ {
+@@ -608,7 +622,10 @@
+     if (win == WND_OTHER_PROCESS)
+     {
+         DWORD style = get_window_long( hwnd, GWL_STYLE );
+-        if (style & (WS_POPUP | WS_CHILD))
++        user_handle_t links[6];
++        if ((style & (WS_POPUP | WS_CHILD)) && neutron_tree_shm_other() && get_shared_window_links( hwnd, links ))
++            retval = wine_server_ptr_handle( (style & WS_POPUP) ? links[1] : links[0] );
++        else if (style & (WS_POPUP | WS_CHILD))
+         {
+             SERVER_START_REQ( get_window_tree )
+             {
+@@ -1009,6 +1026,11 @@
+             release_win_ptr( win );
+             return retval;
+         }
++        else
++        {
++            user_handle_t links[6];
++            if (neutron_tree_shm_other() && get_shared_window_links( hwnd, links )) return wine_server_ptr_handle( links[1] );
++        }
+         /* else fall through to server call */
+     }
+ 
+@@ -1163,12 +1185,18 @@
+         }
+         else /* need to query the server */
+         {
+-            SERVER_START_REQ( get_window_tree )
++            user_handle_t links[6];
++            if (neutron_tree_shm_other() && get_shared_window_links( hwnd, links ))
++                ret = wine_server_ptr_handle( links[0] );
++            else
+             {
+-                req->handle = wine_server_user_handle( hwnd );
+-                if (!wine_server_call_err( req )) ret = wine_server_ptr_handle( reply->parent );
++                SERVER_START_REQ( get_window_tree )
++                {
++                    req->handle = wine_server_user_handle( hwnd );
++                    if (!wine_server_call_err( req )) ret = wine_server_ptr_handle( reply->parent );
++                }
++                SERVER_END_REQ;
+             }
+-            SERVER_END_REQ;
+         }
+         break;
+ 
