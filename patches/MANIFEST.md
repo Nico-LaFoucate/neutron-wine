@@ -1593,6 +1593,17 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 89 — `…z×89-ntdll-tls-one-call` (every app's startup + Illustrator's first document: TLS for loaded DLLs)
+Loading a DLL with a TLS directory, Wine's alloc_tls_slot() opened every thread (NtGetNextThread), asked the server for its TEB
+(NtQueryInformationThread) and closed it: 3 round trips per thread per DLL; Illustrator (~300 threads) ~19k requests on its first
+document (lab trace). Windows' loader allocates the blocks and makes ONE NtSetInformationProcess(ProcessTlsInformation) call per
+operation (ProcessTlsReplaceVector when the slot array grows, ProcessTlsReplaceIndex for the slot). Now the same: structures in
+winternl.h, `virtual_set_tls_info()` walks the TEBs in-process under virtual_mutex (like virtual_clear_tls_index), loader holds its
+lock. Any failure (wow64 thunk, OOM, NEUTRON_TLS_ONECALL=0) falls back to the old loop with nothing changed. tlstest (40 TLS DLLs,
+64/300 threads, vectors grow past 32): all pass on/off/plain 160; loads 35 vs 74 ms (64 thr), 39-66 vs 205-224 ms (300 thr).
+Illustrator 2025 doc 1, same binary on vs off: main thread voluntary switches 41,242 vs 60,328; docs 2/3 unchanged.
+Kill switch NEUTRON_TLS_ONECALL=0. NOT YET BUILT (lab runtime copy 11.10-160p4 = 86-89).
+
 ### patch 88 — `…z×88-win32u-server-prop-cache` (Illustrator slow to make a new document: GetProp round trips)
 Same report as 86. Illustrator's main thread made 27,858 get_window_property round trips while making one document (doc 1; 3,824
 on doc 2), all on its own windows, ~all for two names (`hwnd-prop:adobe.owl.win32.widget.messa…` 18,147, `dvaui::ui::OS_Window::property`
