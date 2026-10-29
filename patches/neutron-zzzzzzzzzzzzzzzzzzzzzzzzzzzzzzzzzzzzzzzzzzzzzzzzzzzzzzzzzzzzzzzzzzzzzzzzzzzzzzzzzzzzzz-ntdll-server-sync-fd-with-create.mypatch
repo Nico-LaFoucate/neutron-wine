@@ -201,8 +201,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
      struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
  };
  
--#define SERVER_PROTOCOL_VERSION 947
-+#define SERVER_PROTOCOL_VERSION 948
+-#define SERVER_PROTOCOL_VERSION 946
++#define SERVER_PROTOCOL_VERSION 947
  
  #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
 --- a/server/event.c
