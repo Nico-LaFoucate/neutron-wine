@@ -1593,6 +1593,30 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 85 — `…z×85-win32u-ime-owner-and-owner-group` (Illustrator's home screen showing between New Document and the new document)
+His words (10-28, checking 159): *"Illustrator feels a little slow going into a document"*. Same Illustrator version (2025) on his
+Windows machine vs the lab: on Windows the document is built while the New Document dialog is still up and the dialog closes after
+it (+731..788 ms after Create); under Wine the dialog closed at +40 ms and the home screen showed until the document appeared (2-3 s
+on 2026, whose own home linger is longer). Call stacks from his Windows machine (harnesses/msglog): the dialog closes with
+ShowWindow(SW_HIDE) from Adobe's UXP code, and Adobe's dispatcher message, sent from another thread, is delivered INSIDE
+win32u!NtUserShowWindow; Windows was waiting on a window of another process in Illustrator's popup family: the IME window of
+CEPHtmlEngine (the extension-panel process), owned by an Illustrator window. Windows rules measured on his machine
+(harnesses/swp-ownergroup.exe): (A) a thread's default IME window is owned by its active top-level (and by the focus window's top
+level when the focus is another thread's child); (B) any SetWindowPos that touches z-order sends WM_WINDOWPOSCHANGING
+(NOMOVE|NOSIZE|NOACTIVATE) to every top-level of the same root owner, hidden ones, IME windows and other threads' windows included,
+synchronously; a SWP_NOZORDER change touches only the window. Wine had neither. This adds: neutron_ime_follow (owner at the IME
+window's creation, on focus and on activation), neutron_ime_release (an IME window is not destroyed with its owner, as on Windows),
+neutron_notify_owner_group (after the window's own WM_WINDOWPOSCHANGING, before the change is applied; other threads with
+SMTO_ABORTIFHUNG 5 s; no second round from a member's handler; skipped for SWP_NOSENDCHANGING), and an ERR line naming the member
+when the round waits over 50 ms. Under the patch swp-ownergroup matches Windows (IME owners; whole group; waits 152-156 ms on the
+slow thread; another thread's message handled inside the call), except the initial owner and that SetActiveWindow alone does not
+raise the window in Wine. Lab Illustrator 2025 with CEP running: both on, 3/3 dialog closes after the document appears (+537..619
+ms); NEUTRON_OWNER_GROUP=0 1/1 and NEUTRON_IME_OWNER=0 2/2 dialog first. Illustrator 2026 2nd document: dialog after the document
+(waited 1007 ms on the Libraries CEP process); right panel draws. No side effects in PS 2026 (docked, 2 docs, Ctrl+O, flash
+unchanged at Windows parity), Premiere 2026, LrC, AE 2026 (Open dialogs; 0 waits over 50 ms). Imperfect: Windows sends the round
+in the group's new z-order with the window among them; here the window's own message comes first.
+Kill switches NEUTRON_IME_OWNER=0, NEUTRON_OWNER_GROUP=0. NOT YET BUILT.
+
 ### patch 84 — `…z×84-win32u-remove-owl-force-show` (Illustrator's right dock blank after a second document)
 REMOVES the psdock workaround that `neutron-zzz-ps2026-complete` (2026-07-20) carried into win32u: "Path B" force-show of
 every hidden OWL.Dock/TabPane/TabGroup/Palette on any OWL.Document creation (scoped in Sept by `…docshow-scope-armed-document`),

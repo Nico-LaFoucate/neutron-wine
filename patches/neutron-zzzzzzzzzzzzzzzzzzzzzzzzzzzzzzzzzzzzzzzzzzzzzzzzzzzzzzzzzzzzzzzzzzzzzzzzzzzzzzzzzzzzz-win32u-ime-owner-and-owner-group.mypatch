@@ -1,0 +1,243 @@
+win32u: IME window ownership and owner-group z-order notifications, as on Windows (Illustrator's New Document dialog)
+
+Measured on Windows 11 (harnesses/swp-ownergroup.exe, his machine): a thread's default IME window is owned by its active
+top-level window (and by the focus window's top level, across threads), and every SetWindowPos that touches z-order sends
+WM_WINDOWPOSCHANGING to the whole owner group, other threads' windows included, waiting for them. Wine left IME windows unowned
+and told only the window itself. Illustrator's New Document dialog relies on the wait: on Windows the hide waits on the
+extension-panel process's IME window in Illustrator's group, Adobe's dispatcher builds the document inside the call, and the
+dialog closes after the document appears. Under Wine it closed first and the home screen showed meanwhile.
+Kill switches NEUTRON_IME_OWNER=0, NEUTRON_OWNER_GROUP=0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/win32u/imm.c
++++ b/dlls/win32u/imm.c
+@@ -283,6 +283,12 @@
+     return name.Length != sizeof(imeW) || memcmp( name.Buffer, imeW, sizeof(imeW) );
+ }
+ 
++/* NEUTRON: an IME window (class "IME" or CS_IME), the windows needs_ime_window() leaves out */
++BOOL neutron_is_ime_window( HWND hwnd )
++{
++    return !needs_ime_window( hwnd );
++}
++
+ BOOL register_imm_window( HWND hwnd )
+ {
+     struct imm_thread_data *thread_data;
+@@ -309,6 +315,8 @@
+         thread_data->default_hwnd = NtUserCreateWindowEx( 0, &class_name, NULL, &name,
+                                                           WS_POPUP | WS_DISABLED | WS_CLIPSIBLINGS,
+                                                           0, 0, 1, 1, 0, 0, 0, 0, 0, 0, NULL, FALSE );
++        /* NEUTRON: owned by the top-level window of the thread's first window, as on Windows (window.c) */
++        neutron_ime_follow( thread_data->default_hwnd, hwnd );
+     }
+ 
+     return TRUE;
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1988,6 +1988,8 @@
+         if (ime_hwnd)
+             send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_ACTIVATE,
+                           HandleToUlong(hwnd) );
++        /* NEUTRON: the focus window's thread hands its IME window to the focus window's top level (window.c) */
++        neutron_ime_follow( ime_hwnd, hwnd );
+ 
+         NtUserNotifyWinEvent( EVENT_OBJECT_FOCUS, hwnd, OBJID_CLIENT, 0 );
+ 
+@@ -2046,6 +2048,9 @@
+     if (prev) *prev = previous;
+     if (previous == hwnd) goto done;
+ 
++    /* NEUTRON: the thread's IME window belongs to its active window (window.c) */
++    if (hwnd) neutron_ime_follow( get_default_ime_window( 0 ), hwnd );
++
+     if (hwnd)
+     {
+         NtUserNotifyWinEvent( EVENT_SYSTEM_FOREGROUND, hwnd, 0, 0 );
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -94,6 +94,8 @@
+ extern HIMC get_window_input_context( HWND hwnd );
+ extern BOOL register_imm_window( HWND hwnd );
+ extern void unregister_imm_window( HWND hwnd );
++extern BOOL neutron_is_ime_window( HWND hwnd );
++extern void neutron_ime_follow( HWND ime, HWND owner );
+ 
+ /* input.c */
+ extern BOOL grab_pointer;
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -1679,6 +1679,52 @@
+     return ret;
+ }
+ 
++/* NEUTRON (2026-10-28): Windows hands a thread's default IME window to the window that becomes active or takes focus.
++ *
++ * Measured on Windows 11 (harnesses/swp-ownergroup.exe): the default IME window of a thread is owned by the thread's active
++ * top-level window (M, P2, P1 after each SetActiveWindow; SetFocus on a child of M -> M), and focusing a child window that
++ * thread B created inside thread A's popup P1 makes thread B's IME window owned by P1. Wine created it unowned and never moved
++ * it. The owner decides which owner group the IME window belongs to (see neutron_notify_owner_group): on Windows, Adobe's
++ * extension-panel process (CEPHtmlEngine, a child window inside an Illustrator panel) thereby has its IME window in
++ * Illustrator's group, and hiding Illustrator's New Document dialog waits on that process (his logs, harnesses/msglog).
++ * Kill switch NEUTRON_IME_OWNER=0. */
++static int neutron_ime_owner(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_IME_OWNER" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++void neutron_ime_follow( HWND ime, HWND owner )
++{
++    if (!neutron_ime_owner() || !ime || !owner) return;
++    owner = NtUserGetAncestor( owner, GA_ROOT );
++    if (!owner || owner == ime || owner == get_desktop_window() || neutron_is_ime_window( owner )) return;
++    if (get_window_relative( ime, GW_OWNER ) == owner) return;
++    set_window_owner( ime, owner );
++}
++
++/* the default IME window outlives its owner on Windows; drop the owner instead of destroying it with the owner */
++static void neutron_ime_release( HWND hwnd )
++{
++    WND *win = get_win_ptr( hwnd );
++
++    if (!win || win == WND_DESKTOP) return;
++    if (win != WND_OTHER_PROCESS)
++    {
++        release_win_ptr( win );
++        set_window_owner( hwnd, 0 );
++        return;
++    }
++    SERVER_START_REQ( set_window_owner )   /* another process's IME window owned by one of our windows */
++    {
++        req->handle = wine_server_user_handle( hwnd );
++        req->owner  = 0;
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++}
++
+ static void neutron_log_shown( HWND hwnd, const char *via );  /* NEUTRON diag: log window shows */
+ static void neutron_geom_log( const char *tag, HWND hwnd, const RECT *win, const RECT *client );  /* NEUTRON avenue-3 */
+ static void neutron_class_ascii( HWND hwnd, char *out /* [64] */ );  /* NEUTRON: defined later */
+@@ -4739,6 +4785,95 @@
+ }
+ 
+ /* NtUserSetWindowPos implementation */
++/* NEUTRON (2026-10-28): Windows tells a window's whole owner group about a z-order change.
++ *
++ * Measured on Windows 11 (harnesses/swp-ownergroup.exe): every SetWindowPos that touches z-order on a top-level window --
++ * ShowWindow(SW_HIDE) of the active popup, SetWindowPos(HWND_TOP) on a popup or on the owner, SetActiveWindow -- sends
++ * WM_WINDOWPOSCHANGING (SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) to every top-level window whose owner chain ends at the same
++ * root owner: hidden ones, IME windows and other threads' windows included. A window of another thread is sent the message
++ * synchronously, so the call waits for that thread (154 ms when it answered after 150 ms) and handles messages other threads
++ * sent to the caller meanwhile. A SWP_NOZORDER change touches only the window itself. Wine sent WM_WINDOWPOSCHANGING to the
++ * window alone and moved its own popups with SWP_NOSENDCHANGING.
++ *
++ * Illustrator relies on the wait: its New Document dialog closes with ShowWindow(SW_HIDE) while Adobe's dispatcher has a
++ * message for the UI thread queued from another thread; on Windows the hide waits on the extension-panel process's IME window
++ * in Illustrator's group, the dispatcher runs inside the call and builds the document, and the dialog disappears only then.
++ * Under Wine the hide was immediate and the home screen showed until the document appeared (his "Illustrator feels a little
++ * slow going into a document").
++ *
++ * Imperfect: Windows sends the messages in the group's new z-order with the window itself among them; here the window gets its
++ * own message first (calc_winpos), then the others top to bottom. Kill switch NEUTRON_OWNER_GROUP=0. */
++static int neutron_owner_group(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_OWNER_GROUP" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static HWND neutron_root_owner( HWND hwnd, const HWND *list, const HWND *owners, unsigned int count )
++{
++    unsigned int depth, i;
++
++    for (depth = 0; depth < 32; depth++)
++    {
++        HWND owner;
++        for (i = 0; i < count; i++) if (list[i] == hwnd) break;
++        owner = i < count ? owners[i] : get_window_relative( hwnd, GW_OWNER );
++        if (!owner) break;
++        hwnd = owner;
++    }
++    return hwnd;
++}
++
++static void neutron_notify_owner_group( const WINDOWPOS *winpos )
++{
++    static __thread int busy;   /* a member that moves a window from its handler starts no second round */
++    HWND *list, *owners, root, prev = HWND_TOP, slow_hwnd = 0;
++    unsigned int i, count, members = 0;
++    DWORD start = NtGetTickCount(), t0, t, slowest = 0;
++
++    if (busy || !(list = list_window_children( 0 ))) return;
++    for (count = 0; list[count]; count++) ;
++    if (!(owners = malloc( count * sizeof(*owners) )))
++    {
++        free( list );
++        return;
++    }
++    for (i = 0; i < count; i++) owners[i] = get_window_relative( list[i], GW_OWNER );
++    root = neutron_root_owner( winpos->hwnd, list, owners, count );
++
++    busy = 1;
++    for (i = 0; i < count; i++)
++    {
++        WINDOWPOS wp = { 0 };
++
++        if (list[i] == winpos->hwnd)
++        {
++            prev = list[i];
++            continue;
++        }
++        if (neutron_root_owner( list[i], list, owners, count ) != root) continue;
++        wp.hwnd = list[i];
++        wp.hwndInsertAfter = prev;
++        wp.flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
++        t0 = NtGetTickCount();
++        send_message_timeout( list[i], WM_WINDOWPOSCHANGING, 0, (LPARAM)&wp, SMTO_ABORTIFHUNG, 5000, FALSE );
++        if ((t = NtGetTickCount() - t0) > slowest) { slowest = t; slow_hwnd = list[i]; }
++        members++;
++        prev = list[i];
++    }
++    busy = 0;
++    if ((t = NtGetTickCount() - start) > 50)   /* a member's thread made the caller wait: name it */
++    {
++        DWORD pid = 0;
++        get_window_thread( slow_hwnd, &pid );
++        ERR( "neutron-ownergroup: %p swp %04x waited %u ms for %u members, slowest %p (pid %04x) %u ms\n",
++             winpos->hwnd, winpos->flags, (unsigned)t, members, slow_hwnd, (unsigned)pid, (unsigned)slowest );
++    }
++    free( owners );
++    free( list );
++}
++
+ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
+ {
+     RECT valid_rects[2], surface_rect;
+@@ -4805,6 +4940,11 @@
+ 
+     if (!calc_winpos( winpos, &old_rects, &new_rects )) goto done;
+ 
++    /* NEUTRON: the rest of the owner group hears about a z-order change before it is applied */
++    if (!(orig_flags & SWP_NOSENDCHANGING) && !(winpos->flags & SWP_NOZORDER) && neutron_owner_group() &&
++        NtUserGetAncestor( winpos->hwnd, GA_PARENT ) == get_desktop_window())
++        neutron_notify_owner_group( winpos );
++
+     /* Fix redundant flags */
+     if (!fixup_swp_flags( winpos, &old_rects.window, parent_x, parent_y )) goto done;
+ 
+@@ -6420,6 +6560,11 @@
+             for (i = 0; children[i]; i++)
+             {
+                 if (get_window_relative( children[i], GW_OWNER ) != hwnd) continue;
++                if (neutron_ime_owner() && neutron_is_ime_window( children[i] ))
++                {
++                    neutron_ime_release( children[i] );   /* NEUTRON: see neutron_ime_follow */
++                    continue;
++                }
+                 if (is_current_thread_window( children[i] ))
+                 {
+                     user_destroy_window( children[i], FALSE );
