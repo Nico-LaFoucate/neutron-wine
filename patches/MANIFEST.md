@@ -1593,6 +1593,47 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 96 — `…z×96-d2d1-compute-area-lazy-tessellation` (ComputeArea gave 0 and Tessellate no triangles on a closed path)
+Found with Wine's own d2d1 tests, after le-birnes flagged failures in neutron-wine#3 (10-30). Lazy tessellation (neutron_lazytess)
+defers triangulation from Close to the first fill, but d2d_geometry_compute_area and d2d_geometry_tessellate read fill.faces without
+d2d_geometry_require_tessellation. test_path_geometry expected 1.70e4 and got 0; ellipse ComputeArea got 0. Both now require it.
+Scratch copy: failures 34 -> 32, path area passes. The ellipse then gives 141.42 vs 100, which is the cubic patch, not this.
+
+### patch 95 — `…z×95-winhttp-queue-async-receive-response` (async WinHttpReceiveResponse waits for the server) — by le-birnes
+From le-birnes/AdobeWine 0046 (LGPL-2.1). With WINHTTP_FLAG_ASYNC Windows returns from WinHttpReceiveResponse at once and
+reports HEADERS_AVAILABLE later; Wine read the reply inside the call when the request had been sent, i.e. in the usual call
+from the SENDREQUEST_COMPLETE callback, so the caller waited for the server. Photoshop calls it holding its own lock, which
+its main thread needs at exit. The read is queued only when the call comes from one of the request's own task callbacks;
+app-thread calls still read inline (keeps winhttp:notification at 0 failures).
+MEASURED (his `wine/tests/winhttp/asyncrecv.c` + `asyncflow.c` with the local test server, same method, only winhttp.dll
+swapped): asyncrecv shipped FAIL (hang), control FAIL (3001 ms), patched PASS (0 ms); asyncflow PASS on all three. Every
+other test of his suite unchanged. Not yet checked in Photoshop under Neutron.
+CHECKED UNDER NEUTRON 10-30: real Photoshop quit (Ctrl+Q to process gone) 10.3, 16.2 s -> 1.5, 1.5 s; prefs saved, log ends normally, no crash report after a quit. 64-bit modules swapped; full build is 164.
+
+### patch 94 — `…z×94-oleaut32-save-typelib-empty-strings` (InDesign cannot be scripted from other programs) — by le-birnes
+From le-birnes/AdobeWine 0088 (LGPL-2.1). ICreateTypeLib2::SaveAllChanges failed with E_UNEXPECTED, and wrote nothing, as
+soon as the library held an empty string (WMSFT_compile_strings took WideCharToMultiByte's 0 for a zero-length string as an
+error). InDesign's "Support for Visual Basic" plug-in builds `Resources for Visual Basic.tlb` with hundreds of empty doc
+strings, so the file was never written and InDesign's COM object answered GetIDsOfNames("DoScript") with
+DISP_E_UNKNOWNNAME. An empty string is now stored with length 0. Upstream master has the old code.
+MEASURED (his `wine/tests/typelib/emptydoc.c`, same method as patch 85, only oleaut32.dll swapped): shipped and control
+SaveAllChanges 0x8000ffff / LoadTypeLibEx 0x80029c4a FAIL, patched PASS (saved, loaded, empty doc string read back). Real
+app in AdobeWine: InDesign 2026 scripted over COM (DoScript) in its 219-function run. Not yet checked under Neutron.
+CHECKED UNDER NEUTRON 10-30: real InDesign on 163: GetIDsOfNames Name/DoScript 0x80020006, no tlb -> Resources for Visual Basic.tlb written, DoScript("2+3") = 5.
+
+### patch 93 — `…z×93-rpcss-drop-classes-of-exited-servers` (COM to a restarted Photoshop fails until rpcss restarts) — by le-birnes
+From le-birnes/AdobeWine 0086 (LGPL-2.1), offered in Discussion #37. A COM server that is killed or crashes never calls
+CoRevokeClassObject, so rpcss kept handing out its class object; CoCreateInstance of a restarted Photoshop then failed with
+RPC_S_SERVER_UNAVAILABLE (0x800706ba) because the object's pipe was gone. Windows forgets the registration when the process
+dies. rpcss now keeps a handle to the registering process (I_RpcBindingInqLocalClientPID) and skips and drops its entries
+once it has exited. Upstream master has the old code.
+MEASURED (his reproducer `wine/tests/rpcss/exitclass.c`: a server registers a class with a fresh CLSID, is killed, the class
+is created again; v11.10-158 runtime, Xvfb, scratch prefix, only rpcss.exe swapped, built from the 11.10-158 tree): shipped
+FAIL (0x800706ba), control build without the patch FAIL, patched PASS (REGDB_E_CLASSNOTREG, as Windows). Real app in
+AdobeWine (Wine 11.18): Photoshop 27.11 -> COM -> kill -9 -> start -> COM: 0x800706ba before, "27.11.0" after. Not yet
+checked in Photoshop under Neutron.
+CHECKED UNDER NEUTRON 10-30 (his "test le-birne's PR", 163 vs 163 + this rpcss): real Photoshop, kill -9, then CoCreateInstance: 0x800706ba x2 -> starts a new Photoshop (/Automation -Embedding) and connects. Offered in PR neutron-wine#3 as 85; ours had reached 92.
+
 ### patch 92 — `…z×92-kernelbase-volume-path-unix-mount` (Lightroom refused catalogs reached through Z:)
 Found testing his *"I also want to test launching an app through a project file in the file manager"* (10-30). A double-clicked .lrcat
 reaches Lightroom as Z:\home\...; it answered "cannot open the catalog ... because Lightroom cannot save changes to this location"
