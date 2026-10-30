@@ -1598,7 +1598,7 @@ His *"I would do the d2d1 work before anything"* (10-30), after le-birnes' note 
 single-threaded, `harnesses/d2d1-tests/`): untouched 11.10 = 2 (succeeded-in-todo, same with everything), 163 = 48, with 96-101 = 2. Those
 tests carry Windows' results. Regression checks, 164 vs 164 + these: Premiere with a project open 0 pixels differ (of a full 175% window; two
 164 runs also 0), After Effects only the Frame Render Time text; `d2shapes.exe` (hard cubic fills and strokes) 0 bytes differ from 163, ~77,000 px
-from clean Wine, so the bite fix stands. Built in 11.10-165, app pass clean, suite on its own DLL = 2. Not published.
+from clean Wine, so the bite fix stands. Shipped in 11.10-165: app pass clean, suite on its own DLL = 2.
 - **97 `d2d1-cubic-pieces-one-curve`:** cubic-bezier-subdivide stored each piece as a curve of its own, so Simplify and ComputeArea ignored the
   tolerance (ellipse 141.4 vs 100 at tolerance 200) and hit testing saw pieces. Cuts are now SPLIT_BEZIER, as at an intersection; the original
   controls are stored once. -3.
@@ -1612,7 +1612,7 @@ from clean Wine, so the bite fix stands. Built in 11.10-165, app pass clean, sui
 - **101 `d2d1-wic-pool-release-factory`:** parked WIC targets hold the factory, so it never reached zero and the pool drain never ran. Drain when only they
   are left; don't park after the app released the factory. -10.
 
-### patch 96 — `…z×96-d2d1-compute-area-lazy-tessellation` (ComputeArea gave 0 and Tessellate no triangles on a closed path)
+### patch 96 — `…z×96-d2d1-compute-area-lazy-tessellation` (ComputeArea gave 0 and Tessellate no triangles on a closed path). Patches 93-96 shipped in 11.10-165.
 Found with Wine's own d2d1 tests, after le-birnes flagged failures in neutron-wine#3 (10-30). Lazy tessellation (neutron_lazytess)
 defers triangulation from Close to the first fill, but d2d_geometry_compute_area and d2d_geometry_tessellate read fill.faces without
 d2d_geometry_require_tessellation. test_path_geometry expected 1.70e4 and got 0; ellipse ComputeArea got 0. Both now require it.
