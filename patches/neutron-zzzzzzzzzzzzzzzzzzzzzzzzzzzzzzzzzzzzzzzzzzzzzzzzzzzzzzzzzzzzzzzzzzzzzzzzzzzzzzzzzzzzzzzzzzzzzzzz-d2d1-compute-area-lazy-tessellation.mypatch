@@ -1,0 +1,36 @@
+d2d1: tessellate a deferred path before ComputeArea and Tessellate read its triangles
+
+Lazy tessellation (neutron_lazytess) defers triangulation from Close to the first
+fill, but ComputeArea and Tessellate read fill.faces without asking for it, so a
+simplified path gave area 0 and no triangles. Found with Wine's own tests after
+le-birnes flagged d2d1 failures in neutron-wine#3: test_path_geometry expected
+1.70e4 and got 0. Each now calls d2d_geometry_require_tessellation first.
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -5157,6 +5157,12 @@
+         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path_geometry);
+         D2D1_TRIANGLE t;
+ 
++        if (FAILED(hr = d2d_geometry_require_tessellation(path_impl)))
++        {
++            ID2D1PathGeometry_Release(path_geometry);
++            return hr;
++        }
++
+         for (size_t i = 0; i < path_impl->fill.face_count; ++i)
+         {
+             const struct d2d_face *face = &path_impl->fill.faces[i];
+@@ -5198,6 +5204,12 @@
+         struct d2d_geometry *path_impl = unsafe_impl_from_ID2D1Geometry((ID2D1Geometry *)path_geometry);
+         D2D1_TRIANGLE t;
+ 
++        if (FAILED(hr = d2d_geometry_require_tessellation(path_impl)))
++        {
++            ID2D1PathGeometry_Release(path_geometry);
++            return hr;
++        }
++
+         for (size_t i = 0; i < path_impl->fill.face_count; ++i)
+         {
+             const struct d2d_face *face = &path_impl->fill.faces[i];
