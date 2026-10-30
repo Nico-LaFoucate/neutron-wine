@@ -1,0 +1,58 @@
+kernelbase: a Unix mount is not a volume mount point to GetVolumePathNameW
+
+ntdll reports every Unix mount as a mount point, so with /home mounted apart
+GetVolumePathNameW answered Z:\home\ for anything under it. Lightroom Classic
+refuses a catalog whose volume path is not a drive root ("on a network volume
+or ... cannot save changes"), so a double-clicked catalog, or one on any Linux
+drive reached through Z:, could not be opened at all.
+
+A real mount point carries reparse data; a Unix mount has none, so the walk now
+goes on past it and answers Z:\. NEUTRON_VOLUME_UNIX_MOUNT=1 restores the old
+answer. Lab, same file and prefix: Z:\ opens the catalog, the switch on brings
+the refusal back.
+
+--- a/dlls/kernelbase/volume.c
++++ b/dlls/kernelbase/volume.c
+@@ -796,6 +796,27 @@
+     return !status;
+ }
+ 
++/* ntdll reports every Unix mount as a mount point, with no reparse data behind it. A real one carries
++ * data. Lightroom refuses a catalog whose volume path is not a drive root, so with /home mounted apart
++ * every catalog reached through Z: looked like a network volume. To a Windows program a Unix mount is a
++ * folder on the drive. NEUTRON_VOLUME_UNIX_MOUNT=1 restores the stop at a Unix mount. */
++static BOOL is_unix_mount( HANDLE file )
++{
++    static int keep = -1;
++    char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
++    IO_STATUS_BLOCK io;
++
++    if (keep < 0)
++    {
++        WCHAR value[2];
++        keep = GetEnvironmentVariableW( L"NEUTRON_VOLUME_UNIX_MOUNT", value, ARRAY_SIZE(value) ) == 1
++                && value[0] == '1';
++    }
++    if (keep) return FALSE;
++    return NtFsControlFile( file, NULL, NULL, NULL, &io, FSCTL_GET_REPARSE_POINT, NULL, 0,
++                            buffer, sizeof(buffer) ) == STATUS_NOT_A_REPARSE_POINT;
++}
++
+ /***********************************************************************
+  *           GetVolumePathNameW   (kernelbase.@)
+  */
+@@ -851,10 +872,13 @@
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         FILE_OPEN_REPARSE_POINT | FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT ))
+         {
++            BOOL unix_mount;
++
+             status = NtQueryInformationFile( file, &io, &attr_info,
+                     sizeof(attr_info), FileAttributeTagInformation );
++            unix_mount = !status && attr_info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT && is_unix_mount( file );
+             NtClose( file );
+-            if (!status)
++            if (!status && !unix_mount)
+             {
+ 
+                 if (attr_info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)

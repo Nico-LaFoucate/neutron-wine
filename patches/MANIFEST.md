@@ -1593,6 +1593,17 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 92 — `…z×92-kernelbase-volume-path-unix-mount` (Lightroom refused catalogs reached through Z:)
+Found testing his *"I also want to test launching an app through a project file in the file manager"* (10-30). A double-clicked .lrcat
+reaches Lightroom as Z:\home\...; it answered "cannot open the catalog ... because Lightroom cannot save changes to this location"
+(network / removable / read-only), then "corrupt" and the catalog picker. Same file by its C:\ path opens. ntdll reports every Unix
+mount as IO_REPARSE_TAG_MOUNT_POINT, so GetVolumePathNameW stopped there and answered Z:\home\artist\ (lab bind mount; any machine with
+/home mounted apart answers Z:\home\, and any catalog on a Linux drive outside the mapped folders answers its own mount). Lightroom
+wants a drive root. Fix: a real mount point carries reparse data, a Unix mount has none (FSCTL_GET_REPARSE_POINT ->
+STATUS_NOT_A_REPARSE_POINT), so the walk goes on and answers Z:\. Lab (Ex161 copy, runtime 162 + this kernelbase, same catalog and
+prefix): opens, lock + wal on the Z: copy, closes clean; NEUTRON_VOLUME_UNIX_MOUNT=1 brings the refusal back with Z:\home\artist\.
+Y:\ pointing at the same folder also opened before the patch. NOT YET BUILT in a release.
+
 ### patch 91 — `…z×91-win32u-sm-maximized-fullscreen-workarea` (Windows parity: SM_C[XY]MAXIMIZED / SM_C[XY]FULLSCREEN)
 Found chasing his *"Camera raw opened too high up on screen and can't be moved"* (10-29). Upstream computed these from the whole
 screen (FIXME "subtract ... application toolbars"), and SM_CYMAXIMIZED added TWO caption heights: at 3840x2160 175% with a 56 px top
