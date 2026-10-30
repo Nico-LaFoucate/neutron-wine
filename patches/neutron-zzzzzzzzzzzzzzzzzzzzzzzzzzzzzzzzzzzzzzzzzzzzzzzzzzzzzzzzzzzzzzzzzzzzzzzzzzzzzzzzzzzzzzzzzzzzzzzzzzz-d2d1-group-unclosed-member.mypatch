@@ -1,0 +1,61 @@
+d2d1: a group keeps an unclosed member empty
+
+A group is a snapshot, and a member path that isn't closed yet counts as empty.
+With the combined path deferred, GetBounds failed with D2DERR_WRONG_STATE on such
+a member, and closing it later changed the group. Build the path at once in that
+case. Wine's test_geometry_group: 3 failures gone.
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -7339,6 +7339,9 @@
+ 
+     TRACE("iface %p, transform %p, bounds %p.\n", iface, transform, bounds);
+ 
++    if (geometry->u.group.path && !InterlockedCompareExchange(&geometry->u.group.path_pending, 0, 0))
++        return ID2D1PathGeometry_GetBounds(geometry->u.group.path, transform, bounds);
++
+     /* NEUTRON LAZY GROUP PATH: the bounds of a union are the union of the bounds, so
+      * this needs no combined path -- which matters because layer masks ask for bounds
+      * and nothing else, and building the path for them is the single biggest slice of
+@@ -7650,9 +7653,8 @@
+ HRESULT d2d_geometry_group_init(struct d2d_geometry *geometry, ID2D1Factory *factory,
+         D2D1_FILL_MODE fill_mode, ID2D1Geometry **geometries, unsigned int geometry_count)
+ {
+-    ID2D1GeometrySink *sink;
++    BOOL eager = FALSE;
+     unsigned int i;
+-    HRESULT hr;
+ 
+     d2d_geometry_init(geometry, factory, &identity, (ID2D1GeometryVtbl *)&d2d_geometry_group_vtbl,
+             &d2d_geometry_group_ops);
+@@ -7676,6 +7678,21 @@
+     geometry->u.group.path = NULL;
+     geometry->u.group.path_hr = S_OK;
+     InterlockedExchange(&geometry->u.group.path_pending, 1);
++    /* A group is a snapshot. A member path that isn't closed yet counts as empty, also after it
++     * is closed, so the combined path can't wait: build it now. */
++    for (i = 0; i < geometry_count; ++i)
++    {
++        struct d2d_geometry *member = unsafe_impl_from_ID2D1Geometry(geometries[i]);
++
++        while (member->ID2D1Geometry_iface.lpVtbl == (const ID2D1GeometryVtbl *)&d2d_transformed_geometry_vtbl)
++            member = unsafe_impl_from_ID2D1Geometry(member->u.transformed.src_geometry);
++        if (member->ID2D1Geometry_iface.lpVtbl == (const ID2D1GeometryVtbl *)&d2d_path_geometry_vtbl
++                && member->u.path.state != D2D_GEOMETRY_STATE_CLOSED)
++        {
++            eager = TRUE;
++            break;
++        }
++    }
+     /* The fill is resolved from the inner path, so it stays pending too -- and it
+      * must be marked pending HERE, not inside the builder: require_tessellation()
+      * tests tess_pending FIRST and early-returns, so a group created and then
+@@ -7683,7 +7700,7 @@
+      * group-drawn UI element vanish in an earlier attempt at this change. */
+     InterlockedExchange(&geometry->tess_pending, 1);
+ 
+-    return S_OK;
++    return eager ? d2d_geometry_group_require_path(geometry) : S_OK;
+ }
+ 
+ /* Build the group's combined path: stream every member into a fresh path geometry

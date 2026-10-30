@@ -1,0 +1,59 @@
+d2d1: resolve lazy tessellation through transformed geometries
+
+A transformed geometry copies its source's fill when created. Under lazy
+tessellation that fill is still empty and nothing filled it in later, so a
+transformed path that had not been drawn yet drew nothing. Mark it pending and
+take the copy on first use, as groups already do. Wine's test_path_geometry and
+test_fill_geometry: 20 failures gone.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -365,9 +365,9 @@
+  * needs the tessellation. So do it on first fill instead of at Close.
+  *
+  * Behavioural note: Close no longer returns a tessellation failure; the error surfaces when
+- * the geometry is filled. Nothing in d2d1 reads the tessellation except the fill path
+- * (verified: only d2d_device_context_fill_geometry; FillContainsPoint/ComputeArea/Stroke*
+- * all work from the figures). */
++ * the geometry is filled. Whatever reads fill.faces or copies a fill by value must go through
++ * d2d_geometry_require_tessellation(): filling, ComputeArea, Tessellate, and the transformed
++ * and group geometries that copy their source's fill. */
+ static inline BOOL neutron_lazytess(void)
+ {
+     static int v = -1;
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -4383,6 +4383,7 @@
+ }
+ 
+ static const struct ID2D1GeometryGroupVtbl d2d_geometry_group_vtbl;
++static const struct ID2D1TransformedGeometryVtbl d2d_transformed_geometry_vtbl;
+ 
+ /* NEUTRON LAZY TESSELLATION: run the work Close used to do, once, on first fill.
+  *
+@@ -4458,6 +4459,14 @@
+                 geometry->fill = path_impl->fill;
+         }
+     }
++    else if (geometry->ID2D1Geometry_iface.lpVtbl == (const ID2D1GeometryVtbl *)&d2d_transformed_geometry_vtbl)
++    {
++        /* Same by-value copy as a group, from the geometry it wraps. */
++        struct d2d_geometry *src_impl = unsafe_impl_from_ID2D1Geometry(geometry->u.transformed.src_geometry);
++
++        if (SUCCEEDED(geometry->tess_hr = d2d_geometry_require_tessellation(src_impl)))
++            geometry->fill = src_impl->fill;
++    }
+     else
+     {
+         geometry->tess_hr = d2d_geometry_tessellate_now(geometry);
+@@ -7242,6 +7251,10 @@
+     geometry->u.transformed.transform = *transform;
+     geometry->fill = src_impl->fill;
+     geometry->outline = src_impl->outline;
++    /* The source may not be tessellated yet (lazy tessellation): its fill is still empty, and
++     * copying that without following up made a transformed path draw nothing. */
++    if (InterlockedCompareExchange(&src_impl->tess_pending, 0, 0))
++        InterlockedExchange(&geometry->tess_pending, 1);
+ }
+ 
+ static inline struct d2d_geometry *impl_from_ID2D1GeometryGroup(ID2D1GeometryGroup *iface)

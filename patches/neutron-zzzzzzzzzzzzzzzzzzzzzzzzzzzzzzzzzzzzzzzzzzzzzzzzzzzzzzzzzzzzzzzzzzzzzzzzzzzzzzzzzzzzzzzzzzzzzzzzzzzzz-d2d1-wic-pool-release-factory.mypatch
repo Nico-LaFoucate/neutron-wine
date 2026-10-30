@@ -1,0 +1,69 @@
+d2d1: let parked WIC render targets go when only they hold the factory
+
+Parked targets hold references to their factory, so it never reached zero and its
+pool drain never ran: the factory and everything in the pool lived until process
+exit. Drain when those references are all that is left, and don't park a target
+whose factory the app has already released. Wine's tests: 10 failures gone.
+
+--- a/dlls/d2d1/d2d1_private.h
++++ b/dlls/d2d1/d2d1_private.h
+@@ -1512,6 +1512,9 @@
+ /* NEUTRON WIC RENDER-TARGET POOL */
+ struct d2d_wic_render_target *d2d_wic_render_target_pool_lookup(struct d2d_factory *factory,
+         IWICBitmap *bitmap, const D2D1_RENDER_TARGET_PROPERTIES *desc);
++/* References a parked WIC render target holds on its factory: its context, its device, and the
++ * device's own. Used as an upper bound: draining the pool early only costs a rebuild. */
++#define D2D_WIC_RT_FACTORY_REFS 3
+ void d2d_factory_drain_wic_rt_pool(struct d2d_factory *factory);
+ /* NEUTRON WIC READ-THROUGH: unmap and release everything still queued or pooled. */
+ void d2d_factory_drain_wic_gpu(struct d2d_factory *factory);
+--- a/dlls/d2d1/factory.c
++++ b/dlls/d2d1/factory.c
+@@ -151,6 +151,18 @@
+ 
+     TRACE("%p decreasing refcount to %lu.\n", iface, refcount);
+ 
++    /* Parked render targets hold references to their factory, so with them in the pool the
++     * count never reached zero and the drain below never ran. When they are all that is left,
++     * let them go. */
++    if (refcount && refcount <= factory->wic_rt_pool_size * D2D_WIC_RT_FACTORY_REFS)
++    {
++        InterlockedIncrement(&factory->refcount);
++        EnterCriticalSection(&factory->cs);
++        d2d_factory_drain_wic_rt_pool(factory);
++        LeaveCriticalSection(&factory->cs);
++        return ID2D1Factory7_Release(iface);
++    }
++
+     if (!refcount)
+     {
+         if (factory->device)
+--- a/dlls/d2d1/wic_render_target.c
++++ b/dlls/d2d1/wic_render_target.c
+@@ -1024,6 +1024,11 @@
+ 
+     factory = unsafe_impl_from_ID2D1Factory((ID2D1Factory *)rt->pool_factory);
+ 
++    /* The app already released the factory: nothing can ask for this target again, and parking
++     * it would keep the factory alive for good. */
++    if (factory->refcount <= (factory->wic_rt_pool_size + 1) * D2D_WIC_RT_FACTORY_REFS)
++        return FALSE;
++
+     EnterCriticalSection(&factory->cs);
+     /* 🚨 EVICT WHEN FULL -- refusing was the whole bug.
+      *
+@@ -1094,12 +1099,13 @@
+ {
+     struct d2d_wic_render_target *rt, *rt2;
+ 
++    /* Each destroy below releases factory references, which reads this size. */
++    factory->wic_rt_pool_size = 0;
+     LIST_FOR_EACH_ENTRY_SAFE(rt, rt2, &factory->wic_rt_pool, struct d2d_wic_render_target, pool_entry)
+     {
+         list_remove(&rt->pool_entry);
+         d2d_wic_render_target_pool_destroy(rt);
+     }
+-    factory->wic_rt_pool_size = 0;
+ }
+ 
+ 

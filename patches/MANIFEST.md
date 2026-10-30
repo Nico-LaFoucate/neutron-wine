@@ -1593,6 +1593,25 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patches 97-101 — Wine's d2d1 tests back to Windows' results (34 + 12 failures of ours, all gone)
+His *"I would do the d2d1 work before anything"* (10-30), after le-birnes' note in neutron-wine#3. Wine's d2d1 tests, full suite (17045 checks,
+single-threaded, `harnesses/d2d1-tests/`): untouched 11.10 = 2 (succeeded-in-todo, same with everything), 163 = 48, with 96-101 = 2. Those
+tests carry Windows' results. Regression checks, 164 vs 164 + these: Premiere with a project open 0 pixels differ (of a full 175% window; two
+164 runs also 0), After Effects only the Frame Render Time text; `d2shapes.exe` (hard cubic fills and strokes) 0 bytes differ from 163, ~77,000 px
+from clean Wine, so the bite fix stands.
+- **97 `d2d1-cubic-pieces-one-curve`:** cubic-bezier-subdivide stored each piece as a curve of its own, so Simplify and ComputeArea ignored the
+  tolerance (ellipse 141.4 vs 100 at tolerance 200) and hit testing saw pieces. Cuts are now SPLIT_BEZIER, as at an intersection; the original
+  controls are stored once. -3.
+- **98 `d2d1-transformed-lazy-tessellation`:** a transformed geometry copied its source's still-empty fill and nothing filled it in, so a transformed
+  path not drawn before drew NOTHING. Pending + by-value copy on first use, like groups. -20.
+- **99 `d2d1-group-unclosed-member`:** a group is a snapshot; an unclosed member is empty for good. Deferred path made GetBounds fail and picked up
+  the member once closed. Built at once in that case. -3.
+- **100 `d2d1-stroke-turn-miter-extension`:** D2D's miter join is clipped at the miter limit, so a stroke carries on past a 180 degree turn by
+  limit * width / 2. Wine's 25.0f was that for limit 10 at width 5; at Premiere's widths it was the spur we removed in July. The shader places it now, from
+  the real width and limit, miter joins only. Premiere width 1, limit 3: 1.5 px, the July bound. -6.
+- **101 `d2d1-wic-pool-release-factory`:** parked WIC targets hold the factory, so it never reached zero and the pool drain never ran. Drain when only they
+  are left; don't park after the app released the factory. -10.
+
 ### patch 96 — `…z×96-d2d1-compute-area-lazy-tessellation` (ComputeArea gave 0 and Tessellate no triangles on a closed path)
 Found with Wine's own d2d1 tests, after le-birnes flagged failures in neutron-wine#3 (10-30). Lazy tessellation (neutron_lazytess)
 defers triangulation from Close to the first fill, but d2d_geometry_compute_area and d2d_geometry_tessellate read fill.faces without

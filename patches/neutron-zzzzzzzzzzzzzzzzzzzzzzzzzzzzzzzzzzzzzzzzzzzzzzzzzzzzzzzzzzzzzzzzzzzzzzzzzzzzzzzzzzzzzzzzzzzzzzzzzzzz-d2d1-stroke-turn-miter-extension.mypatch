@@ -1,0 +1,136 @@
+d2d1: extend a stroke past a 180 degree turn by the miter limit
+
+D2D's miter join is clipped at the miter limit, so a stroke carries on past a
+180 degree turn by limit * width / 2 with a flat end. Wine hardcoded 25 units,
+which is right for the default limit at width 5 and was a spur at any other width
+(Premiere's strokes: limit 3, widths 0.5 to 2.4), so we removed the join outright.
+Windows draws it: Wine's tests expect it. The outline shader now places the far
+end from the real width and limit, and only for miter joins. Premiere's case comes
+out at 1.5 px at width 1, the bound measured in July. 6 failures gone.
+
+--- a/dlls/d2d1/device.c
++++ b/dlls/d2d1/device.c
+@@ -2203,7 +2203,7 @@
+ #define D2D1_DEFAULT_MITER_LIMIT 10.0f
+ 
+ static HRESULT d2d_device_context_update_vs_cb(struct d2d_device_context *context,
+-        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit)
++        const D2D_MATRIX_3X2_F *geometry_transform, float stroke_width, float miter_limit, float turn_extension)
+ {
+     D3D11_MAPPED_SUBRESOURCE map_desc;
+     ID3D11DeviceContext *d3d_context;
+@@ -2232,7 +2232,8 @@
+     cb_data->transform_geometry._32 = geometry_transform->_32;
+     cb_data->transform_geometry.stroke_width = stroke_width;
+     cb_data->misc.x = miter_limit;
+-    cb_data->misc.y = cb_data->misc.z = cb_data->misc.w = 0.0f;
++    cb_data->misc.y = turn_extension;
++    cb_data->misc.z = cb_data->misc.w = 0.0f;
+ 
+     w = &context->drawing_state.transform;
+ 
+@@ -2256,7 +2257,7 @@
+ 
+ static void d2d_device_context_draw_geometry(struct d2d_device_context *render_target,
+         const struct d2d_geometry *geometry, struct d2d_brush *brush, float stroke_width,
+-        float miter_limit)
++        float miter_limit, float turn_extension)
+ {
+     /* NEUTRON LAZY GROUP PATH: a group's outline is a copy taken when its combined
+      * path is built, and that build is deferred -- force it before reading below. */
+@@ -2269,7 +2270,7 @@
+     HRESULT hr;
+ 
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, stroke_width,
+-            miter_limit)))
++            miter_limit, turn_extension)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -2422,8 +2423,11 @@
+             stroke_width /= context->drawing_state.transform.m11;
+     }
+ 
++    /* Only a miter join carries on past a 180 degree turn. */
+     d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, stroke_width,
+-            stroke_style_impl ? stroke_style_impl->desc.miterLimit : D2D1_DEFAULT_MITER_LIMIT);
++            stroke_style_impl ? stroke_style_impl->desc.miterLimit : D2D1_DEFAULT_MITER_LIMIT,
++            !stroke_style_impl ? D2D1_DEFAULT_MITER_LIMIT
++            : stroke_style_impl->desc.lineJoin == D2D1_LINE_JOIN_MITER ? stroke_style_impl->desc.miterLimit : 0.0f);
+ }
+ 
+ static void d2d_device_context_fill_geometry(struct d2d_device_context *render_target,
+@@ -2442,7 +2446,7 @@
+     buffer_data.SysMemSlicePitch = 0;
+ 
+     if (FAILED(hr = d2d_device_context_update_vs_cb(render_target, &geometry->transform, 0.0f,
+-            D2D1_DEFAULT_MITER_LIMIT)))
++            D2D1_DEFAULT_MITER_LIMIT, 0.0f)))
+     {
+         WARN("Failed to update vs constant buffer, hr %#lx.\n", hr);
+         return;
+@@ -5205,7 +5209,7 @@
+         d2d_device_context_fill_geometry(context, geometry_impl, brush_impl, NULL);
+     else
+         d2d_device_context_draw_geometry(context, geometry_impl, brush_impl, r->stroke_width,
+-                D2D1_DEFAULT_MITER_LIMIT);
++                D2D1_DEFAULT_MITER_LIMIT, D2D1_DEFAULT_MITER_LIMIT);
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE d2d_device_context_CreateInk(ID2D1DeviceContext6 *iface,
+@@ -6124,6 +6128,10 @@
+     "            q_i *= misc.x / miter;\n"
+     "    }\n"
+     "\n"
++    "    /* The far end of a 180 degree turn: see d2d_geometry_outline_add_join(). */\n"
++    "    if (dot(next, next) > 2.0f)\n"
++    "        q_i = v_p + misc.y * q_next;\n"
++    "\n"
+     "    o.b = float4(0.0, 0.0, 0.0, 0.0);\n"
+     "\n"
+     "    o.p = mul(float3(position, 1.0f), transform_geometry) + stroke_width * 0.5f * q_i;\n"
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -3507,24 +3507,27 @@
+     if (ccw == 0.0f)
+     {
+         /* The tangents are collinear, which covers two cases: the path carries
+-         * straight on through p0, or it doubles back on itself. Neither needs
+-         * join geometry.
++         * straight on through p0, or it doubles back on itself.
+          *
+-         * A straight continuation needs none because the two segment bands
+-         * already meet flush. A doubling-back turn is a 180 degree corner, so
+-         * its miter ratio is infinite and any finite miter limit bevels it --
+-         * and a bevel across a 180 degree turn is degenerate, i.e. no
+-         * geometry at all.
++         * A straight continuation needs no join: the two segment bands already
++         * meet flush. This fires on every tangent-continuous join, e.g. each
++         * corner of a rounded rectangle whose curve control point continues the
++         * incoming edge, which is how UI toolkits build buttons and scrollbar
++         * thumbs.
+          *
+-         * Wine emitted the same quad for both, extending a hardcoded 25.0f
+-         * units along the path direction. That is a spur sticking out of the
+-         * outline, and unlike the miter in the vertex shader it is baked into
+-         * the vertex POSITION, so the miter limit cannot rein it in. It fires
+-         * on every tangent-continuous join -- e.g. each corner of a rounded
+-         * rectangle whose curve control point continues the incoming edge,
+-         * which is how UI toolkits build buttons and scrollbar thumbs. */
+-        return TRUE;
++         * A 180 degree turn is a corner with an infinite miter, and D2D's miter
++         * join is clipped at the miter limit: the stroke carries on past p0 by
++         * limit * width / 2 with a flat end. Wine hardcoded that as 25 units,
++         * which is right for the default limit at width 5 and a spur at any other
++         * width. Width and limit are only known when drawing, so the shader
++         * places the far end: NEXT of length 2 marks it, along NEXT. */
++        if (d2d_point_dot(prev, next) < 0.0f)
++            return TRUE;
+ 
++        d2d_outline_vertex_set(&v[0], p0->x, p0->y, -prev->x, -prev->y, -prev->x, -prev->y);
++        d2d_outline_vertex_set(&v[1], p0->x, p0->y,  prev->x,  prev->y,  prev->x,  prev->y);
++        d2d_outline_vertex_set(&v[2], p0->x, p0->y,  prev->x,  prev->y, -2.0f * prev->x, -2.0f * prev->y);
++        d2d_outline_vertex_set(&v[3], p0->x, p0->y, -prev->x, -prev->y, -2.0f * prev->x, -2.0f * prev->y);
+     }
+     else if (ccw < 0.0f)
+     {

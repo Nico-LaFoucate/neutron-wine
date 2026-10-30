@@ -1,0 +1,80 @@
+d2d1: keep a subdivided cubic one curve to everything that reads curves back
+
+Patch cubic-bezier-subdivide cut a cubic into pieces for accuracy but stored each
+piece as its own curve, so Simplify and ComputeArea ignored the caller's tolerance
+(ellipse area 141.4 instead of 100 at tolerance 200) and stroke hit testing tested
+the pieces. Mark the cuts SPLIT_BEZIER, as for a curve cut at an intersection, and
+store the original controls once. Wine's tests: 3 failures gone. Fill and stroke
+of hard shapes: 0 pixels differ from before.
+
+--- a/dlls/d2d1/geometry.c
++++ b/dlls/d2d1/geometry.c
+@@ -1097,24 +1097,19 @@
+     return (unsigned int)n;
+ }
+ 
+-static bool d2d_figure_add_single_bezier(struct d2d_figure *figure, const D2D1_POINT_2F *c)
++static bool d2d_figure_add_single_bezier(struct d2d_figure *figure, const D2D1_POINT_2F *c,
++        enum d2d_vertex_type type)
+ {
+     D2D1_RECT_F bezier_bounds;
+     D2D1_POINT_2F p;
+ 
+-    if (!d2d_figure_add_original_bezier_controls(figure, 1, &c[1])
+-            || !d2d_figure_add_original_bezier_controls(figure, 1, &c[2]))
+-    {
+-        return false;
+-    }
+-
+     /* Approximate this cubic Bézier with a quadratic one. The caller has already
+      * subdivided it far enough that the approximation is within tolerance. */
+     p.x = (c[1].x + c[2].x) * 0.75f;
+     p.y = (c[1].y + c[2].y) * 0.75f;
+     p.x -= (figure->vertices[figure->vertex_count - 1].x + c[3].x) * 0.25f;
+     p.y -= (figure->vertices[figure->vertex_count - 1].y + c[3].y) * 0.25f;
+-    figure->vertex_types[figure->vertex_count - 1] = D2D_VERTEX_TYPE_BEZIER;
++    figure->vertex_types[figure->vertex_count - 1] = type;
+ 
+     d2d_rect_get_bezier_bounds(&bezier_bounds, &figure->vertices[figure->vertex_count - 1],
+             &p, &c[3]);
+@@ -1138,6 +1133,13 @@
+     for (i = 0; i < count; ++i)
+     {
+         D2D1_POINT_2F c[4], piece[4], rest[4];
++        enum d2d_vertex_type type = D2D_VERTEX_TYPE_BEZIER;
++
++        if (!d2d_figure_add_original_bezier_controls(figure, 1, &beziers[i].point1)
++                || !d2d_figure_add_original_bezier_controls(figure, 1, &beziers[i].point2))
++        {
++            return false;
++        }
+ 
+         c[0] = figure->vertices[figure->vertex_count - 1];
+         c[1] = beziers[i].point1;
+@@ -1147,20 +1149,21 @@
+         /* A single quadratic cannot represent an arbitrary cubic; approximating one
+          * with one quadratic put the curve several pixels off for anything but a
+          * gentle bend, which showed up as bites taken out of filled shapes. Cut the
+-         * cubic into as many sub-cubics as accuracy requires first. Each piece is
+-         * still a cubic carrying its own two control points, so the geometry streams
+-         * back out unchanged in shape. */
++         * cubic into as many pieces as accuracy requires first. The cuts are
++         * SPLIT_BEZIER vertices, as for a curve cut at an intersection: to Simplify,
++         * ComputeArea, GetBounds and hit testing this is still the one original cubic. */
+         pieces = d2d_cubic_quadratic_piece_count(c);
+ 
+         for (j = 0; j < pieces - 1; ++j)
+         {
+             d2d_cubic_split(c, 1.0f / (float)(pieces - j), piece, rest);
+-            if (!d2d_figure_add_single_bezier(figure, piece))
++            if (!d2d_figure_add_single_bezier(figure, piece, type))
+                 return false;
++            type = D2D_VERTEX_TYPE_SPLIT_BEZIER;
+             memcpy(c, rest, sizeof(c));
+         }
+ 
+-        if (!d2d_figure_add_single_bezier(figure, c))
++        if (!d2d_figure_add_single_bezier(figure, c, type))
+             return false;
+     }
+ 
