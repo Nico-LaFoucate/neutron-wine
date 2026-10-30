@@ -1602,14 +1602,14 @@ mount as IO_REPARSE_TAG_MOUNT_POINT, so GetVolumePathNameW stopped there and ans
 wants a drive root. Fix: a real mount point carries reparse data, a Unix mount has none (FSCTL_GET_REPARSE_POINT ->
 STATUS_NOT_A_REPARSE_POINT), so the walk goes on and answers Z:\. Lab (Ex161 copy, runtime 162 + this kernelbase, same catalog and
 prefix): opens, lock + wal on the Z: copy, closes clean; NEUTRON_VOLUME_UNIX_MOUNT=1 brings the refusal back with Z:\home\artist\.
-Y:\ pointing at the same folder also opened before the patch. NOT YET BUILT in a release.
+Y:\ pointing at the same folder also opened before the patch. Built in 11.10-163 (with 91), not published.
 
 ### patch 91 — `…z×91-win32u-sm-maximized-fullscreen-workarea` (Windows parity: SM_C[XY]MAXIMIZED / SM_C[XY]FULLSCREEN)
 Found chasing his *"Camera raw opened too high up on screen and can't be moved"* (10-29). Upstream computed these from the whole
 screen (FIXME "subtract ... application toolbars"), and SM_CYMAXIMIZED added TWO caption heights: at 3840x2160 175% with a 56 px top
 panel Wine said CYMAXIMIZED 2250 and CYFULLSCREEN 2195, taller than the screen. Windows: work area + 2 x (frame + padded border), and
 work area height - caption. Now: 2114 / 2059 (crprobe). Wine's own maximize code does not read them; only apps do. Kill switch
-NEUTRON_SM_WORKAREA=0. **Did NOT fix Camera Raw** (still y=-44 with it; lab copy 11.10-162sm). Shipped for parity (his rule). NOT YET BUILT.
+NEUTRON_SM_WORKAREA=0. **Did NOT fix Camera Raw** (still y=-44 with it; lab copy 11.10-162sm). Shipped for parity (his rule). Built in 11.10-163, not published.
 Also seen, not fixed: SPI_GETWORKAREA caches its first answer in the FIRST caller's DPI (physical here) and gives it to DPI-unaware
 callers too (crprobe unaware thread: (0,56)-(3840,2160) instead of (0,32)-(2194,1234)).
 
