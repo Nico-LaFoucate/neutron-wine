@@ -1,0 +1,71 @@
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3577,6 +3577,38 @@
+     return rect;
+ }
+ 
++/* NEUTRON: the primary monitor's work area in the given DPI. Windows computes SM_C[XY]FULLSCREEN and SM_C[XY]MAXIMIZED
++ * from it; upstream used the whole screen (and two caption heights), so on a desktop with a panel those metrics were
++ * taller than the screen and Camera Raw (Photoshop's Camera Raw Filter) opened with its title bar above the top edge.
++ * Kill switch NEUTRON_SM_WORKAREA=0 restores the upstream formulas. */
++static BOOL get_primary_work_rect( UINT dpi, RECT *rect )
++{
++    static int on = -1;
++    MONITORINFO info = {.cbSize = sizeof(info)};
++    struct monitor *monitor;
++    BOOL ret = FALSE;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SM_WORKAREA" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_SM_WORKAREA = 0 (environment)\n" );
++    }
++    if (!on || !lock_display_devices( FALSE )) return FALSE;
++
++    LIST_FOR_EACH_ENTRY( monitor, &monitors, struct monitor, entry )
++    {
++        if (!is_monitor_primary( monitor )) continue;
++        monitor_get_info( monitor, &info, dpi );
++        *rect = info.rcWork;
++        ret = TRUE;
++        break;
++    }
++
++    unlock_display_devices();
++    return ret;
++}
++
+ RECT get_primary_monitor_rect( UINT dpi )
+ {
+     struct monitor *monitor;
+@@ -7193,9 +7225,14 @@
+         NtUserSystemParametersInfo( SPI_GETNONCLIENTMETRICS, 0, &ncm, 0 );
+         return ncm.iMenuHeight + 1;
+     case SM_CXFULLSCREEN:
++        /* NEUTRON: as Windows, the primary work area's width (see get_primary_work_rect) */
++        if (get_primary_work_rect( get_thread_dpi(), &rect )) return rect.right - rect.left;
+         /* see the remark for SM_CXMAXIMIZED, at least this formulation is correct */
+         return get_system_metrics( SM_CXMAXIMIZED ) - 2 * get_system_metrics( SM_CXFRAME );
+     case SM_CYFULLSCREEN:
++        /* NEUTRON: as Windows, the primary work area's height less a caption (see get_primary_work_rect) */
++        if (get_primary_work_rect( get_thread_dpi(), &rect ))
++            return rect.bottom - rect.top - get_system_metrics( SM_CYCAPTION );
+         /* see the remark for SM_CYMAXIMIZED, at least this formulation is
+          * correct */
+         return get_system_metrics( SM_CYMAXIMIZED ) - get_system_metrics( SM_CYMIN );
+@@ -7317,9 +7354,14 @@
+     case SM_CYMAXTRACK:
+         return get_system_metrics( SM_CYVIRTUALSCREEN ) + 4 + 2 * get_system_metrics( SM_CYFRAME );
+     case SM_CXMAXIMIZED:
++        /* NEUTRON: as Windows, the primary work area plus the sizing frame on both sides (see get_primary_work_rect) */
++        if (get_primary_work_rect( get_thread_dpi(), &rect ))
++            return rect.right - rect.left + 2 * (get_system_metrics( SM_CXFRAME ) + get_system_metrics( SM_CXPADDEDBORDER ));
+         /* FIXME: subtract the width of any vertical application toolbars*/
+         return get_system_metrics( SM_CXSCREEN ) + 2 * get_system_metrics( SM_CXFRAME );
+     case SM_CYMAXIMIZED:
++        if (get_primary_work_rect( get_thread_dpi(), &rect ))
++            return rect.bottom - rect.top + 2 * (get_system_metrics( SM_CYFRAME ) + get_system_metrics( SM_CXPADDEDBORDER ));
+         /* FIXME: subtract the width of any horizontal application toolbars*/
+         return get_system_metrics( SM_CYSCREEN ) + 2 * get_system_metrics( SM_CYCAPTION );
+     case SM_NETWORK:
