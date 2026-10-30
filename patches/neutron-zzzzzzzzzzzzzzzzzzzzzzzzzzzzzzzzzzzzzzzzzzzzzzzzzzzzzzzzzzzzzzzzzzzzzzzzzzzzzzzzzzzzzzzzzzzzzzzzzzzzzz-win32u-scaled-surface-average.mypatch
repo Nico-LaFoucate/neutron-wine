@@ -1,0 +1,175 @@
+win32u: shrink a scaled window surface by averaging, on one grid
+
+A window whose DPI differs from its monitor's draws at its own DPI and is
+shrunk onto the monitor's surface at every flush. HALFTONE reads two pixels per
+axis, so at 175 % on a 100 % monitor it skips source pixels, and each flush got
+its own ratio from the rounded rectangle. In Animate, while a stroke was drawn,
+thin lines in the repainted rectangle turned dashed or wobbly and the canvas
+edge went blocky until the stroke ended.
+
+Average the covered source pixels, with both grids starting at the surface
+origin, so a small repaint gives the same pixels as a full one. Opaque 32 bpp
+only; anything else keeps the stretch. NEUTRON_SCALED_AVERAGE=0 turns it off.
+Lab, Animate 2024 on a 100 % output next to 175 %, same stroke, two runs each:
+90 canvas edge pixels changed mid-stroke with it off, 0 with it on.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -170,6 +170,117 @@
+     if (hrgn) NtGdiDeleteObjectApp( hrgn );
+ }
+ 
++static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info );
++
++/* NEUTRON: shrink a repainted area by averaging, on one grid for the whole surface. Each destination
++ * pixel takes the source pixels it covers, weighted by how much it covers them, with both grids starting
++ * at the surface origin, so a small repaint gives the same pixels as a full one.
++ *
++ * The stretch below does neither when shrinking. HALFTONE reads two pixels per axis, so at 175 % on a
++ * 100 % monitor it skips source pixels, and every repaint gets its own ratio from the rounded rectangle.
++ * A system-DPI app moved to a lower-DPI monitor showed it: while a stroke was drawn in Animate, thin
++ * lines in the repainted rectangle turned dashed or wobbly, and the canvas edge went blocky until the
++ * stroke ended. Opaque 32 bpp only; anything else takes the stretch. NEUTRON_SCALED_AVERAGE=0 turns it off. */
++static BOOL scaled_surface_average( struct scaled_surface *surface, const RECT *src, RECT *dst,
++                                    const BITMAPINFO *src_info, const void *src_bits )
++{
++    enum { MAX_COLS = 6 };
++    static int on = -1;
++    char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
++    BITMAPINFO *dst_info = (BITMAPINFO *)buffer;
++    const UINT from = surface->dpi_from, to = surface->dpi_to;
++    UINT *sum, *weights, *totals, *first;
++    int src_w, src_h, dst_w, dst_h, width, x, y;
++    BYTE *dst_bits;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_SCALED_AVERAGE" );
++        on = !(e && *e == '0');
++    }
++    if (!on || from <= to || from >= to * (MAX_COLS - 1)) return FALSE;
++    if (surface->header.alpha_mask || surface->header.color_key != CLR_INVALID) return FALSE;
++    if (src_info->bmiHeader.biBitCount != 32 || src_info->bmiHeader.biHeight >= 0) return FALSE;
++    if (!(dst_bits = window_surface_get_color( surface->target_surface, dst_info ))) return FALSE;
++    if (dst_info->bmiHeader.biBitCount != 32 || dst_info->bmiHeader.biHeight >= 0) return FALSE;
++
++    src_w = src_info->bmiHeader.biWidth;
++    src_h = -src_info->bmiHeader.biHeight;
++    dst_w = dst_info->bmiHeader.biWidth;
++    dst_h = -dst_info->bmiHeader.biHeight;
++
++    dst->left = max( src->left, 0 ) * to / from;
++    dst->top = max( src->top, 0 ) * to / from;
++    dst->right = min( (src->right * to + from - 1) / from, dst_w );
++    dst->bottom = min( (src->bottom * to + from - 1) / from, dst_h );
++    if ((width = dst->right - dst->left) <= 0 || dst->bottom <= dst->top) return TRUE;
++
++    if (!(sum = malloc( width * sizeof(UINT) * (4 + MAX_COLS + 2) ))) return FALSE;
++    weights = sum + width * 4;
++    totals = weights + width * MAX_COLS;
++    first = totals + width;
++
++    for (x = 0; x < width; x++)
++    {
++        UINT a = (dst->left + x) * from, b = a + from, sx = a / to, n = 0;
++
++        first[x] = sx;
++        totals[x] = 0;
++        for (; sx * to < b && sx < (UINT)src_w && n < MAX_COLS; sx++, n++)
++        {
++            weights[x * MAX_COLS + n] = min( b, (sx + 1) * to ) - max( a, sx * to );
++            totals[x] += weights[x * MAX_COLS + n];
++        }
++        for (; n < MAX_COLS; n++) weights[x * MAX_COLS + n] = 0;
++    }
++
++    for (y = dst->top; y < dst->bottom; y++)
++    {
++        UINT a = y * from, b = a + from, sy = a / to, height = 0;
++        BYTE *out = dst_bits + y * dst_w * 4 + dst->left * 4;
++
++        memset( sum, 0, width * 4 * sizeof(UINT) );
++        for (; sy * to < b && sy < (UINT)src_h; sy++)
++        {
++            const BYTE *line = (const BYTE *)src_bits + sy * src_w * 4;
++            UINT wy = min( b, (sy + 1) * to ) - max( a, sy * to );
++
++            height += wy;
++            for (x = 0; x < width; x++)
++            {
++                const UINT *w = weights + x * MAX_COLS;
++                const BYTE *p = line + first[x] * 4;
++                UINT *acc = sum + x * 4;
++                int n;
++
++                for (n = 0; n < MAX_COLS && w[n]; n++, p += 4)
++                {
++                    UINT k = w[n] * wy;
++
++                    acc[0] += p[0] * k;
++                    acc[1] += p[1] * k;
++                    acc[2] += p[2] * k;
++                    acc[3] += p[3] * k;
++                }
++            }
++        }
++        if (!height) continue;
++        for (x = 0; x < width; x++, out += 4)
++        {
++            UINT total = totals[x] * height, *acc = sum + x * 4;
++
++            if (!total) continue;
++            out[0] = (acc[0] + total / 2) / total;
++            out[1] = (acc[1] + total / 2) / total;
++            out[2] = (acc[2] + total / 2) / total;
++            out[3] = (acc[3] + total / 2) / total;
++        }
++    }
++
++    free( sum );
++    return TRUE;
++}
++
+ static BOOL scaled_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                   const BITMAPINFO *shape_info, const void *shape_bits )
+@@ -185,21 +296,24 @@
+ 
+     dst = map_dpi_rect( src, surface->dpi_from, surface->dpi_to );
+ 
+-    hdc_dst = NtGdiCreateCompatibleDC( 0 );
+-    hdc_src = NtGdiCreateCompatibleDC( 0 );
+-
+-    NtGdiSelectBitmap( hdc_src, window_surface->color_bitmap );
+-    NtGdiSelectBitmap( hdc_dst, surface->target_surface->color_bitmap );
+-
+-    /* FIXME: implement HALFTONE with alpha for layered surfaces */
+-    if (!window_surface->alpha_mask) set_stretch_blt_mode( hdc_dst, STRETCH_HALFTONE );
+-
+-    NtGdiStretchBlt( hdc_dst, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+-                     hdc_src, src.left, src.top, src.right - src.left, src.bottom - src.top,
+-                     SRCCOPY, 0 );
+-
+-    NtGdiDeleteObjectApp( hdc_dst );
+-    NtGdiDeleteObjectApp( hdc_src );
++    if (!scaled_surface_average( surface, &src, &dst, color_info, color_bits ))
++    {
++        hdc_dst = NtGdiCreateCompatibleDC( 0 );
++        hdc_src = NtGdiCreateCompatibleDC( 0 );
++
++        NtGdiSelectBitmap( hdc_src, window_surface->color_bitmap );
++        NtGdiSelectBitmap( hdc_dst, surface->target_surface->color_bitmap );
++
++        /* FIXME: implement HALFTONE with alpha for layered surfaces */
++        if (!window_surface->alpha_mask) set_stretch_blt_mode( hdc_dst, STRETCH_HALFTONE );
++
++        NtGdiStretchBlt( hdc_dst, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
++                         hdc_src, src.left, src.top, src.right - src.left, src.bottom - src.top,
++                         SRCCOPY, 0 );
++
++        NtGdiDeleteObjectApp( hdc_dst );
++        NtGdiDeleteObjectApp( hdc_src );
++    }
+ 
+     window_surface_lock( surface->target_surface );
+     add_bounds_rect( &surface->target_surface->bounds, &dst );
