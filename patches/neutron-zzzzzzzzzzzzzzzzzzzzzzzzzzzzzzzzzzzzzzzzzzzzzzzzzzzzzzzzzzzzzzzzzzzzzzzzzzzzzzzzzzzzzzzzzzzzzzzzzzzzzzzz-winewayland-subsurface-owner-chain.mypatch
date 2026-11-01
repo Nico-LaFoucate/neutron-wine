@@ -1,0 +1,87 @@
+winewayland: parent a subsurface to the nearest owner with a toplevel
+
+An owned window that becomes a subsurface took its direct owner as parent, even
+when that owner was a subsurface too. A subsurface vanishes with its parent, while
+on Windows an owned window does not vanish with its owner. Photoshop owns a floating
+panel by its shadow window and hides the shadow for the length of a drag, so the
+panel went with it and the compositor reported every pointer motion of the drag as
+0,0. The panel resized wrongly and docked at the left edge of the screen instead of
+moving.
+
+Read the owner chain before taking win_data_mutex and parent the window to the
+nearest owner with an xdg surface. NEUTRON_SUBSURFACE_OWNER_CHAIN=0 turns it off.
+Lab, Photoshop 2026, same steps: off, panel shrinks then docks left; on, panel
+resizes, moves and goes to the other monitor and back.
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1098,6 +1098,43 @@
+     return on;
+ }
+ 
++/* NEUTRON: a subsurface vanishes with its parent, an owned window does not vanish with its owner.
++ * Photoshop owns a floating panel by its shadow window and hides that shadow for the length of a
++ * drag: with the shadow as wl_subsurface parent the panel went with it, and the compositor reported
++ * every pointer motion of the drag as 0,0, so the panel resized wrongly and docked at the screen's
++ * left edge. Keep the owner chain, read here because win32u cannot be called under win_data_mutex,
++ * so the parent can be the nearest owner with a toplevel of its own.
++ * Kill switch NEUTRON_SUBSURFACE_OWNER_CHAIN=0. */
++#define NEUTRON_OWNER_CHAIN_MAX 8
++
++static int neutron_owner_chain(HWND owner, HWND *chain)
++{
++    static int on = -1;
++    int count = 0;
++
++    if (on < 0) on = neutron_gate("NEUTRON_SUBSURFACE_OWNER_CHAIN", TRUE);
++    if (!on) return 0;
++    while (owner && count < NEUTRON_OWNER_CHAIN_MAX)
++    {
++        chain[count++] = owner;
++        owner = NtUserGetWindowRelative(owner, GW_OWNER);
++    }
++    return count;
++}
++
++/* Caller holds win_data_mutex. */
++static HWND neutron_subsurface_parent(HWND owner, const HWND *chain, int count)
++{
++    struct wayland_win_data *data;
++    int i;
++
++    for (i = 0; i < count; i++)
++        if ((data = wayland_win_data_get_nolock(chain[i])) && data->wayland_surface &&
++            data->wayland_surface->xdg_surface)
++            return chain[i];
++    return owner;
++}
++
+ static BOOL neutron_is_clickthrough_overlay(HWND hwnd)
+ {
+     DWORD ex = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
+@@ -1111,6 +1148,8 @@
+     BOOL needs_expose = FALSE;
+     HWND toplevel = NtUserGetAncestor(hwnd, GA_ROOT), owner = NULL;
+     HWND root = toplevel, restack_owner = NULL;   /* NEUTRON #5, see the end of this function */
++    HWND owner_chain[NEUTRON_OWNER_CHAIN_MAX];
++    int owner_chain_len;
+     struct wl_subsurface *old_subsurface = NULL;
+     struct wayland_surface *toplevel_surface = NULL, *owner_surface = NULL;
+     struct wayland_client_surface *client;
+@@ -1138,6 +1177,7 @@
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
++    owner_chain_len = neutron_owner_chain(owner, owner_chain);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+ 
+@@ -1297,7 +1337,7 @@
+         owner_data = NULL;
+         /* Become a subsurface of the owner (classic), unless that would form a
+          * cycle, in which case fall back to the root toplevel. */
+-        if (owner && !is_cycle) toplevel = owner;
++        if (owner && !is_cycle) toplevel = neutron_subsurface_parent(owner, owner_chain, owner_chain_len);
+         toplevel_data = toplevel && toplevel != hwnd ? wayland_win_data_get_nolock(toplevel) : NULL;
+         toplevel_surface = toplevel_data ? toplevel_data->wayland_surface : NULL;
+     }
