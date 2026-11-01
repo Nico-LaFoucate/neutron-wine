@@ -1,0 +1,184 @@
+winewayland: place a subsurface on another scale by its output
+
+wl_subsurface_set_position takes the parent's coordinates, but the position was
+divided by the subsurface's own scale. A per-monitor-aware window that crosses onto
+an output of another scale gets that scale, so a floating Photoshop panel dragged
+from a 175 % monitor to a 100 % one was placed far from where it belonged, past the
+edge of a 1920 wide screen. Pointer motion then came back relative to that place,
+so the cursor read wrong, WM_DPICHANGED fired at every event and the panel jumped
+between two positions and fell back to its start.
+
+When the scales differ, convert the window position through the output each point
+is on, and convert pointer and tablet positions back the same way.
+NEUTRON_SUBSURFACE_OUTPUT_SCALE=0 turns it off. Lab, same drag: 22 scale changes
+with the panel back at its start; with this 2, and it lands where it was dropped,
+resizes there and comes back.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -457,6 +457,10 @@
+      * frame-spill crop shows the window from an inner origin (wayland_surface_attach_shm); every conversion
+      * between surface-local and window positions must go through it (wayland_surface_content_origin). */
+     int content_x, content_y;
++    /* NEUTRON: a subsurface whose scale differs from its parent's: compositor (logical) position of
++     * surface-local (0,0). See wayland_surface_reconfigure_subsurface. */
++    BOOL mixed_scale;
++    double mixed_x, mixed_y;
+     /* NEUTRON: size of the shm buffer last attached, in window px (0 before the first attach).
+      * win32u clips a window surface to the desktop, so a window larger than the desktop has a
+      * buffer SMALLER than its window; see wayland_surface_viewport_destination(). */
+@@ -569,6 +573,7 @@
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+                                           enum wayland_surface_config_state state);
++void wayland_surface_mixed_scale_point(struct wayland_surface *surface, double sx, double sy, POINT *screen);
+ void wayland_surface_coords_from_window(struct wayland_surface *surface,
+                                         int window_x, int window_y,
+                                         int *surface_x, int *surface_y);
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -211,6 +211,7 @@
+         screen.x += window_rect->left + ox;
+         screen.y += window_rect->top + oy;
+     }
++    wayland_surface_mixed_scale_point(surface, wl_fixed_to_double(sx), wl_fixed_to_double(sy), &screen);
+     wayland_clamp_rounding_overshoot(&screen, window_rect);
+ 
+     wayland_win_data_release(data);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -25,6 +25,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <limits.h>
+ #include <math.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+@@ -2218,6 +2219,82 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON: outputs at different scales do not share one factor between window and compositor
++ * coordinates, so a point is converted by the output it is on. Nearest output for a point on none. */
++static struct wayland_output *neutron_output_at(int x, int y, BOOL logical)
++{
++    struct wayland_output *output, *best = NULL;
++    long best_dist = LONG_MAX;
++
++    wl_list_for_each(output, &process_wayland.output_list, link)
++    {
++        const struct wayland_output_state *state = &output->current;
++        int left, top, width, height;
++        long dx, dy, dist;
++
++        if (!state->current_mode) continue;
++        left = logical ? state->logical_x : state->x;
++        top = logical ? state->logical_y : state->y;
++        width = logical ? state->logical_w : wayland_output_mode_width(state, state->current_mode);
++        height = logical ? state->logical_h : wayland_output_mode_height(state, state->current_mode);
++        dx = x < left ? left - x : x >= left + width ? x - (left + width - 1) : 0;
++        dy = y < top ? top - y : y >= top + height ? y - (top + height - 1) : 0;
++        dist = dx * dx + dy * dy;
++        if (dist < best_dist)
++        {
++            best_dist = dist;
++            best = output;
++        }
++    }
++    return best;
++}
++
++static BOOL neutron_window_to_logical(int x, int y, double *logical_x, double *logical_y)
++{
++    struct wayland_output *output;
++    BOOL ret = FALSE;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    if ((output = neutron_output_at(x, y, FALSE)))
++    {
++        const struct wayland_output_state *state = &output->current;
++        *logical_x = state->logical_x + (x - state->x) * (double)state->logical_w /
++                     wayland_output_mode_width(state, state->current_mode);
++        *logical_y = state->logical_y + (y - state->y) * (double)state->logical_h /
++                     wayland_output_mode_height(state, state->current_mode);
++        ret = TRUE;
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    return ret;
++}
++
++/**********************************************************************
++ *          wayland_surface_mixed_scale_point
++ *
++ * NEUTRON: the screen position of a surface-local point of a subsurface whose scale differs from its
++ * parent's, by the output the point is on. Leaves `screen` alone for every other surface.
++ */
++void wayland_surface_mixed_scale_point(struct wayland_surface *surface, double sx, double sy, POINT *screen)
++{
++    struct wayland_output *output;
++    double x, y;
++
++    if (!surface->mixed_scale) return;
++    x = surface->mixed_x + sx;
++    y = surface->mixed_y + sy;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    if ((output = neutron_output_at(round(x), round(y), TRUE)))
++    {
++        const struct wayland_output_state *state = &output->current;
++        screen->x = round(state->x + (x - state->logical_x) *
++                          wayland_output_mode_width(state, state->current_mode) / state->logical_w);
++        screen->y = round(state->y + (y - state->logical_y) *
++                          wayland_output_mode_height(state, state->current_mode) / state->logical_h);
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++}
++
+ /**********************************************************************
+  *          wayland_surface_reconfigure_subsurface
+  *
+@@ -2250,6 +2327,33 @@
+ 
+         wayland_surface_coords_from_window(surface, local_x, local_y, &x, &y);
+ 
++        /* NEUTRON: wl_subsurface_set_position takes the parent's coordinates, and a per-monitor-aware
++         * window that crossed onto an output of another scale has its own scale now, so dividing by
++         * that put a floating Photoshop panel far from where it belonged, past the edge of a 1920 wide
++         * screen. Pointer motion then came back relative to that place and the panel jumped between
++         * two positions at every event. Kill switch NEUTRON_SUBSURFACE_OUTPUT_SCALE=0. */
++        {
++            static int on = -1;
++            double child_x, child_y, parent_x, parent_y;
++
++            if (on < 0) on = neutron_gate("NEUTRON_SUBSURFACE_OUTPUT_SCALE", TRUE);
++            surface->mixed_scale = FALSE;
++            if (on && surface->window.scale != toplevel_surface->window.scale &&
++                neutron_window_to_logical(toplevel_surface->window.rect.left + local_x + origin_x,
++                                          toplevel_surface->window.rect.top + local_y + origin_y,
++                                          &child_x, &child_y) &&
++                neutron_window_to_logical(toplevel_surface->window.rect.left + origin_x,
++                                          toplevel_surface->window.rect.top + origin_y,
++                                          &parent_x, &parent_y))
++            {
++                x = round(child_x - parent_x);
++                y = round(child_y - parent_y);
++                surface->mixed_scale = TRUE;
++                surface->mixed_x = parent_x + x;
++                surface->mixed_y = parent_y + y;
++            }
++        }
++
+         TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
+ 
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
+--- a/dlls/winewayland.drv/wayland_tablet.c
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -233,6 +233,7 @@
+             screen.x += window_rect->left + ox;
+             screen.y += window_rect->top + oy;
+         }
++        wayland_surface_mixed_scale_point(surface, wl_fixed_to_double(x), wl_fixed_to_double(y), &screen);
+         /* NEUTRON: was an UNCONDITIONAL copy of the pointer's clamp -- pinning pen motion to the
+          * focused window's edge however far outside it really was. The pen has the same implicit
+          * grab as the mouse: while the tip is down, focus stays on the surface that received the
