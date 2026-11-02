@@ -1,0 +1,322 @@
+win32u: keep a layered window's pixels across a resize, hold it back until drawing reaches the new edges
+
+Photoshop resizes a floating panel, a layered window, with SWP_NOCOPYBITS and redraws it through its own
+queue instead of WM_PAINT. The new surface kept nothing, and nothing in the update region said a paint was
+coming, so the resize hold did not apply and dark grey blocks went on screen.
+
+The old pixels are now copied to the new surface for a visible layered top-level with no valid_rects, the
+invalid area included: all of a window's own pixels are invalid after such a resize, so only its children
+would be kept and the title row and edges stay dark.
+
+A layered window that grew is then held back until drawing reaches its new edges, for at most 34 ms from the
+first step of a drag. Photoshop sets a panel's width and height in two calls, so the edges add up. A new
+shape marks the whole surface dirty, which reads as drawing, so under this hold that waits for the end of it.
+
+Kill switches NEUTRON_LAYERED_KEEP_BITS=0 and NEUTRON_RESIZE_HOLD_EDGES=0.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -778,6 +778,7 @@
+ 
+ static BOOL neutron_dc_suppress_flush(void);
+ static BOOL neutron_resize_hold_active( struct window_surface *surface );
++static BOOL neutron_resize_hold_edges_waiting( struct window_surface *surface );
+ 
+ void window_surface_flush( struct window_surface *surface )
+ {
+@@ -1074,13 +1075,14 @@
+     {
+         NtGdiDeleteObjectApp( surface->shape_region );
+         surface->shape_region = 0;
+-        surface->bounds = surface->rect;
++        /* NEUTRON: an edge hold reads the bounds as what was drawn, and publishes everything when it ends */
++        if (!neutron_resize_hold_edges_waiting( surface )) surface->bounds = surface->rect;
+     }
+     else if (shape_region && !NtGdiEqualRgn( shape_region, surface->shape_region ))
+     {
+         if (!surface->shape_region) surface->shape_region = NtGdiCreateRectRgn( 0, 0, 0, 0 );
+         NtGdiCombineRgn( surface->shape_region, shape_region, 0, RGN_COPY );
+-        surface->bounds = surface->rect;
++        if (!neutron_resize_hold_edges_waiting( surface )) surface->bounds = surface->rect;
+     }
+ 
+     window_surface_unlock( surface );
+@@ -2024,11 +2026,17 @@
+  * Windows' compositor keeps showing a resized window's previous frame until the window has redrawn (INFERRED,
+  * not verified); do the same: hold the grown surface back until no window in its tree still needs painting,
+  * and never longer than NEUTRON_RESIZE_HOLD_MAX_MS. Kill switch NEUTRON_RESIZE_HOLD=0; NEUTRON_RESIZE_HOLD_TRACE=1
+- * logs each hold. */
++ * logs each hold.
++ *
++ * A layered window can be redrawn through the app's own queue instead of WM_PAINT, Photoshop's floating panels are,
++ * so nothing in the update region says a paint is coming. Those wait for drawing to reach the new edges of the
++ * window instead (neutron_resize_hold_edges), for at most NEUTRON_RESIZE_HOLD_EDGES_MS from the first step of a drag,
++ * so that a fast drag still moves. Kill switch NEUTRON_RESIZE_HOLD_EDGES=0. */
+ #define NEUTRON_RESIZE_HOLD_MAX_MS 250
++#define NEUTRON_RESIZE_HOLD_EDGES_MS 34
+ #define NEUTRON_RESIZE_HOLD_SLOTS 8
+ 
+-static struct { struct window_surface *surface; HWND hwnd; DWORD start; } neutron_holds[NEUTRON_RESIZE_HOLD_SLOTS];
++static struct { struct window_surface *surface; HWND hwnd; DWORD start; int right, bottom; } neutron_holds[NEUTRON_RESIZE_HOLD_SLOTS];
+ static pthread_mutex_t neutron_hold_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static int neutron_resize_hold_on(void)
+@@ -2062,38 +2070,120 @@
+     neutron_holds[slot].surface = surface;
+     neutron_holds[slot].hwnd = hwnd;
+     neutron_holds[slot].start = now;
++    neutron_holds[slot].right = neutron_holds[slot].bottom = 0;
+     pthread_mutex_unlock( &neutron_hold_lock );
+     if (neutron_resize_hold_trace()) ERR( "neutron-resize-hold: t=%u HOLD %p surface %p\n", (UINT)now, hwnd, surface );
+ }
+ 
++static BOOL neutron_resize_hold_edges_waiting( struct window_surface *surface )
++{
++    BOOL ret = FALSE;
++    int i;
++
++    pthread_mutex_lock( &neutron_hold_lock );
++    for (i = 0; i < NEUTRON_RESIZE_HOLD_SLOTS; i++)
++        if (neutron_holds[i].surface == surface) ret = neutron_holds[i].right || neutron_holds[i].bottom;
++    pthread_mutex_unlock( &neutron_hold_lock );
++    return ret;
++}
++
++BOOL neutron_resize_hold_edges_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_RESIZE_HOLD_EDGES" ); v = !(e && e[0] == '0'); }
++    return v && neutron_resize_hold_on();
++}
++
++void neutron_resize_hold_edges( struct window_surface *surface, HWND hwnd, int right, int bottom )
++{
++    int i, slot = 0;
++    DWORD now, start;
++
++    if (!surface || surface == &dummy_surface) return;
++    start = now = NtGetTickCount();
++    pthread_mutex_lock( &neutron_hold_lock );
++    for (i = 0; i < NEUTRON_RESIZE_HOLD_SLOTS; i++)
++    {
++        if (neutron_holds[i].surface && neutron_holds[i].hwnd == hwnd)
++        {
++            /* the next step of a drag: the wait keeps counting from the first one. Photoshop sets a panel's
++             * width and height in two calls, so the edges add up. */
++            slot = i;
++            if (neutron_holds[i].right || neutron_holds[i].bottom)
++            {
++                start = neutron_holds[i].start;
++                right = max( right, neutron_holds[i].right );
++                bottom = max( bottom, neutron_holds[i].bottom );
++            }
++            break;
++        }
++        if (!neutron_holds[i].surface ||
++            (int)(now - neutron_holds[i].start) > (int)(now - neutron_holds[slot].start)) slot = i;
++    }
++    neutron_holds[slot].surface = surface;
++    neutron_holds[slot].hwnd = hwnd;
++    neutron_holds[slot].start = start;
++    neutron_holds[slot].right = right;
++    neutron_holds[slot].bottom = bottom;
++    pthread_mutex_unlock( &neutron_hold_lock );
++    if (neutron_resize_hold_trace())
++        ERR( "neutron-resize-hold: t=%u HOLD edges %p surface %p to %d,%d\n", (UINT)now, hwnd, surface, right, bottom );
++}
++
+ static BOOL neutron_resize_hold_active( struct window_surface *surface )
+ {
+     HWND hwnd = 0, child = 0;
+     UINT flags = UPDATE_PAINT | UPDATE_ALLCHILDREN;
+     DWORD now, start = 0;
+-    int i, slot = -1;
++    int i, slot = -1, right = 0, bottom = 0, cap = NEUTRON_RESIZE_HOLD_MAX_MS;
+     BOOL hold = FALSE;
+ 
+     if (!neutron_resize_hold_on()) return FALSE;
+     pthread_mutex_lock( &neutron_hold_lock );
+     for (i = 0; i < NEUTRON_RESIZE_HOLD_SLOTS; i++)
+-        if (neutron_holds[i].surface == surface) { slot = i; hwnd = neutron_holds[i].hwnd; start = neutron_holds[i].start; break; }
++        if (neutron_holds[i].surface == surface)
++        {
++            slot = i; hwnd = neutron_holds[i].hwnd; start = neutron_holds[i].start;
++            right = neutron_holds[i].right; bottom = neutron_holds[i].bottom;
++            break;
++        }
+     pthread_mutex_unlock( &neutron_hold_lock );
+     if (slot < 0) return FALSE;
+ 
+     now = NtGetTickCount();
+-    if ((int)(now - start) < NEUTRON_RESIZE_HOLD_MAX_MS && surface->hwnd == hwnd &&
+-        get_update_flags( hwnd, &child, &flags ) && (flags & UPDATE_PAINT))
++    if (right || bottom)
++    {
++        RECT bounds;
++
++        cap = NEUTRON_RESIZE_HOLD_EDGES_MS;
++        window_surface_lock( surface );
++        bounds = surface->bounds;
++        window_surface_unlock( surface );
++        if ((int)(now - start) < cap && surface->hwnd == hwnd && (bounds.right < right || bounds.bottom < bottom))
++            hold = TRUE;
++    }
++    else if ((int)(now - start) < NEUTRON_RESIZE_HOLD_MAX_MS && surface->hwnd == hwnd &&
++             get_update_flags( hwnd, &child, &flags ) && (flags & UPDATE_PAINT))
+         hold = TRUE;
+ 
+     if (!hold)
+     {
+         pthread_mutex_lock( &neutron_hold_lock );
+-        if (neutron_holds[slot].surface == surface) neutron_holds[slot].surface = NULL, neutron_holds[slot].hwnd = 0;
++        if (neutron_holds[slot].surface == surface)
++        {
++            neutron_holds[slot].surface = NULL, neutron_holds[slot].hwnd = 0;
++            neutron_holds[slot].right = neutron_holds[slot].bottom = 0;
++        }
+         pthread_mutex_unlock( &neutron_hold_lock );
++        if (right || bottom)
++        {
++            window_surface_lock( surface );
++            surface->bounds = surface->rect;
++            window_surface_unlock( surface );
++        }
+         if (neutron_resize_hold_trace())
+             ERR( "neutron-resize-hold: t=%u RELEASE %p after %u ms (%s)\n", (UINT)now, hwnd, (UINT)(now - start),
+-                 (int)(now - start) >= NEUTRON_RESIZE_HOLD_MAX_MS ? "cap" : "painted" );
++                 (int)(now - start) >= cap ? "cap" : "painted" );
+     }
+     return hold;
+ }
+@@ -2315,12 +2405,13 @@
+  * Move the window bits from a previous window surface when its surface is recreated.
+  */
+ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+-                               const RECT *old_visible_rect, const RECT *valid_rects )
++                               const RECT *old_visible_rect, const RECT *valid_rects, BOOL keep_invalid )
+ {
+     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     BITMAPINFO *info = (BITMAPINFO *)buffer;
+     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
+-    HRGN rgn = get_update_region( hwnd, &flags, NULL );
++    /* NEUTRON: keep_invalid copies what the app will repaint too, see neutron_layered_keep_bits */
++    HRGN rgn = keep_invalid ? 0 : get_update_region( hwnd, &flags, NULL );
+     HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
+     void *bits;
+ 
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -55,7 +55,7 @@
+ extern HRGN get_client_visible_region( HWND hwnd );
+ extern HRGN get_client_surfaces_region( HWND hwnd );
+ extern void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window_surface *old_surface,
+-                                      const RECT *old_visible_rect, const RECT *valid_rects );
++                                      const RECT *old_visible_rect, const RECT *valid_rects, BOOL keep_invalid );
+ extern void register_window_surface( struct window_surface *old,
+                                      struct window_surface *new );
+ 
+@@ -63,6 +63,8 @@
+ extern void window_surface_unlock( struct window_surface *surface );
+ extern void window_surface_flush( struct window_surface *surface );
+ extern void neutron_resize_hold_set( struct window_surface *surface, HWND hwnd );
++extern BOOL neutron_resize_hold_edges_on(void);
++extern void neutron_resize_hold_edges( struct window_surface *surface, HWND hwnd, int right, int bottom );
+ extern void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
+ extern void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
+ 
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -3024,6 +3024,24 @@
+  * copied one. Windows never shows a resized window blank: the contents follow the window. Lightroom Classic's Masks
+  * panel resizes three times per Select Subject, and frame dumps show a whole-panel blank frame each time.
+  * Copy first, then update the shape (and flush). Kill switch NEUTRON_COPY_BEFORE_SHAPE=0. */
++/* NEUTRON: a layered window keeps its contents across a resize on Windows, whatever SWP_NOCOPYBITS says, but
++ * here a new surface starts as the dark fill, and with no valid_rects nothing was copied in. Photoshop
++ * resizes a floating panel, a layered window, that way and redraws through its own queue, not WM_PAINT, so
++ * the resize hold saw nothing to wait for and the empty surface went on screen as dark grey blocks, shrinking
++ * as well as growing. The copy takes the invalid area too: all of a window's own pixels are invalid after such
++ * a resize, its title row and edges here, and only its children would be kept. Kill switch
++ * NEUTRON_LAYERED_KEEP_BITS=0. */
++static BOOL neutron_layered_keep_bits(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_LAYERED_KEEP_BITS" );
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
+ static BOOL neutron_region_after_lock(void)
+ {
+     static int on = -1;
+@@ -3069,7 +3087,7 @@
+     UINT raw_dpi, monitor_dpi, dpi = get_thread_dpi();
+     UINT old_raw_dpi = 0; /* NEUTRON: window's monitor raw dpi before the move (for WM_DPICHANGED) */
+     HMONITOR monitor_override;  /* NEUTRON: driver-authoritative monitor, or 0 */
+-    BOOL ret, is_layered, is_child, need_icons = FALSE, update_region = FALSE;
++    BOOL ret, is_layered, is_child, need_icons = FALSE, update_region = FALSE, keep_bits = FALSE;
+     struct window_rects old_rects;
+     RECT extra_rects[3];
+     struct window_surface *old_surface;
+@@ -3187,9 +3205,27 @@
+             (new_rects->window.right - new_rects->window.left > old_rects.window.right - old_rects.window.left ||
+              new_rects->window.bottom - new_rects->window.top > old_rects.window.bottom - old_rects.window.top))
+             neutron_resize_hold_set( new_surface, hwnd );
++        /* NEUTRON resize hold: a layered window that grew with no bits to keep, on a new surface or on the one it
++         * has, whose spare room holds stale pixels. Three pixels short of the far edge: Photoshop leaves the last
++         * two rows of a panel undrawn. Kill switch NEUTRON_RESIZE_HOLD_EDGES=0. */
++        if (!valid_rects && !is_child && new_surface && old_surface && (win->dwExStyle & WS_EX_LAYERED) &&
++            (win->dwStyle & WS_VISIBLE) && neutron_resize_hold_edges_on())
++        {
++            int width = new_rects->visible.right - new_rects->visible.left;
++            int height = new_rects->visible.bottom - new_rects->visible.top;
++            int old_width = old_rects.visible.right - old_rects.visible.left;
++            int old_height = old_rects.visible.bottom - old_rects.visible.top;
++
++            if (width > old_width || height > old_height)
++                neutron_resize_hold_edges( new_surface, hwnd, width > old_width ? max( old_width + 1, width - 3 ) : 0,
++                                           height > old_height ? max( old_height + 1, height - 3 ) : 0 );
++        }
+         /* NEUTRON fresh-surface-no-blank: when the window got a NEW surface, update_surface_region() (which
+          * flushes, window_surface_set_shape) runs below, after the old bits are copied into it. */
+-        if (old_surface == new_surface || !old_surface || !valid_rects || !neutron_copy_before_shape())
++        keep_bits = !valid_rects && !is_child && new_surface && old_surface && new_surface != old_surface &&
++                    (win->dwExStyle & WS_EX_LAYERED) && (win->dwStyle & WS_VISIBLE) &&
++                    neutron_copy_before_shape() && neutron_layered_keep_bits();
++        if (old_surface == new_surface || !old_surface || (!valid_rects && !keep_bits) || !neutron_copy_before_shape())
+         {
+             /* NEUTRON: after release_win_ptr below, see update_surface_region. Kill switch
+              * NEUTRON_REGION_AFTER_LOCK=0. */
+@@ -3248,7 +3284,7 @@
+ 
+                 if (old_surface != new_surface)
+                 {
+-                    move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, valid_rects );
++                    move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, valid_rects, FALSE );
+                     if (neutron_copy_before_shape()) update_surface_region( surface_win );
+                 }
+                 else
+@@ -3257,6 +3293,21 @@
+                     move_window_bits( hwnd, new_rects, valid_rects, vis_before );
+                 }
+             }
++            else if (keep_bits)
++            {
++                RECT rects[2];
++                int width = min( new_rects->visible.right - new_rects->visible.left,
++                                 old_rects.visible.right - old_rects.visible.left );
++                int height = min( new_rects->visible.bottom - new_rects->visible.top,
++                                  old_rects.visible.bottom - old_rects.visible.top );
++
++                SetRect( &rects[0], new_rects->visible.left, new_rects->visible.top,
++                         new_rects->visible.left + width, new_rects->visible.top + height );
++                SetRect( &rects[1], old_rects.visible.left, old_rects.visible.top,
++                         old_rects.visible.left + width, old_rects.visible.top + height );
++                move_window_bits_surface( hwnd, &new_rects->window, old_surface, &old_rects.visible, rects, TRUE );
++                update_surface_region( surface_win );
++            }
+             window_surface_release( old_surface );
+         }
+         else if (valid_rects)

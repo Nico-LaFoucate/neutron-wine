@@ -1,0 +1,80 @@
+From: Neutron
+Subject: [PATCH] d3d11: keep the last Vulkan device for the next D3D11 device
+
+A D3D11 device is cheap to make on Windows. One Vulkan device costs about 120 ms to make and free on NVIDIA,
+with the driver opened again and a new set of threads. AdobeOwl.dll makes a throwaway D3D11 device each time it
+draws a panel's shadow, which is every step of a panel resize in Photoshop: 180 ms a step, 120 of it this.
+
+The D3D11 device stays new each time, so nothing changes for the app. Only the Vulkan device under it is kept,
+and it goes to the next D3D11 device once nothing else holds it. Reuses are capped at 256 because the pipeline
+manager keeps every shader it has seen until its Vulkan device goes. Kill switch NEUTRON_DXVK_WARM_DEVICE=0.
+
+diff --git a/src/d3d11/d3d11_main.cpp b/src/d3d11/d3d11_main.cpp
+index 2c76f360..60da82df 100644
+--- a/src/d3d11/d3d11_main.cpp
++++ b/src/d3d11/d3d11_main.cpp
+@@ -15,6 +15,36 @@ namespace dxvk {
+ extern "C" {
+   using namespace dxvk;
+   
++  // NEUTRON: a D3D11 device is cheap to make on Windows, but one Vulkan device costs about 120 ms to make and
++  // free here on NVIDIA. AdobeOwl.dll makes a throwaway D3D11 device each time it draws a panel's shadow, which
++  // is every step of a panel resize in Photoshop. The D3D11 device stays new each time; only the Vulkan device
++  // under it is kept, and it goes to the next D3D11 device once nothing else holds it. Reuses are capped because
++  // the pipeline manager keeps every shader it has seen until its Vulkan device goes. The reference held here is
++  // not dropped at exit, the same as a device an app leaks. Kill switch NEUTRON_DXVK_WARM_DEVICE=0.
++  static Rc<DxvkDevice> neutronCreateDevice(const Rc<DxvkAdapter>& adapter) {
++    static const bool enabled = env::getEnvVar("NEUTRON_DXVK_WARM_DEVICE") != "0";
++    static dxvk::mutex mutex;
++    static Rc<DxvkDevice>* warm = new Rc<DxvkDevice>();
++    static uint32_t uses = 0u;
++
++    if (!enabled)
++      return adapter->createDevice();
++
++    std::lock_guard lock(mutex);
++
++    if (*warm != nullptr && (*warm)->adapter() == adapter && (*warm)->refCount() == 1u
++     && (*warm)->getDeviceStatus() == VK_SUCCESS && uses < 256u) {
++      uses += 1u;
++      return *warm;
++    }
++
++    Rc<DxvkDevice> device = adapter->createDevice();
++    *warm = device;
++    uses = 0u;
++    return device;
++  }
++
++
+   HRESULT D3D11InternalCreateDevice(
+           IDXGIFactory*       pFactory,
+           IDXGIAdapter*       pAdapter,
+@@ -66,7 +96,7 @@ extern "C" {
+ 
+     try {
+       // Create Vulkan device so we have up-to-date features / properties
+-      Rc<DxvkDevice> dxvkDevice = dxvkAdapter->createDevice();
++      Rc<DxvkDevice> dxvkDevice = neutronCreateDevice(dxvkAdapter);
+ 
+       // Find the highest feature level supported by the device.
+       // This works because the feature level array is ordered.
+diff --git a/src/util/rc/util_rc.h b/src/util/rc/util_rc.h
+index b92cf00b..bad2c688 100644
+--- a/src/util/rc/util_rc.h
++++ b/src/util/rc/util_rc.h
+@@ -28,6 +28,14 @@ namespace dxvk {
+     force_inline uint32_t decRef() {
+       return --m_refCount;
+     }
++
++    /**
++     * \brief Current reference count
++     * \returns Reference count
++     */
++    force_inline uint32_t refCount() const {
++      return m_refCount.load();
++    }
+     
+   private:
+     
