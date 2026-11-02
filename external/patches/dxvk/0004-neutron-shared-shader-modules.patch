@@ -1,0 +1,124 @@
+From: Neutron
+Subject: [PATCH] d3d11: share one shader set among the D3D11 devices on the warm Vulkan device
+
+0003 keeps the last Vulkan device for the next D3D11 device, but each new D3D11 device still built its
+own shader set, so a throwaway device compiled Direct2D's shaders (and the effect shaders of runtime
+11.10-171) again, and their pipelines with them: about 2 to 4 ms of every step of a Photoshop panel
+resize, where AdobeOwl.dll makes a throwaway device for the panel's shadow.
+
+The devices made on the warm Vulkan device now share one D3D11ShaderModuleSet, kept with the warm slot,
+so a new device finds the shaders, and through them the pipelines, the last one compiled. A shader
+depends only on its bytecode, the Vulkan device and the app's config, the same on all of them. Shaders
+with class linkage or an immediate constant buffer (uploaded by the creating device's initializer) stay
+per device. Kill switch NEUTRON_DXVK_SHARED_SHADERS=0.
+
+Lab, Photoshop panel resize, 4 runs each, alternating: 19.2 vs 22.9 ms main-thread CPU per size change,
+312 vs 246 size changes per drag, page faults per change 2900-3500 vs 4260-4750.
+
+--- a/src/d3d11/d3d11_main.cpp
++++ b/src/d3d11/d3d11_main.cpp
+@@ -12,6 +12,28 @@
+   Logger Logger::s_instance("d3d11.log");
+ }
+   
++namespace dxvk {
++  static dxvk::mutex g_neutronWarmMutex;
++  static Rc<DxvkDevice>* g_neutronWarm = new Rc<DxvkDevice>();
++  static std::shared_ptr<D3D11ShaderModuleSet>* g_neutronWarmShaders = new std::shared_ptr<D3D11ShaderModuleSet>();
++  static uint32_t g_neutronWarmUses = 0u;
++
++  // NEUTRON: the D3D11 devices made on the warm Vulkan device share one shader set, so a new device finds the
++  // shaders, and through them the pipelines, the last one compiled. A throwaway device otherwise compiled
++  // Direct2D's shaders and ours again each time, about 2 to 4 ms of every step of a Photoshop panel resize.
++  // Shaders depend only on their bytecode, the Vulkan device and the app's config, the same on all of them.
++  // Kill switch NEUTRON_DXVK_SHARED_SHADERS=0.
++  std::shared_ptr<D3D11ShaderModuleSet> neutronSharedShaderModules(DxvkDevice* device) {
++    static const bool enabled = env::getEnvVar("NEUTRON_DXVK_SHARED_SHADERS") != "0";
++
++    std::lock_guard lock(g_neutronWarmMutex);
++
++    if (!enabled || g_neutronWarm->ptr() != device)
++      return nullptr;
++    return *g_neutronWarmShaders;
++  }
++}
++
+ extern "C" {
+   using namespace dxvk;
+   
+@@ -23,24 +45,22 @@
+   // not dropped at exit, the same as a device an app leaks. Kill switch NEUTRON_DXVK_WARM_DEVICE=0.
+   static Rc<DxvkDevice> neutronCreateDevice(const Rc<DxvkAdapter>& adapter) {
+     static const bool enabled = env::getEnvVar("NEUTRON_DXVK_WARM_DEVICE") != "0";
+-    static dxvk::mutex mutex;
+-    static Rc<DxvkDevice>* warm = new Rc<DxvkDevice>();
+-    static uint32_t uses = 0u;
+ 
+     if (!enabled)
+       return adapter->createDevice();
+ 
+-    std::lock_guard lock(mutex);
++    std::lock_guard lock(g_neutronWarmMutex);
+ 
+-    if (*warm != nullptr && (*warm)->adapter() == adapter && (*warm)->refCount() == 1u
+-     && (*warm)->getDeviceStatus() == VK_SUCCESS && uses < 256u) {
+-      uses += 1u;
+-      return *warm;
++    if (*g_neutronWarm != nullptr && (*g_neutronWarm)->adapter() == adapter && (*g_neutronWarm)->refCount() == 1u
++     && (*g_neutronWarm)->getDeviceStatus() == VK_SUCCESS && g_neutronWarmUses < 256u) {
++      g_neutronWarmUses += 1u;
++      return *g_neutronWarm;
+     }
+ 
+     Rc<DxvkDevice> device = adapter->createDevice();
+-    *warm = device;
+-    uses = 0u;
++    *g_neutronWarm = device;
++    *g_neutronWarmShaders = std::make_shared<D3D11ShaderModuleSet>();
++    g_neutronWarmUses = 0u;
+     return device;
+   }
+ 
+--- a/src/d3d11/d3d11_device.h
++++ b/src/d3d11/d3d11_device.h
+@@ -46,6 +46,8 @@
+    * Implements the ID3D11Device interfaces
+    * as part of a \ref D3D11DeviceContainer.
+    */
++  std::shared_ptr<D3D11ShaderModuleSet> neutronSharedShaderModules(DxvkDevice* device);
++
+   class D3D11Device final : public ID3D11Device5 {
+     /// Maximum number of resource init commands per command buffer
+     constexpr static uint64_t InitCommandThreshold = 50;
+@@ -512,6 +514,7 @@
+     D3D11StateObjectSet<D3D11RasterizerState>   m_rsStateObjects;
+     D3D11StateObjectSet<D3D11SamplerState>      m_samplerObjects;
+     D3D11ShaderModuleSet                        m_shaderModules;
++    std::shared_ptr<D3D11ShaderModuleSet>       m_neutronSharedShaders;
+ 
+     D3D_FEATURE_LEVEL               m_maxFeatureLevel;
+     D3D11DeviceFeatures             m_deviceFeatures;
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -53,6 +53,7 @@
+     m_shaderOptions     (GetShaderOptions(m_dxvkDevice, m_d3d11Options)),
+     m_maxFeatureLevel   (D3D11DeviceFeatures::GetMaxFeatureLevel(*m_dxvkDevice)),
+     m_deviceFeatures    (*m_dxvkDevice, m_d3d11Options, m_featureLevel) {
++    m_neutronSharedShaders = neutronSharedShaderModules(m_dxvkDevice.ptr());
+     m_initializer = new D3D11Initializer(this);
+     m_context     = new D3D11ImmediateContext(this, m_dxvkDevice);
+     m_d3d10Device = new D3D10Device(this, m_context.ptr());
+@@ -2238,7 +2239,12 @@
+     // Initialize the actual shader
+     D3D11CommonShader commonShader = { };
+ 
+-    HRESULT hr = m_shaderModules.GetShaderModule(this,
++    // NEUTRON: shared with the other devices on the warm Vulkan device (see neutronSharedShaderModules), except a
++    // shader with class linkage or an immediate constant buffer, which this device's initializer uploads.
++    D3D11ShaderModuleSet& modules = m_neutronSharedShaders && !pLinkage && !icbOp
++      ? *m_neutronSharedShaders : m_shaderModules;
++
++    HRESULT hr = modules.GetShaderModule(this,
+       static_cast<D3D11ClassLinkage*>(pLinkage),
+       ShaderKey, ModuleInfo, pShaderBytecode, BytecodeLength,
+       icbInfo, bindingMask, &commonShader);
