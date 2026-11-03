@@ -1,0 +1,100 @@
+user32, win32u, imm32, winewayland, winex11: keyboard layout handles (HKL) are sign-extended from 32 bits, as on Windows.
+
+vMix 29 (.NET Framework 4.8, WinForms) stopped at start with "Unhandled exception: System.OverflowException: Arithmetic
+operation resulted in an overflow. at System.Windows.Forms.InputLanguage.get_Culture()", from Control.WmInputLangChangeRequest
+(lab, 2026-11-03, Wayland driver). WinForms' InputLanguage.Culture does (int)handle, a checked conversion of the IntPtr. An
+HKL is a handle, and 64-bit Windows sign-extends 32-bit handle values, so IME (0xE001xxxx) and custom-layout (0xF0xxxxxx)
+HKLs are 0xFFFFFFFFE001xxxx there and the conversion fits. Wine built every HKL zero-extended (UlongToHandle,
+(HKL)(UINT_PTR)), and the Wayland driver sends an IME HKL in WM_INPUTLANGCHANGEREQUEST to any window with an input context,
+so every 64-bit WinForms app on the Wayland driver could hit it.
+
+All HKL producers now sign-extend (LongToHandle): user32 LoadKeyboardLayoutW, win32u's locale layout, imm32's IME HKLs,
+winewayland's layout and IME HKLs, winex11's IME HKL. Locale HKLs (MAKELONG(lcid, lcid), bit 31 clear) are unchanged;
+consumers read HKL parts through HIWORD/LOWORD and compare HKLs made by the same functions.
+
+Lab, vMix 29 in a prefix with Microsoft .NET 4.8: without this the exception, 2 of 2 runs (on 11.10-173j and 11.10-174);
+with it (174 + this) the language and registration dialogs, 2 of 2.
+
+--- a/dlls/imm32/imm.c
++++ b/dlls/imm32/imm.c
+@@ -2169,7 +2169,7 @@
+     {
+         DWORD disposition = 0;
+ 
+-        hkl = (HKL)(UINT_PTR)MAKELONG( lcid, 0xe000 | count );
++        hkl = LongToHandle( MAKELONG( lcid, 0xe000 | count ) ); /* NEUTRON: sign-extended, as Windows' HKLs */
+         swprintf( path, ARRAY_SIZE(path), layouts_formatW, (ULONG)(ULONG_PTR)hkl);
+         if (!RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0,
+                               KEY_WRITE, NULL, &hkey, &disposition ))
+--- a/dlls/user32/input.c
++++ b/dlls/user32/input.c
+@@ -387,8 +387,9 @@
+     FIXME_(keyboard)( "name %s, flags %x, semi-stub!\n", debugstr_w( name ), flags );
+ 
+     tmp = wcstoul( name, NULL, 16 );
+-    if (HIWORD( tmp )) layout = UlongToHandle( tmp );
+-    else layout = UlongToHandle( MAKELONG( LOWORD( tmp ), LOWORD( tmp ) ) );
++    /* NEUTRON: an HKL is a handle, sign-extended from 32 bits as Windows does (see win32u's get_locale_kbd_layout). */
++    if (HIWORD( tmp )) layout = LongToHandle( tmp );
++    else layout = LongToHandle( MAKELONG( LOWORD( tmp ), LOWORD( tmp ) ) );
+ 
+     if (!((UINT_PTR)layout >> 28)) id = LOWORD( tmp );
+     else id = HIWORD( layout ); /* IME or aliased layout */
+@@ -405,7 +406,7 @@
+         RegCloseKey( hkey );
+     }
+ 
+-    layout = UlongToHandle( MAKELONG( locale, id ) );
++    layout = LongToHandle( MAKELONG( locale, id ) );
+     if ((flags & KLF_ACTIVATE) && NtUserActivateKeyboardLayout( layout, 0 )) return layout;
+ 
+     /* FIXME: semi-stub: returning default layout */
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -991,7 +991,11 @@
+ 
+     NtQueryDefaultLocale( TRUE, &layout );
+     layout = MAKELONG( layout, layout );
+-    return ULongToHandle( layout );
++    /* NEUTRON 2026-11-03: HKLs are handles, sign-extended from 32 bits on 64-bit Windows, as every HKL Wine makes
++     * now is. A zero-extended IME or custom-layout HKL (0x00000000E0010409) made .NET's WinForms throw
++     * OverflowException in InputLanguage.Culture, which does (int)handle, on every WM_INPUTLANGCHANGEREQUEST
++     * (vMix 29 under the Wayland driver). */
++    return LongToHandle( layout );
+ }
+ 
+ /***********************************************************************
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -71,7 +71,7 @@
+ 
+ static HKL get_ime_hkl(LCID locale)
+ {
+-    return ULongToHandle(MAKELONG(locale, 0xe001));
++    return LongToHandle(MAKELONG(locale, 0xe001)); /* NEUTRON: HKLs are sign-extended, see win32u */
+ }
+ 
+ struct layout
+@@ -390,8 +390,9 @@
+ 
+ static HKL get_layout_hkl(struct layout *layout, LCID locale)
+ {
+-    if (!layout->layout_id) return (HKL)(UINT_PTR)MAKELONG(locale, layout->lang);
+-    else return (HKL)(UINT_PTR)MAKELONG(locale, 0xf000 | layout->layout_id);
++    /* NEUTRON: HKLs are sign-extended from 32 bits, as on Windows (see win32u's get_locale_kbd_layout) */
++    if (!layout->layout_id) return LongToHandle(MAKELONG(locale, layout->lang));
++    else return LongToHandle(MAKELONG(locale, 0xf000 | layout->layout_id));
+ }
+ 
+ /* NEUTRON: the VK of a remapped control key.
+--- a/dlls/winex11.drv/xim.c
++++ b/dlls/winex11.drv/xim.c
+@@ -105,7 +105,7 @@
+ 
+ static HKL get_ime_hkl( LCID locale )
+ {
+-    return ULongToHandle( MAKELONG( locale, 0xe001 ) );
++    return LongToHandle( MAKELONG( locale, 0xe001 ) ); /* NEUTRON: HKLs are sign-extended, see win32u */
+ }
+ 
+ static void activate_ime_hkl( HWND hwnd )
