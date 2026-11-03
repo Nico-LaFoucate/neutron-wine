@@ -1,0 +1,194 @@
+user32: a readable outline for check boxes and radio buttons when the palette's 3D ring has none.
+
+FL Studio 2026's installer showed its unselected "Install for" radio button as nothing at all (lab, 2026-11-03). The
+classic control is a COLOR_WINDOW face inside a ring of the 3D edge colors; Neutron's dark palette has face and window 43
+and edges 16 to 60, so an unchecked control sits at about 1.2:1 against its background, and a disabled checked one's mark
+(ButtonShadow 30) vanishes too. WCAG 2.1 asks 3:1 of a control's outline.
+
+DrawFrameControl (user32 and comctl32 v6 buttons both draw through it) now checks the palette: when neither the window
+color nor any of the ring's edge colors (COLOR_WINDOWFRAME for flat/mono) reaches 3:1 against the button face, the ring is
+drawn flat, halfway between the window and window text colors (Neutron: gray 133, 3.8:1), with the face color as its inner
+band; disabled controls use GrayText for the outline and the mark. The palette is not changed. Palettes whose ring is
+readable draw exactly as before (Wine's default: dark shadow 4.8:1).
+
+Lab: test program with every state, user32 and comctl32 v6 buttons: before nearly invisible, after every state outlined;
+FL Studio's installer (32-bit, NSIS) "Install for" radios readable. Not changed: the disabled labels' embossed text (same
+palette problem, text drawing), the tree view's expander arrows.
+
+--- a/dlls/user32/uitools.c
++++ b/dlls/user32/uitools.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <stdarg.h>
++#include <math.h>
+ 
+ #define WINE_NO_INLINE_RECT
+ #include "windef.h"
+@@ -708,6 +709,77 @@
+ }
+ 
+ 
++/* NEUTRON 2026-11-03: a readable outline for check boxes and radio buttons under a palette that has none.
++ *
++ * The classic control is a COLOR_WINDOW face inside a ring of the 3D edge colors (shadow, dark shadow, highlight, light;
++ * COLOR_WINDOWFRAME when flat or mono). A dark palette whose edges sit close to its face -- Neutron's: face and window 43,
++ * edges 16 to 60 -- leaves an unchecked control invisible, about 1.2:1 against its background where WCAG 2.1 asks 3:1 of
++ * a control's outline (FL Studio's installer, 2026-11-03). When neither the window color nor any of those edge colors
++ * reaches 3:1 against the button face, the ring is drawn flat: halfway between the window and window text colors, the way
++ * dark-mode controls outline themselves, or GrayText when the control is disabled (whose mark, ButtonShadow, would vanish
++ * the same way). The palette is not changed and palettes with a readable ring draw exactly as before. */
++static double sys_color_luminance( int index )
++{
++    COLORREF color = GetSysColor( index );
++    double c[3] = { GetRValue(color) / 255.0, GetGValue(color) / 255.0, GetBValue(color) / 255.0 };
++    int i;
++
++    for (i = 0; i < 3; i++) c[i] = c[i] <= 0.03928 ? c[i] / 12.92 : pow( (c[i] + 0.055) / 1.055, 2.4 );
++    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
++}
++
++static BOOL sys_color_readable_on_face( int index )
++{
++    double a = sys_color_luminance( index ), b = sys_color_luminance( COLOR_BTNFACE );
++    return (max( a, b ) + 0.05) / (min( a, b ) + 0.05) >= 3.0;
++}
++
++/* The flat outline color for a check box or radio button whose classic ring would be unreadable; FALSE when it is
++ * readable and the control draws as before. */
++static BOOL unreadable_control_ring( UINT flags, COLORREF *outline )
++{
++    static const int edges[] = { COLOR_BTNSHADOW, COLOR_BTNHIGHLIGHT, COLOR_3DDKSHADOW, COLOR_3DLIGHT };
++    COLORREF window, text;
++    unsigned int i;
++
++    if (sys_color_readable_on_face( COLOR_WINDOW )) return FALSE;
++    if (flags & (DFCS_FLAT | DFCS_MONO))
++    {
++        if (sys_color_readable_on_face( COLOR_WINDOWFRAME )) return FALSE;
++    }
++    else
++    {
++        for (i = 0; i < ARRAY_SIZE(edges); i++)
++            if (sys_color_readable_on_face( edges[i] )) return FALSE;
++    }
++
++    if (flags & DFCS_INACTIVE)
++    {
++        *outline = GetSysColor( COLOR_GRAYTEXT );
++        return TRUE;
++    }
++    window = GetSysColor( COLOR_WINDOW );
++    text = GetSysColor( COLOR_WINDOWTEXT );
++    *outline = RGB( (GetRValue(window) + GetRValue(text)) / 2, (GetGValue(window) + GetGValue(text)) / 2,
++                    (GetBValue(window) + GetBValue(text)) / 2 );
++    return TRUE;
++}
++
++static void fill_frame( HDC dc, const RECT *r, HBRUSH brush, int width )
++{
++    RECT side;
++
++    SetRect( &side, r->left, r->top, r->right, r->top + width );
++    FillRect( dc, &side, brush );
++    SetRect( &side, r->left, r->bottom - width, r->right, r->bottom );
++    FillRect( dc, &side, brush );
++    SetRect( &side, r->left, r->top + width, r->left + width, r->bottom - width );
++    FillRect( dc, &side, brush );
++    SetRect( &side, r->right - width, r->top + width, r->right, r->bottom - width );
++    FillRect( dc, &side, brush );
++}
++
++
+ /************************************************************************
+  *	UITOOLS_DFC_ButtonCheck
+  *
+@@ -722,13 +794,30 @@
+ {
+     RECT myr;
+     UINT flags = BF_RECT | BF_ADJUST;
++    COLORREF outline;
++    BOOL flat_ring = unreadable_control_ring( uFlags, &outline );
+ 
+     UITOOLS_MakeSquareRect(r, &myr);
+ 
+     if(uFlags & DFCS_FLAT) flags |= BF_FLAT;
+     else if(uFlags & DFCS_MONO) flags |= BF_MONO;
+ 
+-    UITOOLS95_DrawRectEdge( dc, &myr, EDGE_SUNKEN, flags, max( (myr.right - myr.left + 8) / 16, 1) );
++    if (flat_ring)
++    {
++        /* the sunken edge's two rings: the outline, then the face color; same geometry as BF_ADJUST */
++        int width = max( (myr.right - myr.left + 8) / 16, 1 );
++        HBRUSH brush = CreateSolidBrush( outline );
++
++        fill_frame( dc, &myr, brush, width );
++        DeleteObject( brush );
++        InflateRect( &myr, -width, -width );
++        if (!(uFlags & DFCS_TRANSPARENT))
++            fill_frame( dc, &myr, GetSysColorBrush( uFlags & (DFCS_INACTIVE | DFCS_PUSHED) ? COLOR_BTNFACE : COLOR_WINDOW ),
++                        width );
++        InflateRect( &myr, -width, -width );
++    }
++    else
++        UITOOLS95_DrawRectEdge( dc, &myr, EDGE_SUNKEN, flags, max( (myr.right - myr.left + 8) / 16, 1) );
+ 
+     if (!(uFlags & DFCS_TRANSPARENT))
+     {
+@@ -746,7 +835,7 @@
+         HPEN old_pen;
+         HBRUSH old_brush;
+         int color = (uFlags & DFCS_INACTIVE) || (uFlags & 0xff) == DFCS_BUTTON3STATE ?
+-            COLOR_BTNSHADOW : COLOR_WINDOWTEXT;
++            (flat_ring ? COLOR_GRAYTEXT : COLOR_BTNSHADOW) : COLOR_WINDOWTEXT;
+ 
+         pt[0].x = myr.right - 1;
+         pt[0].y = myr.top;
+@@ -789,6 +878,8 @@
+     HPEN hpsave;
+     HBRUSH hbsave;
+     int xc, yc;
++    COLORREF outline;
++    BOOL flat_ring = (uFlags & 0xff) == DFCS_BUTTONRADIO && unreadable_control_ring( uFlags, &outline );
+ 
+     if(BorderShrink < 1) BorderShrink = 1;
+ 
+@@ -812,7 +903,28 @@
+     }
+     else
+     {
+-        if(uFlags & (DFCS_FLAT|DFCS_MONO))
++        if (flat_ring)
++        {
++            HPEN pen = CreatePen( PS_SOLID, 1, outline );
++            HBRUSH brush = CreateSolidBrush( outline );
++
++            /* the classic ring's two bands: the outline, then the face color drawn below */
++            hpsave = SelectObject( dc, pen );
++            hbsave = SelectObject( dc, brush );
++            Ellipse( dc, myr.left, myr.top, myr.right, myr.bottom );
++            SelectObject( dc, hbsave );
++            SelectObject( dc, hpsave );
++            DeleteObject( brush );
++            DeleteObject( pen );
++            InflateRect( &myr, -BorderShrink, -BorderShrink );
++            i = !(uFlags & (DFCS_INACTIVE|DFCS_PUSHED)) ? COLOR_WINDOW : COLOR_BTNFACE;
++            hpsave = SelectObject( dc, SYSCOLOR_GetPen( i ) );
++            hbsave = SelectObject( dc, GetSysColorBrush( i ) );
++            Ellipse( dc, myr.left, myr.top, myr.right, myr.bottom );
++            SelectObject( dc, hbsave );
++            SelectObject( dc, hpsave );
++        }
++        else if(uFlags & (DFCS_FLAT|DFCS_MONO))
+         {
+             hpsave = SelectObject(dc, SYSCOLOR_GetPen(COLOR_WINDOWFRAME));
+             hbsave = SelectObject(dc, GetSysColorBrush(COLOR_WINDOWFRAME));
+@@ -858,7 +970,7 @@
+         i = i < 1 ? 1 : i;
+         SetRect(&myr, xc - i + i / 2, yc - i + i / 2, xc + i / 2, yc + i / 2);
+ 
+-        i = uFlags & DFCS_INACTIVE ? COLOR_BTNSHADOW : COLOR_WINDOWTEXT;
++        i = uFlags & DFCS_INACTIVE ? (flat_ring ? COLOR_GRAYTEXT : COLOR_BTNSHADOW) : COLOR_WINDOWTEXT;
+         hbsave = SelectObject(dc, GetSysColorBrush(i));
+         hpsave = SelectObject(dc, SYSCOLOR_GetPen(i));
+         Ellipse(dc, myr.left, myr.top, myr.right, myr.bottom);
