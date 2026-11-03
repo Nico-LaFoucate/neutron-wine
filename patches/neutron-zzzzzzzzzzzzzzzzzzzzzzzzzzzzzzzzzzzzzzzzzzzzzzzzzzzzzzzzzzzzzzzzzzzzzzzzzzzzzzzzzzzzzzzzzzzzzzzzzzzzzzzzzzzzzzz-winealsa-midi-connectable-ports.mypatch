@@ -1,0 +1,83 @@
+winealsa: list only MIDI ports other clients may connect to; a failed midiInOpen leaves the device closed.
+
+FL Studio 2026 showed "The driver was not enabled." and then "The MIDI input device is already allocated" at
+startup and in its MIDI settings, with its two PipeWire inputs marked FAIL (lab, 2026-11-03).
+
+1. Wine made a MIDI device of every sequencer port with read or write access. PipeWire's own ports
+   ("PipeWire-System", "PipeWire-RT-Event", /proc/asound/seq/clients "rwe-") have access but refuse
+   subscription, so midiInOpen's snd_seq_connect_from() can only fail. A port is now listed the way
+   ALSA's own aconnect lists it: access plus the matching SUBS capability, and not NO_EXPORT. Windows
+   lists only MIDI devices that open.
+2. midi_in_open() stored the open descriptor before connecting and returned MMSYSERR_NOTENABLED on a
+   failed connect without clearing it, so the next open answered MMSYSERR_ALLOCATED. Now a failed
+   open (connect or the receive thread) disconnects, clears the device and drops its sequencer
+   reference.
+
+Wine's winmm midi test, standalone: 11.10-173 = 855 tests, 2 failures (midiInOpen dev 0 and 1 rc=3,
+the PipeWire ports); with this = 445 tests, 0 failures. FL Studio on 173: both PipeWire inputs FAIL +
+error dialog; with this, 2 of 2: only Midi Through Port-0 is listed, no error.
+
+--- a/dlls/winealsa.drv/alsamidi.c
++++ b/dlls/winealsa.drv/alsamidi.c
+@@ -282,6 +282,15 @@
+     return MOD_FMSYNTH;
+ }
+ 
++/* Whether other clients may connect to a port in this direction, as ALSA's own aconnect decides it: the access and
++ * the subscription capability, and not hidden from other clients (NO_EXPORT). PipeWire's own sequencer ports
++ * ("PipeWire-System", "PipeWire-RT-Event") are readable and writable but refuse subscription, so a device made from
++ * one could never be opened; Windows lists only MIDI devices that open. */
++static BOOL port_connectable(unsigned int cap, unsigned int access, unsigned int subs)
++{
++    return (cap & (access | subs)) == (access | subs) && !(cap & SND_SEQ_PORT_CAP_NO_EXPORT);
++}
++
+ static void port_add(snd_seq_client_info_t* cinfo, snd_seq_port_info_t* pinfo, unsigned int cap, unsigned int type)
+ {
+     char name[MAXPNAMELEN];
+@@ -289,7 +298,7 @@
+     struct midi_dest *dest;
+     struct midi_src *src;
+ 
+-    if (cap & SND_SEQ_PORT_CAP_WRITE) {
++    if (port_connectable(cap, SND_SEQ_PORT_CAP_WRITE, SND_SEQ_PORT_CAP_SUBS_WRITE)) {
+         TRACE("OUT (%d:%s:%s:%d:%s:%x)\n",snd_seq_client_info_get_client(cinfo),
+               snd_seq_client_info_get_name(cinfo),
+               snd_seq_client_info_get_type(cinfo) == SND_SEQ_USER_CLIENT ? "user" : "kernel",
+@@ -364,7 +373,7 @@
+ 
+         num_dests++;
+     }
+-    if (cap & SND_SEQ_PORT_CAP_READ) {
++    if (port_connectable(cap, SND_SEQ_PORT_CAP_READ, SND_SEQ_PORT_CAP_SUBS_READ)) {
+         TRACE("IN  (%d:%s:%s:%d:%s:%x)\n",snd_seq_client_info_get_client(cinfo),
+               snd_seq_client_info_get_name(cinfo),
+               snd_seq_client_info_get_type(cinfo) == SND_SEQ_USER_CLIENT ? "user" : "kernel",
+@@ -1180,7 +1189,15 @@
+     ret = snd_seq_connect_from(midi_seq, port_in, src->addr.client, src->addr.port);
+     seq_unlock();
+     if (ret < 0)
++    {
++        /* A failed open leaves the device closed: the next midiInOpen must not answer MMSYSERR_ALLOCATED. */
++        WARN("could not connect %d:%d to input port %d: %s\n", src->addr.client, src->addr.port, port_in,
++             snd_strerror(ret));
++        src->midiDesc.hMidi = 0;
++        src->seq = NULL;
++        seq_close();
+         return MMSYSERR_NOTENABLED;
++    }
+ 
+     TRACE("Input port :%d connected %d:%d\n", port_in, src->addr.client, src->addr.port);
+ 
+@@ -1193,6 +1210,11 @@
+             close(rec_cancel_pipe[1]);
+             num_midi_in_started = 0;
+             WARN("Couldn't create thread for midi-in\n");
++            seq_lock();
++            snd_seq_disconnect_from(midi_seq, port_in, src->addr.client, src->addr.port);
++            seq_unlock();
++            src->midiDesc.hMidi = 0;
++            src->seq = NULL;
+             seq_close();
+             return MMSYSERR_ERROR;
+         }
