@@ -21,8 +21,9 @@ last is Neutron's rule for layered surfaces that mix GDI text into per-pixel alp
   the buffer at commit, in surface-local coordinates (scale and crop origin, rounded outward), re-applied when the shape,
   scale or crop origin changes and on every new wl_surface; WS_EX_LAYERED|WS_EX_TRANSPARENT stays an empty region. A
   flush that bails before the commit keeps the shape pending (win32u reports a change once).
-- win32u reports a layered window's shape to the server when it changes (new request set_window_hit_region, appended;
-  protocol 950), from the surface in the window's own dpi (a DPI-scaled window's wrapper, not its device-pixel target);
+- win32u reports a layered window's shape to the server when it changes (new request set_window_hit_region, appended to
+  protocol.def; the build's make_requests, which runs after these patches, generates the headers. The 948 -> 949 hunk
+  makes that regeneration land on 950, distinct from 11.10-175's 949), from the surface in the window's own dpi (a DPI-scaled window's wrapper, not its device-pixel target);
   is_point_in_window then skips a layered window's pixels outside it.
 
 More than 4096 rects: the window takes input everywhere, as before. Same-process and cross-process WindowFromPoint both
@@ -491,53 +492,12 @@ clicks pass but the drop onto the timeline is refused. Photoshop 2026: New Docum
  static const struct window_surface_funcs wayland_window_surface_funcs =
 --- a/include/wine/server_protocol.h
 +++ b/include/wine/server_protocol.h
-@@ -6229,6 +6229,21 @@
- };
- 
- 
-+
-+struct set_window_hit_region_request
-+{
-+    struct request_header __header;
-+    user_handle_t  window;
-+    int            clear;
-+    /* VARARG(region,rectangles); */
-+    char __pad_20[4];
-+};
-+struct set_window_hit_region_reply
-+{
-+    struct reply_header __header;
-+};
-+
-+
- enum request
- {
-     REQ_new_process,
-@@ -6538,6 +6553,7 @@
-     REQ_d3dkmt_object_open_name,
-     REQ_d3dkmt_mutex_acquire,
-     REQ_d3dkmt_mutex_release,
-+    REQ_set_window_hit_region,
-     REQ_NB_REQUESTS
- };
- 
-@@ -6852,6 +6868,7 @@
-     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
-     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
-     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
-+    struct set_window_hit_region_request set_window_hit_region_request;
- };
- union generic_reply
- {
-@@ -7164,8 +7181,9 @@
-     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
-     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+@@ -1,6 +1,6 @@
      struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
-+    struct set_window_hit_region_reply set_window_hit_region_reply;
  };
  
--#define SERVER_PROTOCOL_VERSION 949
-+#define SERVER_PROTOCOL_VERSION 950
+-#define SERVER_PROTOCOL_VERSION 948
++#define SERVER_PROTOCOL_VERSION 949
  
  #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
 --- a/server/protocol.def
@@ -554,71 +514,6 @@ clicks pass but the drop onto the timeline is refused. Photoshop 2026: New Docum
 +    int            clear;         /* no shape any more: hit-test the whole window */
 +    VARARG(region,rectangles);    /* the pixels that take input (relative to the visible rect, window dpi) */
 +@END
---- a/server/request_handlers.h
-+++ b/server/request_handlers.h
-@@ -314,6 +314,7 @@
- DECL_HANDLER(d3dkmt_object_open_name);
- DECL_HANDLER(d3dkmt_mutex_acquire);
- DECL_HANDLER(d3dkmt_mutex_release);
-+DECL_HANDLER(set_window_hit_region);
- 
- typedef void (*req_handler)( const void *req, void *reply );
- static const req_handler req_handlers[REQ_NB_REQUESTS] =
-@@ -625,6 +626,7 @@
-     (req_handler)req_d3dkmt_object_open_name,
-     (req_handler)req_d3dkmt_mutex_acquire,
-     (req_handler)req_d3dkmt_mutex_release,
-+    (req_handler)req_set_window_hit_region,
- };
- 
- C_ASSERT( sizeof(abstime_t) == 8 );
-@@ -2395,3 +2397,6 @@
- C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
- C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
- C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
-+C_ASSERT( offsetof(struct set_window_hit_region_request, window) == 12 );
-+C_ASSERT( offsetof(struct set_window_hit_region_request, clear) == 16 );
-+C_ASSERT( sizeof(struct set_window_hit_region_request) == 24 );
---- a/server/request_trace.h
-+++ b/server/request_trace.h
-@@ -3537,6 +3537,13 @@
-     dump_varargs_bytes( ", runtime=", cur_size );
- }
- 
-+static void dump_set_window_hit_region_request( const struct set_window_hit_region_request *req )
-+{
-+    fprintf( stderr, " window=%08x", req->window );
-+    fprintf( stderr, ", clear=%d", req->clear );
-+    dump_varargs_rectangles( ", region=", cur_size );
-+}
-+
- typedef void (*dump_func)( const void *req );
- 
- static const dump_func req_dumpers[REQ_NB_REQUESTS] =
-@@ -3848,6 +3855,7 @@
-     (dump_func)dump_d3dkmt_object_open_name_request,
-     (dump_func)dump_d3dkmt_mutex_acquire_request,
-     (dump_func)dump_d3dkmt_mutex_release_request,
-+    (dump_func)dump_set_window_hit_region_request,
- };
- 
- static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
-@@ -4159,6 +4167,7 @@
-     (dump_func)dump_d3dkmt_object_open_name_reply,
-     (dump_func)dump_d3dkmt_mutex_acquire_reply,
-     NULL,
-+    NULL,
- };
- 
- static const char * const req_names[REQ_NB_REQUESTS] =
-@@ -4470,6 +4479,7 @@
-     "d3dkmt_object_open_name",
-     "d3dkmt_mutex_acquire",
-     "d3dkmt_mutex_release",
-+    "set_window_hit_region",
- };
- 
- static const struct
 --- a/server/window.c
 +++ b/server/window.c
 @@ -71,6 +71,7 @@
