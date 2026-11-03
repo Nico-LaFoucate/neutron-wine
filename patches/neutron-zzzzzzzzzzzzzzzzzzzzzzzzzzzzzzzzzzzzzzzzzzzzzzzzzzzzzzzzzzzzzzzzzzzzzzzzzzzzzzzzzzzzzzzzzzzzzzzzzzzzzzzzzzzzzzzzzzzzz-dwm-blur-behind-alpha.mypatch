@@ -1,0 +1,249 @@
+dwmapi, win32u, winewayland: DwmEnableBlurBehindWindow composites the window with its pixels' alpha, as on Windows.
+
+CapCut 9.7 (Qt 6.2, lab, 2026-11-03, Wayland driver): opening any of its menus turned the whole screen black except the
+menu. Its menus, its floating EditPilot button and its home window are frameless translucent Qt windows drawn with
+Direct3D 11: WS_EX_LAYERED with SetLayeredWindowAttributes(LWA_ALPHA, 255), a blt-model (DXGI_SWAP_EFFECT_DISCARD) RGBA
+swap chain, and DwmEnableBlurBehindWindow with an empty blur region, which is how Qt makes such a window translucent: once
+blur-behind is on, Windows' compositor blends the window by its pixels' alpha, and blt-model presents land in that window
+surface. A menu is a popup the size of the whole screen, transparent but for the menu. Wine's DwmEnableBlurBehindWindow
+was a stub (E_NOTIMPL), the layered window surface was forced opaque (alpha 255 OR-ed in), and DXVK presented opaque, so
+the transparent part came out black over everything.
+
+DwmEnableBlurBehindWindow(DWM_BB_ENABLE) now sets a flag on the window (NtUserCallHwndParam_SetDwmAlpha, win32u). win32u
+copies it to every surface of the window (a DPI-scaled wrapper's target too), and winewayland then composites that
+surface with its pixels' alpha, the way it already does per-pixel layered surfaces: ARGB buffer, alpha passed through, GDI
+pixels (alpha 0 with a color) kept opaque. The window keeps being hit-tested as a whole, as on Windows. dwmapi also marks
+the window __wine_dwm_alpha, which DXVK's presenter reads (external dxvk 0006): a blt-model swap chain presenting into such
+a window gets VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR when the surface supports it.
+
+Not covered: the blur itself; a constant layered alpha below 255 on top of the pixels' alpha; a window that enables
+blur-behind after its swap chain exists (DXVK reads the mark when it creates the swap chain); DwmExtendFrameIntoClientArea
+(still a stub). Kill switch NEUTRON_DWM_ALPHA=0 (dwmapi returns E_NOTIMPL as before; DXVK's half then never fires).
+
+Lab, CapCut 9.7 on 176 + this + dxvk 0006 (PgI-capcut): Menu opens over the editor, the editor visible around it, 3 of 3
+(submenus too); the EditPilot button loses its black box. NEUTRON_DWM_ALPHA=0 on the same build: black, 1 of 1 (and
+black on 175t, 2 of 2); NEUTRON_DXVK_PREMULTIPLIED=0: black, 1 of 1. Photoshop 2026 (with an earlier 0006 that also
+premultiplied composition swap chains, since dropped as unproven): New Document typed name + document created, captures
+unchanged. Filmora 16 makes no blur-behind calls (start-up traced).
+
+
+--- a/dlls/dwmapi/dwmapi_main.c
++++ b/dlls/dwmapi/dwmapi_main.c
+@@ -28,6 +28,7 @@
+ #include "wingdi.h"
+ #include "winuser.h"
+ #include "dwmapi.h"
++#include "ntuser.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dwmapi);
+@@ -162,9 +163,31 @@
+  */
+ HRESULT WINAPI DwmEnableBlurBehindWindow(HWND hWnd, const DWM_BLURBEHIND *pBlurBuf)
+ {
+-    FIXME("%p %p\n", hWnd, pBlurBuf);
++    char gate[4] = {0};
+ 
+-    return E_NOTIMPL;
++    TRACE("%p %p\n", hWnd, pBlurBuf);
++
++    if (!pBlurBuf) return E_INVALIDARG;
++    if (GetEnvironmentVariableA("NEUTRON_DWM_ALPHA", gate, sizeof(gate)) && gate[0] == '0')
++    {
++        FIXME("%p %p, NEUTRON_DWM_ALPHA=0\n", hWnd, pBlurBuf);
++        return E_NOTIMPL;
++    }
++
++    /* NEUTRON dwm-alpha: the blur itself is not drawn, but the window is composited with its pixels'
++     * alpha, which is what translucent GPU-drawn windows enable it for (Qt: an empty blur region).
++     * win32u composites the window surface that way; the __wine_dwm_alpha mark tells DXVK that a
++     * blt-model swap chain presenting into this window should keep its alpha too (on Windows those
++     * presents land in the window surface DWM blends). */
++    if (pBlurBuf->dwFlags & DWM_BB_ENABLE)
++    {
++        TRACE("enable %d flags %#lx\n", pBlurBuf->fEnable, pBlurBuf->dwFlags);
++        if (!NtUserCallHwndParam( hWnd, !!pBlurBuf->fEnable, NtUserCallHwndParam_SetDwmAlpha ))
++            return E_HANDLE;
++        if (pBlurBuf->fEnable) SetPropW( hWnd, L"__wine_dwm_alpha", (HANDLE)1 );
++        else RemovePropW( hWnd, L"__wine_dwm_alpha" );
++    }
++    return S_OK;
+ }
+ 
+ /**********************************************************************
+--- a/dlls/dwmapi/Makefile.in
++++ b/dlls/dwmapi/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = dwmapi.dll
+-IMPORTS   = user32
++IMPORTS   = user32 win32u
+ IMPORTLIB = dwmapi
+ 
+ VER_FILEDESCRIPTION_STR = "Desktop Window Manager API"
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -330,6 +330,9 @@
+         window_surface_set_layered( surface->target_surface, window_surface->color_key,
+                                     window_surface->alpha_bits, window_surface->alpha_mask );
+     }
++    /* NEUTRON dwm-alpha: the target composites the same way */
++    if (surface->target_surface->dwm_alpha != window_surface->dwm_alpha)
++        window_surface_set_dwm_alpha( surface->target_surface, window_surface->dwm_alpha );
+ 
+     /* NEUTRON shape-hittest: this wrapper reported the shape in the window's dpi; the target's is device pixels */
+     flush_surface( surface->target_surface, FALSE );
+@@ -1145,6 +1148,19 @@
+     }
+     window_surface_unlock( surface );
+ }
++
++/* NEUTRON dwm-alpha: composite the surface with its pixels' alpha (DwmEnableBlurBehindWindow). */
++void window_surface_set_dwm_alpha( struct window_surface *surface, BOOL enable )
++{
++    if (surface == &dummy_surface) return;
++    window_surface_lock( surface );
++    if (surface->dwm_alpha != enable)
++    {
++        surface->dwm_alpha = enable;
++        surface->bounds = surface->rect;
++    }
++    window_surface_unlock( surface );
++}
+ 
+ void window_surface_set_clip( struct window_surface *surface, HRGN clip_region )
+ {
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -80,6 +80,7 @@
+     BOOL               has_icons;     /* window's icons have been initialized */
+     HIMC               imc;           /* window's input context */
+     struct window_surface *surface;   /* Window surface if any */
++    BOOL               dwm_alpha;     /* NEUTRON: DwmEnableBlurBehindWindow enabled, see set_window_dwm_alpha */
+     struct opengl_drawable *current_drawable; /* current GL client surface for this window */
+     struct opengl_drawable *unused_drawable; /* unused GL client surface for this window */
+     struct tagDIALOGINFO *dlgInfo;    /* Dialog additional info (dialogs only) */
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -67,6 +67,7 @@
+ extern void neutron_resize_hold_edges( struct window_surface *surface, HWND hwnd, int right, int bottom );
+ extern void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
+ extern void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );
++extern void window_surface_set_dwm_alpha( struct window_surface *surface, BOOL enable );
+ 
+ /* defwnd.c */
+ extern BOOL adjust_window_rect( RECT *rect, DWORD style, BOOL menu, DWORD ex_style, UINT dpi );
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2908,6 +2908,20 @@
+         window_surface_set_layered( new_surface, key, alpha_bits, 0 );
+     }
+ 
++    /* NEUTRON dwm-alpha */
++    if (new_surface && new_surface != &dummy_surface)
++    {
++        WND *win = get_win_ptr( hwnd );
++        BOOL dwm_alpha = FALSE;
++
++        if (win && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++        {
++            dwm_alpha = win->dwm_alpha;
++            release_win_ptr( win );
++        }
++        window_surface_set_dwm_alpha( new_surface, dwm_alpha );
++    }
++
+     return new_surface;
+ }
+ 
+@@ -7655,6 +7669,32 @@
+     }
+ }
+ 
++/* NEUTRON dwm-alpha: DwmEnableBlurBehindWindow. Windows' compositor then blends the window with its
++ * pixels' alpha (a GPU-drawn translucent window, Qt's "translucent background" for OpenGL/Direct3D
++ * windows, relies on it); the window stays hit-tested as a whole. The flag lives on the window and
++ * is copied to each of its surfaces, which the driver reads when it flushes. */
++static BOOL set_window_dwm_alpha( HWND hwnd, BOOL enable )
++{
++    struct window_surface *surface = NULL;
++    WND *win = get_win_ptr( hwnd );
++
++    if (!win || win == WND_DESKTOP) return FALSE;
++    if (win == WND_OTHER_PROCESS)
++    {
++        FIXME( "not supported on other process window %p\n", hwnd );
++        return FALSE;
++    }
++    win->dwm_alpha = enable;
++    if ((surface = win->surface)) window_surface_add_ref( surface );
++    release_win_ptr( win );
++    if (surface)
++    {
++        window_surface_set_dwm_alpha( surface, enable );
++        window_surface_release( surface );
++    }
++    return TRUE;
++}
++
+ /*****************************************************************************
+  *           NtUserCallHwndParam (win32u.@)
+  */
+@@ -7787,6 +7827,9 @@
+         return get_window_long_size( hwnd, params->offset, params->size, FALSE, TRUE );
+     }
+ 
++    case NtUserCallHwndParam_SetDwmAlpha: /* NEUTRON dwm-alpha */
++        return set_window_dwm_alpha( hwnd, !!param );
++
+     case NtUserCallHwndParam_SetPrivateData:
+     {
+         struct set_private_data_params *params = (void *)param;
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -678,7 +678,8 @@
+         }
+     }
+ 
+-    buffer_format = (shape_bits || wws->layered) ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
++    buffer_format = (shape_bits || wws->layered || window_surface->dwm_alpha) ?
++                    WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+     if (wws->wayland_buffer_queue->format != buffer_format)
+     {
+         int width = wws->wayland_buffer_queue->width;
+@@ -772,6 +773,16 @@
+             if (xo < 0) { const char *e = getenv("NEUTRON_XRGB_OPAQUE"); xo = !(e && e[0] == '0'); }
+             alpha_bits = (shape_bits || xo) ? 0xff000000 : 0;
+         }
++        /* NEUTRON dwm-alpha: DwmEnableBlurBehindWindow -- the compositor blends the window with its
++         * pixels' alpha (Windows does the same). A GPU-drawn translucent window (Qt) leaves its window
++         * surface unpainted, so it must come out transparent, not black, under the GPU content. GDI
++         * pixels (alpha 0 with a color) stay opaque, as for per-pixel layered windows; a constant
++         * layered alpha below 255 is not applied on top. */
++        if (window_surface->dwm_alpha)
++        {
++            alpha_bits = 0;
++            sanitize = TRUE;
++        }
+         {   /* NEUTRON layer-trace (NEUTRON_LAYER_TRACE=1)
+              *
+              * ⛔ NEVER CALL WIN32U FROM IN HERE. THIS TRACE DEADLOCKED PHOTOSHOP (2026-09-09).
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -1421,6 +1421,7 @@
+     NtUserCallHwndParam_GetPrivateData,
+     NtUserCallHwndParam_SetPrivateData,
+     NtUserCallHwndParam_SetWinMonitor, /* NEUTRON: driver sets a window's authoritative monitor */
++    NtUserCallHwndParam_SetDwmAlpha,   /* NEUTRON dwm-alpha: DwmEnableBlurBehindWindow */
+ };
+ 
+ struct get_window_rects_params
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -320,6 +320,7 @@
+     COLORREF                           color_key;    /* layered window surface color key, invalid if CLR_INVALID */
+     UINT                               alpha_bits;   /* layered window global alpha bits, invalid if -1 */
+     UINT                               alpha_mask;   /* layered window per-pixel alpha mask, invalid if 0 */
++    BOOL                               dwm_alpha;    /* NEUTRON: DwmEnableBlurBehindWindow, composite with the pixels' alpha */
+     HRGN                               shape_region; /* shape of the window surface, unshaped if 0 */
+     HBITMAP                            shape_bitmap; /* bitmap for the surface shape (1bpp) */
+     HBITMAP                            color_bitmap; /* bitmap for the surface colors */

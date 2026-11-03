@@ -1,0 +1,90 @@
+From: Neutron
+Subject: [PATCH] dxvk: present with premultiplied alpha into a window that enabled DWM blur-behind
+
+A blt-model (DISCARD/SEQUENTIAL) swap chain presents into its window's own surface, and once the window has
+called DwmEnableBlurBehindWindow, Windows' compositor blends that surface by its pixels' alpha. Qt makes its
+translucent Direct3D windows this way (frameless, LWA_ALPHA 255, blur-behind with an empty region). The
+presenter always asked Vulkan for VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, so the transparent part of such a window
+came out black: CapCut 9.7's menus are popups the size of the screen, and opening one blacked out the screen
+around it.
+
+Wine's dwmapi (Neutron patch 117) marks a blur-behind window __wine_dwm_alpha. When a blt-model swap chain's
+window carries the mark at swap chain (re)creation and the surface supports it, the presenter now uses
+VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR (logged "neutron-premultiplied"). Flip-model and composition swap
+chains, and every unmarked window, are unchanged. The present shaders and the blitter already keep alpha.
+
+Lab, CapCut 9.7 (NVIDIA, Wayland surface offers OPAQUE + PRE_MULTIPLIED): menu over the editor 3 of 3;
+NEUTRON_DXVK_PREMULTIPLIED=0 on the same build, black 1 of 1. Kill switch NEUTRON_DXVK_PREMULTIPLIED=0.
+
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index 472789e9..aecf5275 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -995,6 +995,8 @@ namespace dxvk {
+     // test the Wine dcomp bridge mark. m_surfaceFactory is always a
+     // DxgiSurfaceFactory (sole implementer of IDXGIVkSurfaceFactory).
+     presenterDesc.window = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
++    presenterDesc.windowAlpha = m_desc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD
++                             || m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL;
+ 
+     m_presenter = new Presenter(m_device, m_frameLatencySignal, presenterDesc, [
+       cAdapter  = m_device->adapter(),
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index b84c2918..a869bf83 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -63,7 +63,8 @@ namespace dxvk {
+     m_vki(device->instance()->vki()),
+     m_vkd(device->vkd()),
+     m_surfaceProc(std::move(proc)),
+-    m_window(desc.window) {
++    m_window(desc.window),
++    m_windowAlpha(desc.windowAlpha) {
+     // Only enable FSE if the user explicitly opts in. On Windows, FSE
+     // is required to support VRR or HDR, but blocks alt-tabbing or
+     // overlapping windows, which breaks a number of games.
+@@ -899,6 +900,21 @@ namespace dxvk {
+     swapInfo.imageSharingMode       = VK_SHARING_MODE_EXCLUSIVE;
+     swapInfo.preTransform           = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+     swapInfo.compositeAlpha         = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++
++    // neutron: a blt-model swap chain presents into its window's own surface, and once the window
++    // enabled DWM blur-behind, Windows' compositor blends that surface by its alpha. Qt's translucent
++    // Direct3D windows rely on it (CapCut's menus are full-window translucent popups drawn this way).
++    // Hand the alpha to the compositor when the surface can take it; OPAQUE otherwise, as before.
++    // Checked at every swap chain (re)creation.
++    bool premultiplied = m_windowAlpha && m_window
++      && GetPropW(reinterpret_cast<HWND>(m_window), L"__wine_dwm_alpha");
++
++    if (premultiplied
++     && (caps.surfaceCapabilities.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
++     && env::getEnvVar("NEUTRON_DXVK_PREMULTIPLIED") != "0") {
++      swapInfo.compositeAlpha       = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
++      Logger::info(str::format("neutron-premultiplied: window ", m_window, ", composite alpha PRE_MULTIPLIED"));
++    }
+     swapInfo.presentMode            = m_presentMode;
+     swapInfo.clipped                = VK_TRUE;
+ 
+diff --git a/src/dxvk/dxvk_presenter.h b/src/dxvk/dxvk_presenter.h
+index cb823770..4268e0c1 100644
+--- a/src/dxvk/dxvk_presenter.h
++++ b/src/dxvk/dxvk_presenter.h
+@@ -40,6 +40,10 @@ namespace dxvk {
+     // only to test the Wine dcomp bridge mark (__wine_dcomp_blit). void*
+     // keeps this header platform-agnostic; it is an HWND on Win32.
+     void* window = nullptr;
++    // neutron: a blt-model swap chain. On Windows its presents land in the window's own surface,
++    // which DWM blends by its alpha once the window enabled blur-behind (Wine's dwmapi marks such
++    // a window __wine_dwm_alpha); present with premultiplied alpha then.
++    bool windowAlpha = false;
+   };
+ 
+   /**
+@@ -284,6 +288,7 @@ namespace dxvk {
+     // the stamp (m_boundedAcquire, set via INeutronBoundedAcquire) is the
+     // primary scoping signal and the window mark only a fallback.
+     void*                       m_window = nullptr;
++    bool                        m_windowAlpha = false;
+ 
+     // neutron-bounded-acquire: sticky "this chain is readback-blitted" flag
+     std::atomic<bool>           m_boundedAcquire = { false };
