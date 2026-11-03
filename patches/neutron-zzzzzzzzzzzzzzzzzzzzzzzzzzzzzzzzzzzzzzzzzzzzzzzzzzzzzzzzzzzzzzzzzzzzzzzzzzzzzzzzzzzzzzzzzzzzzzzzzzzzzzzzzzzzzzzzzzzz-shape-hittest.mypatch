@@ -1,0 +1,681 @@
+server, win32u, winewayland: a window takes mouse input only where its shape is, as on Windows.
+
+Filmora 16's first-run walkthrough could not be followed (lab, 2026-11-03, Wayland driver): every click and drag went to the
+walkthrough itself and nothing under it could be used. The walkthrough is "FMaskWindow", a WS_EX_LAYERED per-pixel-alpha
+popup over the whole main window, dimmed except for fully transparent holes over the control the user is asked to use
+("Import Material", "Drag to edit", "Drag to add effect", "Play and preview", "Export video"). Windows hit-tests a layered
+window by its shape: its color-keyed pixels and the fully transparent pixels of a per-pixel-alpha layered window let the
+mouse through ("Layered Windows", Microsoft Learn), as do the pixels outside a window region. Wine ignored the pixels in
+both places a click is routed:
+
+- the compositor: the Wayland input region was the whole surface (empty only for WS_EX_LAYERED|WS_EX_TRANSPARENT), so the
+  compositor gave every click on the transparent holes to the walkthrough's surface;
+- the server: is_point_in_window skipped only WS_EX_LAYERED|WS_EX_TRANSPARENT windows, so WindowFromPoint returned the
+  walkthrough at the holes, and OLE drag and drop, which finds its drop target with WindowFromPoint, refused every drop
+  onto the timeline under it.
+
+win32u already computes the shape before every flush (set_surface_shape: window region, color key, all-zero pixels; the
+last is Neutron's rule for layered surfaces that mix GDI text into per-pixel alpha). Now:
+
+- winewayland turns the surface shape into rects (rows banded) and sets them as the wl_surface input region, applied with
+  the buffer at commit, in surface-local coordinates (scale and crop origin, rounded outward), re-applied when the shape,
+  scale or crop origin changes and on every new wl_surface; WS_EX_LAYERED|WS_EX_TRANSPARENT stays an empty region. A
+  flush that bails before the commit keeps the shape pending (win32u reports a change once).
+- win32u reports a layered window's shape to the server when it changes (new request set_window_hit_region, appended;
+  protocol 950), from the surface in the window's own dpi (a DPI-scaled window's wrapper, not its device-pixel target);
+  is_point_in_window then skips a layered window's pixels outside it.
+
+More than 4096 rects: the window takes input everywhere, as before. Same-process and cross-process WindowFromPoint both
+follow the server. Not covered: a layered window whose only transparency is SetLayeredWindowAttributes constant alpha 0
+(no shape is computed for it). Kill switch NEUTRON_SHAPE_HITTEST=0 (both halves).
+
+Lab, Filmora 16.0.12 on 175 + this (PgI-filmora): the whole walkthrough, Import -> Open -> drag clip to the timeline ->
+drag RGB Stroke onto it -> Play -> Export (file written), and the walkthrough's own close button still takes clicks. With
+NEUTRON_SHAPE_HITTEST=0 on the same build the Import click is eaten, 2 of 2; with the input region alone (no server part)
+clicks pass but the drop onto the timeline is refused. Photoshop 2026: New Document typed name + document created, the
+"Generate Image" coach mark's "Got it" dismisses it. Animate 2024: New Document (CEP) as before.
+
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -281,6 +281,8 @@
+     return TRUE;
+ }
+ 
++static void flush_surface( struct window_surface *surface, BOOL report_hit_shape_changes );
++
+ static BOOL scaled_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
+                                   const BITMAPINFO *color_info, const void *color_bits, BOOL shape_changed,
+                                   const BITMAPINFO *shape_info, const void *shape_bits )
+@@ -329,7 +331,8 @@
+                                     window_surface->alpha_bits, window_surface->alpha_mask );
+     }
+ 
+-    window_surface_flush( surface->target_surface );
++    /* NEUTRON shape-hittest: this wrapper reported the shape in the window's dpi; the target's is device pixels */
++    flush_surface( surface->target_surface, FALSE );
+ 
+     /* NEUTRON: report the target's refusal. A driver flush returns FALSE to say "not yet, keep the bounds
+      * dirty and flush again" (winewayland: the window has no xdg configure yet). For a DPI-scaled window
+@@ -780,8 +783,115 @@
+ static BOOL neutron_resize_hold_active( struct window_surface *surface );
+ static BOOL neutron_resize_hold_edges_waiting( struct window_surface *surface );
+ 
++/* NEUTRON shape-hittest: kill switch NEUTRON_SHAPE_HITTEST=0 (also read by winewayland). */
++static BOOL neutron_shape_hittest(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_SHAPE_HITTEST" ); v = !(e && e[0] == '0'); }
++    return v;
++}
++
++/* More rects than this, and the window is hit-tested whole, as before. */
++#define NEUTRON_HIT_SHAPE_MAX_RECTS 4096
++
++/* NEUTRON shape-hittest: the set pixels of a 1bpp surface shape as region rects (one per run of a row,
++ * rows with the same runs merged into one band, so they are y-x banded), offset by origin. */
++static RECT *hit_shape_rects( const BITMAPINFO *shape_info, const void *shape_bits, POINT origin, UINT *ret_count )
++{
++    int width = shape_info->bmiHeader.biWidth, height = abs( shape_info->bmiHeader.biHeight );
++    int stride, x, y, n, prev_n = 0, *runs, *prev, *swap;
++    UINT count = 0, capacity = 0, band = 0, i;
++    RECT *rects = NULL, *grown;
++
++    *ret_count = 0;
++    if (width <= 0 || !height) return NULL;
++    stride = shape_info->bmiHeader.biSizeImage / height;
++    runs = malloc( (width + 2) * sizeof(*runs) );
++    prev = malloc( (width + 2) * sizeof(*prev) );
++    if (!runs || !prev) goto failed;
++
++    for (y = 0; y < height; y++)
++    {
++        const BYTE *row = (const BYTE *)shape_bits + y * stride;
++
++        for (n = 0, x = 0; x < width;)
++        {
++            int start;
++
++            while (x < width && !(x & 7) && !row[x / 8]) x += 8;
++            while (x < width && !(row[x / 8] & (0x80 >> (x & 7)))) x++;
++            if (x >= width) break;
++            start = x;
++            while (x < width && !(x & 7) && row[x / 8] == 0xff) x += 8;
++            while (x < width && (row[x / 8] & (0x80 >> (x & 7)))) x++;
++            runs[n++] = start;
++            runs[n++] = min( x, width );
++        }
++
++        if (n && n == prev_n && !memcmp( runs, prev, n * sizeof(*runs) ))
++        {
++            for (i = band; i < count; i++) rects[i].bottom = origin.y + y + 1;
++            continue;
++        }
++
++        band = count;
++        if (count + n / 2 > NEUTRON_HIT_SHAPE_MAX_RECTS) goto failed;
++        if (count + n / 2 > capacity)
++        {
++            capacity = max( capacity * 2, count + n / 2 + 64 );
++            if (!(grown = realloc( rects, capacity * sizeof(*rects) ))) goto failed;
++            rects = grown;
++        }
++        for (i = 0; i < n; i += 2)
++            SetRect( &rects[count++], origin.x + runs[i], origin.y + y, origin.x + runs[i + 1], origin.y + y + 1 );
++        swap = prev; prev = runs; runs = swap;
++        prev_n = n;
++    }
++    free( runs );
++    free( prev );
++    *ret_count = count;
++    return rects ? rects : malloc( sizeof(*rects) );
++
++failed:
++    free( runs );
++    free( prev );
++    free( rects );
++    return NULL;
++}
++
++/* NEUTRON shape-hittest: tell the server which pixels of a layered window take mouse input, so
++ * WindowFromPoint (and OLE drag and drop, which finds its drop target with it) passes over the
++ * color-keyed and fully transparent ones, as Windows does. The winewayland driver gives the
++ * compositor the same shape as the surface's input region. Rects are visible-rect relative, in
++ * the window's dpi: this surface's pixels offset by its rect. */
++static void report_hit_shape( struct window_surface *surface, const BITMAPINFO *shape_info, const void *shape_bits )
++{
++    POINT origin = {surface->rect.left, surface->rect.top};
++    RECT *rects = NULL;
++    UINT count = 0;
++
++    if (!surface->hwnd || !neutron_shape_hittest()) return;
++    if (shape_bits && (surface->alpha_mask || surface->color_key != CLR_INVALID))
++        rects = hit_shape_rects( shape_info, shape_bits, origin, &count );
++
++    SERVER_START_REQ( set_window_hit_region )
++    {
++        req->window = wine_server_user_handle( surface->hwnd );
++        req->clear = !rects;
++        if (count) wine_server_add_data( req, rects, count * sizeof(RECT) );
++        wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    free( rects );
++}
++
+ void window_surface_flush( struct window_surface *surface )
+ {
++    flush_surface( surface, TRUE );
++}
++
++static void flush_surface( struct window_surface *surface, BOOL report_hit_shape_changes )
++{
+     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
+     BITMAPINFO *color_info = (BITMAPINFO *)color_buf;
+@@ -813,6 +923,8 @@
+         BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
+         void *shape_bits = window_surface_get_shape( surface, shape_info );
+ 
++        if (shape_changed && report_hit_shape_changes) report_hit_shape( surface, shape_info, shape_bits );
++
+         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
+                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
+ 
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -373,6 +373,16 @@
+     LONG vp_dirty;
+ };
+ 
++/* NEUTRON shape-hittest: the pixels of a window that take mouse input, as win32u's surface shape
++ * gives them (window region, color key, fully transparent layered pixels), in buffer pixels. */
++struct wayland_input_shape
++{
++    UINT serial;    /* changes with every rebuild; 0 = never built */
++    BOOL shaped;    /* FALSE: no shape, the whole surface takes input */
++    UINT count;
++    RECT *rects;
++};
++
+ struct wayland_shm_buffer
+ {
+     struct wl_list link;
+@@ -457,6 +467,12 @@
+      * frame-spill crop shows the window from an inner origin (wayland_surface_attach_shm); every conversion
+      * between surface-local and window positions must go through it (wayland_surface_content_origin). */
+     int content_x, content_y;
++    /* NEUTRON shape-hittest: the input region is the window's shape (input_shape, a copy of the window
++     * surface's), or empty for a click-through window; applied for this scale and content origin. */
++    struct wayland_input_shape input_shape;
++    BOOL input_transparent;
++    double input_scale;
++    int input_x, input_y;
+     /* NEUTRON: a subsurface whose scale differs from its parent's: compositor (logical) position of
+      * surface-local (0,0). See wayland_surface_reconfigure_subsurface. */
+     BOOL mixed_scale;
+@@ -659,7 +675,8 @@
+ 
+ struct wayland_client_surface *get_client_surface(HWND hwnd);
+ void set_client_surface(HWND hwnd, struct wayland_client_surface *client);
+-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region);
++BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
++                                 const struct wayland_input_shape *input_shape);
+ struct wayland_shm_buffer *get_window_surface_contents(HWND hwnd);
+ void ensure_window_surface_contents(HWND hwnd);
+ BOOL wayland_window_can_commit(HWND hwnd);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -510,6 +510,7 @@
+ 
+     wl_display_flush(process_wayland.wl_display);
+ 
++    free(surface->input_shape.rects);
+     free(surface);
+ }
+ 
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -651,17 +651,78 @@
+     return ret;
+ }
+ 
++/* NEUTRON shape-hittest (NEUTRON_SHAPE_HITTEST=0 disables, window_surface.c): Windows hit-tests a window
++ * by its shape. Clicks pass through the parts outside its window region, its color-keyed pixels and the
++ * fully transparent pixels of a per-pixel-alpha layered window ("Layered Windows", Microsoft Learn), to
++ * whatever is below. The input region was the whole surface, so the transparent parts of a layered
++ * window took every click. Filmora 16's first-run walkthrough is a full-window layered popup, transparent
++ * but for its tip card, and nothing under it could be clicked. The region is now win32u's shape, in
++ * surface-local coordinates (rounded outward), empty for a click-through window as before. */
++static void wayland_surface_apply_input_region(struct wayland_surface *surface)
++{
++    struct wl_region *input_region = NULL;
++    int origin_x, origin_y;
++    UINT i;
++
++    wayland_surface_content_origin(surface, &origin_x, &origin_y);
++    surface->input_scale = surface->window.scale;
++    surface->input_x = origin_x;
++    surface->input_y = origin_y;
++
++    if (surface->input_transparent || surface->input_shape.shaped)
++        input_region = wl_compositor_create_region(process_wayland.wl_compositor);
++    if (input_region && !surface->input_transparent)
++    {
++        double scale = surface->window.scale > 0 ? surface->window.scale : 1.0;
++
++        for (i = 0; i < surface->input_shape.count; i++)
++        {
++            const RECT *rect = &surface->input_shape.rects[i];
++            int left = floor((rect->left - origin_x) / scale);
++            int top = floor((rect->top - origin_y) / scale);
++            int right = ceil((rect->right - origin_x) / scale);
++            int bottom = ceil((rect->bottom - origin_y) / scale);
++            wl_region_add(input_region, left, top, right - left, bottom - top);
++        }
++    }
++    wl_surface_set_input_region(surface->wl_surface, input_region);
++    if (input_region) wl_region_destroy(input_region);
++}
++
+ /* Pass through mouse events for layered, transparent windows, to match
+  * Windows behavior. */
+ static void wayland_surface_update_input_region(struct wayland_surface *surface, DWORD exstyle)
+ {
+-    struct wl_region *input_region;
++    surface->input_transparent = (exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED);
++    wayland_surface_apply_input_region(surface);
++}
+ 
+-    input_region = ((exstyle & WS_EX_TRANSPARENT) && (exstyle & WS_EX_LAYERED)) ?
+-                   wl_compositor_create_region(process_wayland.wl_compositor) :
+-                   NULL;
+-    wl_surface_set_input_region(surface->wl_surface, input_region);
+-    if (input_region) wl_region_destroy(input_region);
++/* NEUTRON shape-hittest: take the window surface's shape for this commit; re-apply the region when the
++ * shape, the scale or the content origin changed since it was last applied. */
++static void wayland_surface_set_input_shape(struct wayland_surface *surface,
++                                            const struct wayland_input_shape *shape)
++{
++    int origin_x, origin_y;
++
++    if (shape->serial != surface->input_shape.serial)
++    {
++        RECT *rects = NULL;
++
++        if (shape->count && !(rects = malloc(shape->count * sizeof(*rects)))) return;
++        if (shape->count) memcpy(rects, shape->rects, shape->count * sizeof(*rects));
++        free(surface->input_shape.rects);
++        surface->input_shape = *shape;
++        surface->input_shape.rects = rects;
++    }
++    else
++    {
++        wayland_surface_content_origin(surface, &origin_x, &origin_y);
++        if (!surface->input_shape.shaped || surface->input_transparent ||
++            (surface->input_scale == surface->window.scale &&
++             surface->input_x == origin_x && surface->input_y == origin_y))
++            return;
++    }
++    wayland_surface_apply_input_region(surface);
+ }
+ 
+ /* NEUTRON clickthrough-live (NEUTRON_CLICKTHROUGH_LIVE=0 disables): Windows decides whether a layered
+@@ -2552,7 +2613,8 @@
+     wayland_win_data_release(data);
+ }
+ 
+-BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region)
++BOOL set_window_surface_contents(HWND hwnd, struct wayland_shm_buffer *shm_buffer, HRGN damage_region,
++                                 const struct wayland_input_shape *input_shape)
+ {
+     struct wayland_surface *wayland_surface;
+     struct wayland_win_data *data;
+@@ -2565,6 +2627,7 @@
+         if (wayland_surface_reconfigure(wayland_surface))
+         {
+             wayland_surface_attach_shm(wayland_surface, shm_buffer, damage_region);
++            if (input_shape && input_shape->serial) wayland_surface_set_input_shape(wayland_surface, input_shape);
+             wl_surface_commit(wayland_surface->wl_surface);
+             committed = TRUE;
+         }
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -55,6 +55,9 @@
+     struct window_surface header;
+     struct wayland_buffer_queue *wayland_buffer_queue;
+     BOOL layered;
++    /* NEUTRON shape-hittest: the shape's input rects, rebuilt at the first commit after it changed */
++    struct wayland_input_shape input_shape;
++    BOOL input_stale;
+ };
+ 
+ static struct wayland_window_surface *wayland_window_surface_cast(
+@@ -417,6 +420,103 @@
+     }
+ }
+ 
++/* NEUTRON shape-hittest: kill switch NEUTRON_SHAPE_HITTEST=0 (the whole surface takes input again). */
++static BOOL neutron_shape_hittest(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_SHAPE_HITTEST", TRUE);
++    return on;
++}
++
++/* More rects than this, and the surface keeps taking input everywhere (a shape that fragmented is
++ * not worth thousands of wl_region requests a change). */
++#define NEUTRON_INPUT_SHAPE_MAX_RECTS 4096
++
++/**********************************************************************
++ *          wayland_input_shape_update
++ *
++ * NEUTRON shape-hittest: the set pixels of win32u's 1bpp surface shape as rects, one per run of a
++ * row, rows with the same runs merged into one band. No shape bits: no shape.
++ */
++static void wayland_input_shape_update(struct wayland_input_shape *shape, const BITMAPINFO *shape_info,
++                                       const void *shape_bits)
++{
++    static LONG serial;
++    int width, height, stride, x, y, n, prev_n = 0, *runs, *prev, *swap;
++    UINT count = 0, capacity = 0, band = 0, i;
++    RECT *rects = NULL, *grown;
++
++    free(shape->rects);
++    shape->rects = NULL;
++    shape->count = 0;
++    shape->shaped = FALSE;
++    if (!(shape->serial = InterlockedIncrement(&serial))) shape->serial = InterlockedIncrement(&serial);
++    if (!shape_bits) return;
++
++    width = shape_info->bmiHeader.biWidth;
++    height = abs(shape_info->bmiHeader.biHeight);
++    if (width <= 0 || !height) return;
++    stride = shape_info->bmiHeader.biSizeImage / height;
++
++    runs = malloc((width + 2) * sizeof(*runs));
++    prev = malloc((width + 2) * sizeof(*prev));
++    if (!runs || !prev) goto done;
++
++    for (y = 0; y < height; y++)
++    {
++        const BYTE *row = (const BYTE *)shape_bits + y * stride;
++
++        for (n = 0, x = 0; x < width;)
++        {
++            int start;
++
++            while (x < width && !(x & 7) && !row[x / 8]) x += 8;
++            while (x < width && !(row[x / 8] & (0x80 >> (x & 7)))) x++;
++            if (x >= width) break;
++            start = x;
++            while (x < width && !(x & 7) && row[x / 8] == 0xff) x += 8;
++            while (x < width && (row[x / 8] & (0x80 >> (x & 7)))) x++;
++            runs[n++] = start;
++            runs[n++] = min(x, width);
++        }
++
++        if (n && n == prev_n && !memcmp(runs, prev, n * sizeof(*runs)))
++        {
++            for (i = band; i < count; i++) rects[i].bottom = y + 1;
++            continue;
++        }
++
++        band = count;
++        if (count + n / 2 > NEUTRON_INPUT_SHAPE_MAX_RECTS)
++        {
++            static LONG once;
++            if (!InterlockedExchange(&once, 1))
++                ERR("neutron-shape-hittest: shape of %dx%d needs over %u rects, whole surface takes input\n",
++                    width, height, NEUTRON_INPUT_SHAPE_MAX_RECTS);
++            free(rects);
++            rects = NULL;
++            count = 0;
++            goto done;
++        }
++        if (count + n / 2 > capacity)
++        {
++            capacity = max(capacity * 2, count + n / 2 + 64);
++            if (!(grown = realloc(rects, capacity * sizeof(*rects)))) { free(rects); rects = NULL; count = 0; goto done; }
++            rects = grown;
++        }
++        for (i = 0; i < n; i += 2) SetRect(&rects[count++], runs[i], y, runs[i + 1], y + 1);
++        swap = prev; prev = runs; runs = swap;
++        prev_n = n;
++    }
++    shape->shaped = TRUE;
++    shape->count = count;
++    shape->rects = rects;
++
++done:
++    free(runs);
++    free(prev);
++}
++
+ /***********************************************************************
+  *           wayland_window_surface_flush
+  */
+@@ -432,6 +532,10 @@
+     HRGN copy_from_window_region;
+     uint32_t buffer_format;
+ 
++    /* NEUTRON shape-hittest: win32u reports a shape change once, at the flush that made it; a flush that
++     * bails below must not lose it. */
++    if (shape_changed) wws->input_stale = TRUE;
++
+     /* NEUTRON round-43 A1/A2/B PROBE (env NEUTRON_PROBE_X/Y = victim surface point):
+      * sample the victim pixel at flush ENTER / after repair / in the COMMITTED shm
+      * buffer, plus damage coverage + can_commit bails, to name the case. */
+@@ -775,7 +879,13 @@
+      * region just copied fresh from color_bits) rather than only the current
+      * dirty rect. attach_shm reads the region synchronously, so it is safe to
+      * reset it right after. */
+-    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, shm_buffer->damage_region);
++    if (neutron_shape_hittest() && (wws->input_stale || !wws->input_shape.serial))
++    {
++        wayland_input_shape_update(&wws->input_shape, shape_info, shape_bits);
++        wws->input_stale = FALSE;
++    }
++    flushed = set_window_surface_contents(window_surface->hwnd, shm_buffer, shm_buffer->damage_region,
++                                          neutron_shape_hittest() ? &wws->input_shape : NULL);
+     NtGdiSetRectRgn(shm_buffer->damage_region, 0, 0, 0, 0);
+     wl_display_flush(process_wayland.wl_display);
+ 
+@@ -794,6 +904,7 @@
+     TRACE("surface=%p\n", wws);
+ 
+     wayland_buffer_queue_destroy(wws->wayland_buffer_queue);
++    free(wws->input_shape.rects);
+ }
+ 
+ static const struct window_surface_funcs wayland_window_surface_funcs =
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6229,6 +6229,21 @@
+ };
+ 
+ 
++
++struct set_window_hit_region_request
++{
++    struct request_header __header;
++    user_handle_t  window;
++    int            clear;
++    /* VARARG(region,rectangles); */
++    char __pad_20[4];
++};
++struct set_window_hit_region_reply
++{
++    struct reply_header __header;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6538,6 +6553,7 @@
+     REQ_d3dkmt_object_open_name,
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
++    REQ_set_window_hit_region,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6852,6 +6868,7 @@
+     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
++    struct set_window_hit_region_request set_window_hit_region_request;
+ };
+ union generic_reply
+ {
+@@ -7164,8 +7181,9 @@
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
++    struct set_window_hit_region_reply set_window_hit_region_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 949
++#define SERVER_PROTOCOL_VERSION 950
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4331,3 +4331,11 @@
+     data_size_t         runtime_size;   /* size of client runtime data */
+     VARARG(runtime,bytes);              /* client runtime data */
+ @END
++
++
++/* NEUTRON shape-hittest: set the pixels a layered window is hit-tested by */
++@REQ(set_window_hit_region)
++    user_handle_t  window;        /* handle to the window */
++    int            clear;         /* no shape any more: hit-test the whole window */
++    VARARG(region,rectangles);    /* the pixels that take input (relative to the visible rect, window dpi) */
++@END
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -314,6 +314,7 @@
+ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
++DECL_HANDLER(set_window_hit_region);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -625,6 +626,7 @@
+     (req_handler)req_d3dkmt_object_open_name,
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
++    (req_handler)req_set_window_hit_region,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2395,3 +2397,6 @@
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
+ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
++C_ASSERT( offsetof(struct set_window_hit_region_request, window) == 12 );
++C_ASSERT( offsetof(struct set_window_hit_region_request, clear) == 16 );
++C_ASSERT( sizeof(struct set_window_hit_region_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3537,6 +3537,13 @@
+     dump_varargs_bytes( ", runtime=", cur_size );
+ }
+ 
++static void dump_set_window_hit_region_request( const struct set_window_hit_region_request *req )
++{
++    fprintf( stderr, " window=%08x", req->window );
++    fprintf( stderr, ", clear=%d", req->clear );
++    dump_varargs_rectangles( ", region=", cur_size );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3848,6 +3855,7 @@
+     (dump_func)dump_d3dkmt_object_open_name_request,
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
++    (dump_func)dump_set_window_hit_region_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4159,6 +4167,7 @@
+     (dump_func)dump_d3dkmt_object_open_name_reply,
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
+     NULL,
++    NULL,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4470,6 +4479,7 @@
+     "d3dkmt_object_open_name",
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
++    "set_window_hit_region",
+ };
+ 
+ static const struct
+--- a/server/window.c
++++ b/server/window.c
+@@ -71,6 +71,7 @@
+     struct rectangle surface_rect;    /* window surface rectangle (relative to parent client area) */
+     struct rectangle client_rect;     /* client rectangle (relative to parent client area) */
+     struct region   *win_region;      /* region for shaped windows (relative to window rect) */
++    struct region   *hit_region;      /* NEUTRON shape-hittest: a layered window's opaque pixels (relative to visible rect) */
+     struct region   *update_region;   /* update region (relative to window rect) */
+     unsigned int     style;           /* window style */
+     unsigned int     ex_style;        /* window extended style */
+@@ -176,6 +177,7 @@
+     }
+ 
+     if (win->win_region) free_region( win->win_region );
++    if (win->hit_region) free_region( win->hit_region );
+     if (win->update_region) free_region( win->update_region );
+     if (win->class) release_class( win->class );
+     free( win->text );
+@@ -788,6 +790,7 @@
+     win->class          = class;
+     win->atom           = atom;
+     win->win_region     = NULL;
++    win->hit_region     = NULL;
+     win->update_region  = NULL;
+     win->style          = 0;
+     win->ex_style       = 0;
+@@ -1076,6 +1079,12 @@
+     if (win->win_region &&
+         !point_in_region( win->win_region, *x - win->window_rect.left, *y - win->window_rect.top ))
+         return 0;  /* not in window region */
++    /* NEUTRON shape-hittest: Windows hit-tests a layered window by its shape; its color-keyed and fully
++     * transparent pixels let the mouse through ("Layered Windows", Microsoft Learn). win32u reports the
++     * shape (set_window_hit_region) whenever it changes. */
++    if (win->hit_region && (win->ex_style & WS_EX_LAYERED) &&
++        !point_in_region( win->hit_region, *x - win->visible_rect.left, *y - win->visible_rect.top ))
++        return 0;  /* a transparent pixel */
+     return 1;
+ }
+ 
+@@ -3129,6 +3138,20 @@
+ }
+ 
+ 
++/* NEUTRON shape-hittest: set the pixels a layered window is hit-tested by */
++DECL_HANDLER(set_window_hit_region)
++{
++    struct region *region = NULL;
++    struct window *win = get_window( req->window );
++
++    if (!win) return;
++    if (!req->clear && !(region = create_region_from_req_data( get_req_data(), get_req_data_size() )))
++        return;
++    if (win->hit_region) free_region( win->hit_region );
++    win->hit_region = region;
++}
++
++
+ /* get a window update region */
+ DECL_HANDLER(get_update_region)
+ {
