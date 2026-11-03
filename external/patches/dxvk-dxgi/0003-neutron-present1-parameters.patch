@@ -1,0 +1,19 @@
+dxgi: pass Present1's DXGI_PRESENT_PARAMETERS to the D3D11 swap chain
+
+DxgiSwapChain::PresentBase handed the presenter nullptr, so d3d11 never saw the app's dirty rects and
+could not keep a multi-buffer chain's buffers coherent the way DXGI does (dxvk 0005, copy-forward).
+D3D12 swap chains (vkd3d-proton's presenter) still get nullptr.
+
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -384,7 +384,9 @@
+ 
+     if (wsi::isWindow(m_window) || !m_window) {
+       std::lock_guard<dxvk::mutex> lockBuf(m_lockBuffer);
+-      hr = m_presenter->Present(SyncInterval, PresentFlags, nullptr);
++      // neutron copy-forward: d3d11's swap chain needs the dirty rects to keep the buffers
++      // coherent the way DXGI does (d3d11_swapchain.cpp, CopyForwardDirtyRegion).
++      hr = m_presenter->Present(SyncInterval, PresentFlags, m_is_d3d12 ? nullptr : pPresentParameters);
+     }
+ 
+     if (PresentFlags & DXGI_PRESENT_TEST)

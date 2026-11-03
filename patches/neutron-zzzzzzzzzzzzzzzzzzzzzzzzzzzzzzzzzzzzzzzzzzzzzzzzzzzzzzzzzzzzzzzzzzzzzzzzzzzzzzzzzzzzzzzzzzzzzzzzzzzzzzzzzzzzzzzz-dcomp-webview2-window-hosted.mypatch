@@ -1,0 +1,327 @@
+dcomp, winewayland: a window-hosted WebView2 shows its page.
+
+FL Studio 2026's Browser > SOUNDS tab (WebView2 154) stayed empty, and any app hosting WebView2 in a window
+showed nothing (lab, 2026-11-03, with a minimal WebView2 host as well). Four steps, each measured:
+
+1. DCompositionCreateDevice(IID_IDCompositionDevice) answered E_NOINTERFACE; we had only the desktop
+   device. Chromium's software output (OutputDeviceBacking) CHECKs that call, so the GPU process crashed
+   six times and the browser quit ("GPU process isn't usable. Goodbye."). The device now answers the
+   original IDCompositionDevice by forwarding to the same implementation, as Windows' device does.
+2. register_presentation: Chromium's GPU process presents into its own "Intermediate D3D Window", a child
+   of the browser process's window, inside the host app's window. Its pixels live in the HOST's
+   window_surface, but the bridge took it for same-process and blitted into a detached DC. A target whose
+   top-level window belongs to another process is now cross-process (shared-memory path). Reached only
+   when no CEF panel host matched, so the CEP paths are unchanged.
+3. dcomp_register_external: a composition swapchain Presents with no window, and every frame went to the
+   pending hwnd -- DXVK's hidden 320x240 DXVKDUMMYWINDOW. A Present on a swapchain that a committed visual
+   already registered now marks that presentation. The visual holds DXVK's DxgiSwapChainDispatcher and the
+   Present reports the DxgiSwapChain inside it; ID3DDestructionNotifier, which the dispatcher forwards, names
+   the same object from both. The pending-hwnd fallback stays for swapchains no visual registered.
+4. The readback took GetBuffer(0). After a flip-model Present that is the NEXT back buffer, the frame from
+   BufferCount presents ago, never drawn after a first Present; the presented frame is the last buffer
+   (DXGI's read-only front buffer; DXVK's RotateBackBuffers moves it there). A static page presents once,
+   so it never showed. The readback now takes the presented frame, which is what DWM shows.
+winewayland: the present consumer also presents registered windows of another process whose top-level
+window is ours (step 2's window, presented by the host app's consumer).
+
+Lab, minimal WebView2 host on 11.10-173 + this, page with a counter: page shown and updating, 2 of 2 runs;
+without 2-4 (173d) the window stayed grey. With dxvk 0005 / dxvk-dxgi 0003 every frame is whole. Needs
+dxgi.enableDummyCompositionSwapchain = True for msedgewebview2.exe (without it CreateSwapChainForComposition
+is E_NOTIMPL and the GPU process restarts in a loop).
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -47,6 +47,11 @@
+ struct composition_device
+ {
+     IDCompositionDesktopDevice IDCompositionDesktopDevice_iface;
++    /* The original (Windows 8) device interface. DCompositionCreateDevice(NULL, IID_IDCompositionDevice) is how
++     * Chromium's software compositor gets its device (viz OutputDeviceBacking::GetOrCreateDXObjects), and a failure
++     * there is a CHECK: WebView2 154's GPU process died on every start and the browser gave up ("GPU process isn't
++     * usable. Goodbye."). Same object, same targets and visuals; every method forwards to the desktop device. */
++    IDCompositionDevice IDCompositionDevice_iface;
+     LONG refcount;
+     IUnknown *rendering_device;
+     struct list targets;
+@@ -77,6 +82,11 @@
+     return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDesktopDevice_iface);
+ }
+ 
++static struct composition_device *impl_device_from_IDCompositionDevice(IDCompositionDevice *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice_iface);
++}
++
+ static struct composition_target *impl_target_from_IDCompositionTarget(IDCompositionTarget *iface)
+ {
+     return CONTAINING_RECORD(iface, struct composition_target, IDCompositionTarget_iface);
+@@ -605,7 +615,22 @@
+             if (neutron_dcomp_direct() && p->cross_proc)
+                 direct_sh = neutron_px_ensure(p, hwnd);
+ 
+-            if (FAILED(hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&backbuffer)))
++            /* NEUTRON 2026-11-03: read the frame the app PRESENTED, as DWM shows it. On a flip-model
++             * swapchain Present rotates the buffers: buffer 0 becomes the next back buffer and the
++             * presented frame is the last one (DXGI's read-only front buffer; DXVK's RotateBackBuffers
++             * moves the presented storage there). Buffer 0 is the frame from BufferCount presents ago --
++             * never drawn at all after a first Present, which is the "blank flip rotation" the filters
++             * below were written around, and the only frame a static page ever presents (WebView2). */
++            {
++                DXGI_SWAP_CHAIN_DESC scd;
++                UINT index = 0;
++                if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchain, &scd)) && scd.BufferCount > 1
++                        && (scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
++                            || scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD))
++                    index = scd.BufferCount - 1;
++                hr = IDXGISwapChain_GetBuffer(swapchain, index, &IID_ID3D11Texture2D, (void **)&backbuffer);
++            }
++            if (FAILED(hr))
+             {
+                 if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
+             }
+@@ -1233,6 +1258,20 @@
+         /* cross-process (CEF panel host owned by the Adobe app) -> shared-memory present path;
+          * same-process (program-monitor canvas) -> classic GDI blit. */
+         target_cross_proc = (tpid && tpid != GetCurrentProcessId());
++        /* NEUTRON 2026-11-03: a window of THIS process inside ANOTHER process's top-level window is
++         * cross-process too: its pixels live in the top-level's window_surface, which only that process
++         * can draw into. Chromium's GPU process presents a window-hosted WebView2 into its own
++         * "Intermediate D3D Window" <- Chrome_WidgetWin_1 (browser) <- Chrome_WidgetWin_0 <- the host
++         * app's window; a same-process GDI blit there drew into a detached DC and the WebView stayed
++         * empty (FL Studio's Browser > SOUNDS, any WebView2 host). Only reached when no CEF host
++         * matched, so the CEP paths above are unchanged. */
++        if (!target_cross_proc && !host)
++        {
++            HWND root = GetAncestor(target, GA_ROOT);
++            DWORD rpid = 0;
++            if (root && root != target) GetWindowThreadProcessId(root, &rpid);
++            if (rpid && rpid != GetCurrentProcessId()) target_cross_proc = TRUE;
++        }
+     }
+ 
+     /* NEUTRON DIAG A/B (env NEUTRON_DCOMP_SKIP_CEF=1): do NOT register/blit cross-process
+@@ -1804,6 +1843,12 @@
+         *out = &device->IDCompositionDesktopDevice_iface;
+         return S_OK;
+     }
++    if (IsEqualGUID(iid, &IID_IDCompositionDevice))
++    {
++        IDCompositionDesktopDevice_AddRef(&device->IDCompositionDesktopDevice_iface);
++        *out = &device->IDCompositionDevice_iface;
++        return S_OK;
++    }
+ 
+     ERR("neutron-qi: DEVICE refused %s (E_NOINTERFACE) -- e.g. IDCompositionDevice3 Chromium may need\n",
+         debugstr_guid(iid));
+@@ -2082,6 +2127,124 @@
+     device_CreateSurfaceFromHwnd,
+ };
+ 
++#define DEVICE1_FORWARD(name, params, args) \
++static HRESULT WINAPI device1_##name params \
++{ \
++    struct composition_device *device = impl_device_from_IDCompositionDevice(iface); \
++    return device_##name args; \
++}
++
++static HRESULT WINAPI device1_QueryInterface(IDCompositionDevice *iface, REFIID iid, void **out)
++{
++    struct composition_device *device = impl_device_from_IDCompositionDevice(iface);
++    return device_QueryInterface(&device->IDCompositionDesktopDevice_iface, iid, out);
++}
++
++static ULONG WINAPI device1_AddRef(IDCompositionDevice *iface)
++{
++    struct composition_device *device = impl_device_from_IDCompositionDevice(iface);
++    return device_AddRef(&device->IDCompositionDesktopDevice_iface);
++}
++
++static ULONG WINAPI device1_Release(IDCompositionDevice *iface)
++{
++    struct composition_device *device = impl_device_from_IDCompositionDevice(iface);
++    return device_Release(&device->IDCompositionDesktopDevice_iface);
++}
++
++DEVICE1_FORWARD(Commit, (IDCompositionDevice *iface), (&device->IDCompositionDesktopDevice_iface))
++DEVICE1_FORWARD(WaitForCommitCompletion, (IDCompositionDevice *iface), (&device->IDCompositionDesktopDevice_iface))
++DEVICE1_FORWARD(GetFrameStatistics, (IDCompositionDevice *iface, DCOMPOSITION_FRAME_STATISTICS *statistics),
++        (&device->IDCompositionDesktopDevice_iface, statistics))
++DEVICE1_FORWARD(CreateTargetForHwnd, (IDCompositionDevice *iface, HWND hwnd, BOOL topmost, IDCompositionTarget **target),
++        (&device->IDCompositionDesktopDevice_iface, hwnd, topmost, target))
++DEVICE1_FORWARD(CreateSurface, (IDCompositionDevice *iface, UINT width, UINT height, DXGI_FORMAT format,
++        DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **surface),
++        (&device->IDCompositionDesktopDevice_iface, width, height, format, alpha_mode, surface))
++DEVICE1_FORWARD(CreateVirtualSurface, (IDCompositionDevice *iface, UINT width, UINT height, DXGI_FORMAT format,
++        DXGI_ALPHA_MODE alpha_mode, IDCompositionVirtualSurface **surface),
++        (&device->IDCompositionDesktopDevice_iface, width, height, format, alpha_mode, surface))
++DEVICE1_FORWARD(CreateSurfaceFromHandle, (IDCompositionDevice *iface, HANDLE handle, IUnknown **surface),
++        (&device->IDCompositionDesktopDevice_iface, handle, surface))
++DEVICE1_FORWARD(CreateSurfaceFromHwnd, (IDCompositionDevice *iface, HWND hwnd, IUnknown **surface),
++        (&device->IDCompositionDesktopDevice_iface, hwnd, surface))
++DEVICE1_FORWARD(CreateTranslateTransform, (IDCompositionDevice *iface, IDCompositionTranslateTransform **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateScaleTransform, (IDCompositionDevice *iface, IDCompositionScaleTransform **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateRotateTransform, (IDCompositionDevice *iface, IDCompositionRotateTransform **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateSkewTransform, (IDCompositionDevice *iface, IDCompositionSkewTransform **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateMatrixTransform, (IDCompositionDevice *iface, IDCompositionMatrixTransform **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateTransformGroup, (IDCompositionDevice *iface, IDCompositionTransform **transforms, UINT elements,
++        IDCompositionTransform **transform_group),
++        (&device->IDCompositionDesktopDevice_iface, transforms, elements, transform_group))
++DEVICE1_FORWARD(CreateTranslateTransform3D, (IDCompositionDevice *iface, IDCompositionTranslateTransform3D **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateScaleTransform3D, (IDCompositionDevice *iface, IDCompositionScaleTransform3D **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateRotateTransform3D, (IDCompositionDevice *iface, IDCompositionRotateTransform3D **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateMatrixTransform3D, (IDCompositionDevice *iface, IDCompositionMatrixTransform3D **transform),
++        (&device->IDCompositionDesktopDevice_iface, transform))
++DEVICE1_FORWARD(CreateTransform3DGroup, (IDCompositionDevice *iface, IDCompositionTransform3D **transforms,
++        UINT elements, IDCompositionTransform3D **transform_group),
++        (&device->IDCompositionDesktopDevice_iface, transforms, elements, transform_group))
++DEVICE1_FORWARD(CreateEffectGroup, (IDCompositionDevice *iface, IDCompositionEffectGroup **effect_group),
++        (&device->IDCompositionDesktopDevice_iface, effect_group))
++DEVICE1_FORWARD(CreateRectangleClip, (IDCompositionDevice *iface, IDCompositionRectangleClip **clip),
++        (&device->IDCompositionDesktopDevice_iface, clip))
++DEVICE1_FORWARD(CreateAnimation, (IDCompositionDevice *iface, IDCompositionAnimation **animation),
++        (&device->IDCompositionDesktopDevice_iface, animation))
++
++/* IDCompositionVisual2 derives from IDCompositionVisual, so the v1 device hands out the same visual. */
++static HRESULT WINAPI device1_CreateVisual(IDCompositionDevice *iface, IDCompositionVisual **visual)
++{
++    struct composition_device *device = impl_device_from_IDCompositionDevice(iface);
++    return device_CreateVisual(&device->IDCompositionDesktopDevice_iface, (IDCompositionVisual2 **)visual);
++}
++
++static HRESULT WINAPI device1_CheckDeviceState(IDCompositionDevice *iface, BOOL *valid)
++{
++    TRACE("%p, %p.\n", iface, valid);
++    if (!valid) return E_INVALIDARG;
++    *valid = TRUE;
++    return S_OK;
++}
++
++static const IDCompositionDeviceVtbl composition_device1_vtbl =
++{
++    device1_QueryInterface,
++    device1_AddRef,
++    device1_Release,
++    device1_Commit,
++    device1_WaitForCommitCompletion,
++    device1_GetFrameStatistics,
++    device1_CreateTargetForHwnd,
++    device1_CreateVisual,
++    device1_CreateSurface,
++    device1_CreateVirtualSurface,
++    device1_CreateSurfaceFromHandle,
++    device1_CreateSurfaceFromHwnd,
++    device1_CreateTranslateTransform,
++    device1_CreateScaleTransform,
++    device1_CreateRotateTransform,
++    device1_CreateSkewTransform,
++    device1_CreateMatrixTransform,
++    device1_CreateTransformGroup,
++    device1_CreateTranslateTransform3D,
++    device1_CreateScaleTransform3D,
++    device1_CreateRotateTransform3D,
++    device1_CreateMatrixTransform3D,
++    device1_CreateTransform3DGroup,
++    device1_CreateEffectGroup,
++    device1_CreateRectangleClip,
++    device1_CreateAnimation,
++    device1_CheckDeviceState,
++};
++
+ static HRESULT create_device(IUnknown *rendering_device, REFIID iid, void **out)
+ {
+     struct composition_device *device;
+@@ -2090,6 +2253,7 @@
+     if (!(device = calloc(1, sizeof(*device))))
+         return E_OUTOFMEMORY;
+     device->IDCompositionDesktopDevice_iface.lpVtbl = &composition_device_vtbl;
++    device->IDCompositionDevice_iface.lpVtbl = &composition_device1_vtbl;
+     device->refcount = 1;
+     device->rendering_device = rendering_device;
+     if (rendering_device) IUnknown_AddRef(rendering_device);
+@@ -2125,6 +2289,45 @@
+  * swapchain so the blit thread can present it to its window via GDI. Used for
+  * surfaces that bypass DirectComposition (e.g. Premiere's program monitor),
+  * which otherwise present to an invisible Vulkan child-window surface. */
++/* The DXGI swapchain object behind a pointer, for comparison only (no reference kept). A visual's
++ * content is DXVK's DxgiSwapChainDispatcher; its Present reports the DxgiSwapChain inside it. The
++ * dispatcher answers IUnknown itself but forwards ID3DDestructionNotifier to the inner swapchain, so
++ * that interface names the same object from both pointers. */
++static void *swapchain_identity(IUnknown *swapchain)
++{
++    IUnknown *unk = NULL;
++
++    if (SUCCEEDED(IUnknown_QueryInterface(swapchain, &IID_ID3DDestructionNotifier, (void **)&unk))
++            || SUCCEEDED(IUnknown_QueryInterface(swapchain, &IID_IUnknown, (void **)&unk)))
++        IUnknown_Release(unk);
++    return unk;
++}
++
++/* A Present on a composition swapchain that a committed visual already registered against a window:
++ * mark that presentation for the blit worker and report TRUE. */
++static BOOL mark_present_for_swapchain(IUnknown *swapchain)
++{
++    struct presentation *p;
++    void *want;
++    BOOL found = FALSE;
++
++    if (!swapchain || !(want = swapchain_identity(swapchain)))
++        return FALSE;
++    InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
++    EnterCriticalSection(&presentations_cs);
++    LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++    {
++        if (p->swapchain && swapchain_identity((IUnknown *)p->swapchain) == want)
++        {
++            InterlockedExchange(&p->pending_blit, TRUE);
++            found = TRUE;
++            break;
++        }
++    }
++    LeaveCriticalSection(&presentations_cs);
++    return found;
++}
++
+ void dcomp_register_external(HWND hwnd, IUnknown *swapchain)
+ {
+     /* gluon-register-fallback: composition swapchains present with m_window == 0.
+@@ -2132,6 +2335,11 @@
+      * worker presents to the correct window (UXP composition panels / program monitor). */
+     if (!hwnd)
+     {
++        /* NEUTRON 2026-11-03: a composition swapchain already set as a visual's content and committed
++         * to a target belongs to THAT target's window: this Present is for it. The pending hwnd is the window
++         * DXVK last built a surface for -- for a dummy composition swapchain, DXVK's own hidden 320x240
++         * DXVKDUMMYWINDOW, so every WebView2 frame went to a window nobody sees. */
++        if (mark_present_for_swapchain(swapchain)) return;
+         hwnd = pending_hwnd;
+         ERR("gluon-register-fallback: null hwnd -> using pending_hwnd %p for swapchain %p\n",
+             hwnd, swapchain);
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -235,12 +235,16 @@
+             for (i = 0; i < n; i++)
+             {
+                 HWND hwnd = (HWND)(ULONG_PTR)reg->hwnds[i];
+-                DWORD pid = 0;
++                DWORD pid = 0, root_pid = 0;
+                 if (!hwnd) continue;
+                 GetWindowThreadProcessId(hwnd, &pid);
++                /* NEUTRON 2026-11-03: also a window of another process inside OUR top-level window
++                 * (Chromium's "Intermediate D3D Window" in a WebView2 host app): its pixels belong in
++                 * our window_surface, and GetDC on it here draws there, clipped to it. */
++                if (pid != self) GetWindowThreadProcessId(GetAncestor(hwnd, GA_ROOT), &root_pid);
+                 /* Gate on IsWindowVisible: Premiere keeps multiple CEP hosts registered (e.g. a
+                  * tabbed-away/hidden panel that still renders); only present the on-screen one. */
+-                if (pid == self && IsWindow(hwnd) && IsWindowVisible(hwnd))
++                if ((pid == self || root_pid == self) && IsWindow(hwnd) && IsWindowVisible(hwnd))
+                     neutron_consumer_present(hwnd);
+             }
+         }

@@ -1,0 +1,127 @@
+dwrite: the parsed-font cache tells files apart by loader as well as reference key.
+
+FL Studio 2026's Browser > SOUNDS (WebView2) drew every web-font string with the wrong glyphs, each font shifted by
+a constant: "SOUNDS" as "UQWPFU", "Search Sounds" as "Ugctej"Uqwpfu", track titles one letter off (lab, 2026-11-03).
+
+Our parsed-font cache (neutron-zzz5-dwrite-parsed-font-cache) matched a cached FreeType face by reference key and
+face index alone. A reference key names a file only to its own loader: Skia loads each web font through its own
+IDWriteFontFileLoader with an EMPTY key, so every web font after the first got the first one's parsed font. Shaping
+read the right font's cmap (the fontface and its tables are per loader) and drawing used another font's glyph
+outlines, so each string came out shifted by the difference in leading glyphs between the two fonts.
+
+The cache entry now records the loader and matches on it, and holds a reference on it, so a released loader's
+address cannot be reused by a new loader while the entry lives. Local files (one shared loader) are unaffected.
+
+Lab, FL Studio 2026 SOUNDS on 11.10-173 + 112 + this: every string right, 2 of 2 runs; without this (same build
+otherwise) every web-font string shifted.
+
+--- a/dlls/dwrite/dwrite_private.h
++++ b/dlls/dwrite/dwrite_private.h
+@@ -440,10 +440,10 @@
+         IDWriteFontFaceReference1 **reference);
+ /* Both hand back a refcounted cache-entry cookie in entry_out; release it with
+  * factory_release_font_object() or the entry can be freed while a fontface still uses it. */
+-extern UINT64 factory_get_cached_font_object(IDWriteFactory7 *factory, const void *key, UINT32 key_size, UINT32 index,
+-        void **entry_out);
+-BOOL factory_cache_font_object(IDWriteFactory7 *factory, const void *key, UINT32 key_size, UINT32 index,
+-        UINT64 object, IDWriteFontFileStream *stream, void *data_context, void **entry_out);
++extern UINT64 factory_get_cached_font_object(IDWriteFactory7 *factory, IDWriteFontFileLoader *loader, const void *key,
++        UINT32 key_size, UINT32 index, void **entry_out);
++BOOL factory_cache_font_object(IDWriteFactory7 *factory, IDWriteFontFileLoader *loader, const void *key, UINT32 key_size,
++        UINT32 index, UINT64 object, IDWriteFontFileStream *stream, void *data_context, void **entry_out);
+ void factory_release_font_object(IDWriteFactory7 *factory, void *entry);
+ void factory_release_font_objects(IDWriteFactory7 *factory);
+ HRESULT factory_get_cached_fontface(IDWriteFactory7 *factory, IDWriteFontFile * const *files, UINT32 num_files,
+--- a/dlls/dwrite/font.c
++++ b/dlls/dwrite/font.c
+@@ -5341,10 +5341,16 @@
+         UINT32 cache_key_size = 0;
+         void *cache_entry = NULL;
+         UINT64 cached_object;
++        IDWriteFontFileLoader *cache_loader = NULL;
+ 
+-        if (SUCCEEDED(IDWriteFontFile_GetReferenceKey(fontface->file, &cache_key, &cache_key_size))
+-                && (cached_object = factory_get_cached_font_object(fontface->factory, cache_key,
+-                        cache_key_size, fontface->index, &cache_entry)))
++        /* The file's loader holds a reference while fontface->file does, so it is used here without one. */
++        if (SUCCEEDED(IDWriteFontFile_GetLoader(fontface->file, &cache_loader)))
++            IDWriteFontFileLoader_Release(cache_loader);
++        if (!cache_loader || FAILED(IDWriteFontFile_GetReferenceKey(fontface->file, &cache_key, &cache_key_size)))
++            cache_key = NULL;
++
++        if (cache_key && (cached_object = factory_get_cached_font_object(fontface->factory, cache_loader,
++                        cache_key, cache_key_size, fontface->index, &cache_entry)))
+         {
+             /* factory_get_cached_font_object() handed us a reference along with the object; it is
+              * released in the fontface destructor. Holding it is what keeps eviction from calling
+@@ -5384,7 +5390,7 @@
+                 /* Hand the parsed font and the mapping it points into to the
+                  * factory cache -- FT_New_Memory_Face does not copy the data, so
+                  * the fragment must outlive the face. */
+-                if (cache_key && factory_cache_font_object(fontface->factory, cache_key, cache_key_size,
++                if (cache_key && factory_cache_font_object(fontface->factory, cache_loader, cache_key, cache_key_size,
+                         fontface->index, font_object, fontface->stream, data_context, &cache_entry))
+                 {
+                     fontface->font_object_cache_entry = cache_entry;
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -1011,6 +1011,10 @@
+     UINT64 object;
+     IDWriteFontFileStream *stream;
+     void *data_context;
++    /* A reference key names a file only to its own loader: Skia gives every web font its own loader and an EMPTY key,
++     * so a key-only match handed every web font the first one's parsed font (WebView2 text drawn with another font's
++     * glyphs). The reference keeps a released loader's address from being reused by a new one while this entry lives. */
++    IDWriteFontFileLoader *loader;
+     UINT32 index;
+     UINT32 key_size;
+     void *key;
+@@ -1128,6 +1132,7 @@
+         IDWriteFontFileStream_ReleaseFileFragment(cached->stream, cached->data_context);
+         IDWriteFontFileStream_Release(cached->stream);
+     }
++    if (cached->loader) IDWriteFontFileLoader_Release(cached->loader);
+     free(cached->key);
+     free(cached);
+ }
+@@ -1156,8 +1161,8 @@
+ /* Returns the parsed font AND takes a reference on its cache entry, handed back through
+  * `entry_out`. The caller must pass that cookie to factory_release_font_object() when it is
+  * done -- see the refcount rationale above. */
+-UINT64 factory_get_cached_font_object(IDWriteFactory7 *iface, const void *key, UINT32 key_size, UINT32 index,
+-        void **entry_out)
++UINT64 factory_get_cached_font_object(IDWriteFactory7 *iface, IDWriteFontFileLoader *loader, const void *key,
++        UINT32 key_size, UINT32 index, void **entry_out)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+     struct cached_font_object *cached;
+@@ -1168,7 +1173,8 @@
+     EnterCriticalSection(&factory->cs);
+     LIST_FOR_EACH_ENTRY(cached, &factory->font_objects, struct cached_font_object, entry)
+     {
+-        if (cached->index == index && cached->key_size == key_size && !memcmp(cached->key, key, key_size))
++        if (cached->loader == loader && cached->index == index && cached->key_size == key_size
++                && !memcmp(cached->key, key, key_size))
+         {
+             /* most recently used to the front */
+             list_remove(&cached->entry);
+@@ -1207,8 +1213,8 @@
+ /* Takes ownership of the stream fragment on success, and hands back a cookie in `entry_out`
+  * carrying the inserting face's reference (count starts at 1). Returns FALSE if an equal
+  * entry raced in, in which case the caller keeps ownership and drops its copy. */
+-BOOL factory_cache_font_object(IDWriteFactory7 *iface, const void *key, UINT32 key_size, UINT32 index,
+-        UINT64 object, IDWriteFontFileStream *stream, void *data_context, void **entry_out)
++BOOL factory_cache_font_object(IDWriteFactory7 *iface, IDWriteFontFileLoader *loader, const void *key, UINT32 key_size,
++        UINT32 index, UINT64 object, IDWriteFontFileStream *stream, void *data_context, void **entry_out)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+     struct cached_font_object *cached, *evict = NULL, *candidate;
+@@ -1230,6 +1236,8 @@
+     cached->data_context = data_context;
+     cached->refcount = 1;            /* the inserting fontface */
+     IDWriteFontFileStream_AddRef(stream);
++    cached->loader = loader;
++    IDWriteFontFileLoader_AddRef(loader);
+ 
+     EnterCriticalSection(&factory->cs);
+     list_add_head(&factory->font_objects, &cached->entry);

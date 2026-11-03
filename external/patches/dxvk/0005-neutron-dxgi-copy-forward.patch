@@ -1,0 +1,139 @@
+From: Neutron
+Subject: [PATCH] d3d11: copy the previous frame forward on Present1 with dirty rects, as DXGI does
+
+DXGI's contract for a multi-buffer SEQUENTIAL or FLIP_SEQUENTIAL swap chain presented with dirty rects
+(Microsoft Learn, "Flip model, dirty rectangles, scrolled areas"): the runtime copies, from the previous
+frame onto the current back buffer, the areas the previous BufferCount-1 frames updated minus the areas
+this frame updates. DXVK presented the back buffer as it stood. An app that uploads only its damage then
+shows, outside that damage, whatever the buffer held BufferCount frames ago.
+
+Chromium's software output device (WebView2's GPU process when GPU compositing is off) does exactly
+that: one CopySubresourceRegion of the damage rect into buffer 0 of a 2-buffer FLIP_SEQUENTIAL chain,
+then Present1 with that rect. Lab, a WebView2 page with a counter: without the copy every other frame
+showed text from two frames ago and areas never drawn (black); with it every frame is whole. Same build,
+NEUTRON_DXVK_COPY_FORWARD=0, the tear returns.
+
+dxgi passes the DXGI_PRESENT_PARAMETERS through to d3d11 (dxvk-dxgi 0003). The scroll rect is not handled.
+Kill switch NEUTRON_DXVK_COPY_FORWARD=0.
+
+--- a/src/d3d11/d3d11_swapchain.h
++++ b/src/d3d11/d3d11_swapchain.h
+@@ -164,6 +164,13 @@
+ 
+     void RotateBackBuffers(D3D11ImmediateContext* ctx);
+ 
++    // neutron copy-forward: the dirty rects of the last BufferCount-1 presents, newest first;
++    // an entry with full = true stands for a Present without dirty rects (the whole frame).
++    struct DirtyFrame { bool full; std::vector<RECT> rects; };
++    std::vector<DirtyFrame>   m_dirtyHistory;
++
++    void CopyForwardDirtyRegion(const DXGI_PRESENT_PARAMETERS* pPresentParameters);
++
+     void CreateFrameLatencyEvent();
+ 
+     void CreatePresenter();
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -317,6 +317,8 @@
+       return hr;
+     }
+ 
++    CopyForwardDirtyRegion(pPresentParameters);
++
+     try {
+       hr = PresentImage(SyncInterval);
+     } catch (const DxvkError& e) {
+@@ -894,6 +896,85 @@
+   }
+ 
+ 
++  static void SubtractRect(const RECT& a, const RECT& b, std::vector<RECT>& out) {
++    RECT i = { std::max(a.left, b.left), std::max(a.top, b.top),
++               std::min(a.right, b.right), std::min(a.bottom, b.bottom) };
++
++    if (i.left >= i.right || i.top >= i.bottom) {
++      out.push_back(a);
++      return;
++    }
++
++    if (a.top < i.top)       out.push_back({ a.left, a.top, a.right, i.top });
++    if (i.bottom < a.bottom) out.push_back({ a.left, i.bottom, a.right, a.bottom });
++    if (a.left < i.left)     out.push_back({ a.left, i.top, i.left, i.bottom });
++    if (i.right < a.right)   out.push_back({ i.right, i.top, a.right, i.bottom });
++  }
++
++
++  // neutron copy-forward: DXGI's contract for a multi-buffer (FLIP_)SEQUENTIAL chain presented
++  // with dirty rects ("Flip model, dirty rectangles, scrolled areas"): the runtime copies, from the
++  // previous frame onto the current back buffer, the areas the previous BufferCount-1 frames
++  // updated minus the areas this frame updates. Apps that upload only their damage rely on it:
++  // Chromium's software output (WebView2) copies one damage rect into buffer 0 of a 2-buffer chain
++  // and calls Present1, so without the copy every other frame showed regions from two frames ago.
++  // The scroll rect is not handled. Kill switch NEUTRON_DXVK_COPY_FORWARD=0.
++  void D3D11SwapChain::CopyForwardDirtyRegion(const DXGI_PRESENT_PARAMETERS* pPresentParameters) {
++    static const bool enabled = env::getEnvVar("NEUTRON_DXVK_COPY_FORWARD") != "0";
++
++    if (!enabled || m_backBuffers.size() < 2u)
++      return;
++
++    RECT frame = { 0, 0, LONG(m_desc.Width), LONG(m_desc.Height) };
++    DirtyFrame cur = { true, { } };
++
++    if (pPresentParameters && pPresentParameters->DirtyRectsCount && pPresentParameters->pDirtyRects) {
++      cur.full = false;
++
++      for (UINT i = 0; i < pPresentParameters->DirtyRectsCount; i++) {
++        const RECT& r = pPresentParameters->pDirtyRects[i];
++        RECT c = { std::max(r.left, frame.left), std::max(r.top, frame.top),
++                   std::min(r.right, frame.right), std::min(r.bottom, frame.bottom) };
++
++        if (c.left < c.right && c.top < c.bottom)
++          cur.rects.push_back(c);
++      }
++    }
++
++    if (!cur.full && !m_dirtyHistory.empty()) {
++      std::vector<RECT> copy;
++
++      for (const auto& f : m_dirtyHistory) {
++        if (f.full) {
++          copy.assign(1, frame);
++          break;
++        }
++        copy.insert(copy.end(), f.rects.begin(), f.rects.end());
++      }
++
++      for (const RECT& c : cur.rects) {
++        std::vector<RECT> rest;
++        for (const RECT& r : copy)
++          SubtractRect(r, c, rest);
++        copy = std::move(rest);
++      }
++
++      auto ctx = m_parent->GetContext();
++
++      for (const RECT& r : copy) {
++        D3D11_BOX box = { UINT(r.left), UINT(r.top), 0u, UINT(r.right), UINT(r.bottom), 1u };
++        ctx->CopySubresourceRegion(m_backBuffers[0].ptr(), 0, UINT(r.left), UINT(r.top), 0,
++          m_backBuffers[m_backBuffers.size() - 1u].ptr(), 0, &box);
++      }
++    }
++
++    m_dirtyHistory.insert(m_dirtyHistory.begin(), std::move(cur));
++
++    if (m_dirtyHistory.size() > m_backBuffers.size() - 1u)
++      m_dirtyHistory.resize(m_backBuffers.size() - 1u);
++  }
++
++
+   void D3D11SwapChain::CreateFrameLatencyEvent() {
+     m_frameLatencySignal = new sync::CallbackFence(m_frameId);
+ 
+@@ -955,6 +1036,7 @@
+     // Explicitly destroy current swap image before
+     // creating a new one to free up resources
+     m_backBuffers.clear();
++    m_dirtyHistory.clear();
+ 
+     bool sequential = m_desc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL ||
+                       m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
