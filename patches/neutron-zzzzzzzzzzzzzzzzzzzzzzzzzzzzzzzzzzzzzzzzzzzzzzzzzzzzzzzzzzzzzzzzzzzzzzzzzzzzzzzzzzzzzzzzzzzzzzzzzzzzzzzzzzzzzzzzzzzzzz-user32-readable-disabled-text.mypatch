@@ -1,0 +1,80 @@
+user32: disabled text stays readable when the palette's emboss is invisible.
+
+DrawState(DSS_DISABLED) embosses: the image in COLOR_3DHILIGHT one pixel down-right, then in COLOR_3DSHADOW. Under
+Neutron's dark palette (button face 43, highlight 60, shadow 30) both are 1.3:1 and 1.2:1 against the face, so the
+disabled label of a push button disappeared: Inno Setup's license page (VSDC 11.3 installer, lab 2026-11-03) showed its
+grayed "Next" as an empty button, and the same held for every disabled button in installers and dialogs.
+
+When neither emboss color reaches 2:1 against COLOR_BTNFACE, the image is now drawn once in COLOR_GRAYTEXT (106 on 43,
+2.6:1), the color Windows' themed controls give disabled text. Classic palettes keep their emboss exactly as before:
+Wine's default shadow is 2.3:1 against its face and Windows' classic one about 2.7:1. The palette is not changed (the
+same rule as patch 114's check-box ring). Not covered: controls that emboss by their own code instead of DrawState
+(comctl32's toolbar, for one).
+
+Lab, VSDC installer on 177 + this (lab 177d, PgI-vsdc2): the license page's disabled Next reads, gray; after accepting
+the agreement it draws as enabled text; Back/Cancel and the radios unchanged. Same page on 176: an empty button.
+
+
+--- a/dlls/user32/uitools.c
++++ b/dlls/user32/uitools.c
+@@ -728,10 +728,15 @@
+     return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+ }
+ 
+-static BOOL sys_color_readable_on_face( int index )
++static double sys_color_contrast_on_face( int index )
+ {
+     double a = sys_color_luminance( index ), b = sys_color_luminance( COLOR_BTNFACE );
+-    return (max( a, b ) + 0.05) / (min( a, b ) + 0.05) >= 3.0;
++    return (max( a, b ) + 0.05) / (min( a, b ) + 0.05);
++}
++
++static BOOL sys_color_readable_on_face( int index )
++{
++    return sys_color_contrast_on_face( index ) >= 3.0;
+ }
+ 
+ /* The flat outline color for a check box or radio button whose classic ring would be unreadable; FALSE when it is
+@@ -1686,7 +1691,7 @@
+     COLORREF fg, bg;
+     UINT opcode = flags & 0xf;
+     INT len = wp;
+-    BOOL retval, tmp;
++    BOOL retval, tmp, flat_disabled;
+ 
+     if((opcode == DST_TEXT || opcode == DST_PREFIXTEXT) && !len)    /* The string is '\0' terminated */
+     {
+@@ -1786,13 +1791,22 @@
+         if(!tmp) goto cleanup;
+     }
+ 
+-    if (flags & DSS_DISABLED)
++    /* NEUTRON 2026-11-03: a disabled image is embossed, COLOR_3DHILIGHT one pixel down-right under COLOR_3DSHADOW.
++     * Under Neutron's dark palette (face 43, highlight 60, shadow 30: 1.3:1 and 1.2:1 against the face) the emboss is
++     * invisible and the disabled text of buttons disappeared: Inno Setup's grayed "Next" on its license page read as
++     * an empty button. When neither emboss color reaches 2:1 against the face, draw the image once in COLOR_GRAYTEXT,
++     * the color Windows' themed controls give disabled text. Classic palettes keep their emboss exactly as before:
++     * Wine's default shadow is 2.3:1 and Windows' classic one about 2.7:1. The palette is not changed (see patch 114). */
++    flat_disabled = (flags & DSS_DISABLED) && sys_color_contrast_on_face( COLOR_3DHILIGHT ) < 2.0 &&
++                    sys_color_contrast_on_face( COLOR_3DSHADOW ) < 2.0;
++
++    if ((flags & DSS_DISABLED) && !flat_disabled)
+        hbrtmp = GetSysColorBrush(COLOR_3DHILIGHT);
+     else if (flags & DSS_DEFAULT)
+        hbrtmp = GetSysColorBrush(COLOR_3DSHADOW);
+ 
+     /* Draw light or dark shadow */
+-    if (flags & (DSS_DISABLED|DSS_DEFAULT))
++    if ((flags & (DSS_DISABLED|DSS_DEFAULT)) && hbrtmp)
+     {
+        hbsave = SelectObject(hdc, hbrtmp);
+        if(!hbsave) goto cleanup;
+@@ -1802,7 +1816,7 @@
+ 
+     if (flags & DSS_DISABLED)
+     {
+-       hbr = GetSysColorBrush(COLOR_3DSHADOW);
++       hbr = GetSysColorBrush(flat_disabled ? COLOR_GRAYTEXT : COLOR_3DSHADOW);
+     }
+     else if (!hbr)
+     {
