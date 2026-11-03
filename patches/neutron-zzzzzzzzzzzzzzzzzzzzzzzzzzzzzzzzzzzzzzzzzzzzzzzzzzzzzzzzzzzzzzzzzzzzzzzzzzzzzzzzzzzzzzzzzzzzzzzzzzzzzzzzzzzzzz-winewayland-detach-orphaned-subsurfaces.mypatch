@@ -1,0 +1,75 @@
+winewayland: detach other windows' subsurfaces before destroying their parent wl_surface
+
+FL Studio 26 died a few seconds into startup: "wl_subsurface#69: error 0: no parent", then "Failed to read events
+from the compositor, terminating process". A captioned WS_EX_NOACTIVATE popup that had been a toplevel became an
+owned subsurface; the role change destroys its wayland_surface, and another window was still a wl_subsurface of
+that wl_surface. The next set_position on the orphaned child is a protocol error and the compositor drops the
+connection. Before a wayland_surface is destroyed (role change, or the window going away), clear the subsurface
+role of every window parented to its wl_surface and detach every client (GPU) subsurface on it. On their next
+update WAYLAND_WindowPosChanged parents an owned subsurface to its nearest owner with a toplevel, and
+wayland_client_surface_attach_rect re-creates a client subsurface on the toplevel's current wl_surface.
+Lab: FL Studio 26.1.7 on 172 + patch 109: protocol error at startup every launch; with this patch the main window,
+welcome screen and settings come up (one detach logged at the role change).
+
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -191,6 +191,42 @@
+ }
+ 
+ /***********************************************************************
++ *           neutron_detach_subsurfaces_of
++ *
++ * NEUTRON: a wl_surface about to be destroyed must not leave subsurfaces behind. Another
++ * window's owned subsurface, or a child window's client (GPU) subsurface, can still be parented
++ * to it, and the next request on such a wl_subsurface once its parent is gone is a protocol error
++ * ("no parent"): the compositor drops the whole connection and the process terminates. FL Studio
++ * 26 hit it at startup: a captioned WS_EX_NOACTIVATE popup turned from a toplevel into an owned
++ * subsurface, its old wl_surface was destroyed while another window was still a subsurface of it,
++ * and the next set_position on that child killed the app.
++ *
++ * Detach them first. On the child's next update WAYLAND_WindowPosChanged parents an owned
++ * subsurface to its nearest owner that has a toplevel, and wayland_client_surface_attach_rect
++ * re-creates a client subsurface on the toplevel's current wl_surface. Caller holds
++ * win_data_mutex; this makes no user-lock calls.
++ */
++static void neutron_detach_subsurfaces_of(struct wl_surface *parent, HWND self)
++{
++    struct wayland_win_data *d;
++
++    if (!parent) return;
++    RB_FOR_EACH_ENTRY(d, &win_data_rb, struct wayland_win_data, entry)
++    {
++        if (d->hwnd == self) continue;
++        if (d->wayland_surface && d->wayland_surface->role == WAYLAND_SURFACE_ROLE_SUBSURFACE &&
++            d->wayland_surface->wl_subsurface && d->wayland_surface->subsurface_parent == parent)
++        {
++            TRACE("hwnd=%p loses its parent wl_surface %p\n", d->hwnd, parent);
++            wayland_surface_clear_role(d->wayland_surface);
++        }
++        if (d->client_surface && d->client_surface->wl_subsurface &&
++            d->client_surface->toplevel_wl_surface == parent)
++            wayland_client_surface_attach(d->client_surface, NULL);
++    }
++}
++
++/***********************************************************************
+  *           wayland_win_data_create
+  *
+  * Create a data window structure for an existing window.
+@@ -236,6 +272,8 @@
+ 
+     rb_remove(&win_data_rb, &data->entry);
+ 
++    if (data->wayland_surface) neutron_detach_subsurfaces_of(data->wayland_surface->wl_surface, data->hwnd);
++
+     pthread_mutex_unlock(&win_data_mutex);
+ 
+     if (data->wayland_surface) wayland_surface_destroy(data->wayland_surface);
+@@ -701,6 +739,7 @@
+     if ((surface = data->wayland_surface) && role && surface->role && surface->role != role)
+     {
+         if (client) wayland_client_surface_attach(client, NULL);
++        neutron_detach_subsurfaces_of(surface->wl_surface, data->hwnd);
+         wayland_surface_destroy(data->wayland_surface);
+         data->wayland_surface = NULL;
+     }

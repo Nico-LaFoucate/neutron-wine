@@ -1,0 +1,209 @@
+crypt32: verify a signer's authenticated attributes over the bytes it signed
+
+FL Studio 26.1.4 and later refused to start ("The validity of the program could not be verified"): WinVerifyTrust
+returned TRUST_E_CERT_SIGNATURE for FL64.exe, FLEngine_x64.dll and the installer, all signed under Image-Line's
+current certificate. Verification hashed a re-encoding of the decoded authenticatedAttributes, and that re-encoding
+does not reproduce the signer's bytes for these signatures. PKCS #7 / CMS hash the attributes as encoded by the
+signer (with the [0] IMPLICIT tag read as SET OF), which is what Windows checks. Keep each SignerInfo's encoded
+attributes when the message is decoded and hash those; anything the DER walk does not recognize falls back to the
+old re-encoding. Wine bug 60231.
+Lab: Wine's crypt32 msg tests 1026/0 failures before and after; WinVerifyTrust on Photoshop.exe, AdobeOwl.dll,
+Premiere, AdobeIPCBroker x3, MicrosoftEdgeUpdate.exe = 0 before and after; FL64.exe, FLEngine_x64.dll and the
+installer 80096004 -> 0; FL64.exe with one signed attribute value changed, or with the signature changed,
+80096004 before and after.
+
+--- a/dlls/crypt32/msg.c
++++ b/dlls/crypt32/msg.c
+@@ -969,6 +969,12 @@
+     CRYPT_SIGNED_INFO *info;
+     DWORD              cSignerHandle;
+     CSignerHandles    *signerHandles;
++    /* Decoded messages only: each signer's authenticatedAttributes exactly as
++     * they were encoded, with the [0] IMPLICIT tag already turned into SET OF.
++     * Verification hashes these, not a re-encoding of the decoded attributes.
++     */
++    DWORD              cRawAuthAttrs;
++    CRYPT_DER_BLOB    *rawAuthAttrs;
+ } CSignedMsgData;
+ 
+ /* Constructs the signer handles for the signerIndex'th signer of msg_data.
+@@ -1046,6 +1052,17 @@
+     msg_data->cSignerHandle = 0;
+ }
+ 
++static void CSignedMsgData_FreeRawAuthAttrs(CSignedMsgData *msg_data)
++{
++    DWORD i;
++
++    for (i = 0; i < msg_data->cRawAuthAttrs; i++)
++        CryptMemFree(msg_data->rawAuthAttrs[i].pbData);
++    CryptMemFree(msg_data->rawAuthAttrs);
++    msg_data->rawAuthAttrs = NULL;
++    msg_data->cRawAuthAttrs = 0;
++}
++
+ static BOOL CSignedMsgData_UpdateHash(CSignedMsgData *msg_data,
+  const BYTE *pbData, DWORD cbData)
+ {
+@@ -1131,7 +1148,19 @@
+                     ret = CSignedMsgData_AppendMessageDigestAttribute(msg_data,
+                      i);
+             }
+-            if (ret)
++            if (ret && flag == Verify && i < msg_data->cRawAuthAttrs &&
++             msg_data->rawAuthAttrs[i].cbData)
++            {
++                /* PKCS #7 and CMS hash the DER of the attributes as the signer
++                 * encoded them (with a SET OF tag).  A re-encoding of the
++                 * decoded attributes need not reproduce those bytes, and then
++                 * a valid signature fails with TRUST_E_CERT_SIGNATURE.
++                 */
++                ret = CryptHashData(msg_data->signerHandles[i].authAttrHash,
++                 msg_data->rawAuthAttrs[i].pbData,
++                 msg_data->rawAuthAttrs[i].cbData, 0);
++            }
++            else if (ret)
+             {
+                 LPBYTE encodedAttrs;
+                 DWORD size;
+@@ -1452,6 +1481,8 @@
+             msg->msg_data.info = CryptMemAlloc(sizeof(CRYPT_SIGNED_INFO));
+         else
+             msg->msg_data.info = NULL;
++        msg->msg_data.cRawAuthAttrs = 0;
++        msg->msg_data.rawAuthAttrs = NULL;
+         if (msg->msg_data.info)
+         {
+             memset(msg->msg_data.info, 0, sizeof(CRYPT_SIGNED_INFO));
+@@ -2161,6 +2192,7 @@
+         {
+             LocalFree(msg->u.signed_data.info);
+             CSignedMsgData_CloseHandles(&msg->u.signed_data);
++            CSignedMsgData_FreeRawAuthAttrs(&msg->u.signed_data);
+         }
+         break;
+     }
+@@ -2303,6 +2335,112 @@
+     return ret;
+ }
+ 
++/* Reads one DER element (single-byte tag, definite length) at p.  Returns the
++ * tag, the content and the element's total size, or FALSE if it doesn't fit.
++ */
++static BOOL der_element(const BYTE *p, DWORD avail, BYTE *tag,
++ const BYTE **content, DWORD *content_len, DWORD *total)
++{
++    DWORD len, hdr = 2;
++
++    if (avail < 2 || (p[0] & 0x1f) == 0x1f)
++        return FALSE;
++    *tag = p[0];
++    len = p[1];
++    if (len & 0x80)
++    {
++        DWORD n = len & 0x7f, i;
++
++        if (!n || n > 4 || avail < 2 + n)
++            return FALSE;
++        for (len = 0, i = 0; i < n; i++)
++            len = (len << 8) | p[2 + i];
++        hdr += n;
++    }
++    if (len > avail - hdr)
++        return FALSE;
++    *content = p + hdr;
++    *content_len = len;
++    *total = hdr + len;
++    return TRUE;
++}
++
++/* Finds each SignerInfo's authenticatedAttributes in the encoded SignedData
++ * and keeps a copy of their encoding, so verification can hash the signed
++ * bytes themselves.  Any structure this doesn't recognize leaves the copies
++ * out, and verification falls back to re-encoding the decoded attributes.
++ */
++static void CDecodeMsg_SaveRawAuthAttrs(CSignedMsgData *msg_data,
++ const CRYPT_DER_BLOB *blob)
++{
++    const BYTE *seq, *p, *last = NULL, *signer;
++    DWORD seq_len, len, total, last_len = 0, signer_len, i, n = 0;
++    BYTE tag, last_tag = 0;
++    CRYPT_DER_BLOB *raw;
++
++    if (!msg_data->info->cSignerInfo)
++        return;
++    if (!der_element(blob->pbData, blob->cbData, &tag, &seq, &seq_len, &total) ||
++     tag != 0x30)
++        return;
++    /* signerInfos is the last element of SignedData. */
++    for (p = seq; p < seq + seq_len; p += total)
++    {
++        const BYTE *c;
++
++        if (!der_element(p, seq + seq_len - p, &tag, &c, &len, &total))
++            return;
++        last = c;
++        last_len = len;
++        last_tag = tag;
++    }
++    if (!last || last_tag != 0x31)
++        return;
++    if (!(raw = CryptMemAlloc(msg_data->info->cSignerInfo * sizeof(*raw))))
++        return;
++    memset(raw, 0, msg_data->info->cSignerInfo * sizeof(*raw));
++    for (p = last; p < last + last_len; p += total, n++)
++    {
++        const BYTE *q;
++        DWORD field;
++
++        if (!der_element(p, last + last_len - p, &tag, &signer, &signer_len,
++         &total) || tag != 0x30 || n >= msg_data->info->cSignerInfo)
++            goto fail;
++        /* version, sid, digestAlgorithm, then [0] authenticatedAttributes */
++        for (q = signer, field = 0; q < signer + signer_len; q += len, field++)
++        {
++            const BYTE *c;
++            DWORD clen;
++
++            if (!der_element(q, signer + signer_len - q, &tag, &c, &clen, &len))
++                goto fail;
++            if (field == 3)
++            {
++                if (tag == 0xa0)
++                {
++                    if (!(raw[n].pbData = CryptMemAlloc(len)))
++                        goto fail;
++                    memcpy(raw[n].pbData, q, len);
++                    raw[n].pbData[0] = 0x31; /* SET OF */
++                    raw[n].cbData = len;
++                }
++                break;
++            }
++        }
++    }
++    if (n != msg_data->info->cSignerInfo)
++        goto fail;
++    msg_data->rawAuthAttrs = raw;
++    msg_data->cRawAuthAttrs = n;
++    return;
++
++fail:
++    for (i = 0; i < msg_data->info->cSignerInfo; i++)
++        CryptMemFree(raw[i].pbData);
++    CryptMemFree(raw);
++}
++
+ static BOOL CDecodeMsg_DecodeSignedContent(CDecodeMsg *msg,
+  const CRYPT_DER_BLOB *blob)
+ {
+@@ -2314,7 +2452,10 @@
+      CRYPT_DECODE_ALLOC_FLAG, NULL, (CRYPT_SIGNED_INFO *)&signedInfo,
+      &size);
+     if (ret)
++    {
+         msg->u.signed_data.info = signedInfo;
++        CDecodeMsg_SaveRawAuthAttrs(&msg->u.signed_data, blob);
++    }
+     return ret;
+ }
+ 
