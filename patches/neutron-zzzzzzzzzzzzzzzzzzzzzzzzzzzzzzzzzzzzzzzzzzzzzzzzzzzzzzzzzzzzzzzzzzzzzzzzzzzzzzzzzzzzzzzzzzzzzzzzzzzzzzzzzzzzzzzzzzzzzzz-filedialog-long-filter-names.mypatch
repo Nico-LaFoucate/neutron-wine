@@ -1,0 +1,99 @@
+comdlg32: the restyled file dialog draws filter names of any length (VSDC: "Files of type" empty).
+
+OUR BUG (the Neutron file dialog restyle, shipped 11.10-85). The restyle owner-draws the "Files of type" combo
+(CBS_OWNERDRAWFIXED) and read each item into a fixed 256-character buffer, returning an empty string when the item was
+longer. A filter description can be far longer: VSDC 11.3's Import content dialog starts with "All Video and Image Files
+(*.avi;*.divx;...)" at 756 characters, then two more of 357 and 406, so the field showed nothing and the top three
+dropdown rows were blank (lab, 2026-11-03; a +relay trace showed CB_GETLBTEXTLEN 756 then DrawTextW(L"")). Windows
+shows the description, cut with an ellipsis.
+
+The text is now read at the item's own length into a heap buffer, for both paint paths (the field's WM_PAINT and the
+WM_DRAWITEM of field and dropdown items). DrawText already ends it with an ellipsis where it does not fit.
+
+Lab, VSDC 11.3 on 177 + 118 + this (lab 177e, PgI-vsdc): the field reads "All Video and Image Files (*.avi;...", and the
+three long dropdown rows draw; on 177d both blank (2 of 2).
+
+
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -2371,13 +2371,16 @@
+     if (old_font) SelectObject(dis->hDC, old_font);
+ }
+ 
+-/* text of the filter combo's current selection, for both paint paths */
+-static void neutron_combo_text(HWND combo, int index, WCHAR *buf, int len)
++/* text of a filter combo item, for both paint paths; never NULL, free() it. Allocated at the item's own
++ * length: a filter description can be hundreds of characters (VSDC's "All Video and Image Files (*.avi;...)"
++ * is 756), and a fixed 256-character buffer drew such items, and the field showing them, blank. */
++static WCHAR *neutron_combo_text(HWND combo, int index)
+ {
+-    buf[0] = 0;
+-    if (index == CB_ERR) return;
+-    if (SendMessageW(combo, CB_GETLBTEXTLEN, index, 0) >= len) return;
+-    SendMessageW(combo, CB_GETLBTEXT, index, (LPARAM)buf);
++    LRESULT len = index == CB_ERR ? CB_ERR : SendMessageW(combo, CB_GETLBTEXTLEN, index, 0);
++    WCHAR *buf = calloc(len > 0 ? len + 1 : 1, sizeof(WCHAR));
++
++    if (buf && len > 0 && SendMessageW(combo, CB_GETLBTEXT, index, (LPARAM)buf) == CB_ERR) buf[0] = 0;
++    return buf;
+ }
+ 
+ /* the field portion and the dropdown items of the (CBS_OWNERDRAWFIXED) filter combo */
+@@ -2385,7 +2388,7 @@
+ {
+     BOOL field = (dis->itemState & ODS_COMBOBOXEDIT) != 0;
+     RECT rc = dis->rcItem;
+-    WCHAR text[256];
++    WCHAR *text;
+     HBRUSH brush;
+ 
+     brush = CreateSolidBrush(!field && (dis->itemState & ODS_SELECTED) ? NEUTRON_BTN_HOT
+@@ -2393,8 +2396,7 @@
+     FillRect(dis->hDC, &rc, brush);
+     DeleteObject(brush);
+ 
+-    neutron_combo_text(dis->hwndItem, dis->itemID == (UINT)-1 ? CB_ERR : (int)dis->itemID,
+-                       text, ARRAY_SIZE(text));
++    text = neutron_combo_text(dis->hwndItem, dis->itemID == (UINT)-1 ? CB_ERR : (int)dis->itemID);
+     if (field)
+     {
+         /* same geometry as the subclass's WM_PAINT so the two never disagree by a pixel */
+@@ -2404,8 +2406,9 @@
+     rc.left += neutron_scale(8, This->dpi_x);
+     SetBkMode(dis->hDC, TRANSPARENT);
+     SetTextColor(dis->hDC, field ? NEUTRON_FIELD_DIMTEXT : NEUTRON_FIELD_TEXT);
+-    DrawTextW(dis->hDC, text, -1, &rc,
++    DrawTextW(dis->hDC, text ? text : L"", -1, &rc,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
++    free(text);
+ }
+ 
+ /* Push buttons are BS_OWNERDRAW so every paint path (WM_PAINT and comctl32's direct
+@@ -2475,7 +2478,7 @@
+         PAINTSTRUCT ps;
+         HDC hdc = BeginPaint(hwnd, &ps);
+         HFONT font = (HFONT)SendMessageW(hwnd, WM_GETFONT, 0, 0), old_font = NULL;
+-        WCHAR text[256];
++        WCHAR *text;
+         RECT rc, rc_text;
+         int dpi = This ? This->dpi_x : neutron_window_dpi(hwnd);
+ 
+@@ -2484,15 +2487,16 @@
+                            GetFocus() == hwnd ? NEUTRON_FIELD_FOCUS : NEUTRON_FIELD_BORDER,
+                            neutron_scale(NEUTRON_FIELD_RADIUS, dpi));
+ 
+-        neutron_combo_text(hwnd, SendMessageW(hwnd, CB_GETCURSEL, 0, 0), text, ARRAY_SIZE(text));
++        text = neutron_combo_text(hwnd, SendMessageW(hwnd, CB_GETCURSEL, 0, 0));
+         rc_text = rc;
+         rc_text.left += neutron_scale(8, dpi);
+         rc_text.right -= neutron_scale(28, dpi);
+         if (font) old_font = SelectObject(hdc, font);
+         SetBkMode(hdc, TRANSPARENT);
+         SetTextColor(hdc, NEUTRON_FIELD_DIMTEXT);
+-        DrawTextW(hdc, text, -1, &rc_text,
++        DrawTextW(hdc, text ? text : L"", -1, &rc_text,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
++        free(text);
+         if (old_font) SelectObject(hdc, old_font);
+ 
+         neutron_chevron(hdc, rc.right - neutron_scale(14, dpi), (rc.top + rc.bottom) / 2,
