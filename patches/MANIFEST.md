@@ -1593,7 +1593,7 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
-### patch 119 — `…z×119-filedialog-long-filter-names` (VSDC: "Files of type" empty in the Import dialog) — OUR BUG (file dialog restyle, 85) — committed, not built
+### patch 119 — `…z×119-filedialog-long-filter-names` (VSDC: "Files of type" empty in the Import dialog) — OUR BUG (file dialog restyle, 85) — committed `9ef8ec7`, not built
 Found 11-03 (C172, open item "VSDC Open dialog Files of type empty"). The restyle owner-draws the filter combo and read items into WCHAR[256], returning "" for longer ones; VSDC's first three filters are 756/357/406 chars, so the field and the top three dropdown rows were blank (+relay: CB_GETLBTEXTLEN 756, then DrawTextW(L"")). Now read at the item's length into a heap buffer in both paint paths; DrawText's DT_END_ELLIPSIS cuts it. Lab 177e: field "All Video and Image Files (*.avi;..." + the three rows drawn; 177d blank 2/2. Lab trap: the combo is CBS_OWNERDRAWFIXED and the drawing proc lives in comdlg32.dll (address in the builtin range, matched in /proc/PID/maps); my first guess was VSDC's Codejock skin.
 
 ### patch 118 — `…z×118-user32-readable-disabled-text` (disabled button labels invisible under the dark palette) — committed `24e6212`, not built
