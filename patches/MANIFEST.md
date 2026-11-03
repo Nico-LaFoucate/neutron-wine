@@ -1593,7 +1593,7 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
-### patch 118 — `…z×118-user32-readable-disabled-text` (disabled button labels invisible under the dark palette) — committed, not built
+### patch 118 — `…z×118-user32-readable-disabled-text` (disabled button labels invisible under the dark palette) — committed `24e6212`, not built
 Found 11-03 (C172, the open "disabled control labels unreadable" item). DrawState(DSS_DISABLED) embosses COLOR_3DHILIGHT (+1,+1) under COLOR_3DSHADOW; Neutron's palette gives them 1.3:1 and 1.2:1 against the face (43), so a disabled push button's label disappeared (Inno's grayed "Next" on the license page = empty button). When neither emboss color reaches 2:1 against COLOR_BTNFACE, draw once in COLOR_GRAYTEXT (106, 2.6:1), as Windows' themed controls color disabled text. Classic palettes unchanged by the numbers (Wine default shadow 2.3:1, Windows classic ~2.7:1; not run). Patch 114's contrast helper split into sys_color_contrast_on_face. Not covered: controls that emboss by their own code (comctl32 toolbar). No kill switch (color-only, palette-conditional, as 114).
 Lab (177 + this = lab 177d, VSDC installer in PgI-vsdc2): disabled Next reads gray 2/2; enabled Next normal; Back/Cancel/radios unchanged. Same page on 176: empty button.
 
