@@ -1,0 +1,71 @@
+win32u: Create a per-monitor aware thread's child windows at the coordinates asked for.
+
+What he saw: nothing yet on his desk; found while checking FL Studio's 96-dpi children (the dpi team agent,
+2026-11-04). On a desk with a 175% primary and a 200% screen beside it, a per-monitor aware program's child window
+came out the wrong size: a control asked at (20,20) 300x100 in a window on the 200% screen was created at (23,23)
+343x114, and a child asked past the right edge of a window on the primary was shrunk to 7/8.
+
+Mechanism: NtUserCreateWindowEx maps CREATESTRUCT through map_dpi_create_struct. A per-monitor aware thread has
+get_thread_dpi() == 0, so it picks the dpi to map FROM with monitor_dpi_from_rect on cs.x/y/cx/cy. For a child those
+are relative to the parent's client area, not screen coordinates, so the lookup lands on whichever monitor those
+numbers happen to fall on, and the rect is scaled by that monitor's dpi over the child's (its top-level's). Upstream
+Wine 11.10 does the same. SetWindowPos/MoveWindow from the same thread already treat its coordinates as the child's
+own dpi (map_dpi_rect with 0 is the identity).
+
+Windows behavior: a per-monitor aware thread speaks the dpi of the windows it creates; a child is created at the
+client coordinates given (INFERRED; Windows probe dpichild.exe is waiting, it needs two monitors at different
+scales and prints NOT DECISIVE otherwise).
+
+Change: skip the mapping for a child (parent is not the desktop) when the thread is per-monitor aware and the new
+window is monitor aware. Top-levels, DPI-unaware and system-aware threads are unchanged.
+
+Not covered: a per-monitor thread creating a child of a window of another awareness (mixed hosting) keeps the old
+mapping.
+
+Lab evidence (desk-g: Virtual-0 175% primary, Virtual-1 200% to its right; probe dpichild.exe in a Prg1 copy):
+fixed build 11.10-181d 7 of 8 runs created both children as asked (one run printed nothing before its first flush,
+cause not found, not repeated in 4 timed runs with unbuffered output); same build with NEUTRON_CHILD_CREATE_DPI=0
+2 of 2 mis-scaled exactly as stock 11.10-181 (3 of 3). FL Studio 2026 on 181 vs 181d: same 68 windows, same rects,
+captures differ only in live text (hint bar, memory meter).
+
+Kill switch: NEUTRON_CHILD_CREATE_DPI=0.
+
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -7094,6 +7094,19 @@
+     return on;
+ }
+ 
++/* NEUTRON child-create-dpi; kill switch NEUTRON_CHILD_CREATE_DPI=0 (see NtUserCreateWindowEx). */
++static BOOL neutron_child_create_dpi(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_CHILD_CREATE_DPI" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_CHILD_CREATE_DPI = 0 (environment)\n" );
++    }
++    return on;
++}
++
+ /***********************************************************************
+  *           map_dpi_create_struct
+  */
+@@ -7306,7 +7319,14 @@
+         UINT raw_dpi;
+         win_dpi = monitor_dpi_from_rect( rect, get_thread_dpi(), &raw_dpi );
+     }
+-    if (parent) map_dpi_create_struct( &cs, win_dpi );
++    /* NEUTRON child-create-dpi: a child's x/y/cx/cy are relative to its parent's client area, but with a per-monitor
++     * aware thread (get_thread_dpi() == 0) map_dpi_create_struct looked them up as SCREEN coordinates to pick the dpi
++     * to map from. A child of a window on a 200% screen, asked at (20,20) 300x100, came out (23,23) 343x114 beside a
++     * 175% primary; one asked past the primary's right edge was shrunk 7/8. A per-monitor aware thread already speaks
++     * the child's dpi (its top-level's), as SetWindowPos and MoveWindow assume: Windows creates it as asked. */
++    if (parent && (parent == get_desktop_window() || get_thread_dpi() || !neutron_child_create_dpi() ||
++                   !NTUSER_DPI_CONTEXT_IS_MONITOR_AWARE( get_window_dpi_awareness_context( hwnd ) )))
++        map_dpi_create_struct( &cs, win_dpi );
+ 
+     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
+ 
