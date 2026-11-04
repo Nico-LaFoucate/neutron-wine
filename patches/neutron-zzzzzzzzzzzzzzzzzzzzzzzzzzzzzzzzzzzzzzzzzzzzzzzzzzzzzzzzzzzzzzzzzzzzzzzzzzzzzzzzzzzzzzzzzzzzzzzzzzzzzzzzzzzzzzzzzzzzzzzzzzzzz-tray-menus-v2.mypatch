@@ -1,0 +1,893 @@
+winewayland: tray menus open where the user clicked (layer-shell placement, Plasma's ContextMenu path), and tray polish.
+
+On 180 (patches 123 + 124) a tray menu that is not a Win32 menu, such as Filmora 16's Qt tray menu (Open / Screen
+Recorder / Exit) or a program's own popup window, did not open at the icon on Plasma. It went through the dbusmenu
+request, which carries no click point, so the program placed it at a stale cursor. As an xdg_toplevel KWin centered it,
+listed it in the taskbar, or closed it again at once. Plasma was meanwhile left holding an empty menu that swallowed the
+next click. sway and Hyprland tiled such a menu window to fill the screen. On the dbusmenu path every program got its
+right click at 0,0. Balloons showed the item id ("wine-<class>-<id>") as the application name. His calls: C178 (menus
+at the icon), C179 ("Go for it": non-Win32 menus at the pointer where the compositor allows it, GNOME as it is).
+
+Windows: explorer puts the cursor on the icon before the tray callback, and the program opens its menu at GetCursorPos
+(or at the NOTIFYICON_VERSION_4 anchor). A Win32 menu, a Qt QMenu and a program's own popup all land at the click, on
+top, with the keyboard, and close on Escape, on a choice, or when a click elsewhere takes the foreground.
+
+What changes:
+- window.c / wayland_surface.c: the topmost captionless popups a program shows within 2 s of a tray click explorer
+  relayed to it, and further ones while such a menu is open (its submenus), become zwlr_layer_shell_v1 surfaces where
+  the compositor offers it (KWin, sway, Hyprland, labwc; not GNOME): overlay layer of their output, anchored top-left at
+  the window's own Win32 position, keyboard focus on demand (protocol v4). No exclusive keyboard grab and no surface over
+  the rest of the screen, so a hung program cannot hold the desktop; a click elsewhere takes the keyboard focus away and
+  the program closes its menu as on Windows. explorer marks the click on the desktop window (process id and time).
+- wayland_sni.c, Plasma (XDG_CURRENT_DESKTOP contains KDE, layer-shell present): an icon starts with Menu
+  "/NO_DBUSMENU", so Plasma calls ContextMenu(x, y) with the click point and the program puts its menu there. explorer
+  also tags the icon's window for that click: if the program's TrackPopupMenu offers a Win32 menu, explorer refuses it
+  (the menu opens at the click now, as the program's own window) and announces the item again under a new name with the
+  dbusmenu, so from the next right click Plasma draws the menu at the icon (124). A program that never shows a Win32 menu
+  stays on ContextMenu: no empty Plasma menu, nothing to swallow the next click. Other trays (GNOME's extension, XFCE,
+  waybar) only offer the dbusmenu: unchanged.
+- The dbusmenu path relays the right click at the last point any tray gave for that icon (else for any icon), with the
+  cursor there, instead of 0,0.
+- A balloon's application name is the first line of the icon's tip (tray programs put their name there), else the id.
+
+Not covered:
+- XFCE and waybar (libdbusmenu-gtk) still draw the first menu of an icon in a popup sized for 124's one-item
+  placeholder (a scroll arrow); from the second open the full menu. The host sizes its popup from the layout it holds
+  before it asks the program, and Windows asks the program only on the click.
+- XFCE and waybar send no "closed": after Escape or a click elsewhere the program stays in TrackPopupMenu (pumping its
+  messages) until the next right click. There is no signal to end it on; not changed.
+- GNOME: no layer-shell, so a non-Win32 tray menu is placed by mutter as before. GNOME and XFCE give no click point, so
+  without a prior Activate/ContextMenu the program still gets 0,0 on the dbusmenu path.
+- Plasma, the first right click of a program that uses Win32 menus: its menu opens at the click in the Neutron Win32
+  style, not Plasma's; the re-announcement can move the icon within the tray once.
+- sway and Hyprland not run with this patch (their tiling of the menu window is INFERRED gone: layer surfaces are not
+  tiled). The balloon name is not the exe's version-info name.
+
+Lab, 180 + this (lab 11.10-180t), nested Plasma 6 on a lab desk's own bus (agents/trayv2):
+- Filmora 16's Qt tray menu: at the icon on the first right click of a fresh launch 2/2 (and on reopen 3/3); Escape
+  closes 2/2, a click elsewhere 1/1, "Open Wondershare Filmora" 1/1; the next right click always opened (no swallowed
+  click). NEUTRON_TRAY_POPUP_LAYER=0, same build: no menu at all, as on 180 (1/1).
+- traytest, its own popup window: at the click 3/3, Escape / elsewhere / "Custom B" 1/1 each, never a dbusmenu.
+- traytest, Win32 menu: first right click at the click 2/2, Escape 0 2/2; item announced again with the dbusmenu 2/2;
+  the second right click Plasma's own menu at the icon 2/2, "Second" returned 2; the program got the click point
+  (3318,2105 device) on the dbusmenu path. NEUTRON_TRAY_POPUP_LAYER=0: Plasma's menu from the first click, 0,0 (180).
+- Podman desktops (agents/desktops): GNOME 51 + AppIndicator: menu at the icon on the first open, "Second" 2, Escape 0
+  (as 180); XFCE (labwc + xfce4-panel): first open the placeholder-sized popup, second open the full menu (as 180).
+
+Kill switch NEUTRON_TRAY_POPUP_LAYER=0 (layer placement and the Plasma ContextMenu path); 123/124's are unchanged.
+
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -34,6 +34,7 @@
+ 	window_surface.c \
+ 	wintab.c \
+ 	wlr-data-control-unstable-v1.xml \
++	wlr-layer-shell-unstable-v1.xml \
+ 	xdg-decoration-unstable-v1.xml \
+ 	xdg-output-unstable-v1.xml \
+ 	xdg-shell.xml \
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -201,6 +201,14 @@
+             wl_registry_bind(registry, id, &zwp_tablet_manager_v2_interface, 1);
+         if (process_wayland.seat.wl_seat) wayland_tablet_init();
+     }
++    else if (strcmp(interface, "zwlr_layer_shell_v1") == 0)
++    {
++        /* NEUTRON tray-popup-layer: only to put a tray menu where the application placed it (wayland_surface_make_layer).
++         * Version 4 for on-demand keyboard focus; never an exclusive grab. */
++        process_wayland.zwlr_layer_shell_v1_version = min(version, 4);
++        process_wayland.zwlr_layer_shell_v1 =
++            wl_registry_bind(registry, id, &zwlr_layer_shell_v1_interface, process_wayland.zwlr_layer_shell_v1_version);
++    }
+     else if (strcmp(interface, "wp_viewporter") == 0)
+     {
+         process_wayland.wp_viewporter =
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -39,6 +39,7 @@
+ #include "xdg-output-unstable-v1-client-protocol.h"
+ #include "xdg-shell-client-protocol.h"
+ #include "wlr-data-control-unstable-v1-client-protocol.h"
++#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+ #include "xdg-toplevel-icon-v1-client-protocol.h"
+ #include "pointer-warp-v1-client-protocol.h"
+ #include "tablet-v2-client-protocol.h"
+@@ -118,6 +119,7 @@
+     WAYLAND_SURFACE_ROLE_TOPLEVEL,
+     WAYLAND_SURFACE_ROLE_SUBSURFACE,
+     WAYLAND_SURFACE_ROLE_POPUP,
++    WAYLAND_SURFACE_ROLE_LAYER,  /* NEUTRON tray-popup-layer: a tray menu at its own position */
+ };
+ 
+ struct wayland_keyboard
+@@ -263,6 +265,8 @@
+     struct xdg_toplevel_icon_manager_v1 *xdg_toplevel_icon_manager_v1;
+     struct wp_cursor_shape_manager_v1 *wp_cursor_shape_manager_v1;
+     struct wp_pointer_warp_v1 *wp_pointer_warp_v1;
++    struct zwlr_layer_shell_v1 *zwlr_layer_shell_v1;  /* NEUTRON tray-popup-layer */
++    UINT zwlr_layer_shell_v1_version;
+     struct wayland_seat seat;
+     struct wayland_tablet tablet;   /* NEUTRON: pen/graphics-tablet (WinTab) */
+     struct wayland_keyboard keyboard;
+@@ -458,6 +462,11 @@
+      * a slid panel jumped 491x125 device px (289x74 logical) with 4 ms between samples. */
+     int32_t popup_slide_x, popup_slide_y;
+     BOOL popup_slide_pending;
++    /* NEUTRON tray-popup-layer: WAYLAND_SURFACE_ROLE_LAYER, at margins (output-local logical) from the top-left of
++     * layer_output (see wayland_surface_make_layer) */
++    struct zwlr_layer_surface_v1 *layer_surface;
++    struct wl_output *layer_output;
++    int layer_margin_x, layer_margin_y, layer_width, layer_height;
+     unsigned int popup_slide_applied;   /* bounded: a move re-anchors the popup, see window.c */
+     /* the last xdg_surface window geometry set on this surface */
+     RECT geometry;
+@@ -549,6 +558,15 @@
+ void wayland_surface_make_popup(struct wayland_surface *surface,
+                                 struct wayland_surface *owner, const RECT *rect);
+ void wayland_surface_clear_role(struct wayland_surface *surface);
++/* NEUTRON tray-popup-layer */
++void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect);
++BOOL wayland_tray_popup_wanted(HWND hwnd, DWORD style, DWORD exstyle);
++BOOL wayland_tray_popup_layer_enabled(void);
++LONG wayland_tray_layer_count(void);
++/* Set on the desktop window by explorer (wayland_sni.c) as it relays a tray click: the process the click went to and
++ * when. Spelled out because L"" is a 32-bit wchar_t on the unix side. */
++#define NEUTRON_TRAY_POPUP_PID_PROP_INIT  {'_','_','w','i','n','e','_','t','r','a','y','_','p','o','p','u','p','_','p','i','d',0}
++#define NEUTRON_TRAY_POPUP_TIME_PROP_INIT {'_','_','w','i','n','e','_','t','r','a','y','_','p','o','p','u','p','_','t','i','m','e',0}
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+                                 HRGN surface_damage_region);
+--- a/dlls/winewayland.drv/wayland_sni.c
++++ b/dlls/winewayland.drv/wayland_sni.c
+@@ -198,8 +198,19 @@
+     ULONGLONG        last_activate;   /* for double clicks */
+     dbus_uint32_t    balloon;         /* org.freedesktop.Notifications id, 0 if none */
+     struct sni_menu  menu;
++    /* NEUTRON tray-menus-v2 (patch 125) */
++    BOOL             use_dbusmenu;    /* the item's Menu is the dbusmenu (else "/NO_DBUSMENU": the tray calls ContextMenu) */
++    UINT             generation;      /* bumped when the item is announced again under a new name */
++    BOOL             has_click;
++    POINT            last_click;      /* the last point a tray gave for this icon, Win32 desktop pixels */
++    UINT             context_request; /* KDE: WINE_SYSTRAY_MENU_PROP set for a ContextMenu, to learn the menu kind */
++    ULONGLONG        context_deadline;
++    BOOL             switch_pending;  /* the application showed a Win32 menu: announce the item with the dbusmenu */
+ };
+ 
++static BOOL sni_have_click;
++static POINT sni_last_click;  /* the last point any tray gave, for a dbusmenu request that comes without one */
++
+ static UINT sni_menu_counter;
+ static const WCHAR menu_propW[] = WINE_SYSTRAY_MENU_PROP_INIT;
+ static const WCHAR menu_resultW[] = WINE_SYSTRAY_MENU_RESULT_PROP_INIT;
+@@ -220,6 +231,20 @@
+ static BOOL sni_ready;
+ static pthread_once_t sni_once = PTHREAD_ONCE_INIT;
+ 
++/* NEUTRON tray-menus-v2: on Plasma a tray menu that is not a Win32 menu (Qt's QMenu, a popup window of the
++ * application's own) cannot be drawn by the tray, and the dbusmenu request carries no click point, so such a menu
++ * opened at a stale cursor and left Plasma an empty menu that ate the next click. Plasma calls ContextMenu(x, y) for an
++ * item whose Menu is "/NO_DBUSMENU": the application then gets the click point, as on Windows, and puts its menu there
++ * (a layer surface, window.c). So on Plasma an icon starts that way, and moves to the dbusmenu (Plasma draws the menu at
++ * the icon) once its application has shown a Win32 menu. Other trays (GNOME's extension, XFCE, waybar) only offer the
++ * dbusmenu: unchanged. Needs the layer placement (NEUTRON_TRAY_POPUP_LAYER) and the dbusmenu (NEUTRON_SNI_DBUSMENU). */
++static BOOL sni_kde_context(void)
++{
++    static int kde = -1;
++    if (kde < 0) { const char *d = getenv( "XDG_CURRENT_DESKTOP" ); kde = d && strstr( d, "KDE" ); }
++    return kde && sni_dbusmenu_enabled() && wayland_tray_popup_layer_enabled();
++}
++
+ static ULONGLONG sni_ticks(void)
+ {
+     struct timespec ts;
+@@ -465,7 +490,7 @@
+     }
+     else if (!strcmp( name, "Menu" ))
+     {
+-        const char *path = sni_dbusmenu_enabled() ? DBUSMENU_PATH : "/NO_DBUSMENU";
++        const char *path = icon->use_dbusmenu ? DBUSMENU_PATH : "/NO_DBUSMENU";
+         p_dbus_message_iter_open_container( iter, DBUS_TYPE_VARIANT, DBUS_TYPE_OBJECT_PATH_AS_STRING, &var );
+         p_dbus_message_iter_append_basic( &var, DBUS_TYPE_OBJECT_PATH, &path );
+         p_dbus_message_iter_close_container( iter, &var );
+@@ -579,9 +604,24 @@
+     return NtUserMessageCall( t->owner, t->callback, wp, lp, NULL, NtUserSendNotifyMessage, FALSE );
+ }
+ 
++/* NEUTRON tray-menus-v2: record on the desktop window that this click goes to the owner's process now; the menu that
++ * process shows for it becomes a layer surface at its own position (window.c wayland_tray_popup_wanted) */
++static void mark_tray_click( HWND owner )
++{
++    static const WCHAR pid_propW[] = NEUTRON_TRAY_POPUP_PID_PROP_INIT;
++    static const WCHAR time_propW[] = NEUTRON_TRAY_POPUP_TIME_PROP_INIT;
++    HWND desktop = NtUserGetDesktopWindow();
++    DWORD pid = 0;
++
++    if (!wayland_tray_popup_layer_enabled() || !NtUserGetWindowThread( owner, &pid ) || !pid) return;
++    NtUserSetProp( desktop, time_propW, ULongToHandle( max( 1u, NtGetTickCount() )));
++    NtUserSetProp( desktop, pid_propW, ULongToHandle( pid ));
++}
++
+ /* systray.c tray_icon_wndproc(): a button press as the tray window relays it */
+ static void send_click( const struct sni_target *t, UINT down, UINT up, POINT pt )
+ {
++    mark_tray_click( t->owner );
+     if (!notify_owner( t, down, pt )) return;
+     notify_owner( t, up, pt );
+     if (t->version > 0)
+@@ -597,6 +637,7 @@
+     struct sni_icon *icon;
+     BOOL dblclk = FALSE;
+     ULONGLONG now = sni_ticks();
++    UINT request = 0;
+     POINT pt;
+ 
+     pthread_mutex_lock( &sni_mutex );
+@@ -614,9 +655,22 @@
+         dblclk = icon->last_activate && now - icon->last_activate <= NtUserGetDoubleClickTime();
+         icon->last_activate = dblclk ? 0 : now;
+     }
++    pt = sni_point_to_win32( x, y );
++    if (x || y)
++    {
++        icon->has_click = sni_have_click = TRUE;
++        icon->last_click = sni_last_click = pt;
++    }
++    /* NEUTRON tray-menus-v2: a Win32 menu the application opens for this click tells us its kind (menu_offered) */
++    if (!strcmp( member, "ContextMenu" ) && !icon->use_dbusmenu && sni_kde_context())
++    {
++        if (!(request = ++sni_menu_counter & 0xffff)) request = ++sni_menu_counter & 0xffff;
++        icon->context_request = request;
++        icon->context_deadline = now + 1500;
++    }
+     pthread_mutex_unlock( &sni_mutex );
+ 
+-    pt = sni_point_to_win32( x, y );
++    if (request) NtUserSetProp( t.owner, menu_propW, ULongToHandle( request ));
+     TRACE( "%s at %d,%d -> %s\n", member, x, y, wine_dbgstr_point( &pt ));
+     /* on Windows the pointer is on the icon; applications place their menu with GetCursorPos */
+     if (x || y) NtUserSetCursorPos( pt.x, pt.y );
+@@ -971,6 +1025,7 @@
+     struct sni_target t;
+     struct sni_icon *icon;
+     POINT pt = { 0, 0 };
++    BOOL known = FALSE;
+ 
+     pthread_mutex_lock( &sni_mutex );
+     if (!(icon = find_icon_by_handle( handle )))
+@@ -982,9 +1037,13 @@
+     t.id = icon->id;
+     t.callback = icon->callback;
+     t.version = icon->version;
++    /* NEUTRON tray-menus-v2: the dbusmenu request carries no click point: use the last one a tray gave for this
++     * icon, else for any icon (the tray), and put the cursor there as for a ContextMenu; else the cursor stays */
++    if (icon->has_click) { pt = icon->last_click; known = TRUE; }
++    else if (sni_have_click) { pt = sni_last_click; known = TRUE; }
+     pthread_mutex_unlock( &sni_mutex );
+-    /* the tray does not say where the click was; the pointer is where it is */
+-    NtUserGetCursorPos( &pt );
++    if (known) NtUserSetCursorPos( pt.x, pt.y );
++    else NtUserGetCursorPos( &pt );
+     send_click( &t, WM_RBUTTONDOWN, WM_RBUTTONUP, pt );
+ }
+ 
+@@ -1370,11 +1429,26 @@
+         conn = p_dbus_connection_ref( icon->conn );
+         break;
+     }
++    if (!conn)
++    {
++        /* NEUTRON tray-menus-v2: the ContextMenu probe on Plasma: this icon's application shows Win32 menus. Refused,
++         * the menu opens now as the application's own window at the click; later clicks go to Plasma's tray. */
++        LIST_FOR_EACH_ENTRY( icon, &sni_icons, struct sni_icon, entry )
++        {
++            if ((UINT)(UINT_PTR)icon->owner != (UINT)(UINT_PTR)hwnd || !icon->context_request) continue;
++            if (icon->context_request != LOWORD( data->request )) continue;
++            icon->context_request = 0;
++            icon->switch_pending = TRUE;
++            TRACE( "icon %u of %p shows Win32 menus: the tray will draw them\n", icon->id, hwnd );
++            break;
++        }
++    }
+     pthread_mutex_unlock( &sni_mutex );
+     free( copy );
+     if (!conn)
+     {
+         TRACE( "no tray waits for the menu of %p (request %u)\n", hwnd, data->request );
++        sni_wakeup();
+         return FALSE;
+     }
+ 
+@@ -1842,6 +1916,72 @@
+ }
+ 
+ /* the explorer thread that services every connection (started from dllmain.c in explorer only) */
++/* NEUTRON tray-menus-v2: the ContextMenu probe ends (no Win32 menu came: the application shows its own), and an icon
++ * whose application showed a Win32 menu is announced again with the dbusmenu, under a new name so the tray reads its
++ * Menu again; called without sni_mutex */
++static BOOL context_timeouts(void)
++{
++    struct { HWND owner; UINT request; } expired[16];
++    struct { UINT handle; DBusConnection *old; char name[64]; BOOL visible; } moved[16];
++    unsigned int i, expired_count = 0, moved_count = 0;
++    struct sni_icon *icon;
++    ULONGLONG now = sni_ticks();
++    BOOL active = FALSE;
++
++    pthread_mutex_lock( &sni_mutex );
++    LIST_FOR_EACH_ENTRY( icon, &sni_icons, struct sni_icon, entry )
++    {
++        if (icon->context_request)
++        {
++            active = TRUE;
++            if (now >= icon->context_deadline && expired_count < ARRAY_SIZE(expired))
++            {
++                expired[expired_count].owner = icon->owner;
++                expired[expired_count++].request = icon->context_request;
++                icon->context_request = 0;
++            }
++        }
++        if (icon->switch_pending && moved_count < ARRAY_SIZE(moved))
++        {
++            icon->switch_pending = FALSE;
++            icon->use_dbusmenu = TRUE;
++            icon->generation++;
++            snprintf( icon->name, sizeof(icon->name), "org.kde.StatusNotifierItem-%u-%u-%u",
++                      (UINT)getpid(), icon->handle, icon->generation );
++            moved[moved_count].handle = icon->handle;
++            moved[moved_count].old = icon->conn;
++            moved[moved_count].visible = !icon->hidden;
++            strcpy( moved[moved_count].name, icon->name );
++            icon->conn = NULL;
++            moved_count++;
++        }
++    }
++    pthread_mutex_unlock( &sni_mutex );
++
++    for (i = 0; i < expired_count; i++)
++        if (HandleToUlong( NtUserGetProp( expired[i].owner, menu_propW )) == expired[i].request)
++            NtUserRemoveProp( expired[i].owner, menu_propW );
++
++    for (i = 0; i < moved_count; i++)
++    {
++        DBusConnection *conn = NULL;
++
++        close_connection( moved[i].old );
++        if (moved[i].visible) conn = register_item( moved[i].handle, moved[i].name );
++        pthread_mutex_lock( &sni_mutex );
++        if (conn && (icon = find_icon_by_handle( moved[i].handle )) && !icon->hidden && !icon->conn)
++        {
++            icon->conn = conn;
++            icon->menu.registered_at = sni_ticks();
++            conn = NULL;
++        }
++        pthread_mutex_unlock( &sni_mutex );
++        close_connection( conn );
++        TRACE( "item %u announced again as %s with the dbusmenu\n", moved[i].handle, moved[i].name );
++    }
++    return active;
++}
++
+ NTSTATUS waylanddrv_unix_sni_run( void *arg )
+ {
+     ULONGLONG last_check = 0;
+@@ -1880,6 +2020,7 @@
+         }
+ 
+         menus_active = menu_timeouts();
++        if (context_timeouts()) menus_active = TRUE;
+ 
+         if (sni_ticks() - last_check >= 1000)
+         {
+@@ -1973,6 +2114,7 @@
+         if (!(icon = calloc( 1, sizeof(*icon) ))) return FALSE;
+         icon->owner = nid->hWnd;
+         icon->id = nid->uID;
++        icon->use_dbusmenu = sni_dbusmenu_enabled() && !sni_kde_context();
+         update_from_nid( icon, nid, &icon_changed, &tip_changed, &visibility_changed );
+         set_item_id( icon );
+         pthread_mutex_lock( &sni_mutex );
+@@ -2074,7 +2216,18 @@
+                 h = icon->height;
+             }
+             pthread_mutex_unlock( &sni_mutex );
+-            id = show_balloon( old, icon->item_id, nid, argb, w, h );
++            {
++                /* NEUTRON tray-menus-v2: the notification's application name: the first line of the icon's tip (tray
++                 * applications put their name there), as Windows shows the application's name, not an id */
++                char app[128];
++                const char *nl;
++                pthread_mutex_lock( &sni_mutex );
++                snprintf( app, sizeof(app), "%s", icon->tip && icon->tip[0] ? icon->tip : icon->item_id );
++                pthread_mutex_unlock( &sni_mutex );
++                if ((nl = strchr( app, '\n' ))) app[nl - app] = 0;
++                if (!app[0]) snprintf( app, sizeof(app), "%s", icon->item_id );
++                id = show_balloon( old, app, nid, argb, w, h );
++            }
+             free( argb );
+         }
+         else close_balloon( old );
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -945,6 +945,192 @@
+     ERR("Failed to assign popup role to wayland surface\n");
+ }
+ 
++static struct wayland_output *neutron_output_at(int x, int y, BOOL logical);
++
++/**********************************************************************
++ *          NEUTRON tray-popup-layer
++ *
++ * On Windows an application opens its tray menu at the cursor: explorer puts the cursor on the icon before the tray
++ * callback, and the application (a Qt QMenu, a Win32 menu, a popup window of its own) places its window there. A
++ * Wayland client cannot place its windows: as an xdg_toplevel KWin centered such a menu, listed it in the taskbar,
++ * and sway/Hyprland tiled it (11-04, Filmora 16's Qt tray menu, a traytest Win32 menu).
++ *
++ * The first topmost captionless popup an application shows right after a tray click (wayland_tray_popup_wanted,
++ * window.c) is mapped as a zwlr_layer_shell_v1 surface where the compositor offers one (KWin, sway, Hyprland; not
++ * GNOME): on the overlay layer of its output, anchored top-left at the window's own Win32 position, keyboard focus
++ * on demand (protocol version 4) so Escape and the arrows reach it while a click elsewhere takes the focus away and
++ * the application closes its menu as it does on Windows when it loses the foreground. Never an exclusive keyboard
++ * grab and never a surface over the rest of the screen: a hung application must not hold the desktop. Kill switch
++ * NEUTRON_TRAY_POPUP_LAYER=0. */
++/* tray menus mapped as layers in this process: their submenus are tray menus too (window.c) */
++static LONG neutron_tray_layers;
++LONG wayland_tray_layer_count(void) { return ReadNoFence(&neutron_tray_layers); }
++
++struct neutron_layer_geometry
++{
++    struct wl_output *wl_output;
++    int margin_x, margin_y, width, height;
++};
++
++/* where a window rect (Win32 desktop, device pixels) lands on its output, in that output's logical coordinates */
++static BOOL neutron_layer_geometry(const RECT *rect, struct neutron_layer_geometry *g)
++{
++    struct wayland_output *output;
++    int raw_x = 0, raw_y = 0, raw_w = 0, raw_h = 0, logical_w = 0, logical_h = 0;
++
++    pthread_mutex_lock(&process_wayland.output_mutex);
++    if ((output = neutron_output_at(rect->left, rect->top, FALSE)) && output->current.current_mode)
++    {
++        const struct wayland_output_state *state = &output->current;
++        g->wl_output = output->wl_output;
++        raw_x = state->x;
++        raw_y = state->y;
++        raw_w = wayland_output_mode_width(state, state->current_mode);
++        raw_h = wayland_output_mode_height(state, state->current_mode);
++        logical_w = state->logical_w;
++        logical_h = state->logical_h;
++    }
++    pthread_mutex_unlock(&process_wayland.output_mutex);
++    if (raw_w <= 0 || raw_h <= 0 || logical_w <= 0 || logical_h <= 0) return FALSE;
++
++    g->margin_x = max(0, lround((double)(rect->left - raw_x) * logical_w / raw_w));
++    g->margin_y = max(0, lround((double)(rect->top - raw_y) * logical_h / raw_h));
++    g->width = max(1, lround((double)(rect->right - rect->left) * logical_w / raw_w));
++    g->height = max(1, lround((double)(rect->bottom - rect->top) * logical_h / raw_h));
++    return TRUE;
++}
++
++static void layer_surface_handle_configure(void *private, struct zwlr_layer_surface_v1 *layer_surface,
++                                           uint32_t serial, uint32_t width, uint32_t height)
++{
++    struct wayland_surface *surface;
++    struct wayland_win_data *data;
++    BOOL initial_configure;
++    HWND hwnd = private;
++
++    TRACE("hwnd=%p serial=%u %ux%u\n", hwnd, serial, width, height);
++
++    if (!(data = wayland_win_data_get(hwnd))) return;
++    if (!(surface = data->wayland_surface) || surface->layer_surface != layer_surface)
++    {
++        wayland_win_data_release(data);
++        return;
++    }
++    /* as a popup's: the size is the window's own; acked by the next reconfigure */
++    initial_configure = surface->current.serial == 0;
++    surface->processing.serial = serial;
++    surface->processing.width = width;
++    surface->processing.height = height;
++    surface->processing.processed = TRUE;
++    wayland_win_data_release(data);
++
++    if (initial_configure) NtUserExposeWindowSurface(hwnd, 0, NULL, 0);
++}
++
++static void layer_surface_handle_closed(void *private, struct zwlr_layer_surface_v1 *layer_surface)
++{
++    HWND hwnd = private;
++
++    /* the compositor took it away (its output went): end the menu as a lost capture would */
++    TRACE("hwnd=%p\n", hwnd);
++    NtUserPostMessage(hwnd, WM_CANCELMODE, 0, 0);
++}
++
++static const struct zwlr_layer_surface_v1_listener layer_surface_listener =
++{
++    layer_surface_handle_configure,
++    layer_surface_handle_closed,
++};
++
++/**********************************************************************
++ *          wayland_surface_make_layer
++ *
++ * NEUTRON tray-popup-layer: gives a tray menu the layer role at the window's own position; called again on a move
++ * of the window, it follows it (wayland_surface_reconfigure_layer follows size changes).
++ */
++void wayland_surface_make_layer(struct wayland_surface *surface, const RECT *rect)
++{
++    struct neutron_layer_geometry g;
++
++    if (surface->role == WAYLAND_SURFACE_ROLE_LAYER && surface->layer_surface)
++    {
++        if (surface->current.serial && neutron_layer_geometry(rect, &g) && g.wl_output == surface->layer_output &&
++            (g.margin_x != surface->layer_margin_x || g.margin_y != surface->layer_margin_y))
++        {
++            zwlr_layer_surface_v1_set_margin(surface->layer_surface, g.margin_y, 0, 0, g.margin_x);
++            surface->layer_margin_x = g.margin_x;
++            surface->layer_margin_y = g.margin_y;
++            wl_surface_commit(surface->wl_surface);
++            wl_display_flush(process_wayland.wl_display);
++        }
++        return;
++    }
++
++    wayland_surface_clear_role(surface);
++    surface->role = WAYLAND_SURFACE_ROLE_LAYER;
++
++    if (!process_wayland.zwlr_layer_shell_v1 || !neutron_layer_geometry(rect, &g)) goto err;
++
++    if (!(surface->layer_surface = zwlr_layer_shell_v1_get_layer_surface(process_wayland.zwlr_layer_shell_v1,
++                                                                         surface->wl_surface, g.wl_output,
++                                                                         ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
++                                                                         "wine-tray-menu")))
++        goto err;
++    zwlr_layer_surface_v1_add_listener(surface->layer_surface, &layer_surface_listener, surface->hwnd);
++    zwlr_layer_surface_v1_set_anchor(surface->layer_surface,
++                                     ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
++    /* placed from the output's edge, panels or not, as Windows places it from the screen's */
++    zwlr_layer_surface_v1_set_exclusive_zone(surface->layer_surface, -1);
++    zwlr_layer_surface_v1_set_margin(surface->layer_surface, g.margin_y, 0, 0, g.margin_x);
++    zwlr_layer_surface_v1_set_size(surface->layer_surface, g.width, g.height);
++    zwlr_layer_surface_v1_set_keyboard_interactivity(surface->layer_surface,
++        process_wayland.zwlr_layer_shell_v1_version >= 4 ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND
++                                                         : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
++    surface->layer_output = g.wl_output;
++    surface->layer_margin_x = g.margin_x;
++    surface->layer_margin_y = g.margin_y;
++    surface->layer_width = g.width;
++    surface->layer_height = g.height;
++    InterlockedIncrement(&neutron_tray_layers);
++
++    TRACE("hwnd=%p rect=%s -> margins %d,%d size %dx%d\n", surface->hwnd, wine_dbgstr_rect(rect),
++          g.margin_x, g.margin_y, g.width, g.height);
++    wl_surface_commit(surface->wl_surface);
++    wl_display_flush(process_wayland.wl_display);
++    return;
++
++err:
++    wayland_surface_clear_role(surface);
++    ERR("Failed to assign the layer role to the tray menu %p\n", surface->hwnd);
++}
++
++/* NEUTRON tray-popup-layer: ack the configure and follow the window's moves and size; FALSE until configured */
++static BOOL wayland_surface_reconfigure_layer(struct wayland_surface *surface)
++{
++    struct neutron_layer_geometry g;
++
++    if (surface->processing.serial && surface->processing.processed)
++    {
++        surface->current = surface->processing;
++        memset(&surface->processing, 0, sizeof(surface->processing));
++        zwlr_layer_surface_v1_ack_configure(surface->layer_surface, surface->current.serial);
++    }
++    if (!surface->current.serial) return FALSE;
++
++    if (neutron_layer_geometry(&surface->window.rect, &g) && g.wl_output == surface->layer_output &&
++        (g.margin_x != surface->layer_margin_x || g.margin_y != surface->layer_margin_y ||
++         g.width != surface->layer_width || g.height != surface->layer_height))
++    {
++        zwlr_layer_surface_v1_set_margin(surface->layer_surface, g.margin_y, 0, 0, g.margin_x);
++        zwlr_layer_surface_v1_set_size(surface->layer_surface, g.width, g.height);
++        surface->layer_margin_x = g.margin_x;
++        surface->layer_margin_y = g.margin_y;
++        surface->layer_width = g.width;
++        surface->layer_height = g.height;
++    }
++    return TRUE;
++}
++
+ /**********************************************************************
+  *          wayland_surface_clear_role
+  *
+@@ -1017,6 +1203,16 @@
+         surface->toplevel_hwnd = 0;
+         surface->subsurface_parent = NULL;
+         break;
++
++    case WAYLAND_SURFACE_ROLE_LAYER:  /* NEUTRON tray-popup-layer */
++        if (surface->layer_surface)
++        {
++            zwlr_layer_surface_v1_destroy(surface->layer_surface);
++            surface->layer_surface = NULL;
++            InterlockedDecrement(&neutron_tray_layers);
++        }
++        surface->layer_output = NULL;
++        break;
+     }
+ 
+     memset(&surface->pending, 0, sizeof(surface->pending));
+@@ -2449,6 +2645,10 @@
+         if (!surface->wl_subsurface) break; /* surface role has been cleared */
+         wayland_surface_reconfigure_subsurface(surface, content);
+         break;
++    case WAYLAND_SURFACE_ROLE_LAYER:  /* NEUTRON tray-popup-layer */
++        if (!surface->layer_surface) break; /* surface role has been cleared */
++        if (!wayland_surface_reconfigure_layer(surface)) return FALSE;
++        break;
+     }
+ 
+     if (!content)
+@@ -2498,6 +2698,9 @@
+             !wayland_surface_config_is_compatible(&surface->current, width, height, window->state))
+             return FALSE;
+         return TRUE;
++    case WAYLAND_SURFACE_ROLE_LAYER:  /* NEUTRON tray-popup-layer */
++        if (!surface->layer_surface) return TRUE;
++        return (surface->processing.serial && surface->processing.processed) || surface->current.serial;
+     default:
+         return TRUE; /* NONE / SUBSURFACE: reconfigure never gates the commit */
+     }
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -779,6 +779,12 @@
+                (!(exstyle & WS_EX_LAYERED) || data->layered_attribs_set);
+ 
+     if (!visible) role = WAYLAND_SURFACE_ROLE_NONE;
++    /* NEUTRON tray-popup-layer: a tray menu stays one while it is shown; a new one needs a fresh tray click */
++    else if (!owner_surface && (surface = data->wayland_surface) &&
++             surface->role == WAYLAND_SURFACE_ROLE_LAYER && surface->layer_surface)
++        role = WAYLAND_SURFACE_ROLE_LAYER;
++    else if (!owner_surface && wayland_tray_popup_wanted(data->hwnd, style, exstyle))
++        role = WAYLAND_SURFACE_ROLE_LAYER;
+     else if (owner_surface) role = WAYLAND_SURFACE_ROLE_POPUP;
+     else if (toplevel_surface && !toplevel_surface->xdg_surface &&
+              (neutron_orphan_toplevel() || neutron_orphan_menu(data->hwnd)) &&
+@@ -800,7 +806,8 @@
+         WCHAR cw[64]; char cb[64]; UNICODE_STRING cn; int l, i;
+         const char *rn = role == WAYLAND_SURFACE_ROLE_TOPLEVEL ? "TOPLEVEL" :
+                          role == WAYLAND_SURFACE_ROLE_SUBSURFACE ? "SUBSURFACE" :
+-                         role == WAYLAND_SURFACE_ROLE_POPUP ? "POPUP" : "NONE";
++                         role == WAYLAND_SURFACE_ROLE_POPUP ? "POPUP" :
++                         role == WAYLAND_SURFACE_ROLE_LAYER ? "LAYER" : "NONE";
+         HWND owner = NtUserGetWindowRelative( data->hwnd, GW_OWNER );
+         HWND parent = NtUserGetAncestor( data->hwnd, GA_PARENT );
+         HWND root = NtUserGetAncestor( data->hwnd, GA_ROOT );
+@@ -907,6 +914,9 @@
+     case WAYLAND_SURFACE_ROLE_POPUP:
+         wayland_surface_make_popup(surface, owner_surface, &data->rects.window);
+         break;
++    case WAYLAND_SURFACE_ROLE_LAYER:  /* NEUTRON tray-popup-layer */
++        wayland_surface_make_layer(surface, &data->rects.window);
++        break;
+     }
+ 
+     /* NEUTRON roleless: what was flushed while the surface had no role was consumed, not committed (the role
+@@ -989,6 +999,7 @@
+     case WAYLAND_SURFACE_ROLE_NONE:
+     /* Popups are positioned by the compositor and have no extra state to set. */
+     case WAYLAND_SURFACE_ROLE_POPUP:
++    case WAYLAND_SURFACE_ROLE_LAYER:  /* NEUTRON tray-popup-layer: placed by its margins (reconfigure) */
+         break;
+     case WAYLAND_SURFACE_ROLE_TOPLEVEL:
+         if (!surface->xdg_surface) break; /* surface role has been cleared */
+@@ -1085,6 +1096,47 @@
+     return NtUserGetGUIThreadInfo(GetCurrentThreadId(), &info) ? info.hwndActive : 0;
+ }
+ 
++/* NEUTRON tray-popup-layer (his C179): the topmost captionless popups an application shows within 2 s of a tray click
++ * explorer relayed to it (wayland_sni.c records the click on the desktop window), and further ones while such a menu
++ * is open (its submenus), are its tray menu: they become layer surfaces at their own position where the compositor
++ * offers wlr-layer-shell (wayland_surface_make_layer). Dialogs (a caption), windows that are not topmost (a main
++ * window the click opens), tooltips and click-through windows are not menus. Kill switch NEUTRON_TRAY_POPUP_LAYER=0. */
++BOOL wayland_tray_popup_layer_enabled(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NEUTRON_TRAY_POPUP_LAYER"); on = !(e && e[0] == '0'); }
++    return on && process_wayland.zwlr_layer_shell_v1;
++}
++
++BOOL wayland_tray_popup_wanted(HWND hwnd, DWORD style, DWORD exstyle)
++{
++    static const WCHAR pid_propW[] = NEUTRON_TRAY_POPUP_PID_PROP_INIT;
++    static const WCHAR time_propW[] = NEUTRON_TRAY_POPUP_TIME_PROP_INIT;
++    WCHAR buf[64];
++    UNICODE_STRING name = { 0, sizeof(buf), buf };
++    char class[64];
++    HWND desktop;
++    UINT pid, time;
++    int len, i;
++
++    if (!wayland_tray_popup_layer_enabled()) return FALSE;
++    if ((style & (WS_POPUP | WS_CHILD)) != WS_POPUP || (style & WS_CAPTION) == WS_CAPTION) return FALSE;
++    if (!(exstyle & WS_EX_TOPMOST) || (exstyle & WS_EX_TRANSPARENT)) return FALSE;
++    desktop = NtUserGetDesktopWindow();
++    if (!(pid = HandleToUlong(NtUserGetProp(desktop, pid_propW))) || pid != GetCurrentProcessId()) return FALSE;
++    time = HandleToUlong(NtUserGetProp(desktop, time_propW));
++    if (!wayland_tray_layer_count() && (!time || (UINT)(NtGetTickCount() - time) > 2000)) return FALSE;
++
++    len = NtUserGetClassName(hwnd, FALSE, &name);
++    if (len < 0 || len >= ARRAY_SIZE(class)) len = 0;
++    for (i = 0; i < len; i++) class[i] = (buf[i] >= 'A' && buf[i] <= 'Z') ? buf[i] - 'A' + 'a' : (char)buf[i];
++    class[len] = 0;
++    if (strstr(class, "tooltip")) return FALSE;
++
++    TRACE("hwnd=%p class=%s: tray menu\n", hwnd, class);
++    return TRUE;
++}
++
+ /***********************************************************************
+  *		is_window_managed
+  *
+--- a/dlls/winewayland.drv/wlr-layer-shell-unstable-v1.xml
++++ b/dlls/winewayland.drv/wlr-layer-shell-unstable-v1.xml
+@@ -0,0 +1,157 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="wlr_layer_shell_unstable_v1">
++  <copyright>
++    Copyright © 2017 Drew DeVault
++
++    Permission to use, copy, modify, distribute, and sell this
++    software and its documentation for any purpose is hereby granted
++    without fee, provided that the above copyright notice appear in
++    all copies and that both that copyright notice and this permission
++    notice appear in supporting documentation, and that the name of
++    the copyright holders not be used in advertising or publicity
++    pertaining to distribution of the software without specific,
++    written prior permission.  The copyright holders make no
++    representations about the suitability of this software for any
++    purpose.  It is provided "as is" without express or implied
++    warranty.
++
++    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
++    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
++    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
++    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
++    AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
++    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
++    THIS SOFTWARE.
++  </copyright>
++
++  <!-- Wire definition of wlr-protocols' wlr-layer-shell-unstable-v1 (version 5): requests and events in protocol
++       order. Descriptions are abridged; see the wlr-protocols repository for the full text. -->
++
++  <interface name="zwlr_layer_shell_v1" version="5">
++    <description summary="create surfaces that are layers of the desktop">
++      Clients can use this interface to assign the surface_layer role to
++      wl_surfaces. Such surfaces are assigned to a "layer" of the output and
++      rendered with a defined z-depth respective to each other.
++    </description>
++
++    <request name="get_layer_surface">
++      <description summary="create a layer_surface from a surface"/>
++      <arg name="id" type="new_id" interface="zwlr_layer_surface_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++      <arg name="output" type="object" interface="wl_output" allow-null="true"/>
++      <arg name="layer" type="uint" enum="layer" summary="layer to add this surface to"/>
++      <arg name="namespace" type="string" summary="namespace for the layer surface"/>
++    </request>
++
++    <enum name="error">
++      <entry name="role" value="0" summary="wl_surface has another role"/>
++      <entry name="invalid_layer" value="1" summary="layer value is invalid"/>
++      <entry name="already_constructed" value="2" summary="wl_surface has a buffer attached or committed"/>
++    </enum>
++
++    <enum name="layer">
++      <entry name="background" value="0"/>
++      <entry name="bottom" value="1"/>
++      <entry name="top" value="2"/>
++      <entry name="overlay" value="3"/>
++    </enum>
++
++    <request name="destroy" type="destructor" since="3">
++      <description summary="destroy the layer_shell object"/>
++    </request>
++  </interface>
++
++  <interface name="zwlr_layer_surface_v1" version="5">
++    <description summary="layer metadata interface">
++      An interface that may be implemented by a wl_surface, for surfaces that
++      are designed to be rendered as a layer of a stacked desktop-like
++      environment.
++    </description>
++
++    <request name="set_size">
++      <description summary="sets the size of the surface"/>
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </request>
++
++    <request name="set_anchor">
++      <description summary="configures the anchor point of the surface"/>
++      <arg name="anchor" type="uint" enum="anchor"/>
++    </request>
++
++    <request name="set_exclusive_zone">
++      <description summary="configures the exclusive geometry of this surface"/>
++      <arg name="zone" type="int"/>
++    </request>
++
++    <request name="set_margin">
++      <description summary="sets a margin from the anchor point"/>
++      <arg name="top" type="int"/>
++      <arg name="right" type="int"/>
++      <arg name="bottom" type="int"/>
++      <arg name="left" type="int"/>
++    </request>
++
++    <enum name="keyboard_interactivity">
++      <entry name="none" value="0"/>
++      <entry name="exclusive" value="1"/>
++      <entry name="on_demand" value="2" since="4"/>
++    </enum>
++
++    <request name="set_keyboard_interactivity">
++      <description summary="requests keyboard events"/>
++      <arg name="keyboard_interactivity" type="uint" enum="keyboard_interactivity"/>
++    </request>
++
++    <request name="get_popup">
++      <description summary="assign this layer_surface as an xdg_popup parent"/>
++      <arg name="popup" type="object" interface="xdg_popup"/>
++    </request>
++
++    <request name="ack_configure">
++      <description summary="ack a configure event"/>
++      <arg name="serial" type="uint" summary="the serial from the configure event"/>
++    </request>
++
++    <request name="destroy" type="destructor">
++      <description summary="destroy the layer_surface"/>
++    </request>
++
++    <event name="configure">
++      <description summary="suggest a surface change"/>
++      <arg name="serial" type="uint"/>
++      <arg name="width" type="uint"/>
++      <arg name="height" type="uint"/>
++    </event>
++
++    <event name="closed">
++      <description summary="surface should be closed"/>
++    </event>
++
++    <enum name="error">
++      <entry name="invalid_surface_state" value="0"/>
++      <entry name="invalid_size" value="1"/>
++      <entry name="invalid_anchor" value="2"/>
++      <entry name="invalid_keyboard_interactivity" value="3"/>
++      <entry name="invalid_exclusive_edge" value="4"/>
++    </enum>
++
++    <enum name="anchor" bitfield="true">
++      <entry name="top" value="1"/>
++      <entry name="bottom" value="2"/>
++      <entry name="left" value="4"/>
++      <entry name="right" value="8"/>
++    </enum>
++
++    <request name="set_layer" since="2">
++      <description summary="change the layer of the surface"/>
++      <arg name="layer" type="uint" enum="zwlr_layer_shell_v1.layer"/>
++    </request>
++
++    <request name="set_exclusive_edge" since="5">
++      <description summary="set the edge the exclusive zone will be applied to"/>
++      <arg name="edge" type="uint" enum="anchor"/>
++    </request>
++  </interface>
++</protocol>
