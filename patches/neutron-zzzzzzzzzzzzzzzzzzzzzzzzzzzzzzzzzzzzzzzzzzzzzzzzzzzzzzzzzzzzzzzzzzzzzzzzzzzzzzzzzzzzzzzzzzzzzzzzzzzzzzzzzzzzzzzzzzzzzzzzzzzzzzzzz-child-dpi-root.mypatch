@@ -1,0 +1,71 @@
+win32u: Give another process's child window its top-level's dpi.
+
+What he saw: FL Studio 2026's TNumBar and TVectorPanel children reported 96 dpi inside its 168 dpi window when
+listed from another process; the panels themselves look normal.
+
+Mechanism: get_win_monitor_dpi walks up to the top-level for windows of its own process, but a window of another
+process has no WND here (WND_OTHER_PROCESS), so it took that window's OWN rect. FL's mixer and event-editor panels
+run past the right edge of its maximized window; asked from another process, those children answered with the dpi of
+the screen their clipped-off part lies over (192 on the lab's 200% second screen, SOLID; the 96 first reported, INFERRED, came from a 100% one). In FL's own
+process they report 168 (lab probe, same-process vs other-process on the same windows). The same path serves (INFERRED,
+untested) a plugin window FL's bridge process parents into FL's windows, and cross-process GetWindowRect mapping.
+Upstream Wine 11.10 does the same.
+
+Windows behavior: one dpi for a window tree, the top-level's, whoever asks (INFERRED; Windows probe dpichild.exe is
+waiting, needs two monitors at different scales).
+
+Change: for WND_OTHER_PROCESS, take the rect of NtUserGetAncestor( GA_ROOT ) instead. Only the default walk
+(NEUTRON_DPI_WALK) has it; NEUTRON_DPI_WALK=0 restores the old recursive code wholesale.
+
+Not covered: mixed-hosting children whose awareness differs from their top-level's.
+
+Lab evidence (desk-g, 175% + 200%): dpichild.exe other-process query of children over the 200% screen: 11.10-181d
+168 in 7 of 8 runs (one empty run, see the child-create-dpi patch), NEUTRON_CHILD_DPI_ROOT=0 192 in 2 of 2, stock
+11.10-181 192 in 3 of 3. FL Studio 2026 listed from another process: 181 = 65 windows 168 + 3 at 192 (TNumBar,
+two TVectorPanel); 181d = all 68 at 168, identical rects; FL's look unchanged.
+
+Kill switch: NEUTRON_CHILD_DPI_ROOT=0.
+
+
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -3238,6 +3238,30 @@
+     return ret;
+ }
+ 
++/* NEUTRON child-dpi-root: a window of another process has no WND here, so get_win_monitor_dpi took ITS OWN rect.
++ * For a child that is wrong: FL Studio's mixer panels run past the right edge of its maximized 175% window, and
++ * asked from another process (or by a plugin window FL's bridge parents into them) they reported the dpi of the
++ * 200% screen beside it, 192 instead of 168; in-process they report 168. Windows keeps one dpi for the window tree,
++ * the top-level's, whoever asks. Only the walk (the default, NEUTRON_DPI_WALK) has it. Kill switch
++ * NEUTRON_CHILD_DPI_ROOT=0. */
++static BOOL neutron_child_dpi_root(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_CHILD_DPI_ROOT" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_CHILD_DPI_ROOT = 0 (environment)\n" );
++    }
++    return on;
++}
++
++static HWND other_process_root( HWND hwnd )
++{
++    HWND root = NtUserGetAncestor( hwnd, GA_ROOT );
++    return root ? root : hwnd;
++}
++
+ static UINT get_win_monitor_dpi_recursive( HWND hwnd, UINT *raw_dpi )
+ {
+     UINT dpi = NTUSER_DPI_CONTEXT_GET_DPI( get_window_dpi_awareness_context( hwnd ) );
+@@ -3314,6 +3338,8 @@
+         if (win == WND_DESKTOP) return monitor_dpi_from_rect( rect, get_thread_dpi(), raw_dpi );
+         if (win == WND_OTHER_PROCESS)
+         {
++            /* NEUTRON child-dpi-root: the walk to the top-level stops at another process's window */
++            if (neutron_child_dpi_root()) hwnd = other_process_root( hwnd );
+             dpi = NTUSER_DPI_CONTEXT_GET_DPI( get_window_dpi_awareness_context( hwnd ) );
+             if (!get_window_rect( hwnd, &rect, dpi )) return 0;
+             return monitor_dpi_from_rect( rect, dpi, raw_dpi );
