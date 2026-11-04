@@ -1,0 +1,62 @@
+win32u: with flat menus a grayed menu item is drawn once in COLOR_GRAYTEXT, as Windows does.
+
+Seen 11-04 (Win32 tray menu with NEUTRON_SNI_DBUSMENU=0, any classic Win32 menu): grayed (disabled) items drew as
+doubled, embossed text under the Neutron palette. draw_menu_item draws a disabled item twice, a white copy one pixel
+down-right and then a 0x808080 copy, in FIXED colors whatever the palette. On Neutron's dark menus (Menu 43, GrayText
+106) the white copy is the brightest thing in the row (near-white pixels 229 in the item's row, brightest 251).
+
+Neutron prefixes run flat menus (UserPreferencesMask byte 2 bit 0x02, SPI_GETFLATMENU TRUE); Wine's default does not
+(user_prefs byte 2 = 0x00). With flat menus Windows draws a disabled item once in COLOR_GRAYTEXT, without the emboss of
+3D menus. draw_menu_item already sets COLOR_GRAYTEXT for MF_GRAYED; with flat menus it now skips the white copy and the
+fixed gray, for the item text and the shortcut text. 3D menus (Wine's default) keep the emboss unchanged.
+
+Not covered: 3D (non-flat) menus under a dark palette still emboss in fixed white/gray; owner-drawn items draw
+themselves.
+
+Lab (team "menus", 11.10-181m = 181 + this win32u.so x86_64 + i386; lab/team/menus/menutest, a File/Edit/View bar
+with an enabled and a grayed item each, desk-f at 175%; the grayed row's near-white pixels / brightest pixel):
+181 229 / 251; 181m 0 / 105 (2/2, single GrayText line); NEUTRON_FLAT_MENU_GRAYED=0 on 181m 229 / 251; 181m with
+flat menus off for the session (SPI_SETFLATMENU FALSE) 229 / 251 (3D emboss unchanged).
+
+Kill switch NEUTRON_FLAT_MENU_GRAYED=0.
+
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -1863,6 +1863,14 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON flat-menu-grayed: kill switch NEUTRON_FLAT_MENU_GRAYED=0 (see draw_menu_item). */
++static BOOL neutron_flat_menu_grayed(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_FLAT_MENU_GRAYED" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ /**********************************************************************
+  *           NtUserTranslateAccelerator     (win32u.@)
+  */
+@@ -2786,7 +2794,11 @@
+             if ((item->text[i] == '\t') || (item->text[i] == '\b'))
+                 break;
+ 
+-        if (item->fState & MF_GRAYED)
++        /* NEUTRON flat-menu-grayed: with flat menus (SPI_GETFLATMENU) Windows draws a disabled item once, in
++         * COLOR_GRAYTEXT (set above), without the white-and-gray emboss of 3D menus. The emboss is drawn in fixed
++         * colors, so under a dark palette its white copy stood out as doubled text (Neutron prefixes run flat
++         * menus, 2026-11-04). 3D menus keep it. Kill switch NEUTRON_FLAT_MENU_GRAYED=0. */
++        if ((item->fState & MF_GRAYED) && !(flat_menu && neutron_flat_menu_grayed()))
+         {
+             if (!(item->fState & MF_HILITE) )
+             {
+@@ -2814,7 +2826,7 @@
+                 format = DT_RIGHT | DT_VCENTER | DT_SINGLELINE;
+             }
+ 
+-            if (item->fState & MF_GRAYED)
++            if ((item->fState & MF_GRAYED) && !(flat_menu && neutron_flat_menu_grayed()))
+             {
+                 if (!(item->fState & MF_HILITE) )
+                 {
