@@ -1,0 +1,82 @@
+win32u: after Escape, a click on another menu-bar item opens it.
+
+Seen 11-04 (Premiere and Lightroom Classic, lab copies, 179 and 179d): click File, Escape (the dropdown closes, the bar
+stays in menu mode with File lit), click Edit: no dropdown, 2/2 each. Photoshop and Illustrator opened it.
+
+Plain Win32 test (lab/team/menus/menutest, menuprobe) on 181: in menu mode with NO dropdown open, menu_mouse_move
+still opened the hovered bar item's dropdown, so the pointer reaching Edit opened Edit; the click then landed on an
+already "popped" item, and menu_button_up closes the menu for that (TF_RCVD_BTN_UP, set by File's button-up and never
+cleared): Edit opened on hover and closed ~0.45 s later on the click's release. A move and a click at once
+(SendInput) closed it too: the button-down opened Edit, and its own release met the stale flag.
+
+Now:
+- menu_mouse_move: in menu mode with no dropdown open (Escape closed it, or Alt/F10 started the mode), hovering a bar
+  item only moves the highlight; a click opens it.
+- menu_button_down: a click that opens an item's dropdown clears TF_RCVD_BTN_UP, so that click's own release keeps it
+  open. A click on an item whose dropdown is already open still closes the menu (Wine's toggle, unchanged).
+
+Windows: a self-stopping probe (lab/team/menus/probe/menuprobe.exe: click File, Escape, move to Edit, click Edit; the
+same without Escape; move+click at once; click File twice; logs the open dropdown after each step) is waiting for his
+Windows run. Until then the hover-only rule rests on Windows' keyboard menu mode, INFERRED.
+
+Not covered: menus opened by hover after a dropdown was already open (Wine's toggle on the next click is unchanged);
+the system menu.
+
+Lab (team "menus", 11.10-181n = 181 + this and the flat-menu-grayed patch, win32u.so x86_64 + i386, desk-f):
+- menuprobe under Wine: 181 A: Escape, hover Edit opens it, click closes it; C: move+click closes. 181n A: hover
+  highlights only, click opens Edit and it stays; C: Edit opens and stays; B and D unchanged; 2/2.
+  NEUTRON_MENU_BAR_ESCAPE=0 on 181n: the 181 results.
+- Premiere (copy of PgD-pr2): File, Escape, Edit: 181 no dropdown 2/2; 181n Edit open 2/2 (pixel change under Edit
+  25669, capture prm181n-d1); kill switch on 181n no dropdown 2/2.
+- Lightroom Classic (copy of PgD-lrc2): 181 no dropdown 2/2; 181n Edit open 2/2.
+
+Kill switch NEUTRON_MENU_BAR_ESCAPE=0.
+
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -3645,6 +3645,14 @@
+     return item->wID;
+ }
+ 
++/* NEUTRON menu-bar-escape: kill switch NEUTRON_MENU_BAR_ESCAPE=0 (see menu_mouse_move, menu_button_down). */
++static BOOL neutron_menu_bar_escape(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_MENU_BAR_ESCAPE" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ /***********************************************************************
+  *           switch_tracking
+  *
+@@ -3698,7 +3706,12 @@
+ 
+             /* If the popup menu is not already "popped" */
+             if (!(ptmenu->items[pos].fState & MF_MOUSESELECT))
++            {
+                 pmt->hCurrentMenu = show_sub_popup( pmt->hOwnerWnd, pt_menu, FALSE, flags );
++                /* NEUTRON menu-bar-escape: this click opened the item, so its button-up must not count as a click on
++                 * an already popped item (TF_RCVD_BTN_UP was left set by an earlier click and never cleared). */
++                if (neutron_menu_bar_escape()) pmt->trackFlags &= ~TF_RCVD_BTN_UP;
++            }
+         }
+ 
+         /* A click on an item or anywhere on a popup keeps tracking going */
+@@ -3802,8 +3815,15 @@
+     }
+     else if (ptmenu->FocusedItem != id)
+     {
++        /* NEUTRON menu-bar-escape: in menu mode with no dropdown open (Escape closed it, or Alt/F10 started the mode)
++         * the pointer only moves the bar's highlight; a click opens the item (menu_button_down). Opening on hover here
++         * made the next click a click on an already "popped" item, which closes the menu: after Escape a click on
++         * another bar item never opened it (Premiere, Lightroom Classic, 2026-11-04). */
++        BOOL hover_only = neutron_menu_bar_escape() && pt_menu == pmt->hTopMenu &&
++                          pmt->hCurrentMenu == pmt->hTopMenu && !(ptmenu->wFlags & MF_POPUP);
+         switch_tracking( pmt, pt_menu, id, flags );
+-        pmt->hCurrentMenu = show_sub_popup( pmt->hOwnerWnd, pt_menu, FALSE, flags );
++        if (!hover_only)
++            pmt->hCurrentMenu = show_sub_popup( pmt->hOwnerWnd, pt_menu, FALSE, flags );
+     }
+     return TRUE;
+ }
