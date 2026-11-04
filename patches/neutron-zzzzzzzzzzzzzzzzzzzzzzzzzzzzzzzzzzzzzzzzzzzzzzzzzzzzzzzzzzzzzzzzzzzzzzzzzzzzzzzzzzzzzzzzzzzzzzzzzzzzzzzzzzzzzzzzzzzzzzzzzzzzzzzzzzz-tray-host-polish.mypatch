@@ -1,0 +1,408 @@
+tray-host-polish: full first tray menu on GTK trays, leave a menu those trays never close, program names in notifications
+
+What he saw (patch 123/124 on XFCE (labwc + xfce4-panel) and waybar): the first right-click on a Wine tray icon draws a
+placeholder-sized menu with a scroll arrow (the full menu only from the second open); after a menu is dismissed the
+program stays stuck in its menu until the next right-click; balloon notifications are titled with the tooltip's first line
+or the item id instead of the program's name.
+
+Mechanism:
+1. libdbusmenu/GTK trays (xfce4-panel, waybar; Cinnamon's xapp-sn-watcher shows the same pattern) draw the layout they
+   hold the moment the user clicks and send AboutToShow as a notification; an xdg_popup cannot grow after it maps. On a
+   fresh icon the layout is empty until the program is asked for its menu, which Windows does only on the click.
+2. Those trays never send the dbusmenu "closed" event (bus monitor: only "clicked"; no "opened"/"closed" on XFCE,
+   waybar, Cinnamon), so TrackPopupMenu kept waiting for the tray's answer.
+3. The notification app name came from the tooltip.
+
+Fix:
+1. explorer remembers each program's last tray menu (HKCU\Software\Wine\Explorer\TrayMenus, keyed by the exe path,
+   written when the tray accepts a menu) and hands it to the driver right after NIM_ADD as a request-0 menu; winewayland
+   attaches it as the icon's starting layout (only for an idle icon that uses dbusmenu, never over a live menu) and
+   emits LayoutUpdated, so the tray holds the real layout before its first draw. Every click still asks the program,
+   as Windows does, and replaces it. No host is stalled: nothing waits on the bus.
+2. While TrackPopupMenu waits for the tray it sets __wine_systray_menu_active on its window to the request; the tray's
+   result is applied only while it matches. A button press or key press in the program (the menu being gone: a tray
+   menu holds the input while open) ends the wait with 0, the way the menu closing does on Windows; the message is
+   dispatched normally. The next right-click still supersedes an old request.
+3. explorer stores the program's name (version info FileDescription, else ProductName, else the exe name) as a global
+   atom property on the icon's window on the first balloon; winewayland uses it as the notification's app name
+   (fallback: the tooltip's first line, then the item id).
+
+Windows: the tray asks the program for its menu only on the click (WM_CONTEXTMENU); the program's own menu is open
+until it closes, then TrackPopupMenu returns; the notification shows the program's display name (FileDescription).
+
+Not covered:
+- The first right-click ever for a program (nothing remembered yet) still shows the tray's placeholder on XFCE/waybar.
+- An app-drawn tray menu (patch 125's layer surface) does not close on a click on the empty desktop on sway or
+  Hyprland: the compositor gives Wine no event (0 Wine input events after the click, +keyboard,+waylanddrv,+win, sway).
+  Clicks on another window, Escape and choosing do close it. The Wayland-native fix would be an xdg_popup with a grab on
+  an invisible layer-surface parent (the compositor then dismisses it); not attempted here.
+- waybar never gives a click point on right-click (no ContextMenu even with Menu "/NO_DBUSMENU"), so an app-drawn menu
+  opens at the last known point: after any left-click (Activate x,y) it is at the click; before one it is at Wine's
+  last cursor position (0,0 in a fresh session).
+- Programs that never call TrackPopupMenu (their own popup) are unaffected by 1 and 2.
+
+Lab evidence (runtime 11.10-181t = 181 + this patch; traytest v4, its own tray test program):
+- First open, fresh session: XFCE 182 device rows (2/2) vs 26 with NEUTRON_TRAY_MENU_MEMORY=0 (1/1); Hyprland/waybar
+  140 rows, First/Second/Quit (2/2) vs 38 rows, the scroll-arrow placeholder, with the switch (2/2); Cinnamon full
+  menu at the icon on the first open (1/1).
+- Leaving a menu the tray never closes: click into the program's window -> "menu returned 0" in the same millisecond:
+  XFCE 2/2, Hyprland 2/2; NEUTRON_TRAY_MENU_INPUT_END=0 on the same build: the click does not end it, the next
+  right-click does (XFCE 1/1, Hyprland 1/1). Choices still return their command (Cinnamon "Second" -> 2).
+- Notification app name "Tray Test Program" (FileDescription) (XFCE m1, GNOME g2); exe without version info -> "traytest-nv".
+- Regression: GNOME (nested devkit, AppIndicator 66): first open full, at the icon (g2); right-click + Escape behaves the same on 181 (g4) and 181t (g3): see the note below; Plasma 6 (nested, 126): the app's own menu at the click, Escape 0, second right-click the own menu again, never re-announced (1/1).
+
+Pre-existing, not this patch (GNOME devkit rig): after right-click + Escape the icon vanishes from the top bar and the
+program stays in TrackPopupMenu until it exits; identical on 181 and 181t (1/1 each), unverified on a real GNOME session.
+
+Kill switches: NEUTRON_TRAY_MENU_MEMORY=0 (explorer: no remembered menus), NEUTRON_TRAY_MENU_INPUT_END=0 (the program's
+input no longer ends a tray menu wait).
+Files: include/ntuser.h, dlls/win32u/menu.c, programs/explorer/systray.c, programs/explorer/Makefile.in (version),
+dlls/winewayland.drv/wayland_sni.c.
+
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -4700,6 +4700,26 @@
+ 
+ static const WCHAR tray_menu_propW[] = WINE_SYSTRAY_MENU_PROP_INIT;
+ static const WCHAR tray_menu_resultW[] = WINE_SYSTRAY_MENU_RESULT_PROP_INIT;
++static const WCHAR tray_menu_activeW[] = WINE_SYSTRAY_MENU_ACTIVE_PROP_INIT;
++
++/* NEUTRON tray-host-polish: the user is back in the application: a button press or a key in one of its windows.
++ * While the desktop's tray shows the menu it holds the pointer and the keyboard, so such input means the menu is
++ * gone; trays that never say "closed" (XFCE's panel, waybar) left the application waiting until the next right
++ * click. Windows ends a menu loop on a click elsewhere with 0. Kill switch NEUTRON_TRAY_MENU_INPUT_END=0. */
++static BOOL tray_menu_input_ends( UINT message )
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_TRAY_MENU_INPUT_END" ); on = !(e && e[0] == '0'); }
++    if (!on) return FALSE;
++    switch (message)
++    {
++    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
++    case WM_NCLBUTTONDOWN: case WM_NCRBUTTONDOWN: case WM_NCMBUTTONDOWN: case WM_NCXBUTTONDOWN:
++    case WM_KEYDOWN: case WM_SYSKEYDOWN:
++        return TRUE;
++    }
++    return FALSE;
++}
+ 
+ struct tray_menu_capture
+ {
+@@ -4783,7 +4803,7 @@
+     struct systray_menu_data *data;
+     COPYDATASTRUCT cds;
+     UINT result = 0, size;
+-    BOOL quit = FALSE;
++    BOOL quit = FALSE, back = FALSE;
+     HWND tray;
+     MSG msg;
+ 
+@@ -4800,9 +4820,14 @@
+     cds.dwData = WINE_SYSTRAY_MENU_DATA;
+     cds.cbData = size;
+     cds.lpData = data;
++    NtUserSetProp( hwnd, tray_menu_activeW, ULongToHandle( request ));
+     result = send_message_timeout( tray, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cds, SMTO_ABORTIFHUNG, 2000, FALSE );
+     free( data );
+-    if (result != TRUE) goto failed;
++    if (result != TRUE)
++    {
++        NtUserRemoveProp( hwnd, tray_menu_activeW );
++        goto failed;
++    }
+     TRACE( "menu %p (%u items) shown by the tray for %p\n", handle, c.count, hwnd );
+ 
+     /* as in a menu loop, the application keeps running until the menu closes */
+@@ -4827,11 +4852,18 @@
+                 quit = TRUE;
+                 break;
+             }
++            if (tray_menu_input_ends( msg.message ))
++            {
++                TRACE( "input %#x in %p: the tray's menu is gone\n", msg.message, msg.hwnd );
++                back = TRUE;
++            }
+             NtUserTranslateMessage( &msg, 0 );
+             NtUserDispatchMessage( &msg );
++            if (back) break;
+         }
+-        if (quit) break;
++        if (quit || back) break;
+     }
++    if (is_window( hwnd )) NtUserRemoveProp( hwnd, tray_menu_activeW );
+ 
+     *ret = (flags & TPM_RETURNCMD) ? 0 : TRUE;
+     if (result && result <= c.count && is_window( hwnd ))
+--- a/dlls/winewayland.drv/wayland_sni.c
++++ b/dlls/winewayland.drv/wayland_sni.c
+@@ -214,6 +214,8 @@
+ static UINT sni_menu_counter;
+ static const WCHAR menu_propW[] = WINE_SYSTRAY_MENU_PROP_INIT;
+ static const WCHAR menu_resultW[] = WINE_SYSTRAY_MENU_RESULT_PROP_INIT;
++static const WCHAR menu_activeW[] = WINE_SYSTRAY_MENU_ACTIVE_PROP_INIT;
++static const WCHAR app_nameW[] = WINE_SYSTRAY_APP_NAME_PROP_INIT;
+ 
+ static BOOL sni_dbusmenu_enabled(void)
+ {
+@@ -1025,6 +1027,13 @@
+ /* end the application's TrackPopupMenu: value is the item index + 1, 0 for none; called without sni_mutex */
+ static void finish_app_menu( HWND owner, UINT request, UINT value )
+ {
++    /* NEUTRON tray-host-polish: an application that left the menu by itself (the user clicked or typed in it, see
++     * win32u menu.c) takes no result; one left behind would hold back its next menu */
++    if (HandleToUlong( NtUserGetProp( owner, menu_activeW )) != request)
++    {
++        TRACE( "menu request %u of %p: the application already left it\n", request, owner );
++        return;
++    }
+     TRACE( "menu request %u of %p ends with item %u\n", request, owner, value );
+     NtUserSetProp( owner, menu_resultW, ULongToHandle( MAKELONG( value, request )));
+     NtUserPostMessage( owner, WM_NULL, 0, 0 );
+@@ -1424,6 +1433,35 @@
+     memcpy( copy, data, data->size );
+ 
+     pthread_mutex_lock( &sni_mutex );
++    if (!data->request)
++    {
++        /* NEUTRON tray-host-polish: the program's last menu, remembered by explorer: the layout the tray holds before
++         * the first click (a tray that draws the menu sizes it from that layout), replaced at every click */
++        LIST_FOR_EACH_ENTRY( icon, &sni_icons, struct sni_icon, entry )
++        {
++            if ((UINT)(UINT_PTR)icon->owner != (UINT)(UINT_PTR)hwnd || icon->menu.data || !icon->conn ||
++                !icon->use_dbusmenu) continue;
++            if (icon->menu.state != MENU_IDLE) continue;
++            icon->menu.data = copy;
++            copy = NULL;
++            revision = ++icon->menu.revision;
++            conn = p_dbus_connection_ref( icon->conn );
++            break;
++        }
++        pthread_mutex_unlock( &sni_mutex );
++        free( copy );
++        if (!conn) return FALSE;
++        TRACE( "remembered menu of %p, %u items, revision %u\n", hwnd, data->count, revision );
++        if ((signal = p_dbus_message_new_signal( DBUSMENU_PATH, DBUSMENU_INTERFACE, "LayoutUpdated" )))
++        {
++            p_dbus_message_append_args( signal, DBUS_TYPE_UINT32, &revision, DBUS_TYPE_INT32, &root, DBUS_TYPE_INVALID );
++            p_dbus_connection_send( conn, signal, NULL );
++            p_dbus_message_unref( signal );
++        }
++        p_dbus_connection_unref( conn );
++        sni_wakeup();
++        return TRUE;
++    }
+     LIST_FOR_EACH_ENTRY( icon, &sni_icons, struct sni_icon, entry )
+     {
+         if (icon->menu.state != MENU_WAITING || icon->menu.click_pending || !icon->conn) continue;
+@@ -2230,12 +2268,30 @@
+             {
+                 /* NEUTRON tray-menus-v2: the notification's application name: the first line of the icon's tip (tray
+                  * applications put their name there), as Windows shows the application's name, not an id */
+-                char app[128];
++                char app[128] = "";
+                 const char *nl;
+-                pthread_mutex_lock( &sni_mutex );
+-                snprintf( app, sizeof(app), "%s", icon->tip && icon->tip[0] ? icon->tip : icon->item_id );
+-                pthread_mutex_unlock( &sni_mutex );
+-                if ((nl = strchr( app, '\n' ))) app[nl - app] = 0;
++                char *name;
++                /* NEUTRON tray-host-polish: the program's name from its version info (explorer, ntuser.h), as
++                 * Windows names a toast's application; else the first line of the tip */
++                ATOM atom = HandleToUlong( NtUserGetProp( nid->hWnd, app_nameW ));
++                if (atom)
++                {
++                    char buf[sizeof(ATOM_BASIC_INFORMATION) + 256 * sizeof(WCHAR)];
++                    ATOM_BASIC_INFORMATION *abi = (ATOM_BASIC_INFORMATION *)buf;
++                    if (!NtQueryInformationAtom( atom, AtomBasicInformation, abi, sizeof(buf), NULL ) &&
++                        abi->NameLength && (name = utf8_from_wide( abi->Name, abi->NameLength / sizeof(WCHAR) )))
++                    {
++                        snprintf( app, sizeof(app), "%s", name );
++                        free( name );
++                    }
++                }
++                if (!app[0])
++                {
++                    pthread_mutex_lock( &sni_mutex );
++                    snprintf( app, sizeof(app), "%s", icon->tip && icon->tip[0] ? icon->tip : icon->item_id );
++                    pthread_mutex_unlock( &sni_mutex );
++                    if ((nl = strchr( app, '\n' ))) app[nl - app] = 0;
++                }
+                 if (!app[0]) snprintf( app, sizeof(app), "%s", icon->item_id );
+                 id = show_balloon( old, app, nid, argb, w, h );
+             }
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -701,6 +701,16 @@
+     {'_','_','w','i','n','e','_','s','y','s','t','r','a','y','_','m','e','n','u',0}
+ #define WINE_SYSTRAY_MENU_RESULT_PROP_INIT \
+     {'_','_','w','i','n','e','_','s','y','s','t','r','a','y','_','m','e','n','u','_','r','e','s','u','l','t',0}
++/* NEUTRON tray-host-polish: while TrackPopupMenu waits for the tray's answer it sets WINE_SYSTRAY_MENU_ACTIVE_PROP to
++ * the request; the shell sets the result only while it matches. Some trays never report that the menu closed; the
++ * application then leaves the wait by itself (result 0) when the user clicks or types in it, the menu being gone.
++ * A menu with request 0 is a program's last menu remembered by explorer, the tray's starting layout for its icon.
++ * WINE_SYSTRAY_APP_NAME_PROP on an icon's window is a global atom with the program's name (its version info), for
++ * the notifications of its balloons. */
++#define WINE_SYSTRAY_MENU_ACTIVE_PROP_INIT \
++    {'_','_','w','i','n','e','_','s','y','s','t','r','a','y','_','m','e','n','u','_','a','c','t','i','v','e',0}
++#define WINE_SYSTRAY_APP_NAME_PROP_INIT \
++    {'_','_','w','i','n','e','_','s','y','s','t','r','a','y','_','a','p','p','_','n','a','m','e',0}
+ 
+ struct systray_menu_item
+ {
+--- a/programs/explorer/Makefile.in
++++ b/programs/explorer/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = explorer.exe
+ IMPORTS   = rpcrt4 user32 gdi32 advapi32 win32u
+-DELAYIMPORTS = comctl32 shell32 oleaut32 ole32 shlwapi
++DELAYIMPORTS = comctl32 shell32 oleaut32 ole32 shlwapi version
+ 
+ EXTRADLLFLAGS = -mwindows -municode
+ 
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -843,6 +843,112 @@
+     }
+ }
+ 
++/* NEUTRON tray-host-polish ------------------------------------------------------------------------------------- */
++
++/* the full path of the program that owns a window */
++static BOOL get_window_program( HWND hwnd, WCHAR *path, DWORD size )
++{
++    DWORD pid = 0;
++    HANDLE process;
++    BOOL ret;
++
++    if (!GetWindowThreadProcessId( hwnd, &pid ) || !pid) return FALSE;
++    if (!(process = OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid ))) return FALSE;
++    ret = QueryFullProcessImageNameW( process, 0, path, &size );
++    CloseHandle( process );
++    return ret;
++}
++
++/* Windows names a tray balloon's (toast's) application by its version info, not by an id: the program's
++ * FileDescription, else its ProductName, else the file name. Kept on the icon's window as a global atom for the
++ * display driver (WINE_SYSTRAY_APP_NAME_PROP, ntuser.h). */
++static void set_tray_app_name( HWND hwnd )
++{
++    static const WCHAR propW[] = WINE_SYSTRAY_APP_NAME_PROP_INIT;
++    static const WCHAR transW[] = L"\\VarFileInfo\\Translation";
++    static const WCHAR *const fields[] = { L"FileDescription", L"ProductName" };
++    WCHAR path[MAX_PATH], query[64], name[256] = L"", *value, *p;
++    struct { WORD lang, codepage; } *trans;
++    UINT len, i;
++    DWORD size;
++    void *info = NULL;
++    ATOM atom;
++
++    if (GetPropW( hwnd, propW ) || !get_window_program( hwnd, path, ARRAY_SIZE(path) )) return;
++    if ((size = GetFileVersionInfoSizeW( path, NULL )) && (info = malloc( size )) &&
++        GetFileVersionInfoW( path, 0, size, info ) &&
++        VerQueryValueW( info, transW, (void **)&trans, &len ) && len >= sizeof(*trans))
++    {
++        for (i = 0; i < ARRAY_SIZE(fields) && !name[0]; i++)
++        {
++            swprintf( query, ARRAY_SIZE(query), L"\\StringFileInfo\\%04x%04x\\%s", trans->lang, trans->codepage,
++                      fields[i] );
++            if (VerQueryValueW( info, query, (void **)&value, &len ) && len && value[0])
++                lstrcpynW( name, value, ARRAY_SIZE(name) );
++        }
++    }
++    free( info );
++    if (!name[0])
++    {
++        p = wcsrchr( path, '\\' );
++        lstrcpynW( name, p ? p + 1 : path, ARRAY_SIZE(name) );
++        if ((p = wcsrchr( name, '.' ))) *p = 0;
++    }
++    if (name[0] && (atom = GlobalAddAtomW( name ))) SetPropW( hwnd, propW, ULongToHandle( atom ));
++}
++
++/* A tray that draws a program's menu itself (dbusmenu: XFCE's panel, waybar) sizes the menu from the layout it holds
++ * when the user clicks, before the program can be asked (Windows asks the program only then), so a first menu was a
++ * one-row popup with a scroll arrow. explorer keeps each program's last menu (HKCU\Software\Wine\Explorer\TrayMenus,
++ * by program path) and hands it to the display driver when the program's icon comes back: the tray's starting layout.
++ * The program's own menu still replaces it at every click. Kill switch NEUTRON_TRAY_MENU_MEMORY=0. */
++static BOOL tray_menu_memory(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        WCHAR buf[8];
++        on = !(GetEnvironmentVariableW( L"NEUTRON_TRAY_MENU_MEMORY", buf, ARRAY_SIZE(buf) ) && buf[0] == '0');
++    }
++    return on;
++}
++
++static void remember_tray_menu( HWND hwnd, const struct systray_menu_data *menu )
++{
++    WCHAR path[MAX_PATH];
++    HKEY key;
++
++    if (!tray_menu_memory() || !get_window_program( hwnd, path, ARRAY_SIZE(path) )) return;
++    if (RegCreateKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\Explorer\\TrayMenus", 0, NULL, 0, KEY_SET_VALUE, NULL,
++                         &key, NULL )) return;
++    RegSetValueExW( key, path, 0, REG_BINARY, (const BYTE *)menu, menu->size );
++    RegCloseKey( key );
++}
++
++static void replay_tray_menu( HWND hwnd )
++{
++    struct systray_menu_data *menu;
++    WCHAR path[MAX_PATH];
++    DWORD size = 0, type;
++    HKEY key;
++
++    if (!tray_menu_memory() || !get_window_program( hwnd, path, ARRAY_SIZE(path) )) return;
++    if (RegOpenKeyExW( HKEY_CURRENT_USER, L"Software\\Wine\\Explorer\\TrayMenus", 0, KEY_QUERY_VALUE, &key )) return;
++    if (!RegQueryValueExW( key, path, NULL, &type, NULL, &size ) && type == REG_BINARY &&
++        size >= offsetof( struct systray_menu_data, items[1] ) && (menu = malloc( size )))
++    {
++        if (!RegQueryValueExW( key, path, NULL, NULL, (BYTE *)menu, &size ) && menu->size == size && menu->count &&
++            menu->count <= (size - offsetof( struct systray_menu_data, items )) / sizeof(menu->items[0]))
++        {
++            menu->request = 0;
++            NtUserMessageCall( hwnd, WINE_SYSTRAY_NOTIFY_ICON, WINE_SYSTRAY_MENU_DATA, 0, menu,
++                               NtUserSystemTrayCall, FALSE );
++        }
++        free( menu );
++    }
++    RegCloseKey( key );
++}
++
+ static BOOL handle_incoming(HWND hwndSource, COPYDATASTRUCT *cds)
+ {
+     struct icon *icon = NULL;
+@@ -859,8 +965,11 @@
+             !menu->count || menu->count > (cds->cbData - offsetof( struct systray_menu_data, items )) /
+                                           sizeof(menu->items[0]))
+             return FALSE;
+-        return NtUserMessageCall( hwndSource, WINE_SYSTRAY_NOTIFY_ICON, WINE_SYSTRAY_MENU_DATA, 0,
+-                                  (void *)menu, NtUserSystemTrayCall, FALSE ) == TRUE;
++        if (NtUserMessageCall( hwndSource, WINE_SYSTRAY_NOTIFY_ICON, WINE_SYSTRAY_MENU_DATA, 0,
++                               (void *)menu, NtUserSystemTrayCall, FALSE ) != TRUE)
++            return FALSE;
++        remember_tray_menu( hwndSource, menu );
++        return TRUE;
+     }
+ 
+     if (cds->cbData < sizeof(*data)) return FALSE;
+@@ -920,12 +1029,16 @@
+         nid.hBalloonIcon = CreateIcon(NULL, data->balloon_icon_info.width, data->balloon_icon_info.height, data->balloon_icon_info.planes, data->balloon_icon_info.bpp,
+                                       icon_data, icon_data + cbMaskBits);
+     }
++    if ((nid.uFlags & NIF_INFO) && nid.szInfo[0]) set_tray_app_name( nid.hWnd );
+     /* try forwarding to the display driver first */
+     if (cds->dwData == NIM_ADD || !(icon = get_icon( nid.hWnd, nid.uID )))
+     {
+         if ((ret = NtUserMessageCall( hwndSource, WINE_SYSTRAY_NOTIFY_ICON, cds->dwData, 0,
+                                       &nid, NtUserSystemTrayCall, FALSE )) != -1)
++        {
++            if (cds->dwData == NIM_ADD && ret) replay_tray_menu( nid.hWnd );
+             goto done;
++        }
+         ret = FALSE;
+     }
+ 
