@@ -1,0 +1,46 @@
+winewayland: on Plasma every tray menu is the application's own, opened at the click (his option B).
+
+Patch 125 started a Plasma tray icon without the dbusmenu (so Plasma calls ContextMenu with the click point) and, once
+its application showed a Win32 menu, re-registered the item with the dbusmenu so later right-clicks were drawn by
+Plasma at the icon. The first menu then looked different from the later ones, and the re-registration could move the
+icon once. His call (11-04): "Option b" -- on Plasma always show the application's own menu at the click, which is how
+Windows shows tray menus (the application draws them). GNOME, XFCE and waybar keep the dbusmenu: their trays only offer
+that.
+
+The ContextMenu probe that triggered the switch is now opt-in (NEUTRON_TRAY_PLASMA_DBUSMENU=1 restores 125's behavior).
+Nothing else changes: the menu is placed at the click by 125's layer surface.
+
+Lab 180u (= 180 + 125 + this winewayland.so, both arches), nested Plasma 6 on desk E, traytest v4 (a Win32 menu):
+right-click, Escape, right-click: both menus are the application's own window at the click ("menu at cursor
+1896,1203"), Escape returns 0, the item is never re-announced, 2/2. NEUTRON_TRAY_PLASMA_DBUSMENU=1 on the same build:
+"shows Win32 menus: the tray will draw", "announced again", the second right-click opens Plasma's menu, 1/1.
+
+--- a/dlls/winewayland.drv/wayland_sni.c
++++ b/dlls/winewayland.drv/wayland_sni.c
+@@ -245,6 +245,17 @@
+     return kde && sni_dbusmenu_enabled() && wayland_tray_popup_layer_enabled();
+ }
+ 
++/* NEUTRON tray-plasma-own-menu (his option B, 2026-11-04): on Plasma every tray menu is the application's own, opened at
++ * the click, as Windows shows tray menus (the application draws them). The ContextMenu probe that moved an icon to the
++ * dbusmenu after its first Win32 menu (Plasma-drawn menus from the second click on, a first menu that looked different,
++ * the icon re-registered and moving once) is opt-in: NEUTRON_TRAY_PLASMA_DBUSMENU=1. */
++static BOOL sni_kde_probe(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_TRAY_PLASMA_DBUSMENU" ); on = e && e[0] == '1'; }
++    return on;
++}
++
+ static ULONGLONG sni_ticks(void)
+ {
+     struct timespec ts;
+@@ -662,7 +673,7 @@
+         icon->last_click = sni_last_click = pt;
+     }
+     /* NEUTRON tray-menus-v2: a Win32 menu the application opens for this click tells us its kind (menu_offered) */
+-    if (!strcmp( member, "ContextMenu" ) && !icon->use_dbusmenu && sni_kde_context())
++    if (!strcmp( member, "ContextMenu" ) && !icon->use_dbusmenu && sni_kde_context() && sni_kde_probe())
+     {
+         if (!(request = ++sni_menu_counter & 0xffff)) request = ++sni_menu_counter & 0xffff;
+         icon->context_request = request;
