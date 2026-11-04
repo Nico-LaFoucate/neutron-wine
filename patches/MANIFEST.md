@@ -1593,7 +1593,7 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
-### patch 120 — `…z×120-treeview-expander-cleared-ground` (tree lines ran through the expander triangles; his pick B, C175) — committed, not built
+### patch 120 — `…z×120-treeview-expander-cleared-ground` (tree lines ran through the expander triangles; his pick B, C175) — committed `8d47155`, not built
 Our triangle expander (…n-comctl32-treeview-triangle-expander) did not clear what was under it; the boxed +/- it replaced was a filled rectangle, so lines stopped at it. Shown three variants (triangle over lines / triangle on cleared ground / boxed +/-), he picked B. FillRect of the item background over the glyph square before Polygon. Builds into comctl32 AND comctl32_v6 (PARENTSRC). Neutron-shell chevrons (file dialog) return earlier, unchanged. Lab 178f: FL installer Choose Components, line breaks around each triangle (zoom), 178 runs through.
 
 ### patch 119 — `…z×119-filedialog-long-filter-names` (VSDC: "Files of type" empty in the Import dialog) — OUR BUG (file dialog restyle, 85) — IN 11.10-178 (built, not published)
