@@ -1,0 +1,1369 @@
+win32u, winewayland, explorer: a tray icon's Win32 menu opens at the icon, drawn by the desktop's tray (dbusmenu).
+
+With patch 123 a tray icon's right click reached the application, whose TrackPopupMenu window KWin put in the middle of
+the screen with a taskbar entry. Windows opens it at the icon. His call (C178): tray menus at the icon, drawn by the
+desktop. Every SNI tray draws a menu at the icon when the item exports one over com.canonical.dbusmenu, so the item's
+Menu is now a dbusmenu, filled from the application's own HMENU:
+- when the tray opens the menu (AboutToShow on the root, with the "opened" event Plasma and GNOME send), explorer marks
+  the icon's window (WINE_SYSTRAY_MENU_PROP) and relays the right click as before;
+- TrackPopupMenu on a marked window sends WM_ENTERMENULOOP / WM_INITMENU / WM_INITMENUPOPUP as on Windows (and
+  WM_INITMENUPOPUP to each submenu, before the menu shows rather than when it opens), copies the items to Shell_TrayWnd
+  (WM_COPYDATA, explorer hands it to the driver), and runs a message loop until the tray's menu closes;
+- the tray's "clicked" gives the result a click in the Win32 menu gives (WM_COMMAND, WM_MENUCOMMAND for
+  MNS_NOTIFYBYPOS, or the id with TPM_RETURNCMD), "closed" gives none (Qt's "closed" comes before "clicked": 400 ms);
+- labels keep mnemonics (& -> _, && -> &, _ -> __) and drop the "\tCtrl+O" part; separators, grayed items, checked
+  and radio items, submenus. Item ids carry the menu's revision, so no host keeps an old item's properties.
+Hosts differ, measured in the lab:
+- GNOME's AppIndicator extension calls AboutToShow ahead of time (at attach) and never calls ContextMenu: under 123 a
+  right click did nothing there. An AboutToShow without an "opened" event gets "nothing new" and the application gets
+  no click (Windows sends tray messages only on clicks); the root then holds one disabled item (the tooltip) until the
+  first menu comes, since GNOME opens only a non-empty menu. Hosts that send no "opened" at all (waybar) get the menu
+  when they ask later than 3 s after the item appeared.
+- An application whose menu is not a Win32 menu (Qt's QMenu: Filmora) sends nothing; after a second the tray is told
+  nothing is new and the application's window shows as before; Plasma then shows no menu of its own.
+Not covered: non-Win32 menus still open where the compositor puts them (KWin, sway and Hyprland offer
+zwlr_layer_shell_v1, GNOME does not; not used); owner-drawn and system menus keep the Win32 popup; item bitmaps;
+WM_MENUSELECT while hovering; a host that never sends "closed" (waybar) leaves the application in TrackPopupMenu
+(still processing its messages) until the next click or menu; waybar draws the very first menu in a popup sized for the
+placeholder (scroll arrow), later ones at full size; swaybar's own tray calls ContextMenu (no dbusmenu), so there the
+Win32 menu window shows as with 123 (sway tiles it).
+
+Lab, 179 + 123 + this (lab 11.10-179d), tray test program (agents/dbusmenu/menutest: check set in WM_INITMENUPOPUP,
+radio, grayed, submenu filled in its WM_INITMENUPOPUP, default item, "&Open\tCtrl+O", "Save_as && quit", separator):
+- scripted dbusmenu host: the menu came 1-12 ms after AboutToShow, every property as above; TPM_RETURNCMD 13 / 21
+  (submenu) / 0 (closed) / 0 (grayed clicked, then closed); "closed" then "clicked" 21; AboutToShowGroup 10; WM_COMMAND
+  12 / 20 / cancel TRUE without a command / 99 (exit); WM_MENUCOMMAND position + menu (13, 21, 99); a second open
+  without "closed" ends the first with 0 and shows the second; legacy (WM_RBUTTONUP) and NOTIFYICON_VERSION_4 apps;
+- nested Plasma 6: the menu at the icon in Plasma's style, submenu, Sub B -> 21, Escape 0 (2/2), Large 13 (2/2),
+  click outside 0 (2/2), unchecked item without a box; Filmora's Qt menu (2/2 + 1/1): its own window, no Plasma menu;
+- GNOME with the AppIndicator extension (podman): no click at attach; the menu at the icon in GNOME's style, Large 13
+  (2/2), Escape 0, click outside 0; first open on a fresh icon 3/3 (1 fail right after the session started, not seen
+  again);
+- waybar (sway, podman): from the second open the menu at the icon, Large 13, checked/unchecked right.
+- kill switch NEUTRON_SNI_DBUSMENU=0: Menu /NO_DBUSMENU; Plasma: the Win32 menu in the middle with a taskbar entry (123).
+Lab trap: the Unix side of win32u/winewayland has 32-bit wchar_t, so L"__wine_..." property names read as "_" and
+the request and its result overwrote each other (a second open without "closed" hung); WCHAR initializers fix it.
+
+Kill switch NEUTRON_SNI_DBUSMENU=0.
+
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -4646,6 +4646,198 @@
+     exit_tracking( hwnd, FALSE );
+ }
+ 
++/* NEUTRON sni-dbusmenu (2026-11-04, his C178: tray menus at the icon, drawn by the desktop).
++ *
++ * On Windows a tray icon's context menu opens at the icon, in the taskbar. With the icon in the desktop's own tray
++ * (winewayland's StatusNotifierItem, patch 123) the application's menu window cannot be placed there: a Wayland
++ * client does not position its windows, so KWin put it in the middle of the screen with a taskbar entry. The tray
++ * draws a menu at the icon itself when the item exports one over com.canonical.dbusmenu, so while the shell waits
++ * for an icon's menu (WINE_SYSTRAY_MENU_PROP on the icon's window, see ntuser.h), TrackPopupMenu on that window does
++ * what it does on Windows up to the point of showing the popup (WM_ENTERMENULOOP, WM_INITMENU, WM_INITMENUPOPUP),
++ * hands the items to the shell, and runs a message loop until the desktop's menu closes; the chosen item then gives
++ * the same WM_COMMAND / WM_MENUCOMMAND or TPM_RETURNCMD result as a click in the Win32 menu would.
++ * Differences: submenus get their WM_INITMENUPOPUP before the menu shows instead of when they open; owner-drawn
++ * menus, system menus and a shell that does not take the menu keep the Win32 popup; item bitmaps are not shown.
++ * Kill switch NEUTRON_SNI_DBUSMENU=0. */
++static BOOL neutron_tray_dbusmenu(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_SNI_DBUSMENU" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static const WCHAR tray_menu_propW[] = WINE_SYSTRAY_MENU_PROP_INIT;
++static const WCHAR tray_menu_resultW[] = WINE_SYSTRAY_MENU_RESULT_PROP_INIT;
++
++struct tray_menu_capture
++{
++    struct systray_menu_item *items;
++    struct { HMENU menu; UINT pos; UINT_PTR id; } *entries;
++    WCHAR *text;
++    UINT   count, max;
++    UINT   text_len, text_max;
++    BOOL   unsupported;
++};
++
++static UINT tray_menu_add_text( struct tray_menu_capture *c, const WCHAR *str )
++{
++    UINT len = wcslen( str ) + 1, offset = c->text_len;
++
++    if (c->text_len + len > c->text_max)
++    {
++        UINT max = max( c->text_max * 2, c->text_len + len + 256 );
++        WCHAR *text = realloc( c->text, max * sizeof(WCHAR) );
++        if (!text) { c->unsupported = TRUE; return ~0u; }
++        c->text = text;
++        c->text_max = max;
++    }
++    memcpy( c->text + c->text_len, str, len * sizeof(WCHAR) );
++    c->text_len += len;
++    return offset;
++}
++
++static void tray_menu_capture( struct tray_menu_capture *c, HWND hwnd, HMENU handle, INT parent, UINT flags,
++                               int depth )
++{
++    struct menu *menu;
++    UINT i;
++
++    if (depth > 8) { c->unsupported = TRUE; return; }
++    for (i = 0; !c->unsupported; i++)
++    {
++        struct systray_menu_item *item;
++        HMENU submenu = 0;
++        UINT index;
++
++        /* WM_INITMENUPOPUP for an earlier submenu may have changed this menu: look it up for every item */
++        if (!(menu = unsafe_menu_ptr( handle )) || i >= menu->nItems) break;
++        if (c->count == c->max)
++        {
++            UINT max = c->max ? c->max * 2 : 32;
++            void *items = realloc( c->items, max * sizeof(*c->items) );
++            void *entries = items ? realloc( c->entries, max * sizeof(*c->entries) ) : NULL;
++            if (items) c->items = items;
++            if (!items || !entries) { c->unsupported = TRUE; break; }
++            c->entries = entries;
++            c->max = max;
++        }
++        index = c->count++;
++        item = &c->items[index];
++        item->parent = parent;
++        item->type = menu->items[i].fType & (MFT_SEPARATOR | MFT_RADIOCHECK | MFT_BITMAP | MFT_OWNERDRAW | MF_POPUP);
++        item->state = menu->items[i].fState;
++        item->text = ~0u;
++        c->entries[index].menu = handle;
++        c->entries[index].pos = i;
++        c->entries[index].id = menu->items[i].wID;
++        if (item->type & MFT_OWNERDRAW) c->unsupported = TRUE;
++        if (IS_STRING_ITEM( menu->items[i].fType ) && menu->items[i].text)
++            item->text = tray_menu_add_text( c, menu->items[i].text );
++        if ((item->type & MF_POPUP) && menu->items[i].hSubMenu) submenu = menu->items[i].hSubMenu;
++        if (submenu)
++        {
++            if (!(flags & TPM_NONOTIFY)) send_message( hwnd, WM_INITMENUPOPUP, (WPARAM)submenu, i );
++            tray_menu_capture( c, hwnd, submenu, index, flags, depth + 1 );
++        }
++    }
++}
++
++/* the shell shows the menu; TRUE with *ret set when it did, FALSE to show the Win32 popup */
++static BOOL tray_menu_show( HMENU handle, UINT flags, HWND hwnd, UINT request, BOOL *ret )
++{
++    static const WCHAR trayW[] = {'S','h','e','l','l','_','T','r','a','y','W','n','d',0};
++    UNICODE_STRING tray_class = RTL_CONSTANT_STRING( trayW );
++    struct tray_menu_capture c = { 0 };
++    struct systray_menu_data *data;
++    COPYDATASTRUCT cds;
++    UINT result = 0, size;
++    BOOL quit = FALSE;
++    HWND tray;
++    MSG msg;
++
++    tray_menu_capture( &c, hwnd, handle, -1, flags, 0 );
++    if (c.unsupported || !c.count || !(tray = NtUserFindWindowEx( 0, 0, &tray_class, NULL, 0 ))) goto failed;
++
++    size = offsetof( struct systray_menu_data, items[c.count] ) + c.text_len * sizeof(WCHAR);
++    if (!(data = malloc( size ))) goto failed;
++    data->size = size;
++    data->request = request;
++    data->count = c.count;
++    memcpy( data->items, c.items, c.count * sizeof(*c.items) );
++    memcpy( &data->items[c.count], c.text, c.text_len * sizeof(WCHAR) );
++    cds.dwData = WINE_SYSTRAY_MENU_DATA;
++    cds.cbData = size;
++    cds.lpData = data;
++    result = send_message_timeout( tray, WM_COPYDATA, (WPARAM)hwnd, (LPARAM)&cds, SMTO_ABORTIFHUNG, 2000, FALSE );
++    free( data );
++    if (result != TRUE) goto failed;
++    TRACE( "menu %p (%u items) shown by the tray for %p\n", handle, c.count, hwnd );
++
++    /* as in a menu loop, the application keeps running until the menu closes */
++    result = 0;
++    for (;;)
++    {
++        UINT_PTR value = (UINT_PTR)NtUserGetProp( hwnd, tray_menu_resultW );
++
++        if (value && HIWORD( value ) == LOWORD( request ))
++        {
++            NtUserRemoveProp( hwnd, tray_menu_resultW );
++            result = LOWORD( value );
++            break;
++        }
++        if (!is_window( hwnd ) || !is_window( tray )) break;
++        NtUserMsgWaitForMultipleObjectsEx( 0, NULL, 100, QS_ALLINPUT, 0 );
++        while (NtUserPeekMessage( &msg, 0, 0, 0, PM_REMOVE ))
++        {
++            if (msg.message == WM_QUIT)
++            {
++                NtUserPostQuitMessage( msg.wParam );
++                quit = TRUE;
++                break;
++            }
++            NtUserTranslateMessage( &msg, 0 );
++            NtUserDispatchMessage( &msg );
++        }
++        if (quit) break;
++    }
++
++    *ret = (flags & TPM_RETURNCMD) ? 0 : TRUE;
++    if (result && result <= c.count && is_window( hwnd ))
++    {
++        const struct systray_menu_item *item = &c.items[result - 1];
++        struct menu *menu = unsafe_menu_ptr( c.entries[result - 1].menu );
++        struct menu *top = unsafe_menu_ptr( handle );
++
++        TRACE( "tray chose item %u (id %#lx)\n", result, (long)c.entries[result - 1].id );
++        if (!(item->type & (MF_POPUP | MFT_SEPARATOR)) && !(item->state & (MF_GRAYED | MF_DISABLED)))
++        {
++            /* exec_focused_item */
++            if (!(flags & TPM_RETURNCMD))
++            {
++                DWORD style = (menu ? menu->dwStyle : 0) | (top ? top->dwStyle : 0);
++                if (style & MNS_NOTIFYBYPOS)
++                    NtUserPostMessage( hwnd, WM_MENUCOMMAND, c.entries[result - 1].pos,
++                                       (LPARAM)c.entries[result - 1].menu );
++                else
++                    NtUserPostMessage( hwnd, WM_COMMAND, c.entries[result - 1].id, 0 );
++            }
++            else *ret = c.entries[result - 1].id;
++        }
++    }
++    if (is_window( hwnd )) send_message( hwnd, WM_MENUSELECT, MAKEWPARAM( 0, 0xffff ), 0 );
++    free( c.items );
++    free( c.entries );
++    free( c.text );
++    return TRUE;
++
++failed:
++    TRACE( "menu %p stays a Win32 popup (unsupported %d, %u items)\n", handle, c.unsupported, c.count );
++    free( c.items );
++    free( c.entries );
++    free( c.text );
++    return FALSE;
++}
++
+ /**********************************************************************
+  *           NtUserTrackPopupMenuEx   (win32u.@)
+  */
+@@ -4654,6 +4846,7 @@
+ {
+     struct menu *menu;
+     BOOL ret = FALSE;
++    UINT tray_request = 0;
+ 
+     TRACE( "hmenu %p flags %04x (%d,%d) hwnd %p params %p rect %s\n",
+            handle, flags, x, y, hwnd, params,
+@@ -4671,6 +4864,11 @@
+         return FALSE;
+     }
+ 
++    /* NEUTRON sni-dbusmenu: is the tray waiting for this window's menu? */
++    if (neutron_tray_dbusmenu() && !(menu->wFlags & MF_SYSMENU) &&
++        (tray_request = HandleToUlong( NtUserGetProp( hwnd, tray_menu_propW ))))
++        NtUserRemoveProp( hwnd, tray_menu_propW );
++
+     if (init_popup( hwnd, handle, flags ))
+     {
+         init_tracking( hwnd, handle, TRUE, flags );
+@@ -4683,7 +4881,9 @@
+             init_sys_menu_popup( handle, get_window_long( hwnd, GWL_STYLE ),
+                                  get_class_long( hwnd, GCL_STYLE, FALSE ));
+ 
+-        if (show_popup( hwnd, handle, 0, flags, x, y, 0, 0 ))
++        if (tray_request && tray_menu_show( handle, flags, hwnd, tray_request, &ret ))
++            ;  /* the desktop's tray showed it */
++        else if (show_popup( hwnd, handle, 0, flags, x, y, 0, 0 ))
+             ret = track_menu( handle, flags | TPM_POPUPMENU, 0, 0, hwnd,
+                               params ? &params->rcExclude : NULL );
+         exit_tracking( hwnd, TRUE );
+--- a/dlls/winewayland.drv/wayland_sni.c
++++ b/dlls/winewayland.drv/wayland_sni.c
+@@ -50,10 +50,11 @@
+  * subsurface, in explorer's floating tray too), and wayland_keyboard.c releases the keys when the focused surface is
+  * destroyed (a menu closed with Escape left Escape auto-repeating, which closed every later menu at once).
+  *
+- * Not covered: Wayland does not let a client place a toplevel, so the menu appears where the compositor puts it
+- * (KWin: the middle of the screen, with a taskbar entry while it is open), not at the tray; exporting the menu over
+- * com.canonical.dbusmenu so the desktop draws it at the icon would need the application's HMENU from its own process.
+- * A click outside the menu closes it only when the focus leaves the application. Icons already in explorer's floating
++ * A Win32 context menu (TrackPopupMenu) is drawn by the tray at the icon through com.canonical.dbusmenu (NEUTRON
++ * sni-dbusmenu, below and in dlls/win32u/menu.c). Not covered: any other menu (a Qt menu, the application's own
++ * window) still appears where the compositor puts it, since Wayland does not let a client place a toplevel (KWin:
++ * the middle of the screen, with a taskbar entry while it is open), and a click outside such a menu closes it only
++ * when the focus leaves the application. Icons already in explorer's floating
+  * window when a watcher appears stay there. Keyboard selection (NIN_KEYSELECT). X11 sessions keep winex11's XEmbed
+  * docking, which places menus at the icon.
+  * Kill switch NEUTRON_SNI=0. */
+@@ -125,11 +126,14 @@
+     DO_FUNC(dbus_message_iter_get_basic); \
+     DO_FUNC(dbus_message_iter_init); \
+     DO_FUNC(dbus_message_iter_init_append); \
++    DO_FUNC(dbus_message_iter_next); \
+     DO_FUNC(dbus_message_iter_open_container); \
++    DO_FUNC(dbus_message_iter_recurse); \
+     DO_FUNC(dbus_message_new_error); \
+     DO_FUNC(dbus_message_new_method_call); \
+     DO_FUNC(dbus_message_new_method_return); \
+     DO_FUNC(dbus_message_new_signal); \
++    DO_FUNC(dbus_message_ref); \
+     DO_FUNC(dbus_message_set_no_reply); \
+     DO_FUNC(dbus_message_unref); \
+     DO_FUNC(dbus_threads_init_default)
+@@ -144,6 +148,37 @@
+ #define WATCHER_PATH      "/StatusNotifierWatcher"
+ #define NOTIFY_NAME       "org.freedesktop.Notifications"
+ #define NOTIFY_PATH       "/org/freedesktop/Notifications"
++#define DBUSMENU_INTERFACE "com.canonical.dbusmenu"
++#define DBUSMENU_PATH     "/MenuBar"
++#define MENU_PLACEHOLDER_ID 0x7ffffff0  /* the only item until the application's menu comes, for hosts that need one */
++
++/* NEUTRON sni-dbusmenu: the icon's context menu, drawn by the tray at the icon (see dlls/win32u/menu.c) */
++enum sni_menu_state
++{
++    MENU_IDLE,
++    MENU_WAITING,      /* AboutToShow pending: the right click went to the application, its menu has not come */
++    MENU_SHOWN,        /* the tray shows the application's menu */
++    MENU_CLOSING,      /* the tray said "closed"; a "clicked" may still follow */
++};
++
++struct sni_menu
++{
++    enum sni_menu_state state;
++    UINT             request;         /* WINE_SYSTRAY_MENU_PROP value, 16 bits, never 0 */
++    DBusMessage     *about_to_show;   /* the pending AboutToShow / AboutToShowGroup call */
++    BOOL             group;           /* it was AboutToShowGroup */
++    ULONGLONG        deadline;        /* MENU_WAITING: give up; MENU_CLOSING: cancel */
++    BOOL             click_pending;   /* the right click waits for the application to leave its previous menu */
++    DBusMessage     *pending;         /* an AboutToShow not yet known to be the user's: GNOME's extension calls it */
++    BOOL             pending_group;   /*   to prefetch, the user's opening comes with an "opened" event */
++    ULONGLONG        pending_until;
++    ULONGLONG        opened_at;       /* the last "opened" event on the root */
++    ULONGLONG        registered_at;   /* the item was (re)announced to the watcher */
++    BOOL             host_prefetches; /* the host asked ahead of time (GNOME): it opens only a non-empty menu */
++    BOOL             foreign;         /* a right click brought no Win32 menu: the application shows its own */
++    struct systray_menu_data *data;   /* the application's menu */
++    dbus_uint32_t    revision;
++};
+ 
+ struct sni_icon
+ {
+@@ -162,8 +197,20 @@
+     unsigned int    *argb;            /* network byte order ARGB32 */
+     ULONGLONG        last_activate;   /* for double clicks */
+     dbus_uint32_t    balloon;         /* org.freedesktop.Notifications id, 0 if none */
++    struct sni_menu  menu;
+ };
+ 
++static UINT sni_menu_counter;
++static const WCHAR menu_propW[] = WINE_SYSTRAY_MENU_PROP_INIT;
++static const WCHAR menu_resultW[] = WINE_SYSTRAY_MENU_RESULT_PROP_INIT;
++
++static BOOL sni_dbusmenu_enabled(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_SNI_DBUSMENU" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ static pthread_mutex_t sni_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static struct list sni_icons = LIST_INIT( sni_icons );
+ static UINT sni_next_handle = 1;
+@@ -418,7 +465,7 @@
+     }
+     else if (!strcmp( name, "Menu" ))
+     {
+-        const char *path = "/NO_DBUSMENU";
++        const char *path = sni_dbusmenu_enabled() ? DBUSMENU_PATH : "/NO_DBUSMENU";
+         p_dbus_message_iter_open_container( iter, DBUS_TYPE_VARIANT, DBUS_TYPE_OBJECT_PATH_AS_STRING, &var );
+         p_dbus_message_iter_append_basic( &var, DBUS_TYPE_OBJECT_PATH, &path );
+         p_dbus_message_iter_close_container( iter, &var );
+@@ -680,10 +727,791 @@
+     p_dbus_connection_flush( conn );
+ }
+ 
++/* ---- the context menu (com.canonical.dbusmenu) ---------------------------------------------------------------- */
++
++/* NEUTRON sni-dbusmenu (2026-11-04, his C178). Windows opens a tray icon's menu at the icon. The application's own
++ * menu window cannot be placed there on Wayland (KWin centered it, with a taskbar entry), but the tray draws a
++ * dbusmenu at the icon. So the item's Menu is a dbusmenu: when the tray is about to show it (AboutToShow on the
++ * root), the right click goes to the application as before, with WINE_SYSTRAY_MENU_PROP on the icon's window; the
++ * application's TrackPopupMenu sends its menu here instead of showing it (dlls/win32u/menu.c, through explorer's
++ * WM_COPYDATA), the reply tells the tray to fetch the layout, and the tray's "clicked" / "closed" events end the
++ * application's TrackPopupMenu with that item or none. An application that shows anything else (a Qt menu, its own
++ * window) sends nothing; after a second the tray is told there is nothing new and the application's window shows
++ * as before. */
++
++static const char dbusmenu_introspection[] =
++    DBUS_INTROSPECT_1_0_XML_DOCTYPE_DECL_NODE
++    "<node>\n"
++    " <interface name='org.freedesktop.DBus.Introspectable'>\n"
++    "  <method name='Introspect'><arg name='data' direction='out' type='s'/></method>\n"
++    " </interface>\n"
++    " <interface name='org.freedesktop.DBus.Properties'>\n"
++    "  <method name='Get'><arg name='interface' direction='in' type='s'/><arg name='name' direction='in' type='s'/>"
++    "<arg name='value' direction='out' type='v'/></method>\n"
++    "  <method name='GetAll'><arg name='interface' direction='in' type='s'/>"
++    "<arg name='properties' direction='out' type='a{sv}'/></method>\n"
++    " </interface>\n"
++    " <interface name='" DBUSMENU_INTERFACE "'>\n"
++    "  <property name='Version' type='u' access='read'/>\n"
++    "  <property name='TextDirection' type='s' access='read'/>\n"
++    "  <property name='Status' type='s' access='read'/>\n"
++    "  <property name='IconThemePath' type='as' access='read'/>\n"
++    "  <method name='GetLayout'><arg type='i' name='parentId' direction='in'/>"
++    "<arg type='i' name='recursionDepth' direction='in'/><arg type='as' name='propertyNames' direction='in'/>"
++    "<arg type='u' name='revision' direction='out'/><arg type='(ia{sv}av)' name='layout' direction='out'/></method>\n"
++    "  <method name='GetGroupProperties'><arg type='ai' name='ids' direction='in'/>"
++    "<arg type='as' name='propertyNames' direction='in'/><arg type='a(ia{sv})' name='properties' direction='out'/></method>\n"
++    "  <method name='GetProperty'><arg type='i' name='id' direction='in'/><arg type='s' name='name' direction='in'/>"
++    "<arg type='v' name='value' direction='out'/></method>\n"
++    "  <method name='Event'><arg type='i' name='id' direction='in'/><arg type='s' name='eventId' direction='in'/>"
++    "<arg type='v' name='data' direction='in'/><arg type='u' name='timestamp' direction='in'/></method>\n"
++    "  <method name='EventGroup'><arg type='a(isvu)' name='events' direction='in'/>"
++    "<arg type='ai' name='idErrors' direction='out'/></method>\n"
++    "  <method name='AboutToShow'><arg type='i' name='id' direction='in'/>"
++    "<arg type='b' name='needUpdate' direction='out'/></method>\n"
++    "  <method name='AboutToShowGroup'><arg type='ai' name='ids' direction='in'/>"
++    "<arg type='ai' name='updatesNeeded' direction='out'/><arg type='ai' name='idErrors' direction='out'/></method>\n"
++    "  <signal name='ItemsPropertiesUpdated'><arg type='a(ia{sv})' name='updatedProps'/>"
++    "<arg type='a(ias)' name='removedProps'/></signal>\n"
++    "  <signal name='LayoutUpdated'><arg type='u' name='revision'/><arg type='i' name='parent'/></signal>\n"
++    "  <signal name='ItemActivationRequested'><arg type='i' name='id'/><arg type='u' name='timestamp'/></signal>\n"
++    " </interface>\n"
++    "</node>\n";
++
++/* the text of an item, NULL for none (checked when the menu arrived) */
++static const WCHAR *menu_item_text( const struct systray_menu_data *data, UINT index )
++{
++    if (data->items[index].text == ~0u) return NULL;
++    return (const WCHAR *)&data->items[data->count] + data->items[index].text;
++}
++
++/* Item ids carry the menu's revision: (revision << 16) | (index + 1). A host updating an item it already has keeps
++ * properties the new layout leaves out or clears (Plasma kept an unchecked item checkable), so every menu from the
++ * application gets items the host has never seen. */
++static int menu_item_id( const struct sni_icon *icon, UINT index )
++{
++    return (int)(((icon->menu.revision % 0x7ffe) + 1) << 16 | (index + 1));
++}
++
++/* the item index of a dbusmenu id, -1 for none (the root, the placeholder, an old revision) */
++static int menu_item_index( const struct sni_icon *icon, int id )
++{
++    UINT index = (id & 0xffff) - 1;
++    if (id <= 0 || id == MENU_PLACEHOLDER_ID || !icon->menu.data) return -1;
++    if ((UINT)id >> 16 != (icon->menu.revision % 0x7ffe) + 1 || index >= icon->menu.data->count) return -1;
++    return index;
++}
++
++/* a Win32 item text as a dbusmenu label: "&Open\tCtrl+O" -> "_Open", "&&" -> "&", "_" -> "__" */
++static char *menu_label( const WCHAR *text )
++{
++    const WCHAR *s;
++    WCHAR *buf, *p;
++    char *ret;
++    int len = 0;
++
++    if (!text) return NULL;
++    while (text[len]) len++;
++    if (!(buf = malloc( (len * 2 + 1) * sizeof(WCHAR) ))) return NULL;
++    for (s = text, p = buf; *s && *s != '\t'; s++)
++    {
++        if (*s == '&')
++        {
++            if (s[1] == '&') { *p++ = '&'; s++; }
++            else *p++ = '_';
++        }
++        else if (*s == '_') { *p++ = '_'; *p++ = '_'; }
++        else *p++ = *s;
++    }
++    *p = 0;
++    ret = utf8_from_wide( buf, p - buf );
++    free( buf );
++    return ret;
++}
++
++static void append_entry_variant( DBusMessageIter *dict, const char *key, int type, const void *value )
++{
++    DBusMessageIter entry, var;
++    char sig[2] = { type, 0 };
++
++    p_dbus_message_iter_open_container( dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry );
++    p_dbus_message_iter_append_basic( &entry, DBUS_TYPE_STRING, &key );
++    p_dbus_message_iter_open_container( &entry, DBUS_TYPE_VARIANT, sig, &var );
++    p_dbus_message_iter_append_basic( &var, type, value );
++    p_dbus_message_iter_close_container( &entry, &var );
++    p_dbus_message_iter_close_container( dict, &entry );
++}
++
++/* the a{sv} of item id (0 = the root, n = item n - 1, MENU_PLACEHOLDER_ID) */
++static void append_menu_properties( DBusMessageIter *iter, const struct sni_icon *icon, int id )
++{
++    const struct systray_menu_data *data = icon->menu.data;
++    const struct systray_menu_item *item;
++    DBusMessageIter dict;
++    const char *str;
++
++    int index = menu_item_index( icon, id );
++
++    p_dbus_message_iter_open_container( iter, DBUS_TYPE_ARRAY, "{sv}", &dict );
++    if (id == MENU_PLACEHOLDER_ID)
++    {
++        dbus_bool_t no = FALSE;
++        str = icon->tip && icon->tip[0] ? icon->tip : "\xe2\x80\xa6";  /* the tooltip, or an ellipsis */
++        append_entry_variant( &dict, "label", DBUS_TYPE_STRING, &str );
++        append_entry_variant( &dict, "enabled", DBUS_TYPE_BOOLEAN, &no );
++    }
++    else if (index < 0)
++    {
++        str = "submenu";
++        append_entry_variant( &dict, "children-display", DBUS_TYPE_STRING, &str );
++    }
++    else if ((item = &data->items[index])->type & MFT_SEPARATOR)
++    {
++        str = "separator";
++        append_entry_variant( &dict, "type", DBUS_TYPE_STRING, &str );
++    }
++    else
++    {
++        char *label = menu_label( menu_item_text( data, index ));
++        str = label ? label : "";
++        append_entry_variant( &dict, "label", DBUS_TYPE_STRING, &str );
++        free( label );
++        if (item->state & (MFS_GRAYED | MFS_DISABLED))
++        {
++            dbus_bool_t no = FALSE;
++            append_entry_variant( &dict, "enabled", DBUS_TYPE_BOOLEAN, &no );
++        }
++        {
++            /* Windows shows no box on an unchecked item, so only a checked one is a toggle; "" says so outright
++             * (hosts that patch properties between layouts, libdbusmenu-gtk, otherwise keep an old toggle) */
++            dbus_int32_t on = !!(item->state & MFS_CHECKED);
++            str = !on ? "" : (item->type & MFT_RADIOCHECK) ? "radio" : "checkmark";
++            append_entry_variant( &dict, "toggle-type", DBUS_TYPE_STRING, &str );
++            append_entry_variant( &dict, "toggle-state", DBUS_TYPE_INT32, &on );
++        }
++        if (item->type & MF_POPUP)
++        {
++            str = "submenu";
++            append_entry_variant( &dict, "children-display", DBUS_TYPE_STRING, &str );
++        }
++    }
++    p_dbus_message_iter_close_container( iter, &dict );
++}
++
++/* (ia{sv}av) of item id with depth levels of children (-1: all). Until the application's menu first comes, the
++ * root has one disabled item: GNOME's extension opens only a non-empty menu, and waybar shows what it has at once.
++ * Hosts that ask first (Plasma) replace it before showing anything; once an application has shown it uses its own
++ * menu (a Qt one), those get an empty root, so they show nothing next to the application's menu. */
++static void append_menu_layout( DBusMessageIter *iter, const struct sni_icon *icon, int id, int depth )
++{
++    const struct systray_menu_data *data = icon->menu.data;
++    DBusMessageIter strct, children, var;
++    dbus_int32_t i32 = id;
++    UINT i;
++
++    p_dbus_message_iter_open_container( iter, DBUS_TYPE_STRUCT, NULL, &strct );
++    p_dbus_message_iter_append_basic( &strct, DBUS_TYPE_INT32, &i32 );
++    append_menu_properties( &strct, icon, id );
++    p_dbus_message_iter_open_container( &strct, DBUS_TYPE_ARRAY, DBUS_TYPE_VARIANT_AS_STRING, &children );
++    if (depth && data && id != MENU_PLACEHOLDER_ID)
++    {
++        int parent = id ? menu_item_index( icon, id ) : -1;
++        for (i = 0; i < data->count; i++)
++        {
++            if (data->items[i].parent != parent || (id && parent < 0)) continue;
++            p_dbus_message_iter_open_container( &children, DBUS_TYPE_VARIANT, "(ia{sv}av)", &var );
++            append_menu_layout( &var, icon, menu_item_id( icon, i ), depth < 0 ? -1 : depth - 1 );
++            p_dbus_message_iter_close_container( &children, &var );
++        }
++    }
++    else if (depth && !id && !data && (icon->menu.host_prefetches || !icon->menu.foreign))
++    {
++        p_dbus_message_iter_open_container( &children, DBUS_TYPE_VARIANT, "(ia{sv}av)", &var );
++        append_menu_layout( &var, icon, MENU_PLACEHOLDER_ID, 0 );
++        p_dbus_message_iter_close_container( &children, &var );
++    }
++    p_dbus_message_iter_close_container( &strct, &children );
++    p_dbus_message_iter_close_container( iter, &strct );
++}
++
++static void reply_about_to_show( DBusConnection *conn, DBusMessage *msg, BOOL need_update, BOOL group )
++{
++    DBusMessageIter iter, array;
++    DBusMessage *reply;
++    dbus_bool_t update = need_update;
++    dbus_int32_t root = 0;
++
++    if (!conn || !msg || !(reply = p_dbus_message_new_method_return( msg ))) return;
++    p_dbus_message_iter_init_append( reply, &iter );
++    if (!group) p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_BOOLEAN, &update );
++    else
++    {
++        p_dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, DBUS_TYPE_INT32_AS_STRING, &array );
++        if (need_update) p_dbus_message_iter_append_basic( &array, DBUS_TYPE_INT32, &root );
++        p_dbus_message_iter_close_container( &iter, &array );
++        p_dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, DBUS_TYPE_INT32_AS_STRING, &array );
++        p_dbus_message_iter_close_container( &iter, &array );
++    }
++    p_dbus_connection_send( conn, reply, NULL );
++    p_dbus_message_unref( reply );
++    p_dbus_connection_flush( conn );
++}
++
++/* end the application's TrackPopupMenu: value is the item index + 1, 0 for none; called without sni_mutex */
++static void finish_app_menu( HWND owner, UINT request, UINT value )
++{
++    TRACE( "menu request %u of %p ends with item %u\n", request, owner, value );
++    NtUserSetProp( owner, menu_resultW, ULongToHandle( MAKELONG( value, request )));
++    NtUserPostMessage( owner, WM_NULL, 0, 0 );
++}
++
++/* the right click that makes the application open its menu, as ContextMenu relays it */
++static void relay_context_menu( UINT handle )
++{
++    struct sni_target t;
++    struct sni_icon *icon;
++    POINT pt = { 0, 0 };
++
++    pthread_mutex_lock( &sni_mutex );
++    if (!(icon = find_icon_by_handle( handle )))
++    {
++        pthread_mutex_unlock( &sni_mutex );
++        return;
++    }
++    t.owner = icon->owner;
++    t.id = icon->id;
++    t.callback = icon->callback;
++    t.version = icon->version;
++    pthread_mutex_unlock( &sni_mutex );
++    /* the tray does not say where the click was; the pointer is where it is */
++    NtUserGetCursorPos( &pt );
++    send_click( &t, WM_RBUTTONDOWN, WM_RBUTTONUP, pt );
++}
++
++/* the user opens the menu: ask the application for it, reply to the held AboutToShow when it comes (or after a second) */
++static void menu_start_request( DBusConnection *conn, UINT handle )
++{
++    DBusMessage *stale = NULL, *msg;
++    BOOL stale_group = FALSE, group, had_open = FALSE;
++    UINT old_request = 0, request;
++    struct sni_icon *icon;
++    HWND owner;
++
++    pthread_mutex_lock( &sni_mutex );
++    if (!(icon = find_icon_by_handle( handle )) || !(msg = icon->menu.pending))
++    {
++        pthread_mutex_unlock( &sni_mutex );
++        return;
++    }
++    group = icon->menu.pending_group;
++    icon->menu.pending = NULL;
++    if (icon->menu.state == MENU_WAITING)
++    {
++        stale = icon->menu.about_to_show;
++        stale_group = icon->menu.group;
++    }
++    if (icon->menu.state == MENU_SHOWN || icon->menu.state == MENU_CLOSING)
++    {
++        had_open = TRUE;
++        old_request = icon->menu.request;
++    }
++    if (!(request = ++sni_menu_counter & 0xffff)) request = ++sni_menu_counter & 0xffff;
++    icon->menu.state = MENU_WAITING;
++    icon->menu.request = request;
++    icon->menu.about_to_show = msg;
++    icon->menu.group = group;
++    icon->menu.click_pending = had_open;
++    icon->menu.deadline = sni_ticks() + (had_open ? 2000 : 1000);
++    owner = icon->owner;
++    pthread_mutex_unlock( &sni_mutex );
++
++    if (stale)
++    {
++        reply_about_to_show( conn, stale, FALSE, stale_group );
++        p_dbus_message_unref( stale );
++    }
++    TRACE( "menu request %u for %p\n", request, owner );
++    /* a host that never said "closed" left the application in its previous menu: end that one first */
++    if (had_open) finish_app_menu( owner, old_request, 0 );
++    NtUserSetProp( owner, menu_propW, ULongToHandle( request ));
++    if (!had_open) relay_context_menu( handle );
++    sni_wakeup();
++}
++
++/* AboutToShow on the root. On Windows the application hears of its tray menu only when the user clicks, so a host
++ * asking ahead of time (GNOME's extension does, right after the item registers) gets "nothing new" and the
++ * application nothing; the user's opening comes with an "opened" event (before it from GNOME, just after it from
++ * Plasma). A host that sends no "opened" gets the menu when it asks later than 3 s after the item appeared. */
++static void menu_about_to_show( DBusConnection *conn, DBusMessage *msg, UINT handle, BOOL group )
++{
++    DBusMessage *stale = NULL;
++    BOOL stale_group = FALSE, user;
++    struct sni_icon *icon;
++    ULONGLONG now = sni_ticks();
++
++    pthread_mutex_lock( &sni_mutex );
++    if (!(icon = find_icon_by_handle( handle )))
++    {
++        pthread_mutex_unlock( &sni_mutex );
++        reply_about_to_show( conn, msg, FALSE, group );
++        return;
++    }
++    if (icon->menu.pending)
++    {
++        stale = icon->menu.pending;
++        stale_group = icon->menu.pending_group;
++    }
++    icon->menu.pending = p_dbus_message_ref( msg );
++    icon->menu.pending_group = group;
++    icon->menu.pending_until = now + 200;
++    user = icon->menu.opened_at && now - icon->menu.opened_at <= 1000;
++    pthread_mutex_unlock( &sni_mutex );
++
++    if (stale)
++    {
++        reply_about_to_show( conn, stale, FALSE, stale_group );
++        p_dbus_message_unref( stale );
++    }
++    if (user) menu_start_request( conn, handle );
++    sni_wakeup();
++}
++
++static void menu_event( DBusConnection *conn, UINT handle, int id, const char *event )
++{
++    struct sni_icon *icon;
++    HWND owner = 0;
++    UINT request = 0, value = 0;
++    BOOL finish = FALSE, start = FALSE;
++
++    pthread_mutex_lock( &sni_mutex );
++    if (!id && !strcmp( event, "opened" ) && (icon = find_icon_by_handle( handle )))
++    {
++        icon->menu.opened_at = sni_ticks();
++        start = icon->menu.pending != NULL;
++    }
++    if ((icon = find_icon_by_handle( handle )) && icon->menu.data &&
++        (icon->menu.state == MENU_SHOWN || icon->menu.state == MENU_CLOSING))
++    {
++        int index = menu_item_index( icon, id );
++        if (!strcmp( event, "clicked" ) && index >= 0 &&
++            !(icon->menu.data->items[index].type & (MF_POPUP | MFT_SEPARATOR)))
++        {
++            finish = TRUE;
++            value = index + 1;
++        }
++        else if (!strcmp( event, "closed" ) && !id && icon->menu.state == MENU_SHOWN)
++        {
++            /* Qt menus say "closed" before "clicked" */
++            icon->menu.state = MENU_CLOSING;
++            icon->menu.deadline = sni_ticks() + 400;
++        }
++        if (finish)
++        {
++            icon->menu.state = MENU_IDLE;
++            owner = icon->owner;
++            request = icon->menu.request;
++        }
++    }
++    pthread_mutex_unlock( &sni_mutex );
++    TRACE( "event %s on item %d%s\n", event, id, finish ? ", ends the menu" : start ? ", the user opens it" : "" );
++    if (finish) finish_app_menu( owner, request, value );
++    if (start) menu_start_request( conn, handle );
++    sni_wakeup();
++}
++
++static DBusHandlerResult menu_message( DBusConnection *conn, DBusMessage *msg, void *user_data )
++{
++    UINT handle = (UINT)(UINT_PTR)user_data;
++    DBusMessageIter iter, array, sub;
++    DBusMessage *reply = NULL;
++    struct sni_icon *icon;
++    const char *iface, *name, *event;
++    dbus_int32_t id = 0, depth = -1;
++    DBusError error;
++
++    p_dbus_error_init( &error );
++    if (p_dbus_message_is_method_call( msg, "org.freedesktop.DBus.Introspectable", "Introspect" ))
++    {
++        const char *xml = dbusmenu_introspection;
++        reply = p_dbus_message_new_method_return( msg );
++        p_dbus_message_append_args( reply, DBUS_TYPE_STRING, &xml, DBUS_TYPE_INVALID );
++    }
++    else if (p_dbus_message_is_method_call( msg, "org.freedesktop.DBus.Properties", "Get" ) ||
++             p_dbus_message_is_method_call( msg, "org.freedesktop.DBus.Properties", "GetAll" ))
++    {
++        static const char *props[] = { "Version", "TextDirection", "Status", "IconThemePath" };
++        BOOL all = !strcmp( p_dbus_message_get_member( msg ), "GetAll" );
++        DBusMessageIter dict, entry, var, strs;
++        dbus_uint32_t version = 3;
++        unsigned int i;
++
++        name = NULL;
++        if (!all && !p_dbus_message_get_args( msg, &error, DBUS_TYPE_STRING, &iface, DBUS_TYPE_STRING, &name,
++                                             DBUS_TYPE_INVALID ))
++            reply = p_dbus_message_new_error( msg, DBUS_ERROR_INVALID_ARGS, error.message );
++        else
++        {
++            reply = p_dbus_message_new_method_return( msg );
++            p_dbus_message_iter_init_append( reply, &iter );
++            if (all) p_dbus_message_iter_open_container( &iter, DBUS_TYPE_ARRAY, "{sv}", &dict );
++            for (i = 0; i < ARRAY_SIZE(props); i++)
++            {
++                DBusMessageIter *target = &iter;
++                if (!all && strcmp( name, props[i] )) continue;
++                if (all)
++                {
++                    p_dbus_message_iter_open_container( &dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry );
++                    p_dbus_message_iter_append_basic( &entry, DBUS_TYPE_STRING, &props[i] );
++                    target = &entry;
++                }
++                if (i == 0)
++                {
++                    p_dbus_message_iter_open_container( target, DBUS_TYPE_VARIANT, DBUS_TYPE_UINT32_AS_STRING, &var );
++                    p_dbus_message_iter_append_basic( &var, DBUS_TYPE_UINT32, &version );
++                    p_dbus_message_iter_close_container( target, &var );
++                }
++                else if (i == 3)
++                {
++                    p_dbus_message_iter_open_container( target, DBUS_TYPE_VARIANT, "as", &var );
++                    p_dbus_message_iter_open_container( &var, DBUS_TYPE_ARRAY, DBUS_TYPE_STRING_AS_STRING, &strs );
++                    p_dbus_message_iter_close_container( &var, &strs );
++                    p_dbus_message_iter_close_container( target, &var );
++                }
++                else append_variant_string( target, i == 1 ? "ltr" : "normal" );
++                if (all) p_dbus_message_iter_close_container( &dict, &entry );
++                else break;
++            }
++            if (all) p_dbus_message_iter_close_container( &iter, &dict );
++            else if (i == ARRAY_SIZE(props))
++            {
++                p_dbus_message_unref( reply );
++                reply = p_dbus_message_new_error( msg, DBUS_ERROR_UNKNOWN_PROPERTY, name );
++            }
++        }
++    }
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "GetLayout" ))
++    {
++        p_dbus_message_iter_init( msg, &iter );
++        if (p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_INT32)
++        {
++            p_dbus_message_iter_get_basic( &iter, &id );
++            if (p_dbus_message_iter_next( &iter ) && p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_INT32)
++                p_dbus_message_iter_get_basic( &iter, &depth );
++        }
++        pthread_mutex_lock( &sni_mutex );
++        icon = find_icon_by_handle( handle );
++        if (!icon || (id && id != MENU_PLACEHOLDER_ID && menu_item_index( icon, id ) < 0))
++            reply = p_dbus_message_new_error( msg, DBUS_ERROR_INVALID_ARGS, "no such item" );
++        else
++        {
++            dbus_uint32_t revision = icon->menu.revision;
++            reply = p_dbus_message_new_method_return( msg );
++            p_dbus_message_iter_init_append( reply, &iter );
++            p_dbus_message_iter_append_basic( &iter, DBUS_TYPE_UINT32, &revision );
++            append_menu_layout( &iter, icon, id, depth );
++        }
++        pthread_mutex_unlock( &sni_mutex );
++    }
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "GetGroupProperties" ))
++    {
++        DBusMessageIter out, strct;
++        reply = p_dbus_message_new_method_return( msg );
++        p_dbus_message_iter_init_append( reply, &out );
++        p_dbus_message_iter_open_container( &out, DBUS_TYPE_ARRAY, "(ia{sv})", &array );
++        pthread_mutex_lock( &sni_mutex );
++        if ((icon = find_icon_by_handle( handle )) && p_dbus_message_iter_init( msg, &iter ) &&
++            p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_ARRAY)
++        {
++            p_dbus_message_iter_recurse( &iter, &sub );
++            while (p_dbus_message_iter_get_arg_type( &sub ) == DBUS_TYPE_INT32)
++            {
++                p_dbus_message_iter_get_basic( &sub, &id );
++                if (!id || id == MENU_PLACEHOLDER_ID || menu_item_index( icon, id ) >= 0)
++                {
++                    p_dbus_message_iter_open_container( &array, DBUS_TYPE_STRUCT, NULL, &strct );
++                    p_dbus_message_iter_append_basic( &strct, DBUS_TYPE_INT32, &id );
++                    append_menu_properties( &strct, icon, id );
++                    p_dbus_message_iter_close_container( &array, &strct );
++                }
++                if (!p_dbus_message_iter_next( &sub )) break;
++            }
++        }
++        pthread_mutex_unlock( &sni_mutex );
++        p_dbus_message_iter_close_container( &out, &array );
++    }
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "GetProperty" ))
++        reply = p_dbus_message_new_error( msg, DBUS_ERROR_NOT_SUPPORTED, "use GetGroupProperties" );
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "Event" ))
++    {
++        if (p_dbus_message_iter_init( msg, &iter ) && p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_INT32)
++        {
++            p_dbus_message_iter_get_basic( &iter, &id );
++            if (p_dbus_message_iter_next( &iter ) && p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_STRING)
++            {
++                p_dbus_message_iter_get_basic( &iter, &event );
++                menu_event( conn, handle, id, event );
++            }
++        }
++        reply = p_dbus_message_new_method_return( msg );
++    }
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "EventGroup" ))
++    {
++        DBusMessageIter out, errors;
++        if (p_dbus_message_iter_init( msg, &iter ) && p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_ARRAY)
++        {
++            p_dbus_message_iter_recurse( &iter, &array );
++            while (p_dbus_message_iter_get_arg_type( &array ) == DBUS_TYPE_STRUCT)
++            {
++                p_dbus_message_iter_recurse( &array, &sub );
++                if (p_dbus_message_iter_get_arg_type( &sub ) == DBUS_TYPE_INT32)
++                {
++                    p_dbus_message_iter_get_basic( &sub, &id );
++                    if (p_dbus_message_iter_next( &sub ) && p_dbus_message_iter_get_arg_type( &sub ) == DBUS_TYPE_STRING)
++                    {
++                        p_dbus_message_iter_get_basic( &sub, &event );
++                        menu_event( conn, handle, id, event );
++                    }
++                }
++                if (!p_dbus_message_iter_next( &array )) break;
++            }
++        }
++        reply = p_dbus_message_new_method_return( msg );
++        p_dbus_message_iter_init_append( reply, &out );
++        p_dbus_message_iter_open_container( &out, DBUS_TYPE_ARRAY, DBUS_TYPE_INT32_AS_STRING, &errors );
++        p_dbus_message_iter_close_container( &out, &errors );
++    }
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "AboutToShow" ))
++    {
++        p_dbus_message_get_args( msg, &error, DBUS_TYPE_INT32, &id, DBUS_TYPE_INVALID );
++        if (!id)
++        {
++            menu_about_to_show( conn, msg, handle, FALSE );  /* replied later */
++            p_dbus_error_free( &error );
++            return DBUS_HANDLER_RESULT_HANDLED;
++        }
++        reply_about_to_show( conn, msg, FALSE, FALSE );  /* submenus came with the menu */
++    }
++    else if (p_dbus_message_is_method_call( msg, DBUSMENU_INTERFACE, "AboutToShowGroup" ))
++    {
++        BOOL root = FALSE;
++        if (p_dbus_message_iter_init( msg, &iter ) && p_dbus_message_iter_get_arg_type( &iter ) == DBUS_TYPE_ARRAY)
++        {
++            p_dbus_message_iter_recurse( &iter, &sub );
++            while (p_dbus_message_iter_get_arg_type( &sub ) == DBUS_TYPE_INT32)
++            {
++                p_dbus_message_iter_get_basic( &sub, &id );
++                if (!id) root = TRUE;
++                if (!p_dbus_message_iter_next( &sub )) break;
++            }
++        }
++        if (root)
++        {
++            menu_about_to_show( conn, msg, handle, TRUE );
++            p_dbus_error_free( &error );
++            return DBUS_HANDLER_RESULT_HANDLED;
++        }
++        reply_about_to_show( conn, msg, FALSE, TRUE );
++    }
++    else
++    {
++        p_dbus_error_free( &error );
++        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
++    }
++
++    if (reply)
++    {
++        p_dbus_connection_send( conn, reply, NULL );
++        p_dbus_message_unref( reply );
++    }
++    p_dbus_error_free( &error );
++    return DBUS_HANDLER_RESULT_HANDLED;
++}
++
++/* a menu from the application's TrackPopupMenu (explorer's WM_COPYDATA); TRUE when the tray shows it */
++static LRESULT menu_offered( HWND hwnd, const struct systray_menu_data *data )
++{
++    struct systray_menu_data *copy;
++    UINT i, text_len, header;
++    struct sni_icon *icon;
++    DBusConnection *conn = NULL;
++    DBusMessage *msg = NULL, *signal;
++    dbus_uint32_t revision = 0;
++    dbus_int32_t root = 0;
++    BOOL group = FALSE;
++    const WCHAR *text;
++
++    /* the application's data: everything it points at must be inside it */
++    header = offsetof( struct systray_menu_data, items[data->count] );
++    if (data->size < header || (data->size - header) % sizeof(WCHAR)) return FALSE;
++    text_len = (data->size - header) / sizeof(WCHAR);
++    text = (const WCHAR *)&data->items[data->count];
++    if (text_len && text[text_len - 1]) return FALSE;
++    for (i = 0; i < data->count; i++)
++        if (data->items[i].parent >= (INT)i || data->items[i].parent < -1 ||
++            (data->items[i].text != ~0u && data->items[i].text >= text_len))
++            return FALSE;
++    if (!(copy = malloc( data->size ))) return FALSE;
++    memcpy( copy, data, data->size );
++
++    pthread_mutex_lock( &sni_mutex );
++    LIST_FOR_EACH_ENTRY( icon, &sni_icons, struct sni_icon, entry )
++    {
++        if (icon->menu.state != MENU_WAITING || icon->menu.click_pending || !icon->conn) continue;
++        if ((UINT)(UINT_PTR)icon->owner != (UINT)(UINT_PTR)hwnd) continue;
++        if (icon->menu.request != LOWORD( data->request )) continue;
++        free( icon->menu.data );
++        icon->menu.data = copy;
++        copy = NULL;
++        icon->menu.state = MENU_SHOWN;
++        revision = ++icon->menu.revision;
++        msg = icon->menu.about_to_show;
++        group = icon->menu.group;
++        icon->menu.about_to_show = NULL;
++        conn = p_dbus_connection_ref( icon->conn );
++        break;
++    }
++    pthread_mutex_unlock( &sni_mutex );
++    free( copy );
++    if (!conn)
++    {
++        TRACE( "no tray waits for the menu of %p (request %u)\n", hwnd, data->request );
++        return FALSE;
++    }
++
++    TRACE( "menu of %p, %u items, revision %u\n", hwnd, data->count, revision );
++    if ((signal = p_dbus_message_new_signal( DBUSMENU_PATH, DBUSMENU_INTERFACE, "LayoutUpdated" )))
++    {
++        p_dbus_message_append_args( signal, DBUS_TYPE_UINT32, &revision, DBUS_TYPE_INT32, &root, DBUS_TYPE_INVALID );
++        p_dbus_connection_send( conn, signal, NULL );
++        p_dbus_message_unref( signal );
++    }
++    reply_about_to_show( conn, msg, TRUE, group );
++    if (msg) p_dbus_message_unref( msg );
++    p_dbus_connection_unref( conn );
++    sni_wakeup();
++    return TRUE;
++}
++
++/* WAITING past the deadline, a deferred right click, CLOSING past its grace; called without sni_mutex */
++static BOOL menu_timeouts(void)
++{
++    struct { UINT handle; HWND owner; UINT request; int what; DBusMessage *msg; BOOL group; DBusConnection *conn; }
++        work[16];
++    struct { UINT handle; DBusMessage *msg; BOOL group; BOOL user; DBusConnection *conn; } held[16];
++    unsigned int held_count = 0;
++    struct sni_icon *icon;
++    ULONGLONG now = sni_ticks();
++    unsigned int i, count = 0;
++    BOOL active = FALSE;
++
++    pthread_mutex_lock( &sni_mutex );
++    LIST_FOR_EACH_ENTRY( icon, &sni_icons, struct sni_icon, entry )
++    {
++        if (icon->menu.pending)
++        {
++            active = TRUE;
++            if (now >= icon->menu.pending_until && held_count < ARRAY_SIZE(held))
++            {
++                held[held_count].handle = icon->handle;
++                held[held_count].user = now - icon->menu.registered_at >= 3000;
++                held[held_count].msg = NULL;
++                held[held_count].conn = icon->conn ? p_dbus_connection_ref( icon->conn ) : NULL;
++                if (!held[held_count].user)
++                {
++                    /* asked ahead of time: nothing for the application. The host opens only a non-empty menu:
++                     * have it fetch the placeholder (or the last menu) */
++                    held[held_count].msg = icon->menu.pending;
++                    held[held_count].group = icon->menu.pending_group;
++                    icon->menu.pending = NULL;
++                    icon->menu.host_prefetches = TRUE;
++                }
++                held_count++;
++            }
++        }
++        if (icon->menu.state == MENU_IDLE) continue;
++        active = TRUE;
++        if (count == ARRAY_SIZE(work)) break;
++        work[count].handle = icon->handle;
++        work[count].owner = icon->owner;
++        work[count].request = icon->menu.request;
++        work[count].msg = NULL;
++        work[count].conn = NULL;
++        work[count].what = 0;
++        if (icon->menu.state == MENU_WAITING && now >= icon->menu.deadline)
++        {
++            /* the application showed no Win32 menu (or no menu at all) */
++            work[count].what = 1;
++            if (!icon->menu.data) icon->menu.foreign = TRUE;
++            work[count].msg = icon->menu.about_to_show;
++            work[count].group = icon->menu.group;
++            work[count].conn = icon->conn ? p_dbus_connection_ref( icon->conn ) : NULL;
++            icon->menu.about_to_show = NULL;
++            icon->menu.state = MENU_IDLE;
++        }
++        else if (icon->menu.state == MENU_WAITING && icon->menu.click_pending) work[count].what = 2;
++        else if (icon->menu.state == MENU_CLOSING && now >= icon->menu.deadline)
++        {
++            work[count].what = 3;
++            icon->menu.state = MENU_IDLE;
++        }
++        if (work[count].what) count++;
++    }
++    pthread_mutex_unlock( &sni_mutex );
++
++    for (i = 0; i < held_count; i++)
++    {
++        if (held[i].user) menu_start_request( held[i].conn, held[i].handle );
++        else
++        {
++            TRACE( "AboutToShow ahead of time on item %u\n", held[i].handle );
++            reply_about_to_show( held[i].conn, held[i].msg, TRUE, held[i].group );
++            p_dbus_message_unref( held[i].msg );
++        }
++        if (held[i].conn) p_dbus_connection_unref( held[i].conn );
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        switch (work[i].what)
++        {
++        case 1:
++            TRACE( "no menu came from %p for request %u\n", work[i].owner, work[i].request );
++            NtUserRemoveProp( work[i].owner, menu_propW );
++            /* "update": a host showing the placeholder drops it (Plasma then shows nothing) */
++            reply_about_to_show( work[i].conn, work[i].msg, TRUE, work[i].group );
++            if (work[i].msg) p_dbus_message_unref( work[i].msg );
++            if (work[i].conn) p_dbus_connection_unref( work[i].conn );
++            break;
++        case 2:
++            /* the application has left its previous menu once it took that result */
++            if (!NtUserGetProp( work[i].owner, menu_resultW ))
++            {
++                BOOL relay = FALSE;
++                pthread_mutex_lock( &sni_mutex );
++                if ((icon = find_icon_by_handle( work[i].handle )) && icon->menu.state == MENU_WAITING &&
++                    icon->menu.click_pending)
++                {
++                    icon->menu.click_pending = FALSE;
++                    icon->menu.deadline = sni_ticks() + 1000;
++                    relay = TRUE;
++                }
++                pthread_mutex_unlock( &sni_mutex );
++                if (relay) relay_context_menu( work[i].handle );
++            }
++            break;
++        case 3:
++            finish_app_menu( work[i].owner, work[i].request, 0 );
++            break;
++        }
++    }
++    return active;
++}
++
+ /* put the item on the bus and announce it to the watcher; called without sni_mutex */
+ static DBusConnection *register_item( UINT handle, const char *name )
+ {
+     static const DBusObjectPathVTable vtable = { .message_function = item_message };
++    static const DBusObjectPathVTable menu_vtable = { .message_function = menu_message };
+     DBusConnection *conn;
+     DBusMessage *msg;
+     DBusError error;
+@@ -697,7 +1525,9 @@
+     }
+     p_dbus_connection_set_exit_on_disconnect( conn, FALSE );
+     if (p_dbus_bus_request_name( conn, name, DBUS_NAME_FLAG_DO_NOT_QUEUE, &error ) != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER ||
+-        !p_dbus_connection_register_object_path( conn, SNI_PATH, &vtable, (void *)(UINT_PTR)handle ))
++        !p_dbus_connection_register_object_path( conn, SNI_PATH, &vtable, (void *)(UINT_PTR)handle ) ||
++        (sni_dbusmenu_enabled() &&
++         !p_dbus_connection_register_object_path( conn, DBUSMENU_PATH, &menu_vtable, (void *)(UINT_PTR)handle )))
+     {
+         WARN( "cannot register %s: %s\n", name, error.message ? error.message : "" );
+         p_dbus_error_free( &error );
+@@ -886,6 +1716,7 @@
+                     p_dbus_connection_send( icon->conn, reg, NULL );
+                     p_dbus_message_unref( reg );
+                     p_dbus_connection_flush( icon->conn );
++                    icon->menu.registered_at = sni_ticks();
+                 }
+                 pthread_mutex_unlock( &sni_mutex );
+             }
+@@ -958,6 +1789,22 @@
+     while (p_dbus_connection_dispatch( conn ) == DBUS_DISPATCH_DATA_REMAINS);
+ }
+ 
++/* free an icon that is off the list; called without sni_mutex */
++static void free_icon( struct sni_icon *icon )
++{
++    /* an application still in a menu the tray showed for this icon gets "nothing chosen" */
++    if (icon->menu.state == MENU_SHOWN || icon->menu.state == MENU_CLOSING)
++        finish_app_menu( icon->owner, icon->menu.request, 0 );
++    if (icon->menu.about_to_show) p_dbus_message_unref( icon->menu.about_to_show );
++    if (icon->menu.pending) p_dbus_message_unref( icon->menu.pending );
++    free( icon->menu.data );
++    close_balloon( icon->balloon );
++    close_connection( icon->conn );
++    free( icon->tip );
++    free( icon->argb );
++    free( icon );
++}
++
+ /* icons whose owner window is gone: Windows clears them when the pointer passes over them */
+ static void remove_dead_icons(void)
+ {
+@@ -990,11 +1837,7 @@
+     LIST_FOR_EACH_ENTRY_SAFE( icon, next, &dead, struct sni_icon, entry )
+     {
+         TRACE( "owner %p of icon %u is gone\n", icon->owner, icon->id );
+-        close_balloon( icon->balloon );
+-        close_connection( icon->conn );
+-        free( icon->tip );
+-        free( icon->argb );
+-        free( icon );
++        free_icon( icon );
+     }
+ }
+ 
+@@ -1002,6 +1845,7 @@
+ NTSTATUS waylanddrv_unix_sni_run( void *arg )
+ {
+     ULONGLONG last_check = 0;
++    BOOL menus_active = FALSE;
+ 
+     if (!sni_init()) return STATUS_NOT_SUPPORTED;
+     NtUserSetThreadDpiAwarenessContext( NTUSER_DPI_PER_MONITOR_AWARE_V2 );
+@@ -1026,7 +1870,7 @@
+         if (sni_wake[0] >= 0) { fds[nfds].fd = sni_wake[0]; fds[nfds++].events = POLLIN; }
+         for (i = 0; i < count; i++)
+             if (p_dbus_connection_get_unix_fd( conns[i], &fd )) { fds[nfds].fd = fd; fds[nfds++].events = POLLIN; }
+-        poll( fds, nfds, 500 );
++        poll( fds, nfds, menus_active ? 50 : 500 );
+         if (sni_wake[0] >= 0) while (read( sni_wake[0], buf, sizeof(buf) ) > 0);
+ 
+         for (i = 0; i < count; i++)
+@@ -1035,6 +1879,8 @@
+             p_dbus_connection_unref( conns[i] );
+         }
+ 
++        menus_active = menu_timeouts();
++
+         if (sni_ticks() - last_check >= 1000)
+         {
+             remove_dead_icons();
+@@ -1093,11 +1939,7 @@
+     pthread_mutex_lock( &sni_mutex );
+     list_remove( &icon->entry );
+     pthread_mutex_unlock( &sni_mutex );
+-    close_balloon( icon->balloon );
+-    close_connection( icon->conn );
+-    free( icon->tip );
+-    free( icon->argb );
+-    free( icon );
++    free_icon( icon );
+ }
+ 
+ LRESULT WAYLAND_NotifyIcon( HWND hwnd, UINT msg, NOTIFYICONDATAW *nid )
+@@ -1108,6 +1950,8 @@
+     LRESULT ret = TRUE;
+ 
+     if (!sni_enabled() || !sni_init()) return -1;
++    if (msg == WINE_SYSTRAY_MENU_DATA)
++        return sni_dbusmenu_enabled() ? menu_offered( hwnd, (const struct systray_menu_data *)nid ) : FALSE;
+ 
+     pthread_mutex_lock( &sni_mutex );
+     icon = find_icon( nid->hWnd, nid->uID );
+@@ -1145,6 +1989,7 @@
+             }
+             pthread_mutex_lock( &sni_mutex );
+             icon->conn = conn;
++            icon->menu.registered_at = sni_ticks();
+             pthread_mutex_unlock( &sni_mutex );
+             sni_wakeup();
+         }
+@@ -1174,6 +2019,7 @@
+             {
+                 pthread_mutex_lock( &sni_mutex );
+                 icon->conn = conn;
++                icon->menu.registered_at = sni_ticks();
+                 pthread_mutex_unlock( &sni_mutex );
+                 sni_wakeup();
+             }
+@@ -1259,14 +2105,7 @@
+         list_add_tail( &gone, &icon->entry );
+     }
+     pthread_mutex_unlock( &sni_mutex );
+-    LIST_FOR_EACH_ENTRY_SAFE( icon, next, &gone, struct sni_icon, entry )
+-    {
+-        close_balloon( icon->balloon );
+-        close_connection( icon->conn );
+-        free( icon->tip );
+-        free( icon->argb );
+-        free( icon );
+-    }
++    LIST_FOR_EACH_ENTRY_SAFE( icon, next, &gone, struct sni_icon, entry ) free_icon( icon );
+ }
+ 
+ #else  /* SONAME_LIBDBUS_1 */
+--- a/include/ntuser.h
++++ b/include/ntuser.h
+@@ -688,6 +688,37 @@
+     WINE_SYSTRAY_DOCK_REMOVE,
+ };
+ 
++/* NEUTRON sni-dbusmenu: a tray menu handed to the desktop's tray instead of being shown by the application.
++ * While the shell waits for a tray icon's context menu, it sets WINE_SYSTRAY_MENU_PROP (a non-zero request number)
++ * on the icon's window and relays the right click. TrackPopupMenu on that window then sends its menu, after the
++ * usual WM_INITMENUPOPUP, to Shell_TrayWnd as WM_COPYDATA with dwData WINE_SYSTRAY_MENU_DATA (wParam: the window);
++ * explorer passes it to the display driver as WINE_SYSTRAY_NOTIFY_ICON with that dwData as the "message". When the
++ * menu closes the shell sets WINE_SYSTRAY_MENU_RESULT_PROP to MAKELONG(item index + 1 or 0, request number) and
++ * posts WM_NULL to the window. */
++#define WINE_SYSTRAY_MENU_DATA         0x4e544d31  /* 'NTM1' */
++/* initializers for WCHAR arrays: unix code has no 16-bit L"" literals */
++#define WINE_SYSTRAY_MENU_PROP_INIT \
++    {'_','_','w','i','n','e','_','s','y','s','t','r','a','y','_','m','e','n','u',0}
++#define WINE_SYSTRAY_MENU_RESULT_PROP_INIT \
++    {'_','_','w','i','n','e','_','s','y','s','t','r','a','y','_','m','e','n','u','_','r','e','s','u','l','t',0}
++
++struct systray_menu_item
++{
++    INT   parent;          /* index of the submenu item this one is in, -1 at the top */
++    UINT  type;            /* MFT_* (MFT_SEPARATOR, MFT_RADIOCHECK, ...), plus MF_POPUP for a submenu */
++    UINT  state;           /* MFS_* */
++    UINT  text;            /* offset of the text in WCHARs after the items, ~0u for none */
++};
++
++struct systray_menu_data
++{
++    UINT  size;            /* total bytes */
++    UINT  request;         /* the WINE_SYSTRAY_MENU_PROP value it answers */
++    UINT  count;           /* items */
++    struct systray_menu_item items[1];
++    /* then the NUL-terminated texts */
++};
++
+ /* NtUserDragDropCall calls */
+ enum wine_drag_drop_call
+ {
+--- a/programs/explorer/systray.c
++++ b/programs/explorer/systray.c
+@@ -851,6 +851,18 @@
+     NOTIFYICONDATAW nid;
+     int ret = FALSE;
+ 
++    /* NEUTRON sni-dbusmenu: a tray icon's menu for the display driver's tray (see ntuser.h) */
++    if (cds->dwData == WINE_SYSTRAY_MENU_DATA)
++    {
++        const struct systray_menu_data *menu = cds->lpData;
++        if (cds->cbData < offsetof( struct systray_menu_data, items ) || menu->size != cds->cbData ||
++            !menu->count || menu->count > (cds->cbData - offsetof( struct systray_menu_data, items )) /
++                                          sizeof(menu->items[0]))
++            return FALSE;
++        return NtUserMessageCall( hwndSource, WINE_SYSTRAY_NOTIFY_ICON, WINE_SYSTRAY_MENU_DATA, 0,
++                                  (void *)menu, NtUserSystemTrayCall, FALSE ) == TRUE;
++    }
++
+     if (cds->cbData < sizeof(*data)) return FALSE;
+     data = cds->lpData;
+     icon_data = data->icon_data;
