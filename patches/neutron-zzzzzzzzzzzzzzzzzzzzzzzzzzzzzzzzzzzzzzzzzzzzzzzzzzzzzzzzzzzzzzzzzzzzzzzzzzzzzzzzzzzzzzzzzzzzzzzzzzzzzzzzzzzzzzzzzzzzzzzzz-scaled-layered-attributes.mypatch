@@ -1,0 +1,63 @@
+win32u: a DPI-scaled layered window hands its per-pixel alpha to the real surface even when its shape is unchanged.
+
+Filmora's installer showed a black promo banner while it downloads. The page loads and renders; on top of it the
+installer (DuiLib) lays an owned layered window, "wae_mask", 600x330, painted with UpdateLayeredWindow as white at
+alpha 1 (premultiplied 1,1,1,1) plus a minimize button. It catches the mouse while the slides show through. We
+showed it opaque, so the banner area was a flat (1,1,1). Found with Ghidra (CMaskWnd, DuiLib's layered paint and
+its #01ffffff fill) and NEUTRON_LAYER_TRACE: the mask's driver surface was layered with alpha_mask 0, which the
+driver paints opaque, while the shadow windows of the same installer got alpha_mask ff000000.
+
+The installer is not DPI-aware, so at 175% each window surface is win32u's scaling wrapper around the driver
+surface. UpdateLayeredWindow marks the wrapper per-pixel (alpha_mask) after the window is already on screen, and
+the wrapper passed its layered attributes on only when the shape bitmap changed. DuiLib gives every window a
+window region on WM_SIZE, so the shape was already the whole window, and a veil with no fully transparent pixel
+gives the same whole-window shape: no change, nothing handed on. The shadows have fully transparent edges, so
+theirs changed and got through. The wrapper now hands the attributes on at every flush;
+window_surface_set_layered marks the target dirty only when a value differs.
+
+Lab test host (lab/axhost, 32-bit, the banner page in a WebBrowser with the installer's veil done the DuiLib way,
+judged by pixel count): with the window region, 178 black 2/2, 178 + this showed the page 2/2, and black again
+with the kill switch on the same build. Without the region, or in a DPI-aware process, it showed the page on 178.
+The installer itself, 178 + this: the banner shows the carousel with the minimize button on top.
+
+Kill switch NEUTRON_SCALED_LAYERED=0.
+
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -162,6 +162,14 @@
+     return CONTAINING_RECORD( window_surface, struct scaled_surface, header );
+ }
+ 
++/* NEUTRON scaled-layered: kill switch NEUTRON_SCALED_LAYERED=0 (see scaled_surface_flush). */
++static BOOL neutron_scaled_layered(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_SCALED_LAYERED" ); v = !(e && e[0] == '0'); }
++    return v;
++}
++
+ static void scaled_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
+ {
+     struct scaled_surface *surface = get_scaled_surface( window_surface );
+@@ -326,10 +334,19 @@
+         HRGN hrgn = map_dpi_region( window_surface->shape_region, surface->dpi_from, surface->dpi_to );
+         window_surface_set_shape( surface->target_surface, hrgn );
+         if (hrgn) NtGdiDeleteObjectApp( hrgn );
+-
++    }
++    /* NEUTRON scaled-layered: the target composites with this wrapper's layered attributes, so hand them on at
++     * every flush, not only when the shape bitmap changed. UpdateLayeredWindow marks the wrapper per-pixel
++     * (alpha_mask) after the window is already on screen. A window with a window region already has a full
++     * shape, and pixels that all have some alpha give the same full shape, so the shape never "changed" and the
++     * target stayed "layered, no attributes", which the driver paints opaque. Filmora's installer: a DPI-unaware
++     * DuiLib veil (white at alpha 1, with DuiLib's WM_SIZE window region) over the promo banner came out (1,1,1)
++     * black at 175%; DPI-aware, or without the region, the page showed through (2026-11-04).
++     * window_surface_set_layered only marks the target dirty when a value differs.
++     * Kill switch NEUTRON_SCALED_LAYERED=0. */
++    if (shape_changed || neutron_scaled_layered())
+         window_surface_set_layered( surface->target_surface, window_surface->color_key,
+                                     window_surface->alpha_bits, window_surface->alpha_mask );
+-    }
+     /* NEUTRON dwm-alpha: the target composites the same way */
+     if (surface->target_surface->dwm_alpha != window_surface->dwm_alpha)
+         window_surface_set_dwm_alpha( surface->target_surface, window_surface->dwm_alpha );
