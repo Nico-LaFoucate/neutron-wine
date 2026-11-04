@@ -1,0 +1,133 @@
+mshtml: zoom on the top document's body or root element zooms the page.
+
+Filmora's installer fits its 640x360 promo page into a 600x338 slot with body.style.zoom = 0.9375 (IHTMLStyle3
+put_zoom, its log: "[banner] fit ok ... zoom=[0.9375]"). Wine stored the value and WARNed "stub", so the page showed
+unscaled: the slide cut 44 px at the right and 26 px at the bottom, the pagination dots hidden. His call (11-04).
+
+IE scales an element and its content by its zoom; on the body or root element that is the whole page. Gecko 2.47 has
+no CSS zoom, but it has the page zoom Wine already uses for OLECMDID_OPTICAL_ZOOM (set_viewer_zoom, nsIContentViewer
+SetFullZoom), so a zoom put on the top document's body or documentElement inline style now sets that. Values as IE
+takes them: a number, "93.75%", "normal". zoom: 1 (the common IE layout hack) leaves the page zoom alone unless the
+document zoomed it before; then it puts it back to 1.
+
+Not covered: zoom on any other element (stored, WARN "stub" as before), zoom from style sheets, frames, and a host's
+optical zoom together with a body zoom (IE multiplies them; this sets the page zoom).
+
+Lab, 178 + 121 + this (lab 178h): the installer's banner shows the whole slide and its six pagination dots; on
+178g (without this) the slide is cut. Test pages in lab/axhost (32-bit, a 400x200 block measured in device px):
+body.style.zoom = "50%" from script 399 px (178g: 799), zoom 1 799, a div's zoom 0.5 799 (unchanged, not covered),
+0.5 then 1 799.
+
+--- a/dlls/mshtml/htmlstyle.c
++++ b/dlls/mshtml/htmlstyle.c
+@@ -6195,6 +6195,89 @@
+     return E_NOTIMPL;
+ }
+ 
++/* NEUTRON css-zoom: a zoom value as IE takes it (a number, "93.75%", "normal"); FALSE if it is not one. */
++static BOOL neutron_zoom_factor(const VARIANT *v, float *ret)
++{
++    WCHAR *end;
++    double d;
++
++    switch(V_VT(v)) {
++    case VT_I4: d = V_I4(v); break;
++    case VT_R4: d = V_R4(v); break;
++    case VT_R8: d = V_R8(v); break;
++    case VT_BSTR:
++        if(!V_BSTR(v) || !*V_BSTR(v) || !wcsicmp(V_BSTR(v), L"normal")) { d = 1; break; }
++        d = wcstod(V_BSTR(v), &end);
++        if(end == V_BSTR(v)) return FALSE;
++        if(*end == '%') { d /= 100; end++; }
++        if(*end) return FALSE;
++        break;
++    default:
++        return FALSE;
++    }
++    if(!(d > 0)) return FALSE;
++    *ret = d;
++    return TRUE;
++}
++
++/* NEUTRON css-zoom: zoom on the top document's body or root element scales the whole page in IE. Gecko 2.47 has
++ * no CSS zoom, but it has the page zoom Wine already uses for OLECMDID_OPTICAL_ZOOM, so apply it there. Filmora's
++ * installer sets body.style.zoom = 0.9375 to fit its 640x360 promo page into 600x338; ignored, the page was cut at
++ * the right and bottom (2026-11-04). Not covered: zoom on any other element, zoom in style sheets, frames, and
++ * combining with a host's optical zoom (IE multiplies them; this sets the page zoom). Returns TRUE if applied. */
++static BOOL neutron_apply_root_zoom(CSSStyle *css, const VARIANT *v)
++{
++    IHTMLStyle *html_style;
++    HTMLDocumentNode *doc;
++    HTMLOuterWindow *top;
++    nsIDOMElement *nsroot;
++    HTMLDOMNode *node;
++    HTMLElement *elem;
++    BOOL is_root = FALSE;
++    float factor;
++    int i;
++
++    if(!neutron_zoom_factor(v, &factor))
++        return FALSE;
++    if(FAILED(IHTMLCSSStyleDeclaration_QueryInterface(&css->IHTMLCSSStyleDeclaration_iface, &IID_IHTMLStyle,
++                                                      (void**)&html_style)))
++        return FALSE;   /* not an element's inline style */
++    elem = impl_from_IHTMLStyle(html_style)->elem;
++    IHTMLStyle_Release(html_style);
++
++    doc = elem->node.doc;
++    if(!doc || !doc->browser || !(top = doc->browser->content_window) || !top->base.inner_window
++       || top->base.inner_window->doc != doc)
++        return FALSE;   /* not the top document */
++
++    for(i = 0; i < 2 && !is_root; i++) {
++        nsroot = NULL;
++        if(i == 0 && doc->html_document)
++            nsIDOMHTMLDocument_GetBody(doc->html_document, (nsIDOMHTMLElement **)&nsroot);
++        else if(i == 1 && doc->dom_document)
++            nsIDOMDocument_GetDocumentElement(doc->dom_document, &nsroot);
++        if(!nsroot)
++            continue;
++        if(SUCCEEDED(get_node((nsIDOMNode*)nsroot, FALSE, &node)) && node) {
++            is_root = node == &elem->node;
++            node_release(node);
++        }
++        nsIDOMElement_Release(nsroot);
++    }
++    if(!is_root)
++        return FALSE;
++
++    /* zoom: 1 is the common IE hack; leave the page zoom alone unless this document zoomed it before */
++    if(factor == 1 && !doc->neutron_root_zoom)
++        return TRUE;
++    if(factor != doc->neutron_root_zoom) {
++        TRACE("page zoom %f for the root zoom style\n", factor);
++        set_viewer_zoom(doc->browser, factor);
++        doc->neutron_root_zoom = factor;
++    }
++    return TRUE;
++}
++
+ static HRESULT WINAPI HTMLCSSStyleDeclaration_put_zoom(IHTMLCSSStyleDeclaration *iface, VARIANT v)
+ {
+     CSSStyle *This = impl_from_IHTMLCSSStyleDeclaration(iface);
+@@ -6205,7 +6288,7 @@
+ 
+     /* zoom property is IE CSS extension that is mostly used as a hack to workaround IE bugs.
+      * The value is set to 1 then. We can safely ignore setting zoom to 1. */
+-    if(V_VT(&v) != VT_I4 || V_I4(&v) != 1)
++    if(!neutron_apply_root_zoom(This, &v) && (V_VT(&v) != VT_I4 || V_I4(&v) != 1))
+         WARN("stub for %s\n", debugstr_variant(&v));
+ 
+     hres = dispex_get_dprop_ref(&This->dispex, L"zoom", TRUE, &var);
+--- a/dlls/mshtml/mshtml_private.h
++++ b/dlls/mshtml/mshtml_private.h
+@@ -1173,6 +1173,9 @@
+     unsigned int emulate_mode : 1;
+     unsigned int content_ready : 1;
+     unsigned int unload_sent : 1;
++    /* NEUTRON css-zoom: the page zoom last applied for a zoom style on this document's body or root element
++     * (0 = never applied). */
++    float neutron_root_zoom;
+ 
+     IHTMLDOMImplementation *dom_implementation;
+     IHTMLNamespaceCollection *namespaces;
