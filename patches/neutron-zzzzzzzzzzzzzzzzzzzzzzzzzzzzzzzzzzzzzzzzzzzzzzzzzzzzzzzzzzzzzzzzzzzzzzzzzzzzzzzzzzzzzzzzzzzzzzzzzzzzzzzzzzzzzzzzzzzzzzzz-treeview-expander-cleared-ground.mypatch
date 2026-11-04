@@ -1,0 +1,33 @@
+comctl32: the tree expander triangle sits on cleared ground, so the tree lines stop at it.
+
+Neutron draws the tree expander as a filled triangle (the …n-comctl32-treeview-triangle-expander patch; the boxed
++/- it replaced is what comctl32 draws once the visual style is off). The boxed glyph was a filled rectangle, so
+the tree lines stopped at its edge; the bare triangle let them run straight through it. At an installer's row
+height (FL Studio 2026's NSIS components tree, lab 2026-11-03) the lines crossing every triangle read as clutter.
+His pick (C175) of three variants shown side by side: keep the triangle, clear the lines under it.
+
+The square the glyph occupies is now filled with the item background before the triangle is drawn. The file
+dialog's folder tree (TVS_EX_NEUTRON_SHELL chevrons) returns before this code and is unchanged.
+
+Lab, 178 + this (lab 178f), FL Studio installer's Choose Components page: the vertical line breaks around each
+triangle (zoomed capture); on 178 it runs through them. A test tree (buttons, lines, root lines, check boxes)
+the same.
+
+
+--- a/dlls/comctl32/treeview.c
++++ b/dlls/comctl32/treeview.c
+@@ -2437,6 +2437,14 @@
+         HBRUSH old_br = SelectObject(hdc, br);
+         HPEN np = CreatePen(PS_SOLID, 0, GETTXTCOLOR(infoPtr->clrText));
+         HPEN op = SelectObject(hdc, np);
++        /* NEUTRON 2026-11-03: the glyph sits on cleared ground. The boxed +/- it replaced was a filled
++         * rectangle, so the tree lines stopped at its edge; the bare triangle let them run straight through
++         * it, and at an installer's row height (FL Studio's components tree) that read as clutter. */
++        RECT ground = { centerx - s - 1, centery - s - 1, centerx + s + 2, centery + s + 2 };
++        HBRUSH bk = CreateSolidBrush(clrBk);
++
++        FillRect(hdc, &ground, bk);
++        DeleteObject(bk);
+ 
+         if (item->state & TVIS_EXPANDED && !(item->state & TVIS_EXPANDPARTIAL))
+         {
