@@ -1,0 +1,163 @@
+winewayland: publish an unmeasured output's work area before a maximized window follows onto it
+
+Seen in the lab (regress182 agent, 11-05; he asked for it to be chased): on a mixed-scale desk (175% primary with a
+top panel, 200% screen beside it without one), Photoshop 2026 maximized and moved to the 200% screen (Super+Shift+Right),
+started there, or maximized and placed there by KWin, showed its MENU BAR ABOVE the top of the screen and a black strip
+about 33 logical px tall at the bottom. Identical on 181 and 182c.
+
+Mechanism (SOLID, lab desk p, winfo probe in a PMv2 view + neutron-follow log lines):
+- Wayland has no work-area protocol. display.c gives an output its measured maximized height once something was
+  maximized on it in this prefix (.neutron-maximized-inset), else the 32-logical-px titlebar estimate. A fresh Photoshop
+  prefix has no line for the 200% screen, so its rcWork was (3841,228)-(7681,2324) on monitor (3841,164)-(7681,2324):
+  64 raw px inset on a screen with no panel.
+- wayland_window_follow_output moved the window to that rcWork: (3841,228)-(7681,2388), 64 px past the bottom. The same
+  call reported the compositor's 1920x1080 configure as that output's measurement, but by PostMessage: the desktop
+  process published the real work area only after the move.
+- Photoshop reads its monitor's work area while handling the move: its maximized client (3841,164) came out 64 px ABOVE
+  its window and its window region (which hides what lies outside the work area) ended at 2095. The menu bar (child
+  OWL.ApplicationBar) fell outside the window's surface; the window's last 64 rows were black.
+- Placing the window from the measurement alone (v1 of this patch) fixed the rect but not the picture: Photoshop still
+  read the estimate and its window region came out (0,63)-(3840,2159) -- the menu-bar row black; RedrawWindow did not
+  paint it.
+
+Windows: the work area of the monitor a maximized window moves to is known before the move, so the window rect, the
+app's client/region and the monitor list agree.
+
+Fix: when the work area this maximized configure gives the output (display.c's rule and plausibility guard) differs
+from the published rcWork, deliver the measurement synchronously (wayland_report_output_maximized_h_sync:
+SendMessageTimeout to the desktop window, 1 s, SMTO_ABORTIFHUNG), so the monitor list is rebuilt BEFORE the move, then
+move into the re-read work area; on a timeout still place the window from the measurement. Only a maximized (not
+fullscreen) follow move onto another output, only when the configure belongs to that output (fits, same scale = what
+workarea#3 records). Logs "neutron-follow-workarea:" when it acts.
+
+Lab evidence (runtime 11.10-182p = 182c + this winewayland.so, both arms on the same build, V1 unmeasured each run):
+- maximized + Super+Shift+Right: ON 2/2 correct, OFF 2/2 bug (rect (3841,228)-(7681,2388), 65 px bottom strip).
+- started with the pointer on V1 (KWin places it there): ON 2/2 correct, OFF 2/2 bug.
+- restored, Super+PageUp, KWin maximizes it onto V1: ON 2/2 correct, OFF 2/2 bug.
+- ON: "published synchronously: yes" every time; win = client = (3841,164)-(7681,2324), region (0,-1)-(3840,2159);
+  both doc-move captures PIXEL-IDENTICAL (0 px) to regress182's known-good (V1 already measured) capture.
+- Single 175% screen (Virtual-1 disabled): PS ON vs OFF pixel-identical (0 px), n=1 each.
+- Lightroom Classic maximized + Super+Shift+Right to V1 (V1 unmeasured): OFF rect (3841,228)-(7681,2388), ON
+  (3841,164)-(7681,2324); the window looks the same in both (title, menu, filmstrip in place), n=1 each.
+
+Not covered: a window maximized by win32u directly on an unmeasured output without a follow move (no such path found;
+restored Super+Shift+Right does not move Photoshop in KWin); Premiere was not moved to V1 in this rig (title drag
+did nothing), so it is untested here (the change only acts on maximized follow moves); the WM_DPICHANGED suggested rect
+is scaled twice when the new rect is already sized for the new output (seen, not changed here).
+
+Kill switch: NEUTRON_FOLLOW_WORKAREA=0.
+
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -608,6 +608,7 @@
+ static inline void neutron_zorder_changed(void) { InterlockedIncrement(&neutron_zorder_generation); }
+ BOOL neutron_workarea_save_output(const char *name, int logical_h);
+ void wayland_report_output_maximized_h(uint32_t output_id, int logical_h);
++BOOL wayland_report_output_maximized_h_sync(uint32_t output_id, int logical_h);
+ BOOL wayland_surface_config_is_compatible(struct wayland_surface_config *conf,
+                                           int width, int height,
+                                           enum wayland_surface_config_state state);
+--- a/dlls/winewayland.drv/wayland_output.c
++++ b/dlls/winewayland.drv/wayland_output.c
+@@ -167,6 +167,22 @@
+     NtUserPostMessage(desktop_hwnd, WM_WAYLAND_INIT_DISPLAY_DEVICES, (WPARAM)logical_h, (LPARAM)output_id);
+ }
+ 
++/* NEUTRON follow-workarea: the same report, delivered SYNCHRONOUSLY (bounded wait), for a maximized window that is about
++ * to move onto that output: when the call returns the desktop process has stored the measurement and rebuilt the
++ * monitor list, so this process -- and the application, while it handles the move -- reads the output's real work
++ * area instead of the estimate the measurement replaces. TRUE if the desktop process handled the message. */
++BOOL wayland_report_output_maximized_h_sync(uint32_t output_id, int logical_h)
++{
++    struct send_message_timeout_params params = {.flags = SMTO_ABORTIFHUNG, .timeout = 1000};
++    HWND desktop_hwnd;
++
++    if (!process_wayland.initialized || !output_id || logical_h <= 0 || !neutron_workarea_per_output()) return FALSE;
++    if (!(desktop_hwnd = NtUserGetDesktopWindow())) return FALSE;
++    NtUserMessageCall(desktop_hwnd, WM_WAYLAND_INIT_DISPLAY_DEVICES, (WPARAM)logical_h, (LPARAM)output_id, &params,
++                      NtUserSendMessageTimeout, FALSE);
++    return params.result != 0;
++}
++
+ void wayland_report_maximized_logical_h(int logical_h)
+ {
+     HWND desktop_hwnd;
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -2034,6 +2034,14 @@
+     return on;
+ }
+ 
++/* NEUTRON follow-workarea: kill switch NEUTRON_FOLLOW_WORKAREA=0 (move to the monitor list's work area, as before). */
++static BOOL neutron_follow_workarea(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_FOLLOW_WORKAREA", TRUE);
++    return on;
++}
++
+ static void wayland_window_follow_output(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+@@ -2054,6 +2062,8 @@
+     HMONITOR win_mon = 0, out_mon = 0;
+     MONITORINFO win_mi = {.cbSize = sizeof(win_mi)}, out_mi = {.cbSize = sizeof(out_mi)};
+     UINT context;
++    /* NEUTRON follow-workarea: the maximized configure is this output's (what workarea#3 records) */
++    BOOL cfg_for_output = FALSE;
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if ((surface = data->wayland_surface) && wayland_surface_is_toplevel(surface) &&
+@@ -2119,6 +2129,7 @@
+     {
+         BOOL fits = !found || out_lw <= 0 || out_lh <= 0 || (cfg_w <= out_lw + 1 && cfg_h <= out_lh + 1);
+         BOOL same_scale = !found || pref_scale <= 0.0 || out_scale <= 0.0 || fabs(pref_scale - out_scale) < 0.01;
++        cfg_for_output = found && cfg_h > 0 && fits && same_scale;
+         if (!neutron_workarea_guard() || (fits && same_scale))
+             wayland_report_output_maximized_h(id, cfg_h);
+         else if (neutron_wl_diag())
+@@ -2140,6 +2151,43 @@
+ 
+         cur_area = full ? win_mi.rcMonitor : win_mi.rcWork;
+         out_area = full ? out_mi.rcMonitor : out_mi.rcWork;
++        /* NEUTRON follow-workarea (2026-11-05). Lab desk: Photoshop 2026 maximized and moved to the 200% screen beside
++         * the 175% one (Super+Shift+Right), or started there: its menu bar sat above the top of the screen and a black
++         * strip about 33 logical px tall showed at the bottom. That screen has no panel, but until something has been
++         * maximized on it in this prefix its work area is the 32-logical-px titlebar estimate (display.c), so this
++         * move put the window at work top = monitor top + 64 px with the configure's full monitor height: 64 px past
++         * the bottom. The configure is that output's measurement, reported just above, but by message: the desktop
++         * process published the real work area (the monitor) only AFTER the move. Photoshop reads its monitor's work
++         * area while it handles the move -- its maximized client and its window region (which hides what lies outside
++         * the work area) come from it -- so it laid its client out 64 px ABOVE its own window: the menu bar fell
++         * outside the window's surface and the window's last 64 rows were non-client black. Placing the window from
++         * the measurement alone was not enough: Photoshop still read the estimate and its window region cut off the
++         * top 63 rows (black where the menu bar belongs). On Windows the work area of the monitor a maximized window
++         * moves to is known before the move, so the window, the app and the monitor list always agree. Do the same:
++         * when the work area this configure gives the output (display.c's rule) differs from the published one,
++         * deliver the measurement synchronously, so the monitor list is rebuilt BEFORE the move, then move into the
++         * re-read work area; if the desktop process does not answer in time, still place the window from the
++         * measurement. Kill switch NEUTRON_FOLLOW_WORKAREA=0. */
++        if (!full && cfg_for_output && neutron_follow_workarea() && neutron_workarea_per_output() &&
++            out_lh > 0 && cfg_h <= out_lh && (out_lh - cfg_h) < out_lh / 4)
++        {
++            RECT measured = out_mi.rcMonitor, published = out_area;
++            int mon_h = measured.bottom - measured.top;
++            int inset = (int)(((double)(out_lh - cfg_h) * mon_h) / out_lh + 0.5);
++            BOOL sent = FALSE;
++
++            if (inset > 0 && inset < mon_h) measured.top += inset;
++            if (!EqualRect(&measured, &out_area))
++            {
++                sent = wayland_report_output_maximized_h_sync(id, cfg_h);
++                if (sent && NtUserGetMonitorInfo(out_mon, &out_mi)) out_area = out_mi.rcWork;
++                ERR("neutron-follow-workarea: hwnd=%p output %u work area %s, configure %dx%d of %dx%d gives %s;"
++                    " published synchronously: %s, now %s\n", hwnd, id, wine_dbgstr_rect(&published), cfg_w, cfg_h,
++                    out_lw, out_lh, wine_dbgstr_rect(&measured), sent ? "yes" : "NO (timeout)",
++                    wine_dbgstr_rect(&out_area));
++            }
++            out_area = measured;
++        }
+         left = cur_area.left - win.left;
+         top = cur_area.top - win.top;
+         right = win.right - cur_area.right;
