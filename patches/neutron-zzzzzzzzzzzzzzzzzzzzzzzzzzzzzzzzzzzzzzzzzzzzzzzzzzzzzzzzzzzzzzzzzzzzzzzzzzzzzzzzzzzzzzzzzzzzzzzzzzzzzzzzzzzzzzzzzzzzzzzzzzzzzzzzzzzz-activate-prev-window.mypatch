@@ -1,0 +1,142 @@
+win32u: when the active window goes away, activate the window that was active before it, as Windows does.
+
+Seen 11-04 (CapCut 9.7): when its menu (an unowned layered tool window) closed, Wine activated CapCut's EditPilot tool
+window, not the main window. activate_other_window tried a popup's owner, then walked the z-order and took the first
+window it could activate, tool windows included.
+
+Windows (measured on his Windows 11 box, 216 dpi, probes actprobe and actprobe2, 2/2 each): after the active popup is
+destroyed, Windows activates the window that was active before it (spwndActivePrev), after a popup's owner. A tool
+window directly below, layered or not, owned or not, is passed over, and so is a normal window that was never active
+lying above the previous one in z-order. With the previous window minimized or hidden it activates nothing of the
+process.
+
+Now set_active_window records, on the newly active window, the window its queue had active before (WND.active_prev,
+calloc'd). activate_other_window tries the owner first (unchanged), then that previous window if it still exists, can
+be activated (visible, enabled, not minimized) and is not owned by the window going away, then the z-order walk, which
+now passes over WS_EX_TOOLWINDOW windows. Kill switch NEUTRON_ACTIVATE_PREV=0.
+
+Not covered: with the previous window minimized, Neutron still activates it (actprobe2 d1; plain 181 does the same,
+most likely the compositor's keyboard focus, not this path). Activation that comes from another process.
+
+This does NOT fix CapCut's menu Escape (first Escape fails every other time): same 3 of 6 with the switch on and off.
+It ships for Windows parity.
+
+Lab (11.10-181k2 = 181 + this win32u.so x86_64 + i386; desk-n, own prefix PgI-actm; desk-b for CapCut):
+- actprobe2, 2 of 2: a1 a2 b1 b2 c e f MAIN, d2 none = Windows; d1 MAIN (Windows none). Switch off, same build,
+  2 of 2: TOOL in every case except d1 MAIN = plain 181.
+- actprobe (team agent capcut), 2 of 2: MAIN in all four cases = Windows.
+- CapCut 9.7 Escape (armk, 6 trials per arm, same build): on F W F W F W, off F W F W F W.
+Adobe apps: not yet checked (menus, dialog close); part of the regression pass before the next build.
+
+Kill switch NEUTRON_ACTIVATE_PREV=0.
+
+
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2052,6 +2052,18 @@
+     if (prev) *prev = previous;
+     if (previous == hwnd) goto done;
+ 
++    /* NEUTRON activate-prev: remember the window this queue had active before, as Windows does (spwndActivePrev),
++     * so that activate_other_window can go back to it (see there). */
++    if (hwnd)
++    {
++        WND *win = get_win_ptr( hwnd );
++        if (win && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
++        {
++            win->active_prev = previous;
++            release_win_ptr( win );
++        }
++    }
++
+     /* NEUTRON: the thread's IME window belongs to its active window (window.c) */
+     if (hwnd) neutron_ime_follow( get_default_ime_window( 0 ), hwnd );
+ 
+--- a/dlls/win32u/ntuser_private.h
++++ b/dlls/win32u/ntuser_private.h
+@@ -81,6 +81,7 @@
+     HIMC               imc;           /* window's input context */
+     struct window_surface *surface;   /* Window surface if any */
+     BOOL               dwm_alpha;     /* NEUTRON: DwmEnableBlurBehindWindow enabled, see set_window_dwm_alpha */
++    HWND               active_prev;   /* NEUTRON activate-prev: the window its queue had active before this one */
+     struct opengl_drawable *current_drawable; /* current GL client surface for this window */
+     struct opengl_drawable *unused_drawable; /* unused GL client surface for this window */
+     struct tagDIALOGINFO *dlgInfo;    /* Dialog additional info (dialogs only) */
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5557,6 +5557,43 @@
+     return !(style & WS_DISABLED);
+ }
+ 
++/* NEUTRON activate-prev: when the active window is destroyed or hidden, Windows goes back to the window that was
++ * active before it, after trying a popup's owner. Its z-order search for another window passes over tool windows and
++ * minimized windows, and when nothing qualifies it activates nothing. Measured on Windows 11 (actprobe, actprobe2):
++ * MAIN in every case where MAIN was active before the destroyed popup, also with a normal window that was never
++ * active above MAIN in z-order and with a tool window, layered or not, owned or not, directly below the popup; nothing
++ * of the process when MAIN was minimized or hidden. Wine walked the z-order and activated the next visible window, so
++ * CapCut 9.7's EditPilot tool window took the activation when its menu closed.
++ * Kill switch NEUTRON_ACTIVATE_PREV=0. */
++static BOOL neutron_activate_prev(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_ACTIVATE_PREV" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++/* NEUTRON activate-prev: the window that was active before hwnd, if it can take the activation back */
++static HWND neutron_active_prev( HWND hwnd )
++{
++    HWND prev, owner;
++    WND *win = get_win_ptr( hwnd );
++
++    if (!win || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
++    prev = win->active_prev;
++    release_win_ptr( win );
++    if (!prev || prev == hwnd || !is_window( prev ) || !can_activate_window( prev )) return 0;
++    /* not one of hwnd's owned windows, which go away with it */
++    for (owner = get_window_relative( prev, GW_OWNER ); owner; owner = get_window_relative( owner, GW_OWNER ))
++        if (owner == hwnd) return 0;
++    return prev;
++}
++
++static BOOL can_activate_next_window( HWND hwnd, BOOL skip_tool )
++{
++    if (!can_activate_window( hwnd )) return FALSE;
++    return !skip_tool || !(get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TOOLWINDOW);
++}
++
+ /*******************************************************************
+  *         activate_other_window
+  *
+@@ -5565,6 +5602,7 @@
+ static void activate_other_window( HWND hwnd )
+ {
+     HWND hwnd_to, fg;
++    BOOL prev_rule = neutron_activate_prev();
+ 
+     if ((get_window_long( hwnd, GWL_STYLE ) & WS_POPUP) &&
+         (hwnd_to = get_window_relative( hwnd, GW_OWNER )))
+@@ -5573,11 +5611,13 @@
+         if (can_activate_window( hwnd_to )) goto done;
+     }
+ 
++    if (prev_rule && (hwnd_to = neutron_active_prev( hwnd ))) goto done;
++
+     hwnd_to = hwnd;
+     for (;;)
+     {
+         if (!(hwnd_to = get_window_relative( hwnd_to, GW_HWNDNEXT ))) break;
+-        if (can_activate_window( hwnd_to )) goto done;
++        if (can_activate_next_window( hwnd_to, prev_rule )) goto done;
+     }
+ 
+     hwnd_to = get_window_relative( get_desktop_window(), GW_CHILD );
+@@ -5588,7 +5628,7 @@
+             hwnd_to = 0;
+             break;
+         }
+-        if (can_activate_window( hwnd_to )) goto done;
++        if (can_activate_next_window( hwnd_to, prev_rule )) goto done;
+         if (!(hwnd_to = get_window_relative( hwnd_to, GW_HWNDNEXT ))) break;
+     }
+ 
