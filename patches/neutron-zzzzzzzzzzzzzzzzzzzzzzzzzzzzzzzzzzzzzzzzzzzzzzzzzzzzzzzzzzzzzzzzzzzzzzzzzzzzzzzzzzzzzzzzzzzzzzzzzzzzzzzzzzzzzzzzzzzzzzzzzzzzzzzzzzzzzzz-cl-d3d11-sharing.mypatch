@@ -1,0 +1,1592 @@
+opencl: implement cl_khr_d3d11_sharing on the PE side, so After Effects on AMD/Intel gets its D3D11 device (Advanced 3D)
+
+What the reporter saw (Neutron#47, an AMD RX 7600, RADV + ROCm OpenCL, AE 26.5): "After Effects reports not being able
+to utilize advanced 3d even thought it should be". His words for this team: "get advanced 3d working on non-nvidia
+cards. I don't want to leave them high and dry."
+
+Mechanism (SOLID, ae47 + claex static RE of AE 26.5, ae47 lab A/B):
+- AE offers Advanced 3D (Calder) only when Mercury's GF device hands AfterFXLib an ID3D11Device (FL >= 11_0, adapter
+  memory >= 4e9). On the OpenCL path GPUFoundation creates that device only when the OpenCL device lists
+  cl_khr_d3d11_sharing and clGetDeviceIDsFromD3D11KHR matches one of the DXGI adapters; then it creates the context with
+  CL_CONTEXT_D3D11_DEVICE_KHR. Calder renders with D3D11 on that device and VideoFrame hands each frame back to OpenCL
+  with clCreateFromD3D11Texture2DKHR + Acquire + clEnqueueCopyImageToBuffer + Release; DisplaySurface asks for
+  clCreateFromD3D11BufferKHR.
+- Wine's opencl filtered cl_khr_d3d11_sharing out (make_opencl: "needs wined3d integration") and
+  clGetExtensionFunctionAddressForPlatform was a NULL stub; Linux OpenCL drivers know nothing of Direct3D. NVIDIA is not
+  affected: AE runs CUDA there, and our nvcuda has the cuD3D11 interop.
+- Advertising the extension alone (ae47 lab 182a) made Advanced 3D available (2/2) but the comp viewer went black (2/2):
+  AE then needs working shared memory objects.
+
+Windows: AMD's and Intel's OpenCL drivers implement cl_khr_d3d11_sharing (the shared object IS the D3D11 resource).
+
+Fix (new dlls/opencl/pe_d3d11.c, on the PE side over the host implementation; no unix-side change):
+- cl_khr_d3d11_sharing is added to the extension string of GPU devices (and of platforms that have one).
+  clGetExtensionFunctionAddressForPlatform / clGetExtensionFunctionAddress return the six KHR functions.
+- clGetDeviceIDsFromD3D11KHR matches OpenCL devices to the adapter by PCI location (the adapter's Vulkan physical
+  device through DXVK's IDXGIVkInteropAdapter, VK_EXT_pci_bus_info, against cl_khr_pci_bus_info, CL_DEVICE_TOPOLOGY_AMD
+  or NVIDIA's PCI ids), then by device UUID, then by vendor id for GPUs; it returns the host's own cl_device_id handles,
+  only for the adapter that is that GPU, CL_DEVICE_NOT_FOUND otherwise.
+- clCreateContext / clCreateContextFromType take CL_CONTEXT_D3D11_DEVICE_KHR (and CL_CONTEXT_INTEROP_USER_SYNC) off the
+  host's property list, check the context's devices against the D3D11 device's adapter (CL_INVALID_D3D11_DEVICE_KHR) and
+  keep a reference to the device.
+- A shared memory object is a host buffer, 2D image or 3D image of the same size and format as the D3D11 (sub)resource
+  (the Khronos DXGI_FORMAT table). Acquire copies the D3D11 contents in, through a staging resource on the application's
+  device (CopySubresourceRegion + Map + blocking write); release copies them back (blocking read + Map + copy; a
+  DYNAMIC resource is mapped WRITE_DISCARD directly). Both are complete when the call returns, which gives the implicit
+  synchronization the spec asks for without CL_CONTEXT_INTEROP_USER_SYNC (AE passes it only on Intel). The application's
+  immediate context is used under ID3D11Multithread Enter/Leave with protection on (AE's renderer uses it on another
+  thread; AE turns protection on itself).
+- Spec error codes for wrong devices, foreign/immutable/multisampled resources, bad subresources and flags, formats
+  outside the table, double acquire, release without acquire, plain cl_mems, contexts without a D3D11 device.
+  CL_MEM_D3D11_RESOURCE_KHR and CL_IMAGE_D3D11_SUBRESOURCE_KHR are answered.
+- Lifetime: each shared cl_mem and interop context carries one reference of ours; when the application's release leaves
+  only ours (CL_*_REFERENCE_COUNT 1), the staging resource and the D3D11 references are dropped and ours released.
+- make_opencl lists the six hand-written functions (clCreateContext, clCreateContextFromType, clReleaseContext,
+  clReleaseMemObject, clGetMemObjectInfo, clGetImageInfo) in needs_pe_wrapper; their generated thunks are removed from
+  pe_thunks.c exactly as a regeneration would.
+
+Not covered: zero copy (every acquire/release is a GPU -> host -> GPU round trip, ~7 ms per displayed frame in the
+lab; release writes back even when OpenCL only read the object, which AE's viewer texture never needs); the cl_nv_d3d11_sharing names (AE asks for them only on NVIDIA, which runs CUDA);
+CL_CONTEXT_D3D11_PREFER_SHARED_RESOURCES_KHR; clGetContextInfo(CL_CONTEXT_PROPERTIES) returns the host's list;
+acquire/release events are markers (CL_COMMAND_MARKER); the "already created from this subresource" error; NV12
+(cl_intel_d3d11_nv12_media_sharing stays unsupported, NV12 gives CL_INVALID_IMAGE_FORMAT_DESCRIPTOR); 32-bit is built
+but untested (no 32-bit host OpenCL on the lab box).
+
+Lab evidence (NVIDIA RTX 5070 box; AMD path through ae47's #44 spoof: NVIDIA OpenCL reports itself as AMD gfx1200,
+nvcuda=d, DXVK AMD ids; runtime 11.10-182x1 = 182 + this opencl.dll + the spoof, 182x1n = 182 + this opencl.dll only):
+- Conformance exe (clcore/test/cl-d3d11-conformance.exe, 82 checks: device match both sources, interop context, Buffer
+  read-modify-write with a GPU-side D3D11 write before acquire, Texture2D R8G8B8A8_UNORM, B8G8R8A8_UNORM,
+  R16G16B16A16_FLOAT, R32G32B32A32_FLOAT, R32_FLOAT, R8_UNORM both ways at 67x33, array+mip subresource, Texture3D,
+  1080p/4K frames re-acquired with new contents, another thread using the immediate context meanwhile, refcounts, 26
+  error paths): ON 82/82 n=2 on 182x1 + spoof and n=2 on 182x1n (NVIDIA as itself); kill switch on the SAME builds:
+  extension absent, no adapter matched (= 182) n=2 each. Device match went by PCI 0000:01:00.0 although DXGI reported
+  vendor 1002 (trace). 1080p RGBA8: acquire ~1.5 ms, release ~0.7 ms; 4K: ~7 / ~2.5 ms.
+- After Effects 26.5 (claex, AeX1, DirectX display as on a non-CUDA box, comp with extruded 3D text, panel, floor,
+  spot light with shadows, camera):
+  - 182x1, renderer Advanced 3D, n=3: calder_ok 1, Advanced 3D sticks, no warning; viewer shows the comp and animates
+    in playback; PNG render identical in all 3 runs. AE shares one Texture2D R8G8B8A8_UNORM 2711x1172 (= the viewer;
+    UAV, SHARED|NTHANDLE) and 3 DisplaySurface buffers of 12.9 MB (MISC_SHARED): the viewer's display path, used by
+    Classic 3D too; per displayed frame one texture and one buffer acquire/release; 0 errors, 1-9 ms per call.
+  - kill switch on 182x1, n=2: no D3D11 device, Advanced 3D refused, render pixel-identical to 182 (n=2).
+  - 182 n=2: Advanced 3D refused. ae47's advertise-only 182a n=2: Advanced 3D accepted, viewer 90% black.
+  - Classic 3D on 182x1 (which also shows its viewer through the shared texture and buffers): viewer and PNG render
+    identical to the kill-switch arm (n=3 on, n=1 off) and the render pixel-identical to 182 (n=2).
+  - The Advanced 3D render differs from the CUDA reference (182, NVIDIA) only in the shadows (dark and crisp on OpenCL,
+    faint on CUDA; 4.6-5.0% of pixels). ae47's 182a without any Texture2D sharing renders the same PNG as 182x1 (diff
+    0), so that difference is Calder on OpenCL vs CUDA, not this patch.
+  - Cost: our acquire averages 2.1 ms and release 1.35 ms (1200 calls of a playback, lab build 182x2), i.e. ~7 ms per
+    displayed frame for the 2711x1172 viewer (one texture + one buffer each way) on this RTX 5070.
+- Premiere 2026 (real `neutron launch`, DirectX display) and Media Encoder 2026 on the OpenCL path (claex, 182x1 + spoof):
+  Premiere now takes DisplaySurface's CL-D3D11 buffer path (3-7 buffers, 0 errors); Program Monitor paused and playing
+  correct, H.264 export 300 frames; AME OpenCL export 300 frames; n=2 each. Kill switch arm: same exports, decoded
+  frame at 5 s identical (diff 0).
+
+Kill switch: NEUTRON_DISABLE_CL_D3D11_SHARING=1 (no extension, NULL function addresses, context properties passed
+through untouched: the 182 behavior).
+
+
+--- a/dlls/opencl/Makefile.in
++++ b/dlls/opencl/Makefile.in
+@@ -3,6 +3,7 @@
+ UNIX_LIBS = $(OPENCL_LIBS)
+ 
+ SOURCES = \
++	pe_d3d11.c \
+ 	pe_thunks.c \
+ 	pe_wrappers.c \
+ 	unix_thunks.c \
+--- a/dlls/opencl/make_opencl
++++ b/dlls/opencl/make_opencl
+@@ -69,7 +69,8 @@
+ 
+ my %unsupported_extensions =
+     (
+-        # Needs wined3d integration.
++        # Needs wined3d integration. cl_khr_d3d11_sharing is implemented on the PE side (pe_d3d11.c), which adds
++        # it to the extension strings itself; the host never has it.
+         "cl_intel_d3d11_nv12_media_sharing" => 1,
+         "cl_intel_dx9_media_sharing" => 1,
+         "cl_khr_d3d10_sharing" => 1,
+@@ -328,6 +329,14 @@
+             "clGetExtensionFunctionAddress" => 1,
+             "clGetExtensionFunctionAddressForPlatform" => 1,
+ 
++            # NEUTRON (Neutron#47): cl_khr_d3d11_sharing, pe_d3d11.c
++            "clCreateContext" => 1,
++            "clCreateContextFromType" => 1,
++            "clGetImageInfo" => 1,
++            "clGetMemObjectInfo" => 1,
++            "clReleaseContext" => 1,
++            "clReleaseMemObject" => 1,
++
+             # deprecated and absent from headers
+             "clSetCommandQueueProperty" => 1,
+ 
+--- a/dlls/opencl/pe_d3d11.c
++++ b/dlls/opencl/pe_d3d11.c
+@@ -0,0 +1,1223 @@
++/*
++ * cl_khr_d3d11_sharing on top of the host OpenCL implementation
++ *
++ * Copyright 2026 Neutron contributors
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* NEUTRON (GitHub Neutron#47): the OpenCL drivers for AMD and Intel GPUs on Windows implement cl_khr_d3d11_sharing,
++ * and After Effects' GPU layer creates the D3D11 device it needs for Advanced 3D only through it: it asks
++ * clGetDeviceIDsFromD3D11KHR which DXGI adapter belongs to its OpenCL device, creates its D3D11 device there, and then
++ * shares D3D11 buffers and textures with OpenCL for its viewer and video frames. Linux OpenCL drivers know nothing of
++ * Direct3D, so the extension is implemented here, on the PE side, over the host implementation:
++ *
++ * - an interop context is a host context; the D3D11 device given with CL_CONTEXT_D3D11_DEVICE_KHR is kept with it;
++ * - a shared memory object is a host buffer or image of the same size and format as the D3D11 (sub)resource;
++ * - acquire copies the D3D11 contents into it (through a staging resource on the application's D3D11 device) and
++ *   release copies them back, both complete when the call returns, which also covers CL_CONTEXT_INTEROP_USER_SYNC;
++ * - OpenCL devices are matched to DXGI adapters by PCI location (Vulkan, through DXVK's interop interface, against
++ *   cl_khr_pci_bus_info or the vendor's own device queries), then by device UUID, then by vendor.
++ *
++ * NEUTRON_DISABLE_CL_D3D11_SHARING=1 turns all of it off: the extension is not advertised again. */
++
++#include <stdarg.h>
++#include <string.h>
++
++#define COBJMACROS
++#include "opencl_private.h"
++#include "opencl_types.h"
++#include "unixlib.h"
++
++#include "initguid.h"
++#include "d3d11_4.h"
++#include "d3d10.h"
++#include "wine/vulkan.h"
++#include "wine/list.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(opencl);
++
++#define CL_INVALID_D3D11_DEVICE_KHR             -1006
++#define CL_INVALID_D3D11_RESOURCE_KHR           -1007
++#define CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR  -1008
++#define CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR      -1009
++#define CL_D3D11_DEVICE_KHR                     0x4019
++#define CL_D3D11_DXGI_ADAPTER_KHR               0x401A
++#define CL_PREFERRED_DEVICES_FOR_D3D11_KHR      0x401B
++#define CL_ALL_DEVICES_FOR_D3D11_KHR            0x401C
++#define CL_CONTEXT_D3D11_DEVICE_KHR             0x401D
++#define CL_MEM_D3D11_RESOURCE_KHR               0x401E
++#define CL_IMAGE_D3D11_SUBRESOURCE_KHR          0x401F
++
++#define CL_DEVICE_UUID_KHR                      0x106A
++#define CL_DEVICE_PCI_BUS_INFO_KHR              0x410F
++#define CL_DEVICE_TOPOLOGY_AMD                  0x4037
++#define CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD        1
++#define CL_DEVICE_PCI_BUS_ID_NV                 0x4008
++#define CL_DEVICE_PCI_SLOT_ID_NV                0x4009
++#define CL_DEVICE_PCI_DOMAIN_ID_NV              0x400A
++
++/* DXVK's dxgi interop interface, see dxvk/src/dxgi/dxgi_interfaces.h */
++typedef struct IDXGIVkInteropAdapter IDXGIVkInteropAdapter;
++typedef struct
++{
++    HRESULT (WINAPI *QueryInterface)( IDXGIVkInteropAdapter *iface, REFIID iid, void **out );
++    ULONG (WINAPI *AddRef)( IDXGIVkInteropAdapter *iface );
++    ULONG (WINAPI *Release)( IDXGIVkInteropAdapter *iface );
++    void (WINAPI *GetVulkanHandles)( IDXGIVkInteropAdapter *iface, VkInstance *instance, VkPhysicalDevice *device );
++} IDXGIVkInteropAdapterVtbl;
++struct IDXGIVkInteropAdapter { const IDXGIVkInteropAdapterVtbl *lpVtbl; };
++DEFINE_GUID( IID_IDXGIVkInteropAdapter, 0x3a6d8f2c, 0xb0e8, 0x4ab4, 0xb4, 0xdc, 0x4f, 0xd2, 0x48, 0x91, 0xbf, 0xa5 );
++
++struct gpu_id
++{
++    UINT vendor;
++    BOOL pci_valid, domain_valid;
++    UINT domain, bus, device, function;
++    BOOL uuid_valid;
++    BYTE uuid[16];
++};
++
++struct d3d11_context
++{
++    struct list entry;
++    cl_context context;           /* holds one host reference of ours */
++    ID3D11Device *device;
++    ID3D11DeviceContext *immediate;
++    ID3D11Multithread *multithread;
++    LONG mems;                    /* shared memory objects still alive */
++    BOOL released;                /* the application released it at least once */
++};
++
++struct d3d11_mem
++{
++    struct list entry;
++    cl_mem mem;                   /* holds one host reference of ours */
++    struct d3d11_context *context;
++    void *app_resource;           /* as given, returned for CL_MEM_D3D11_RESOURCE_KHR */
++    ID3D11Resource *resource;
++    D3D11_RESOURCE_DIMENSION dimension;
++    D3D11_USAGE usage;
++    UINT subresource;
++    size_t size, width, height, depth;
++    ID3D11Resource *staging;
++    BOOL acquired;
++    BOOL released;
++};
++
++static struct list d3d11_contexts = LIST_INIT( d3d11_contexts );
++static struct list d3d11_mems = LIST_INIT( d3d11_mems );
++static LONG d3d11_objects;
++
++static CRITICAL_SECTION d3d11_cs;
++static CRITICAL_SECTION_DEBUG d3d11_cs_debug =
++{
++    0, 0, &d3d11_cs,
++    { &d3d11_cs_debug.ProcessLocksList, &d3d11_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": d3d11_cs") }
++};
++static CRITICAL_SECTION d3d11_cs = { &d3d11_cs_debug, -1, 0, 0, 0, 0 };
++
++static const struct
++{
++    DXGI_FORMAT dxgi;
++    cl_image_format cl;
++}
++format_table[] =
++{
++    /* the cl_khr_d3d11_sharing format table */
++    {DXGI_FORMAT_R32G32B32A32_FLOAT, {CL_RGBA, CL_FLOAT}},
++    {DXGI_FORMAT_R32G32B32A32_UINT,  {CL_RGBA, CL_UNSIGNED_INT32}},
++    {DXGI_FORMAT_R32G32B32A32_SINT,  {CL_RGBA, CL_SIGNED_INT32}},
++    {DXGI_FORMAT_R16G16B16A16_FLOAT, {CL_RGBA, CL_HALF_FLOAT}},
++    {DXGI_FORMAT_R16G16B16A16_UNORM, {CL_RGBA, CL_UNORM_INT16}},
++    {DXGI_FORMAT_R16G16B16A16_UINT,  {CL_RGBA, CL_UNSIGNED_INT16}},
++    {DXGI_FORMAT_R16G16B16A16_SNORM, {CL_RGBA, CL_SNORM_INT16}},
++    {DXGI_FORMAT_R16G16B16A16_SINT,  {CL_RGBA, CL_SIGNED_INT16}},
++    {DXGI_FORMAT_B8G8R8A8_UNORM,     {CL_BGRA, CL_UNORM_INT8}},
++    {DXGI_FORMAT_R8G8B8A8_UNORM,     {CL_RGBA, CL_UNORM_INT8}},
++    {DXGI_FORMAT_R8G8B8A8_UINT,      {CL_RGBA, CL_UNSIGNED_INT8}},
++    {DXGI_FORMAT_R8G8B8A8_SNORM,     {CL_RGBA, CL_SNORM_INT8}},
++    {DXGI_FORMAT_R8G8B8A8_SINT,      {CL_RGBA, CL_SIGNED_INT8}},
++    {DXGI_FORMAT_R32G32_FLOAT,       {CL_RG, CL_FLOAT}},
++    {DXGI_FORMAT_R32G32_UINT,        {CL_RG, CL_UNSIGNED_INT32}},
++    {DXGI_FORMAT_R32G32_SINT,        {CL_RG, CL_SIGNED_INT32}},
++    {DXGI_FORMAT_R16G16_FLOAT,       {CL_RG, CL_HALF_FLOAT}},
++    {DXGI_FORMAT_R16G16_UNORM,       {CL_RG, CL_UNORM_INT16}},
++    {DXGI_FORMAT_R16G16_UINT,        {CL_RG, CL_UNSIGNED_INT16}},
++    {DXGI_FORMAT_R16G16_SNORM,       {CL_RG, CL_SNORM_INT16}},
++    {DXGI_FORMAT_R16G16_SINT,        {CL_RG, CL_SIGNED_INT16}},
++    {DXGI_FORMAT_R8G8_UNORM,         {CL_RG, CL_UNORM_INT8}},
++    {DXGI_FORMAT_R8G8_UINT,          {CL_RG, CL_UNSIGNED_INT8}},
++    {DXGI_FORMAT_R8G8_SNORM,         {CL_RG, CL_SNORM_INT8}},
++    {DXGI_FORMAT_R8G8_SINT,          {CL_RG, CL_SIGNED_INT8}},
++    {DXGI_FORMAT_R32_FLOAT,          {CL_R, CL_FLOAT}},
++    {DXGI_FORMAT_R32_UINT,           {CL_R, CL_UNSIGNED_INT32}},
++    {DXGI_FORMAT_R32_SINT,           {CL_R, CL_SIGNED_INT32}},
++    {DXGI_FORMAT_R16_FLOAT,          {CL_R, CL_HALF_FLOAT}},
++    {DXGI_FORMAT_R16_UNORM,          {CL_R, CL_UNORM_INT16}},
++    {DXGI_FORMAT_R16_UINT,           {CL_R, CL_UNSIGNED_INT16}},
++    {DXGI_FORMAT_R16_SNORM,          {CL_R, CL_SNORM_INT16}},
++    {DXGI_FORMAT_R16_SINT,           {CL_R, CL_SIGNED_INT16}},
++    {DXGI_FORMAT_R8_UNORM,           {CL_R, CL_UNORM_INT8}},
++    {DXGI_FORMAT_R8_UINT,            {CL_R, CL_UNSIGNED_INT8}},
++    {DXGI_FORMAT_R8_SNORM,           {CL_R, CL_SNORM_INT8}},
++    {DXGI_FORMAT_R8_SINT,            {CL_R, CL_SIGNED_INT8}},
++};
++
++BOOL d3d11_sharing_enabled(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv( "NEUTRON_DISABLE_CL_D3D11_SHARING" );
++        enabled = !(env && *env == '1');
++        if (!enabled) WARN( "cl_khr_d3d11_sharing disabled by NEUTRON_DISABLE_CL_D3D11_SHARING\n" );
++    }
++    return enabled;
++}
++
++static cl_int host_device_info( cl_device_id device, cl_device_info name, size_t size, void *value )
++{
++    struct clGetDeviceInfo_params params = { device, name, size, value, NULL };
++    return OPENCL_CALL( clGetDeviceInfo, &params );
++}
++
++static cl_int host_get_devices( cl_platform_id platform, cl_device_type type, cl_device_id **devices, cl_uint *count )
++{
++    struct clGetDeviceIDs_params params = { platform, type, 0, NULL, count };
++    cl_int ret;
++
++    *devices = NULL;
++    if ((ret = OPENCL_CALL( clGetDeviceIDs, &params ))) return ret;
++    if (!(*devices = calloc( *count, sizeof(**devices) ))) return CL_OUT_OF_HOST_MEMORY;
++    params.num_entries = *count;
++    params.devices = *devices;
++    params.num_devices = NULL;
++    if ((ret = OPENCL_CALL( clGetDeviceIDs, &params )))
++    {
++        free( *devices );
++        *devices = NULL;
++    }
++    return ret;
++}
++
++static cl_int host_context_refcount( cl_context context, cl_uint *count )
++{
++    struct clGetContextInfo_params params = { context, CL_CONTEXT_REFERENCE_COUNT, sizeof(*count), count, NULL };
++    return OPENCL_CALL( clGetContextInfo, &params );
++}
++
++static cl_int host_mem_refcount( cl_mem mem, cl_uint *count )
++{
++    struct clGetMemObjectInfo_params params = { mem, CL_MEM_REFERENCE_COUNT, sizeof(*count), count, NULL };
++    return OPENCL_CALL( clGetMemObjectInfo, &params );
++}
++
++static void host_release_context( cl_context context )
++{
++    struct clReleaseContext_params params = { context };
++    OPENCL_CALL( clReleaseContext, &params );
++}
++
++static void host_release_mem( cl_mem mem )
++{
++    struct clReleaseMemObject_params params = { mem };
++    OPENCL_CALL( clReleaseMemObject, &params );
++}
++
++/* the OpenCL side of an adapter: its PCI location, UUID and vendor id */
++static void get_cl_device_id( cl_device_id device, struct gpu_id *id )
++{
++    struct { cl_uint domain, bus, device, function; } pci;
++    union
++    {
++        struct { cl_uint type; cl_uint data[5]; } raw;
++        struct { cl_uint type; char unused[17]; unsigned char bus, device, function; } pcie;
++    } topology;
++    cl_uint bus, slot, domain;
++
++    memset( id, 0, sizeof(*id) );
++    host_device_info( device, CL_DEVICE_VENDOR_ID, sizeof(id->vendor), &id->vendor );
++
++    if (!host_device_info( device, CL_DEVICE_PCI_BUS_INFO_KHR, sizeof(pci), &pci ))
++    {
++        id->pci_valid = id->domain_valid = TRUE;
++        id->domain = pci.domain;
++        id->bus = pci.bus;
++        id->device = pci.device;
++        id->function = pci.function;
++    }
++    else if (!host_device_info( device, CL_DEVICE_TOPOLOGY_AMD, sizeof(topology), &topology )
++             && topology.raw.type == CL_DEVICE_TOPOLOGY_TYPE_PCIE_AMD)
++    {
++        id->pci_valid = TRUE;
++        id->bus = topology.pcie.bus;
++        id->device = topology.pcie.device;
++        id->function = topology.pcie.function;
++    }
++    else if (!host_device_info( device, CL_DEVICE_PCI_BUS_ID_NV, sizeof(bus), &bus )
++             && !host_device_info( device, CL_DEVICE_PCI_SLOT_ID_NV, sizeof(slot), &slot ))
++    {
++        id->pci_valid = TRUE;
++        id->bus = bus;
++        id->device = slot >> 3;
++        id->function = slot & 7;
++        if (!host_device_info( device, CL_DEVICE_PCI_DOMAIN_ID_NV, sizeof(domain), &domain ))
++        {
++            id->domain_valid = TRUE;
++            id->domain = domain;
++        }
++    }
++
++    if (!host_device_info( device, CL_DEVICE_UUID_KHR, sizeof(id->uuid), id->uuid ))
++        id->uuid_valid = TRUE;
++
++    TRACE( "device %p: vendor %04x, pci %d %04x:%02x:%02x.%x, uuid %d\n", device, id->vendor, id->pci_valid,
++           id->domain, id->bus, id->device, id->function, id->uuid_valid );
++}
++
++/* the DXGI side: the adapter's Vulkan physical device when DXVK provides it, its DXGI description otherwise */
++static void get_adapter_id( IDXGIAdapter *adapter, struct gpu_id *id )
++{
++    PFN_vkEnumerateDeviceExtensionProperties enum_extensions;
++    PFN_vkGetPhysicalDeviceProperties2 get_properties2;
++    VkPhysicalDevicePCIBusInfoPropertiesEXT pci = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
++    VkPhysicalDeviceIDProperties uuid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
++    VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
++    PFN_vkGetInstanceProcAddr get_proc_addr = NULL;
++    VkPhysicalDevice physical_device = NULL;
++    IDXGIVkInteropAdapter *interop;
++    VkExtensionProperties *extensions;
++    VkInstance instance = NULL;
++    DXGI_ADAPTER_DESC desc;
++    uint32_t i, count = 0;
++    HMODULE module;
++
++    memset( id, 0, sizeof(*id) );
++    if (SUCCEEDED(IDXGIAdapter_GetDesc( adapter, &desc ))) id->vendor = desc.VendorId;
++
++    if (FAILED(IDXGIAdapter_QueryInterface( adapter, &IID_IDXGIVkInteropAdapter, (void **)&interop ))) return;
++    interop->lpVtbl->GetVulkanHandles( interop, &instance, &physical_device );
++    interop->lpVtbl->Release( interop );
++
++    if ((module = GetModuleHandleW( L"winevulkan.dll" )) || (module = GetModuleHandleW( L"vulkan-1.dll" )))
++        get_proc_addr = (void *)GetProcAddress( module, "vkGetInstanceProcAddr" );
++    if (!instance || !physical_device || !get_proc_addr) return;
++    if (!(get_properties2 = (void *)get_proc_addr( instance, "vkGetPhysicalDeviceProperties2" ))
++            && !(get_properties2 = (void *)get_proc_addr( instance, "vkGetPhysicalDeviceProperties2KHR" )))
++        return;
++
++    properties.pNext = &uuid;
++    if ((enum_extensions = (void *)get_proc_addr( instance, "vkEnumerateDeviceExtensionProperties" ))
++            && !enum_extensions( physical_device, NULL, &count, NULL )
++            && (extensions = calloc( count, sizeof(*extensions) )))
++    {
++        if (!enum_extensions( physical_device, NULL, &count, extensions ))
++        {
++            for (i = 0; i < count; i++)
++                if (!strcmp( extensions[i].extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME )) uuid.pNext = &pci;
++        }
++        free( extensions );
++    }
++    get_properties2( physical_device, &properties );
++
++    id->vendor = properties.properties.vendorID;
++    id->uuid_valid = TRUE;
++    memcpy( id->uuid, uuid.deviceUUID, sizeof(id->uuid) );
++    if (uuid.pNext)
++    {
++        id->pci_valid = id->domain_valid = TRUE;
++        id->domain = pci.pciDomain;
++        id->bus = pci.pciBus;
++        id->device = pci.pciDevice;
++        id->function = pci.pciFunction;
++    }
++
++    TRACE( "adapter %p: %s, vendor %04x, pci %d %04x:%02x:%02x.%x\n", adapter, debugstr_a(properties.properties.deviceName),
++           id->vendor, id->pci_valid, id->domain, id->bus, id->device, id->function );
++}
++
++static BOOL gpu_ids_match( const struct gpu_id *adapter, const struct gpu_id *device, cl_device_id cl_device )
++{
++    cl_device_type type = 0;
++
++    if (adapter->pci_valid && device->pci_valid)
++        return adapter->bus == device->bus && adapter->device == device->device && adapter->function == device->function
++               && (!adapter->domain_valid || !device->domain_valid || adapter->domain == device->domain);
++    if (adapter->uuid_valid && device->uuid_valid)
++        return !memcmp( adapter->uuid, device->uuid, sizeof(adapter->uuid) );
++    host_device_info( cl_device, CL_DEVICE_TYPE, sizeof(type), &type );
++    return (type & CL_DEVICE_TYPE_GPU) && adapter->vendor && adapter->vendor == device->vendor;
++}
++
++static BOOL device_matches_adapter( cl_device_id device, const struct gpu_id *adapter )
++{
++    struct gpu_id id;
++
++    get_cl_device_id( device, &id );
++    return gpu_ids_match( adapter, &id, device );
++}
++
++static IDXGIAdapter *get_d3d11_device_adapter( ID3D11Device *device )
++{
++    IDXGIAdapter *adapter = NULL;
++    IDXGIDevice *dxgi_device;
++
++    if (SUCCEEDED(ID3D11Device_QueryInterface( device, &IID_IDXGIDevice, (void **)&dxgi_device )))
++    {
++        if (FAILED(IDXGIDevice_GetAdapter( dxgi_device, &adapter ))) adapter = NULL;
++        IDXGIDevice_Release( dxgi_device );
++    }
++    return adapter;
++}
++
++static cl_int WINAPI clGetDeviceIDsFromD3D11KHR( cl_platform_id platform, cl_uint source, void *object, cl_uint set,
++                                                 cl_uint num_entries, cl_device_id *devices, cl_uint *num_devices )
++{
++    IDXGIAdapter *adapter = NULL;
++    cl_device_id *all;
++    ID3D11Device *device;
++    struct gpu_id id;
++    cl_uint count, i, found = 0;
++    cl_int ret;
++
++    TRACE( "(%p, %#x, %p, %#x, %u, %p, %p)\n", platform, source, object, set, num_entries, devices, num_devices );
++
++    if (set != CL_PREFERRED_DEVICES_FOR_D3D11_KHR && set != CL_ALL_DEVICES_FOR_D3D11_KHR) return CL_INVALID_VALUE;
++    if ((!num_entries && devices) || (!devices && !num_devices) || !object) return CL_INVALID_VALUE;
++
++    if (source == CL_D3D11_DEVICE_KHR)
++    {
++        if (FAILED(IUnknown_QueryInterface( (IUnknown *)object, &IID_ID3D11Device, (void **)&device )))
++            return CL_INVALID_VALUE;
++        adapter = get_d3d11_device_adapter( device );
++        ID3D11Device_Release( device );
++    }
++    else if (source == CL_D3D11_DXGI_ADAPTER_KHR)
++    {
++        if (FAILED(IUnknown_QueryInterface( (IUnknown *)object, &IID_IDXGIAdapter, (void **)&adapter )))
++            adapter = NULL;
++    }
++    if (!adapter) return CL_INVALID_VALUE;
++    get_adapter_id( adapter, &id );
++    IDXGIAdapter_Release( adapter );
++
++    if ((ret = host_get_devices( platform, CL_DEVICE_TYPE_ALL, &all, &count ))) return ret;
++    for (i = 0; i < count; i++)
++    {
++        if (!device_matches_adapter( all[i], &id )) continue;
++        if (devices && found < num_entries) devices[found] = all[i];
++        found++;
++    }
++    free( all );
++
++    TRACE( "found %u device(s)\n", found );
++    if (num_devices) *num_devices = found;
++    return found ? CL_SUCCESS : CL_DEVICE_NOT_FOUND;
++}
++
++/* called with d3d11_cs held: take the objects nobody but us references any more off the lists */
++static void collect_unused_objects( struct list *mems, struct list *contexts )
++{
++    struct d3d11_context *context, *next_context;
++    struct d3d11_mem *mem, *next_mem;
++    cl_uint count;
++
++    LIST_FOR_EACH_ENTRY_SAFE( mem, next_mem, &d3d11_mems, struct d3d11_mem, entry )
++    {
++        if (!mem->released || host_mem_refcount( mem->mem, &count ) || count > 1) continue;
++        list_remove( &mem->entry );
++        list_add_tail( mems, &mem->entry );
++        mem->context->mems--;
++    }
++    LIST_FOR_EACH_ENTRY_SAFE( context, next_context, &d3d11_contexts, struct d3d11_context, entry )
++    {
++        if (!context->released || context->mems || host_context_refcount( context->context, &count ) || count > 1)
++            continue;
++        list_remove( &context->entry );
++        list_add_tail( contexts, &context->entry );
++    }
++}
++
++static void free_unused_objects( struct list *mems, struct list *contexts )
++{
++    struct d3d11_context *context, *next_context;
++    struct d3d11_mem *mem, *next_mem;
++
++    LIST_FOR_EACH_ENTRY_SAFE( mem, next_mem, mems, struct d3d11_mem, entry )
++    {
++        TRACE( "freeing memory object %p\n", mem->mem );
++        if (mem->staging) ID3D11Resource_Release( mem->staging );
++        ID3D11Resource_Release( mem->resource );
++        host_release_mem( mem->mem );
++        InterlockedDecrement( &d3d11_objects );
++        free( mem );
++    }
++    LIST_FOR_EACH_ENTRY_SAFE( context, next_context, contexts, struct d3d11_context, entry )
++    {
++        TRACE( "freeing context %p\n", context->context );
++        if (context->multithread) ID3D11Multithread_Release( context->multithread );
++        ID3D11DeviceContext_Release( context->immediate );
++        ID3D11Device_Release( context->device );
++        host_release_context( context->context );
++        InterlockedDecrement( &d3d11_objects );
++        free( context );
++    }
++}
++
++static void release_unused_objects(void)
++{
++    struct list mems = LIST_INIT( mems ), contexts = LIST_INIT( contexts );
++
++    EnterCriticalSection( &d3d11_cs );
++    collect_unused_objects( &mems, &contexts );
++    LeaveCriticalSection( &d3d11_cs );
++    free_unused_objects( &mems, &contexts );
++}
++
++static struct d3d11_context *find_context( cl_context handle )
++{
++    struct d3d11_context *context;
++
++    LIST_FOR_EACH_ENTRY( context, &d3d11_contexts, struct d3d11_context, entry )
++        if (context->context == handle) return context;
++    return NULL;
++}
++
++static struct d3d11_mem *find_mem( cl_mem handle )
++{
++    struct d3d11_mem *mem;
++
++    LIST_FOR_EACH_ENTRY( mem, &d3d11_mems, struct d3d11_mem, entry )
++        if (mem->mem == handle) return mem;
++    return NULL;
++}
++
++/* the application released a context: free it once only our reference is left */
++void d3d11_context_released( cl_context handle )
++{
++    struct d3d11_context *context;
++
++    if (!ReadNoFence( &d3d11_objects )) return;
++    EnterCriticalSection( &d3d11_cs );
++    if ((context = find_context( handle ))) context->released = TRUE;
++    LeaveCriticalSection( &d3d11_cs );
++    if (context) release_unused_objects();
++}
++
++void d3d11_mem_released( cl_mem handle )
++{
++    struct d3d11_mem *mem;
++
++    if (!ReadNoFence( &d3d11_objects )) return;
++    EnterCriticalSection( &d3d11_cs );
++    if ((mem = find_mem( handle ))) mem->released = TRUE;
++    LeaveCriticalSection( &d3d11_cs );
++    if (mem) release_unused_objects();
++}
++
++static cl_int check_context_devices( cl_context context, const struct gpu_id *adapter )
++{
++    struct clGetContextInfo_params params = { context, CL_CONTEXT_DEVICES, 0, NULL, NULL };
++    cl_device_id *devices;
++    size_t size, i;
++    cl_int ret;
++
++    params.param_value_size_ret = &size;
++    if ((ret = OPENCL_CALL( clGetContextInfo, &params ))) return ret;
++    if (!(devices = malloc( size ))) return CL_OUT_OF_HOST_MEMORY;
++    params.param_value_size = size;
++    params.param_value = devices;
++    params.param_value_size_ret = NULL;
++    if (!(ret = OPENCL_CALL( clGetContextInfo, &params )))
++    {
++        for (i = 0; i < size / sizeof(*devices); i++)
++        {
++            if (device_matches_adapter( devices[i], adapter )) continue;
++            WARN( "device %p cannot interoperate with the D3D11 device\n", devices[i] );
++            ret = CL_INVALID_D3D11_DEVICE_KHR;
++            break;
++        }
++    }
++    free( devices );
++    return ret;
++}
++
++/* clCreateContext and clCreateContextFromType: CL_CONTEXT_D3D11_DEVICE_KHR is ours, the host never sees it */
++cl_context d3d11_create_context( const cl_context_properties *properties, cl_uint num_devices,
++                                 const cl_device_id *devices, cl_device_type device_type, BOOL from_type,
++                                 void (WINAPI *pfn_notify)(const char *, const void *, size_t, void *),
++                                 void *user_data, cl_int *errcode_ret )
++{
++    cl_context_properties *host_properties = NULL;
++    const cl_context_properties *props = properties;
++    struct d3d11_context *record = NULL;
++    ID3D11Device *device = NULL;
++    IDXGIAdapter *adapter;
++    struct gpu_id id;
++    cl_context context = NULL;
++    cl_int ret = CL_SUCCESS;
++    size_t i, n = 0;
++    BOOL seen = FALSE;
++
++    if (d3d11_sharing_enabled() && properties)
++    {
++        for (i = 0; properties[i]; i += 2) ;
++        if (!(host_properties = malloc( (i + 1) * sizeof(*host_properties) )))
++        {
++            ret = CL_OUT_OF_HOST_MEMORY;
++            goto done;
++        }
++        for (i = 0; properties[i]; i += 2)
++        {
++            if (properties[i] == CL_CONTEXT_D3D11_DEVICE_KHR)
++            {
++                if (seen)
++                {
++                    ret = CL_INVALID_PROPERTY;
++                    goto done;
++                }
++                seen = TRUE;
++                if (properties[i + 1] && FAILED(IUnknown_QueryInterface( (IUnknown *)properties[i + 1],
++                                                                         &IID_ID3D11Device, (void **)&device )))
++                {
++                    WARN( "%p is not a D3D11 device\n", (void *)properties[i + 1] );
++                    ret = CL_INVALID_D3D11_DEVICE_KHR;
++                    goto done;
++                }
++                continue;
++            }
++            /* acquire and release are complete when they return, so the application's choice changes nothing */
++            if (properties[i] == CL_CONTEXT_INTEROP_USER_SYNC) continue;
++            host_properties[n++] = properties[i];
++            host_properties[n++] = properties[i + 1];
++        }
++        host_properties[n] = 0;
++        if (seen) props = host_properties;
++    }
++
++    if (from_type)
++    {
++        struct clCreateContextFromType_params params = { &context, props, device_type, pfn_notify, user_data, &ret };
++        OPENCL_CALL( clCreateContextFromType, &params );
++    }
++    else
++    {
++        struct clCreateContext_params params = { &context, props, num_devices, devices, pfn_notify, user_data, &ret };
++        OPENCL_CALL( clCreateContext, &params );
++    }
++    if (!context || !device) goto done;
++
++    if (!(adapter = get_d3d11_device_adapter( device )))
++    {
++        ret = CL_INVALID_D3D11_DEVICE_KHR;
++        goto done;
++    }
++    get_adapter_id( adapter, &id );
++    IDXGIAdapter_Release( adapter );
++    if ((ret = check_context_devices( context, &id ))) goto done;
++
++    if (!(record = calloc( 1, sizeof(*record) )))
++    {
++        ret = CL_OUT_OF_HOST_MEMORY;
++        goto done;
++    }
++    record->context = context;
++    record->device = device;
++    ID3D11Device_GetImmediateContext( device, &record->immediate );
++    /* our copies go through the application's immediate context, possibly from another thread than its own
++     * D3D11 work: turn on the D3D11 runtime's own locking (ID3D11Multithread) and take it around each use */
++    if (FAILED(ID3D11DeviceContext_QueryInterface( record->immediate, &IID_ID3D11Multithread,
++                                                   (void **)&record->multithread ))
++            && FAILED(ID3D11Device_QueryInterface( device, &IID_ID3D10Multithread, (void **)&record->multithread )))
++        record->multithread = NULL;
++    if (record->multithread) ID3D11Multithread_SetMultithreadProtected( record->multithread, TRUE );
++    else WARN( "no ID3D11Multithread, D3D11 copies are not serialized with the application\n" );
++
++    InterlockedIncrement( &d3d11_objects );
++    EnterCriticalSection( &d3d11_cs );
++    list_add_tail( &d3d11_contexts, &record->entry );
++    LeaveCriticalSection( &d3d11_cs );
++    TRACE( "context %p shares with D3D11 device %p\n", context, device );
++    device = NULL;
++
++done:
++    if (ret && context)
++    {
++        host_release_context( context );
++        context = NULL;
++    }
++    else if (context && record)
++    {
++        /* the reference that keeps the context, and our record of it, alive until we free it */
++        struct clRetainContext_params params = { context };
++        OPENCL_CALL( clRetainContext, &params );
++    }
++    if (device) ID3D11Device_Release( device );
++    free( host_properties );
++    if (errcode_ret) *errcode_ret = ret;
++    return context;
++}
++
++static const cl_image_format *get_image_format( DXGI_FORMAT format )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(format_table); i++)
++        if (format_table[i].dxgi == format) return &format_table[i].cl;
++    return NULL;
++}
++
++static IUnknown *get_iunknown( void *object )
++{
++    IUnknown *unknown;
++
++    if (FAILED(IUnknown_QueryInterface( (IUnknown *)object, &IID_IUnknown, (void **)&unknown ))) return NULL;
++    IUnknown_Release( unknown );
++    return unknown;
++}
++
++static cl_mem create_d3d11_mem( cl_context handle, cl_mem_flags flags, void *app_resource,
++                                D3D11_RESOURCE_DIMENSION dimension, UINT subresource, cl_int *errcode_ret )
++{
++    const cl_image_format *format = NULL;
++    struct d3d11_context *context;
++    ID3D11Resource *resource = NULL;
++    ID3D11Device *resource_device;
++    D3D11_RESOURCE_DIMENSION type;
++    struct d3d11_mem *mem = NULL;
++    cl_image_desc desc = {0};
++    cl_mem handle_mem = NULL;
++    cl_int ret = CL_SUCCESS;
++    UINT mip = 0;
++
++    release_unused_objects();
++
++    EnterCriticalSection( &d3d11_cs );
++    if ((context = find_context( handle ))) context->mems++;
++    LeaveCriticalSection( &d3d11_cs );
++    if (!context)
++    {
++        ret = CL_INVALID_CONTEXT;
++        goto done;
++    }
++
++    if (flags && flags != CL_MEM_READ_WRITE && flags != CL_MEM_READ_ONLY && flags != CL_MEM_WRITE_ONLY)
++    {
++        ret = CL_INVALID_VALUE;
++        goto done;
++    }
++    if (!app_resource || FAILED(IUnknown_QueryInterface( (IUnknown *)app_resource, &IID_ID3D11Resource,
++                                                         (void **)&resource )))
++    {
++        resource = NULL;
++        ret = CL_INVALID_D3D11_RESOURCE_KHR;
++        goto done;
++    }
++    ID3D11Resource_GetType( resource, &type );
++    ID3D11Resource_GetDevice( resource, &resource_device );
++    if (get_iunknown( resource_device ) != get_iunknown( context->device ))
++    {
++        WARN( "resource %p belongs to another D3D11 device\n", app_resource );
++        type = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++    }
++    ID3D11Device_Release( resource_device );
++    if (type != dimension)
++    {
++        ret = CL_INVALID_D3D11_RESOURCE_KHR;
++        goto done;
++    }
++
++    if (!(mem = calloc( 1, sizeof(*mem) )))
++    {
++        ret = CL_OUT_OF_HOST_MEMORY;
++        goto done;
++    }
++    mem->context = context;
++    mem->app_resource = app_resource;
++    mem->dimension = dimension;
++    mem->subresource = subresource;
++    mem->depth = 1;
++
++    switch (dimension)
++    {
++    case D3D11_RESOURCE_DIMENSION_BUFFER:
++    {
++        D3D11_BUFFER_DESC buffer_desc;
++
++        ID3D11Buffer_GetDesc( (ID3D11Buffer *)resource, &buffer_desc );
++        mem->usage = buffer_desc.Usage;
++        mem->size = buffer_desc.ByteWidth;
++        break;
++    }
++    case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
++    {
++        D3D11_TEXTURE2D_DESC texture_desc;
++
++        ID3D11Texture2D_GetDesc( (ID3D11Texture2D *)resource, &texture_desc );
++        mem->usage = texture_desc.Usage;
++        if (texture_desc.SampleDesc.Count > 1)
++        {
++            ret = CL_INVALID_D3D11_RESOURCE_KHR;
++            goto done;
++        }
++        if (subresource >= texture_desc.MipLevels * texture_desc.ArraySize)
++        {
++            ret = CL_INVALID_VALUE;
++            goto done;
++        }
++        mip = subresource % texture_desc.MipLevels;
++        mem->width = max( 1, texture_desc.Width >> mip );
++        mem->height = max( 1, texture_desc.Height >> mip );
++        format = get_image_format( texture_desc.Format );
++        desc.image_type = CL_MEM_OBJECT_IMAGE2D;
++        break;
++    }
++    case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
++    {
++        D3D11_TEXTURE3D_DESC texture_desc;
++
++        ID3D11Texture3D_GetDesc( (ID3D11Texture3D *)resource, &texture_desc );
++        mem->usage = texture_desc.Usage;
++        if (subresource >= texture_desc.MipLevels)
++        {
++            ret = CL_INVALID_VALUE;
++            goto done;
++        }
++        mem->width = max( 1, texture_desc.Width >> subresource );
++        mem->height = max( 1, texture_desc.Height >> subresource );
++        mem->depth = max( 1, texture_desc.Depth >> subresource );
++        format = get_image_format( texture_desc.Format );
++        desc.image_type = CL_MEM_OBJECT_IMAGE3D;
++        break;
++    }
++    default:
++        break;
++    }
++    if (mem->usage == D3D11_USAGE_IMMUTABLE)
++    {
++        ret = CL_INVALID_D3D11_RESOURCE_KHR;
++        goto done;
++    }
++
++    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        struct clCreateBuffer_params params = { &handle_mem, handle, flags, mem->size, NULL, &ret };
++        OPENCL_CALL( clCreateBuffer, &params );
++    }
++    else if (!format)
++    {
++        ret = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
++    }
++    else
++    {
++        struct clCreateImage_params params = { &handle_mem, handle, flags, format, &desc, NULL, &ret };
++
++        desc.image_width = mem->width;
++        desc.image_height = mem->height;
++        desc.image_depth = dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? mem->depth : 0;
++        OPENCL_CALL( clCreateImage, &params );
++    }
++    if (!ret && !handle_mem) ret = CL_OUT_OF_RESOURCES;
++    if (ret) goto done;
++
++    {
++        /* the reference that keeps the object, and our record of it, alive until we free it */
++        struct clRetainMemObject_params params = { handle_mem };
++        OPENCL_CALL( clRetainMemObject, &params );
++    }
++    mem->mem = handle_mem;
++    mem->resource = resource;
++    resource = NULL;
++    InterlockedIncrement( &d3d11_objects );
++    EnterCriticalSection( &d3d11_cs );
++    list_add_tail( &d3d11_mems, &mem->entry );
++    LeaveCriticalSection( &d3d11_cs );
++    TRACE( "memory object %p shares D3D11 resource %p subresource %u\n", handle_mem, app_resource, subresource );
++    mem = NULL;
++
++done:
++    if (ret && handle_mem)
++    {
++        host_release_mem( handle_mem );
++        handle_mem = NULL;
++    }
++    if (!handle_mem && context)
++    {
++        EnterCriticalSection( &d3d11_cs );
++        context->mems--;
++        LeaveCriticalSection( &d3d11_cs );
++    }
++    free( mem );
++    if (resource) ID3D11Resource_Release( resource );
++    if (errcode_ret) *errcode_ret = ret;
++    return handle_mem;
++}
++
++static cl_mem WINAPI clCreateFromD3D11BufferKHR( cl_context context, cl_mem_flags flags, ID3D11Buffer *resource,
++                                                 cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %p)\n", context, wine_dbgstr_longlong(flags), resource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_BUFFER, 0, errcode_ret );
++}
++
++static cl_mem WINAPI clCreateFromD3D11Texture2DKHR( cl_context context, cl_mem_flags flags, ID3D11Texture2D *resource,
++                                                    UINT subresource, cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %u, %p)\n", context, wine_dbgstr_longlong(flags), resource, subresource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE2D, subresource, errcode_ret );
++}
++
++static cl_mem WINAPI clCreateFromD3D11Texture3DKHR( cl_context context, cl_mem_flags flags, ID3D11Texture3D *resource,
++                                                    UINT subresource, cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %u, %p)\n", context, wine_dbgstr_longlong(flags), resource, subresource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE3D, subresource, errcode_ret );
++}
++
++static void lock_d3d11( struct d3d11_context *context )
++{
++    if (context->multithread) ID3D11Multithread_Enter( context->multithread );
++}
++
++static void unlock_d3d11( struct d3d11_context *context )
++{
++    if (context->multithread) ID3D11Multithread_Leave( context->multithread );
++}
++
++static HRESULT create_staging( struct d3d11_mem *mem )
++{
++    ID3D11Device *device = mem->context->device;
++    HRESULT hr = E_FAIL;
++
++    switch (mem->dimension)
++    {
++    case D3D11_RESOURCE_DIMENSION_BUFFER:
++    {
++        D3D11_BUFFER_DESC desc;
++
++        ID3D11Buffer_GetDesc( (ID3D11Buffer *)mem->resource, &desc );
++        desc.Usage = D3D11_USAGE_STAGING;
++        desc.BindFlags = 0;
++        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
++        desc.MiscFlags &= D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
++        hr = ID3D11Device_CreateBuffer( device, &desc, NULL, (ID3D11Buffer **)&mem->staging );
++        break;
++    }
++    case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
++    {
++        D3D11_TEXTURE2D_DESC desc;
++
++        ID3D11Texture2D_GetDesc( (ID3D11Texture2D *)mem->resource, &desc );
++        desc.Width = mem->width;
++        desc.Height = mem->height;
++        desc.MipLevels = desc.ArraySize = 1;
++        desc.Usage = D3D11_USAGE_STAGING;
++        desc.BindFlags = 0;
++        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
++        desc.MiscFlags = 0;
++        hr = ID3D11Device_CreateTexture2D( device, &desc, NULL, (ID3D11Texture2D **)&mem->staging );
++        break;
++    }
++    case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
++    {
++        D3D11_TEXTURE3D_DESC desc;
++
++        ID3D11Texture3D_GetDesc( (ID3D11Texture3D *)mem->resource, &desc );
++        desc.Width = mem->width;
++        desc.Height = mem->height;
++        desc.Depth = mem->depth;
++        desc.MipLevels = 1;
++        desc.Usage = D3D11_USAGE_STAGING;
++        desc.BindFlags = 0;
++        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
++        desc.MiscFlags = 0;
++        hr = ID3D11Device_CreateTexture3D( device, &desc, NULL, (ID3D11Texture3D **)&mem->staging );
++        break;
++    }
++    default:
++        break;
++    }
++    if (FAILED(hr))
++    {
++        ERR( "failed to create a staging resource for %p, hr %#lx\n", mem->app_resource, hr );
++        mem->staging = NULL;
++    }
++    return hr;
++}
++
++static cl_int write_host_mem( cl_command_queue queue, struct d3d11_mem *mem, const D3D11_MAPPED_SUBRESOURCE *map,
++                              cl_uint num_events, const cl_event *events )
++{
++    if (mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        struct clEnqueueWriteBuffer_params params = { queue, mem->mem, CL_TRUE, 0, mem->size, map->pData,
++                                                      num_events, events, NULL };
++        return OPENCL_CALL( clEnqueueWriteBuffer, &params );
++    }
++    else
++    {
++        size_t origin[3] = {0, 0, 0}, region[3] = {mem->width, mem->height, mem->depth};
++        size_t slice_pitch = mem->dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? map->DepthPitch : 0;
++        struct clEnqueueWriteImage_params params = { queue, mem->mem, CL_TRUE, origin, region, map->RowPitch,
++                                                     slice_pitch, map->pData, num_events, events, NULL };
++        return OPENCL_CALL( clEnqueueWriteImage, &params );
++    }
++}
++
++static cl_int read_host_mem( cl_command_queue queue, struct d3d11_mem *mem, const D3D11_MAPPED_SUBRESOURCE *map,
++                             cl_uint num_events, const cl_event *events )
++{
++    if (mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        struct clEnqueueReadBuffer_params params = { queue, mem->mem, CL_TRUE, 0, mem->size, map->pData,
++                                                     num_events, events, NULL };
++        return OPENCL_CALL( clEnqueueReadBuffer, &params );
++    }
++    else
++    {
++        size_t origin[3] = {0, 0, 0}, region[3] = {mem->width, mem->height, mem->depth};
++        size_t slice_pitch = mem->dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? map->DepthPitch : 0;
++        struct clEnqueueReadImage_params params = { queue, mem->mem, CL_TRUE, origin, region, map->RowPitch,
++                                                    slice_pitch, map->pData, num_events, events, NULL };
++        return OPENCL_CALL( clEnqueueReadImage, &params );
++    }
++}
++
++/* acquire: D3D11 resource -> staging -> host object */
++static cl_int copy_to_host( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events, const cl_event *events )
++{
++    struct d3d11_context *context = mem->context;
++    D3D11_MAPPED_SUBRESOURCE map;
++    HRESULT hr;
++    cl_int ret;
++
++    if (!mem->staging && FAILED(create_staging( mem ))) return CL_OUT_OF_RESOURCES;
++
++    lock_d3d11( context );
++    ID3D11DeviceContext_CopySubresourceRegion( context->immediate, mem->staging, 0, 0, 0, 0,
++                                               mem->resource, mem->subresource, NULL );
++    hr = ID3D11DeviceContext_Map( context->immediate, mem->staging, 0, D3D11_MAP_READ, 0, &map );
++    unlock_d3d11( context );
++    if (FAILED(hr))
++    {
++        ERR( "failed to map the staging resource of %p, hr %#lx\n", mem->app_resource, hr );
++        return CL_OUT_OF_RESOURCES;
++    }
++
++    ret = write_host_mem( queue, mem, &map, num_events, events );
++
++    lock_d3d11( context );
++    ID3D11DeviceContext_Unmap( context->immediate, mem->staging, 0 );
++    unlock_d3d11( context );
++    return ret;
++}
++
++/* release: host object -> staging -> D3D11 resource; a dynamic resource takes the data directly */
++static cl_int copy_from_host( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events, const cl_event *events )
++{
++    struct d3d11_context *context = mem->context;
++    BOOL dynamic = mem->usage == D3D11_USAGE_DYNAMIC;
++    ID3D11Resource *target = dynamic ? mem->resource : mem->staging;
++    UINT target_sub = dynamic ? mem->subresource : 0;
++    D3D11_MAPPED_SUBRESOURCE map;
++    HRESULT hr;
++    cl_int ret;
++
++    if (!target) return CL_OUT_OF_RESOURCES;
++
++    lock_d3d11( context );
++    hr = ID3D11DeviceContext_Map( context->immediate, target, target_sub,
++                                  dynamic ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE, 0, &map );
++    unlock_d3d11( context );
++    if (FAILED(hr))
++    {
++        ERR( "failed to map %p for writing, hr %#lx\n", mem->app_resource, hr );
++        return CL_OUT_OF_RESOURCES;
++    }
++
++    ret = read_host_mem( queue, mem, &map, num_events, events );
++
++    lock_d3d11( context );
++    ID3D11DeviceContext_Unmap( context->immediate, target, target_sub );
++    if (!ret && !dynamic)
++        ID3D11DeviceContext_CopySubresourceRegion( context->immediate, mem->resource, mem->subresource, 0, 0, 0,
++                                                   mem->staging, 0, NULL );
++    unlock_d3d11( context );
++    return ret;
++}
++
++static cl_int enqueue_d3d11_objects( cl_command_queue queue, cl_uint num_objects, const cl_mem *mem_objects,
++                                     cl_uint num_events, const cl_event *events, cl_event *event, BOOL acquire )
++{
++    struct clGetCommandQueueInfo_params info = { queue, CL_QUEUE_CONTEXT, sizeof(cl_context), NULL, NULL };
++    struct d3d11_mem **mems = NULL;
++    cl_context handle;
++    cl_uint i, j, done = 0;
++    cl_int ret;
++
++    if ((!num_objects && mem_objects) || (num_objects && !mem_objects)) return CL_INVALID_VALUE;
++    if ((!num_events && events) || (num_events && !events)) return CL_INVALID_EVENT_WAIT_LIST;
++    info.param_value = &handle;
++    if ((ret = OPENCL_CALL( clGetCommandQueueInfo, &info ))) return ret;
++    if (num_objects && !(mems = calloc( num_objects, sizeof(*mems) ))) return CL_OUT_OF_HOST_MEMORY;
++
++    EnterCriticalSection( &d3d11_cs );
++    if (!find_context( handle )) ret = CL_INVALID_CONTEXT;
++    for (i = 0; !ret && i < num_objects; i++)
++    {
++        if (!(mems[i] = find_mem( mem_objects[i] ))) ret = CL_INVALID_MEM_OBJECT;
++        else if (mems[i]->context->context != handle) ret = CL_INVALID_CONTEXT;
++        else if (acquire && mems[i]->acquired) ret = CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR;
++        else if (!acquire && !mems[i]->acquired) ret = CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
++        for (j = 0; !ret && j < i; j++)
++            if (mems[j] == mems[i]) ret = acquire ? CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR : CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
++    }
++    /* no other acquire or release of these objects can start until we are done */
++    for (i = 0; !ret && i < num_objects; i++) mems[i]->acquired = !mems[i]->acquired;
++    LeaveCriticalSection( &d3d11_cs );
++    if (ret)
++    {
++        free( mems );
++        return ret;
++    }
++
++    for (done = 0; done < num_objects; done++)
++    {
++        /* the wait list applies to the first copy, each copy is complete before the next one starts */
++        if (acquire) ret = copy_to_host( queue, mems[done], done ? 0 : num_events, done ? NULL : events );
++        else ret = copy_from_host( queue, mems[done], done ? 0 : num_events, done ? NULL : events );
++        if (ret) break;
++    }
++
++    if (ret)
++    {
++        WARN( "%s failed for %p, error %d\n", acquire ? "acquire" : "release", mem_objects[done], ret );
++        EnterCriticalSection( &d3d11_cs );
++        for (i = 0; i < num_objects; i++) mems[i]->acquired = !mems[i]->acquired;
++        LeaveCriticalSection( &d3d11_cs );
++    }
++    else if (event)
++    {
++        struct clEnqueueMarkerWithWaitList_params params = { queue, num_objects ? 0 : num_events,
++                                                             num_objects ? NULL : events, event };
++        ret = OPENCL_CALL( clEnqueueMarkerWithWaitList, &params );
++    }
++    else if (!num_objects && num_events)
++    {
++        struct clEnqueueMarkerWithWaitList_params params = { queue, num_events, events, NULL };
++        ret = OPENCL_CALL( clEnqueueMarkerWithWaitList, &params );
++    }
++    free( mems );
++    return ret;
++}
++
++static cl_int WINAPI clEnqueueAcquireD3D11ObjectsKHR( cl_command_queue queue, cl_uint num_objects,
++                                                      const cl_mem *mem_objects, cl_uint num_events,
++                                                      const cl_event *events, cl_event *event )
++{
++    TRACE( "(%p, %u, %p, %u, %p, %p)\n", queue, num_objects, mem_objects, num_events, events, event );
++    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, TRUE );
++}
++
++static cl_int WINAPI clEnqueueReleaseD3D11ObjectsKHR( cl_command_queue queue, cl_uint num_objects,
++                                                      const cl_mem *mem_objects, cl_uint num_events,
++                                                      const cl_event *events, cl_event *event )
++{
++    TRACE( "(%p, %u, %p, %u, %p, %p)\n", queue, num_objects, mem_objects, num_events, events, event );
++    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, FALSE );
++}
++
++static cl_int return_pointer( void *ptr, size_t size, void *value, size_t *ret_size )
++{
++    if (ret_size) *ret_size = sizeof(ptr);
++    if (!value) return CL_SUCCESS;
++    if (size < sizeof(ptr)) return CL_INVALID_VALUE;
++    memcpy( value, &ptr, sizeof(ptr) );
++    return CL_SUCCESS;
++}
++
++/* CL_MEM_D3D11_RESOURCE_KHR and CL_IMAGE_D3D11_SUBRESOURCE_KHR; FALSE for every other query */
++BOOL d3d11_get_mem_info( cl_mem handle, cl_uint name, size_t size, void *value, size_t *ret_size, cl_int *ret )
++{
++    struct d3d11_mem *mem;
++
++    if (!d3d11_sharing_enabled()) return FALSE;
++    if (name != CL_MEM_D3D11_RESOURCE_KHR && name != CL_IMAGE_D3D11_SUBRESOURCE_KHR) return FALSE;
++
++    EnterCriticalSection( &d3d11_cs );
++    if (!(mem = find_mem( handle )) || (name == CL_IMAGE_D3D11_SUBRESOURCE_KHR
++                                        && mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER))
++        *ret = CL_INVALID_D3D11_RESOURCE_KHR;
++    else if (name == CL_MEM_D3D11_RESOURCE_KHR)
++        *ret = return_pointer( mem->app_resource, size, value, ret_size );
++    else
++    {
++        if (ret_size) *ret_size = sizeof(UINT);
++        if (value && size < sizeof(UINT)) *ret = CL_INVALID_VALUE;
++        else
++        {
++            if (value) memcpy( value, &mem->subresource, sizeof(UINT) );
++            *ret = CL_SUCCESS;
++        }
++    }
++    LeaveCriticalSection( &d3d11_cs );
++    return TRUE;
++}
++
++void *d3d11_get_extension_function( const char *name )
++{
++    static const struct
++    {
++        const char *name;
++        void *func;
++    }
++    functions[] =
++    {
++        {"clCreateFromD3D11BufferKHR", clCreateFromD3D11BufferKHR},
++        {"clCreateFromD3D11Texture2DKHR", clCreateFromD3D11Texture2DKHR},
++        {"clCreateFromD3D11Texture3DKHR", clCreateFromD3D11Texture3DKHR},
++        {"clEnqueueAcquireD3D11ObjectsKHR", clEnqueueAcquireD3D11ObjectsKHR},
++        {"clEnqueueReleaseD3D11ObjectsKHR", clEnqueueReleaseD3D11ObjectsKHR},
++        {"clGetDeviceIDsFromD3D11KHR", clGetDeviceIDsFromD3D11KHR},
++    };
++    unsigned int i;
++
++    if (!name || !d3d11_sharing_enabled()) return NULL;
++    for (i = 0; i < ARRAY_SIZE(functions); i++)
++        if (!strcmp( name, functions[i].name )) return functions[i].func;
++    return NULL;
++}
++
++/* cl_khr_d3d11_sharing is listed for GPU devices, and for platforms that have one */
++BOOL d3d11_device_has_sharing( cl_device_id device )
++{
++    cl_device_type type = 0;
++
++    if (!d3d11_sharing_enabled()) return FALSE;
++    return !host_device_info( device, CL_DEVICE_TYPE, sizeof(type), &type ) && (type & CL_DEVICE_TYPE_GPU);
++}
++
++BOOL d3d11_platform_has_sharing( cl_platform_id platform )
++{
++    struct clGetDeviceIDs_params params = { platform, CL_DEVICE_TYPE_GPU, 0, NULL, NULL };
++    cl_uint count = 0;
++
++    if (!d3d11_sharing_enabled()) return FALSE;
++    params.num_devices = &count;
++    return !OPENCL_CALL( clGetDeviceIDs, &params ) && count;
++}
+--- a/dlls/opencl/pe_thunks.c
++++ b/dlls/opencl/pe_thunks.c
+@@ -47,24 +47,6 @@
+     return __retval;
+ }
+ 
+-cl_context WINAPI clCreateContext( const cl_context_properties* properties, cl_uint num_devices, const cl_device_id* devices, void (WINAPI* pfn_notify)(const char* errinfo, const void* private_info, size_t cb, void* user_data), void* user_data, cl_int* errcode_ret )
+-{
+-    cl_context __retval;
+-    struct clCreateContext_params params = { &__retval, properties, num_devices, devices, pfn_notify, user_data, errcode_ret };
+-    TRACE( "(%p, %u, %p, %p, %p, %p)\n", properties, num_devices, devices, pfn_notify, user_data, errcode_ret );
+-    OPENCL_CALL( clCreateContext, &params );
+-    return __retval;
+-}
+-
+-cl_context WINAPI clCreateContextFromType( const cl_context_properties* properties, cl_device_type device_type, void (WINAPI* pfn_notify)(const char* errinfo, const void* private_info, size_t cb, void* user_data), void* user_data, cl_int* errcode_ret )
+-{
+-    cl_context __retval;
+-    struct clCreateContextFromType_params params = { &__retval, properties, device_type, pfn_notify, user_data, errcode_ret };
+-    TRACE( "(%p, %s, %p, %p, %p)\n", properties, wine_dbgstr_longlong(device_type), pfn_notify, user_data, errcode_ret );
+-    OPENCL_CALL( clCreateContextFromType, &params );
+-    return __retval;
+-}
+-
+ cl_mem WINAPI clCreateImage( cl_context context, cl_mem_flags flags, const cl_image_format* image_format, const cl_image_desc* image_desc, void* host_ptr, cl_int* errcode_ret )
+ {
+     cl_mem __retval;
+@@ -397,13 +379,6 @@
+     return OPENCL_CALL( clGetEventProfilingInfo, &params );
+ }
+ 
+-cl_int WINAPI clGetImageInfo( cl_mem image, cl_image_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+-{
+-    struct clGetImageInfo_params params = { image, param_name, param_value_size, param_value, param_value_size_ret };
+-    TRACE( "(%p, %u, %Iu, %p, %p)\n", image, param_name, param_value_size, param_value, param_value_size_ret );
+-    return OPENCL_CALL( clGetImageInfo, &params );
+-}
+-
+ cl_int WINAPI clGetKernelArgInfo( cl_kernel kernel, cl_uint arg_index, cl_kernel_arg_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+ {
+     struct clGetKernelArgInfo_params params = { kernel, arg_index, param_name, param_value_size, param_value, param_value_size_ret };
+@@ -425,13 +400,6 @@
+     return OPENCL_CALL( clGetKernelWorkGroupInfo, &params );
+ }
+ 
+-cl_int WINAPI clGetMemObjectInfo( cl_mem memobj, cl_mem_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret )
+-{
+-    struct clGetMemObjectInfo_params params = { memobj, param_name, param_value_size, param_value, param_value_size_ret };
+-    TRACE( "(%p, %u, %Iu, %p, %p)\n", memobj, param_name, param_value_size, param_value, param_value_size_ret );
+-    return OPENCL_CALL( clGetMemObjectInfo, &params );
+-}
+-
+ cl_int WINAPI clGetPlatformIDs( cl_uint num_entries, cl_platform_id* platforms, cl_uint* num_platforms )
+ {
+     struct clGetPlatformIDs_params params = { num_entries, platforms, num_platforms };
+@@ -483,13 +451,6 @@
+     return OPENCL_CALL( clReleaseCommandQueue, &params );
+ }
+ 
+-cl_int WINAPI clReleaseContext( cl_context context )
+-{
+-    struct clReleaseContext_params params = { context };
+-    TRACE( "(%p)\n", context );
+-    return OPENCL_CALL( clReleaseContext, &params );
+-}
+-
+ cl_int WINAPI clReleaseDevice( cl_device_id device )
+ {
+     struct clReleaseDevice_params params = { device };
+@@ -511,13 +472,6 @@
+     return OPENCL_CALL( clReleaseKernel, &params );
+ }
+ 
+-cl_int WINAPI clReleaseMemObject( cl_mem memobj )
+-{
+-    struct clReleaseMemObject_params params = { memobj };
+-    TRACE( "(%p)\n", memobj );
+-    return OPENCL_CALL( clReleaseMemObject, &params );
+-}
+-
+ cl_int WINAPI clReleaseProgram( cl_program program )
+ {
+     struct clReleaseProgram_params params = { program };
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -25,7 +25,20 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
+-static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size )
++/* cl_khr_d3d11_sharing, pe_d3d11.c */
++extern BOOL d3d11_device_has_sharing( cl_device_id device );
++extern BOOL d3d11_platform_has_sharing( cl_platform_id platform );
++extern void *d3d11_get_extension_function( const char *name );
++extern cl_context d3d11_create_context( const cl_context_properties *properties, cl_uint num_devices,
++        const cl_device_id *devices, cl_device_type device_type, BOOL from_type,
++        void (WINAPI *pfn_notify)(const char *, const void *, size_t, void *), void *user_data, cl_int *errcode_ret );
++extern void d3d11_context_released( cl_context context );
++extern void d3d11_mem_released( cl_mem mem );
++extern BOOL d3d11_get_mem_info( cl_mem mem, cl_uint name, size_t size, void *value, size_t *ret_size, cl_int *ret );
++
++static const char d3d11_sharing[] = "cl_khr_d3d11_sharing";
++
++static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size, BOOL d3d11 )
+ {
+     char *p = win_exts;
+     const char *ext;
+@@ -47,6 +60,7 @@
+         if (*end == ' ') ++end;
+         ext = end;
+     }
++    if (d3d11) win_size += sizeof(d3d11_sharing);
+ 
+     if (ret_size) *ret_size = win_size;
+     if (!win_exts) return CL_SUCCESS;
+@@ -72,6 +86,12 @@
+         if (*end == ' ') ++end;
+         ext = end;
+     }
++    if (d3d11)
++    {
++        if (p != win_exts) *p++ = ' ';
++        memcpy( p, d3d11_sharing, sizeof(d3d11_sharing) - 1 );
++        p += sizeof(d3d11_sharing) - 1;
++    }
+     *p = 0;
+ 
+     TRACE( "returning extension string %s\n", debugstr_a(win_exts) );
+@@ -108,7 +128,7 @@
+             return ret;
+         }
+ 
+-        ret = filter_extensions( unix_exts, size, value, ret_size );
++        ret = filter_extensions( unix_exts, size, value, ret_size, d3d11_platform_has_sharing( platform ) );
+ 
+         free( unix_exts );
+     }
+@@ -151,7 +171,7 @@
+             return ret;
+         }
+ 
+-        ret = filter_extensions( unix_exts, size, value, ret_size );
++        ret = filter_extensions( unix_exts, size, value, ret_size, d3d11_device_has_sharing( device ) );
+ 
+         free( unix_exts );
+     }
+@@ -176,11 +196,8 @@
+ {
+     void * ret = 0;
+     TRACE("(%s)\n",func_name);
+-#if 0
+-    ret = clGetExtensionFunctionAddress(func_name);
+-#else
+-    FIXME("extensions not implemented\n");
+-#endif
++    if (!(ret = d3d11_get_extension_function( func_name )))
++        FIXME("extension %s not implemented\n", debugstr_a(func_name));
+     TRACE("(%s)=%p\n",func_name, ret);
+     return ret;
+ }
+@@ -196,8 +213,79 @@
+ 
+ void * WINAPI clGetExtensionFunctionAddressForPlatform( cl_platform_id platform, const char *func_name )
+ {
+-    FIXME( "(%p, %s) stub!\n", platform, debugstr_a(func_name) );
+-    return NULL;
++    void *ret;
++
++    TRACE( "(%p, %s)\n", platform, debugstr_a(func_name) );
++
++    if (!(ret = d3d11_get_extension_function( func_name )))
++        FIXME( "(%p, %s) stub!\n", platform, debugstr_a(func_name) );
++    return ret;
++}
++
++
++cl_context WINAPI clCreateContext( const cl_context_properties *properties, cl_uint num_devices,
++        const cl_device_id *devices, void (WINAPI *pfn_notify)(const char *errinfo, const void *private_info,
++        size_t cb, void *user_data), void *user_data, cl_int *errcode_ret )
++{
++    TRACE( "(%p, %u, %p, %p, %p, %p)\n", properties, num_devices, devices, pfn_notify, user_data, errcode_ret );
++    return d3d11_create_context( properties, num_devices, devices, 0, FALSE, pfn_notify, user_data, errcode_ret );
++}
++
++
++cl_context WINAPI clCreateContextFromType( const cl_context_properties *properties, cl_device_type device_type,
++        void (WINAPI *pfn_notify)(const char *errinfo, const void *private_info, size_t cb, void *user_data),
++        void *user_data, cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %p, %p)\n", properties, wine_dbgstr_longlong(device_type), pfn_notify, user_data, errcode_ret );
++    return d3d11_create_context( properties, 0, NULL, device_type, TRUE, pfn_notify, user_data, errcode_ret );
++}
++
++
++cl_int WINAPI clReleaseContext( cl_context context )
++{
++    struct clReleaseContext_params params = { context };
++    cl_int ret;
++
++    TRACE( "(%p)\n", context );
++
++    if (!(ret = OPENCL_CALL( clReleaseContext, &params ))) d3d11_context_released( context );
++    return ret;
++}
++
++
++cl_int WINAPI clReleaseMemObject( cl_mem memobj )
++{
++    struct clReleaseMemObject_params params = { memobj };
++    cl_int ret;
++
++    TRACE( "(%p)\n", memobj );
++
++    if (!(ret = OPENCL_CALL( clReleaseMemObject, &params ))) d3d11_mem_released( memobj );
++    return ret;
++}
++
++
++cl_int WINAPI clGetMemObjectInfo( cl_mem memobj, cl_mem_info name, size_t size, void *value, size_t *ret_size )
++{
++    struct clGetMemObjectInfo_params params = { memobj, name, size, value, ret_size };
++    cl_int ret;
++
++    TRACE( "(%p, %u, %Iu, %p, %p)\n", memobj, name, size, value, ret_size );
++
++    if (d3d11_get_mem_info( memobj, name, size, value, ret_size, &ret )) return ret;
++    return OPENCL_CALL( clGetMemObjectInfo, &params );
++}
++
++
++cl_int WINAPI clGetImageInfo( cl_mem image, cl_image_info name, size_t size, void *value, size_t *ret_size )
++{
++    struct clGetImageInfo_params params = { image, name, size, value, ret_size };
++    cl_int ret;
++
++    TRACE( "(%p, %u, %Iu, %p, %p)\n", image, name, size, value, ret_size );
++
++    if (d3d11_get_mem_info( image, name, size, value, ret_size, &ret )) return ret;
++    return OPENCL_CALL( clGetImageInfo, &params );
+ }
+ 
+ 
