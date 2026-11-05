@@ -1,0 +1,204 @@
+winewayland.drv: Send the button release of a press whose surface this process destroyed.
+
+Seen in the lab (CapCut 9.7, 11-03/11-04): after Escape closed the menu, the next click on "Menu" did not reopen it.
+This patch does NOT fix that symptom (see "Lab evidence"); it fixes a Windows delta found while tracing it: when
+CapCut closes its menu because the user clicked outside it, the click's WM_LBUTTONUP never reaches any window and
+Wine keeps the left button down until the next click.
+
+Mechanism: CapCut's menu is a full-window layered overlay; a click outside the menu content lands on that overlay and
+CapCut calls DestroyWindow() on the menu inside its WM_LBUTTONDOWN. The compositor holds an implicit grab on the pressed
+surface; once the client destroys that surface, KWin sends the button's release to nobody (focus updates are blocked
+while a button is held), and then sends wl_pointer.enter for the main window, which carries no button state.
+winewayland therefore never calls NtUserSendHardwareInput for the release: wineserver keeps VK_LBUTTON down, the main
+window gets WM_MOUSEMOVE with MK_LBUTTON and no WM_LBUTTONUP, and the application is left with a press that never
+ends (Qt keeps its left-button-down state until the next real press).
+
+Windows behavior: there is no implicit grab to lose; the button-up is hardware input that goes to the capture window,
+or without one to the window under the cursor (here the main window), when the button is released.
+
+Change: wayland_surface_destroy() records the buttons the driver sent down and not up while the destroyed surface had
+the pointer focus. The next pointer event from the compositor (on KWin the enter that follows the physical release; or
+a button event) first sends their release with NtUserSendHardwareInput, so wineserver routes WM_xBUTTONUP to the window
+under the cursor as on Windows. If a compositor does deliver the real release later, it is dropped, so the application
+never gets two. A new press of that button ends the wait. Upstream winewayland has the same gap.
+
+Not covered: if the pointer ends on another client's surface, the release is sent only when it next enters one of
+ours (until then GetAsyncKeyState still reports the button down). Pointer-constraint and relative-motion paths are
+unchanged.
+
+Lab evidence (desk-b, CapCut 9.7 in a PgI-capcut copy, menu opened and closed by a click on its overlay):
+- stock 11.10-181: 0 of 4 click-closes delivered a WM_LBUTTONUP (traces c2t1 x3, c2p1 x1; +waylanddrv shows no
+  wl_pointer.button release at all, then pointer enter on the main window ~49 ms after the press).
+- 11.10-181e (this patch), traced: 1 of 1 delivered: WM_LBUTTONUP to the main window 47 ms after the press (the
+  fakeptr click holds 50 ms); untraced run: the release fired 2 times for 3 click-closes (one not accounted for).
+- same build 11.10-181e with NEUTRON_PTR_RELEASE_DESTROYED=0: 0 of 2 click-closes delivered a WM_LBUTTONUP (traced c2v0; WM_MOUSEMOVE with MK_LBUTTON
+  only, gate line "= 0 (environment)"); CapCut outcome F,W,F,W (2/4).
+- CapCut's own symptom is unchanged by this patch: first-Escape outcome F,W,F,W,F,W (3/6) on 181e on, as on stock
+  181 (3/6); with every menu closed by a second Escape instead of a click, the first Escape fails 6/6 and the second
+  closes 6/6 on stock 181 -- a separate cause, not this one.
+- Photoshop/Premiere menu + Escape check on 11.10-181e: Photoshop 2026 (PgD-ps2 copy): File opened 2/2, Escape
+  closed it 2/2. Premiere 2026 (PgD-pr2 copy): cycle 1 opened File and Escape closed the dropdown (bar stays lit in
+  menu mode); in cycle 2 the click on File did NOT open it -- the menus team's open bug "after Escape, a click on a
+  menu-bar item" (team/menus/menu-bar-escape.mypatch), not this patch: its gate never evaluated in that session (no
+  "neutron-gateresolved: NEUTRON_PTR_RELEASE_DESTROYED" among 104 err:waylanddrv lines), so none of its code ran.
+  (The copy also showed Premiere's "quit unexpectedly while a project was open" toast at start, carried over from the
+  source prefix's earlier session.)
+
+Kill switch: NEUTRON_PTR_RELEASE_DESTROYED=0.
+
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -152,6 +152,9 @@
+     BOOL pending_warp;
+     uint32_t enter_serial;
+     uint32_t button_serial;
++    uint32_t buttons_down;     /* NEUTRON: bit (button - BTN_MOUSE) per button we sent down and not up yet */
++    uint32_t release_pending;  /* NEUTRON: buttons held on a surface we destroyed; the compositor will not send their up */
++    uint32_t released_early;   /* NEUTRON: buttons we released for it; their late real release is dropped */
+     struct wayland_cursor cursor;
+     double accum_x;
+     double accum_y;
+@@ -816,6 +819,7 @@
+ LRESULT WAYLAND_NotifyIcon(HWND hwnd, UINT msg, NOTIFYICONDATAW *data);
+ void WAYLAND_CleanupIcons(HWND hwnd);
+ void wayland_keyboard_release_destroyed_focus(void);
++BOOL wayland_pointer_release_destroyed_on(void);
+ NTSTATUS waylanddrv_unix_sni_run(void *arg);
+ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags);
+ void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small);
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -269,6 +269,71 @@
+ 
+ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor);
+ 
++/* NEUTRON (2026-11-04): the button release of a press whose window this process destroyed.
++ *
++ * Seen in the lab (CapCut 9.7, 11-03): after Escape closed its menu, the next click on Menu did not reopen it. CapCut closes
++ * its menu when the user clicks outside it: the click lands on the menu's own full-window overlay and CapCut calls
++ * DestroyWindow() on the menu inside its WM_LBUTTONDOWN. The compositor holds an implicit grab on the pressed surface;
++ * once that surface is gone it sends the button's release to nobody, and the next thing we hear is a wl_pointer.enter
++ * on the main window, which carries no button state. Wine never sends the WM_LBUTTONUP, so wineserver keeps VK_LBUTTON
++ * down and the application is left with a press that never ends (measured on KWin, lab 181: 0 of 6 such closes
++ * delivered the release; the main window got WM_MOUSEMOVE with MK_LBUTTON and no WM_LBUTTONUP).
++ *
++ * Windows has no implicit grab to lose: the button-up is a hardware event that goes to the capture window or, without
++ * one, to the window under the cursor, here the main window. So: wayland_surface_destroy() records the buttons still
++ * held on the destroyed pointer-focus surface; the next pointer event from the compositor (the enter that follows the
++ * release on KWin, or a button event) first sends their release, as the hardware would have. If the compositor does
++ * deliver the real release later anyway, it is dropped so the application does not get two. Not covered: a release
++ * while the pointer stays over another client's surface is sent only when the pointer next reaches one of ours.
++ * Kill switch NEUTRON_PTR_RELEASE_DESTROYED=0. */
++BOOL wayland_pointer_release_destroyed_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_PTR_RELEASE_DESTROYED", TRUE);
++    return on;
++}
++
++static uint32_t pointer_button_bit(uint32_t button)
++{
++    return button >= BTN_MOUSE && button < BTN_MOUSE + 32 ? 1u << (button - BTN_MOUSE) : 0;
++}
++
++static void pointer_release_pending(HWND hwnd, const char *where)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    uint32_t pending, bit;
++    INPUT input = {0};
++
++    pthread_mutex_lock(&pointer->mutex);
++    pending = pointer->release_pending;
++    pointer->release_pending = 0;
++    pointer->buttons_down &= ~pending;
++    pointer->released_early |= pending;
++    pthread_mutex_unlock(&pointer->mutex);
++    if (!pending) return;
++
++    ERR("neutron-ptrrel: buttons %#x were held on a destroyed surface; sending their release at %s (hwnd %p)\n",
++        pending, where, hwnd);
++    input.type = INPUT_MOUSE;
++    for (bit = 0; bit < 32; bit++)
++    {
++        if (!(pending & (1u << bit))) continue;
++        input.mi.mouseData = 0;
++        switch (BTN_MOUSE + bit)
++        {
++        case BTN_LEFT: input.mi.dwFlags = MOUSEEVENTF_LEFTUP; break;
++        case BTN_RIGHT: input.mi.dwFlags = MOUSEEVENTF_RIGHTUP; break;
++        case BTN_MIDDLE: input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP; break;
++        case BTN_SIDE:
++        case BTN_BACK: input.mi.dwFlags = MOUSEEVENTF_XUP; input.mi.mouseData = XBUTTON1; break;
++        case BTN_EXTRA:
++        case BTN_FORWARD: input.mi.dwFlags = MOUSEEVENTF_XUP; input.mi.mouseData = XBUTTON2; break;
++        default: continue;
++        }
++        NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    }
++}
++
+ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+                                  uint32_t serial, struct wl_surface *wl_surface,
+                                  wl_fixed_t sx, wl_fixed_t sy)
+@@ -290,6 +355,9 @@
+     pointer->enter_serial = serial;
+     pthread_mutex_unlock(&pointer->mutex);
+ 
++    /* NEUTRON: on KWin this enter is what follows the release of a press on a surface we destroyed */
++    pointer_release_pending(hwnd, "enter");
++
+     /* The cursor is undefined at every enter, so we set it again with
+      * the latest information we have. */
+     wayland_set_cursor(hwnd, NULL, FALSE);
+@@ -322,12 +390,37 @@
+                                   uint32_t state)
+ {
+     struct wayland_pointer *pointer = &process_wayland.pointer;
++    uint32_t bit = pointer_button_bit(button);
+     INPUT input = {0};
++    BOOL drop = FALSE;
+     HWND hwnd;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+-    if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
++    /* NEUTRON: release what a destroyed surface left held first, then drop the late real release of a button we
++     * already released for it (see pointer_release_pending); a new press of that button ends the wait. */
++    hwnd = wayland_pointer_get_focused_hwnd();
++    pointer_release_pending(hwnd, "button");
++    pthread_mutex_lock(&pointer->mutex);
++    if (state == WL_POINTER_BUTTON_STATE_RELEASED && (pointer->released_early & bit))
++    {
++        pointer->released_early &= ~bit;
++        drop = TRUE;
++    }
++    else if (hwnd && state == WL_POINTER_BUTTON_STATE_PRESSED)
++    {
++        pointer->released_early &= ~bit;
++        pointer->buttons_down |= bit;
++    }
++    else if (hwnd) pointer->buttons_down &= ~bit;
++    pthread_mutex_unlock(&pointer->mutex);
++    if (drop)
++    {
++        ERR("neutron-ptrrel: dropping the late release of button %#x (already released)\n", button);
++        return;
++    }
++
++    if (!hwnd) return;
+ 
+     input.type = INPUT_MOUSE;
+ 
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -444,6 +444,9 @@
+     {
+         process_wayland.pointer.focused_hwnd = NULL;
+         process_wayland.pointer.enter_serial = 0;
++        /* NEUTRON: buttons still held on this surface lose their release (wayland_pointer.c, pointer_release_pending) */
++        if (process_wayland.pointer.buttons_down && wayland_pointer_release_destroyed_on())
++            process_wayland.pointer.release_pending |= process_wayland.pointer.buttons_down;
+     }
+     if (process_wayland.pointer.constraint_hwnd == surface->hwnd)
+         wayland_pointer_clear_constraint();
