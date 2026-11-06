@@ -134,9 +134,40 @@ if [ -f "$_inf" ]; then
         echo "   installed). This build's base is UNVERIFIED, not verified." >&2
     fi
     if [ "$_same" -eq 0 ] && [ "$_diff" -gt 0 ]; then
-        echo "package: ⛔ BASE DRIFT — this build's wine.inf matches NO installed runtime ($_diff differ)." >&2
-        echo "   The base tree changed under us. Investigate before shipping; do NOT pin the mtime." >&2
-        exit 4
+        # One of OUR patches can change wine.inf on purpose (11.10-183: widl-winmd-complete adds
+        # windows.foundation.winmd to [WinmdFiles]). That is not drift when every line that differs from
+        # the newest installed runtime's wine.inf is a line a patch in patches/ adds or removes in
+        # loader/wine.inf.in. Anything else still stops the build.
+        _newest="$(ls -d "$HOME"/.local/share/neutron/runtimes/neutron-wine-*/share/wine/wine.inf 2>/dev/null \
+                   | grep -v "neutron-wine-$VERSION/" | sort -V | tail -1)"
+        _why="$(python3 - "$_inf" "$_newest" "$(dirname "$0")/../patches" <<'PY'
+import difflib, glob, os, sys
+new, old, pdir = sys.argv[1:4]
+diff = [l for l in difflib.unified_diff(open(old, errors="replace").read().splitlines(),
+                                        open(new, errors="replace").read().splitlines(), lineterm="", n=0)
+        if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+explained, names = set(), []
+for p in sorted(glob.glob(os.path.join(pdir, "*.mypatch")) + glob.glob(os.path.join(pdir, "*.patch"))):
+    cur, mine = None, False
+    for l in open(p, errors="replace").read().splitlines():
+        if l.startswith("+++ "):
+            cur = l[4:].split("\t")[0]
+        elif cur and cur.endswith("loader/wine.inf.in") and l[:1] in "+-" and not l.startswith(("+++", "---")):
+            explained.add(l); mine = True
+    if mine:
+        names.append(os.path.basename(p))
+left = [l for l in diff if l not in explained]
+print("OK " + " ".join(n[-60:] for n in names) if diff and not left else "NO " + " | ".join(left[:5]))
+PY
+)"
+        case "$_why" in
+            OK*) echo "package: NOTE — wine.inf differs from every installed runtime ($_diff), and every changed" >&2
+                 echo "   line comes from our patches to loader/wine.inf.in:${_why#OK}" >&2 ;;
+            *)   echo "package: ⛔ BASE DRIFT — this build's wine.inf matches NO installed runtime ($_diff differ)." >&2
+                 echo "   Lines no patch of ours explains: ${_why#NO }" >&2
+                 echo "   The base tree changed under us. Investigate before shipping; do NOT pin the mtime." >&2
+                 exit 4 ;;
+        esac
     fi
     if [ "$_diff" -gt 0 ]; then
         echo "package: NOTE — wine.inf matches $_same installed runtime(s) and differs from $_diff:$_difflist" >&2

@@ -224,8 +224,11 @@ never = [b"neutron-rtlog", b"NEUTRON_VKENC_TEST_STUB"]   # the stub backend is t
 # hooks above, Get/SetBackgroundColor implemented (so the stubs' "BackgroundColor: Not implemented"
 # strings are gone; the implementation logs nothing), and nothing else.
 dxgi_never = [b"\xa1\xf6\xd0\xb5\x4e\x7c\x2a\x4d\x9b\x8e\x3f\x5a\x2c\x1d\x0e\x9f",  # IID_INeutronBoundedAcquire
-              b"NEUTRON_", b"neutron-acq", b"neutron-sctrace", b"GetBackgroundColor -> S_OK",
+              b"neutron-acq", b"neutron-sctrace", b"GetBackgroundColor -> S_OK",
               b"BackgroundColor"]
+# ...and no NEUTRON_ switch but the ones a dxvk-dxgi patch declares: 0004 (11.10-183) logs the bridge's PresentBase line
+# once per swap chain, NEUTRON_DXVK_PRESENT_LOG=1 brings back the per-Present line.
+dxgi_switches = {b"NEUTRON_DXVK_PRESENT_LOG"}
 home_needles = [home.encode() + b"/", (home + "/").encode("utf-16-le"),
                 home.replace("/", "\\").encode(), home.replace("/", "\\").encode("utf-16-le")]
 # DXVK's version is `git describe --dirty=+`; the hash abbreviation length varies by clone.
@@ -245,6 +248,8 @@ for rel, s, key, val, dest in rows:
     if rel == "dxvk/x86_64-windows/dxgi.dll":
         for m in dxgi_never:
             if m in b: errors.append(f"{rel}: contains {m!r}, which the validated dxgi did not have")
+        for m in sorted(set(re.findall(rb"NEUTRON_[A-Z0-9_]+", b)) - dxgi_switches):
+            errors.append(f"{rel}: contains {m.decode()}, a switch no dxvk-dxgi patch declares")
     for m in home_needles:
         if m in b: errors.append(f"{rel}: contains the builder's home path")
     if "-unix/" in rel:
