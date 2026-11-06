@@ -1,0 +1,134 @@
+# neutron-fd-floor
+#
+# Touches: dlls/ntdll/unix/server.c only. Kill switch: NEUTRON_FD_HIGH=0. Log: one
+# "neutron-fdhigh: gate NEUTRON_FD_HIGH resolved to N (floor 1024)" err line per process.
+#
+# WHAT THE REPORTER SAW (GitHub Neutron#46, Lightroom Classic 15.6, Ubuntu Studio 26.10, kernel 7.3, KDE Wayland, Intel UHD 770 +
+# RTX 4070 Laptop, runtime 172): "Hangs when first Importing due to Auto Culling Tooltip" -- the tip shows without its
+# graphics, then Lightroom quietly closes. 11-06: worked after a gst-inspect, crashed on the next two launches, worked
+# after a reboot. Both crash logs end with GStreamer's msdk "Failed to create a MFX session" and then glibc's
+# "*** bit out of range 0 - FD_SETSIZE on fd_set ***: terminated".
+#
+# MECHANISM
+# 1. winegstreamer calls gst_init with --gst-disable-registry-fork (upstream Wine since 2010). When GStreamer's plugin
+#    registry is stale or missing, every new or changed host plugin is loaded and initialized INSIDE the app (here:
+#    the tip's help clip is the first GStreamer use in Lightroom). An abort in the middle means the registry is never
+#    written, so every later launch scans and dies again until something outside Wine rebuilds the registry.
+# 2. A Wine process keeps its own descriptors at the lowest free numbers: three or four server pipes per thread
+#    (server_pipe) and one fd per in-process sync object (ntsync, wine_server_receive_fd). Measured on 182 and 183rc:
+#    Lightroom 1,267-1,556 fds (950-1,022 of 0-1023 in use), Photoshop 2026 ~2,000, Premiere 2026 ~3,400 (all 1,024 in use).
+# 3. Any host library that then opens a descriptor gets a number >= 1024; if it waits on it with select(), glibc's
+#    _FORTIFY_SOURCE check in FD_SET aborts the whole process. Ubuntu's gstreamer1.0-plugins-bad depends on
+#    libopenni2-0; the openni2 plugin's class_init starts OpenNI2, whose PS1080 driver runs a udev thread that does
+#    FD_SET(fd) on its new udev monitor fd (openni2 2.2.0.33 XnLinuxUSB.cpp:308). gdb in Ubuntu 24.04: __fdelt_chk <-
+#    libPS1080.so.0. msdk sits next to it in the same scan; the Intel stack (iHD, libmfx-gen, libvpl, libmfx, libva,
+#    libdrm, gmmlib) imports neither select nor __fdelt_chk.
+# Fix: wine_server_receive_fd() and server_pipe() move each new descriptor to 1024 and up with F_DUPFD_CLOEXEC (lowest
+# free number >= 1024) and close the low one; if that fails (RLIMIT_NOFILE <= 1024) the low fd is kept and one err line
+# says so. Every fd the server hands the client and every server pipe goes through these two functions, and both move
+# the fd before its number is sent to the server.
+#
+# WINDOWS: an app's kernel handles are not POSIX file descriptors, so nothing a Windows app loads ever sees
+# descriptor pressure from them. Keeping 0-1023 for host libraries is the closest equivalent.
+#
+# NOT COVERED: winewayland's shm memfds and other Wine fds not made by these two functions (Premiere: 10 low pipes);
+# the in-process registry scan itself (host plugins' init code still runs inside the app; re-enabling GStreamer's
+# scanner fork in winegstreamer is a separate decision); the reporter's exact plugin set (Ubuntu 26.10, GStreamer 1.28 with
+# oneVPL) and their Intel iGPU were not run here. Cost: 2 extra syscalls per received fd or per pipe end.
+#
+# LAB EVIDENCE (11.10-183w = 183rc + this; host driver 615.78, Mesa 26.2.6, kernel 7.3.1)
+#   fdprobe.exe (1500 events + 200 idle threads, then winegstreamer DllGetClassObject = gst_init), fresh registry:
+#     host, probe plugin (plugin_init: eventfd + FD_SET + select): NEUTRON_FD_HIGH=0 2/2 abort (plugin fd 2318);
+#                                                                  fix 2/2 survived (plugin fd 6; 6 fds in 0-1023)
+#     Ubuntu 24.04 container, Ubuntu's own plugins (openni2, msdk), ntsync: NEUTRON_FD_HIGH=0 2/2 abort; fix 2/2
+#                                                                  survived; kill switch with openni2 set aside 1/1 survived
+#   Lightroom, culling tip reset, fresh registry + probe plugin (the scan runs when the tip's clip starts):
+#     NEUTRON_FD_HIGH=0: 2/2 Lightroom gone at the tip (abort, plugin fd 1596/1546, registry not written)
+#     fix: 2/2 tip + clip playing (13,498 of 30,044 clip px changed between two shots), registry written,
+#          Lightroom 1,495-1,549 fds, 156 in 0-1023
+#   Photoshop 2026 (fix): Chepino Valley opened and drawn; 2,170 fds, 151 in 0-1023, no Wine pipe/ntsync fd below 1024.
+#   Premiere 2026 (fix): Waterfalls opened, playback moved the Program monitor; 4,254 fds, 229 in 0-1023.
+#   32-bit process (fdprobe32.exe, i386 ntdll.so): kill switch 1,024 of 0-1023 in use; fix 6 (ntsync + pipes all >= 1024).
+#
+--- a/dlls/ntdll/unix/server.c	2026-11-06 09:07:53.262830548 -0500
++++ b/dlls/ntdll/unix/server.c	2026-11-06 09:08:58.347686069 -0500
+@@ -121,6 +121,48 @@
+ 
+ sigset_t server_block_set;  /* signals to block during server calls */
+ static int fd_socket = -1;  /* socket to exchange file descriptors with the server */
++
++/* NEUTRON: Wine's own long-lived descriptors -- the per-thread server pipes and every fd received from the server
++ * (in-process sync objects, cached file fds) -- go to FD_SETSIZE (1024) and up instead of the lowest free number.
++ * Lightroom, Photoshop and Premiere hold 1,300-3,400 of them, which filled all of 0-1023, so any host library in the
++ * process that waits with select() on a descriptor it just opened got an fd >= 1024 and glibc's _FORTIFY_SOURCE check
++ * aborted the whole app ("bit out of range 0 - FD_SETSIZE on fd_set"): GStreamer's in-process plugin scan loading
++ * OpenNI2/msdk killed Lightroom at the Assisted Culling tip (Neutron#46). On Windows an app's handles are not file
++ * descriptors, so nothing it loads ever sees them. NEUTRON_FD_HIGH=0 restores the lowest-free placement. */
++#define NEUTRON_FD_FLOOR 1024
++
++static BOOL neutron_fd_high(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_FD_HIGH" );
++        on = !(e && e[0] == '0');
++        ERR( "neutron-fdhigh: gate NEUTRON_FD_HIGH resolved to %d (floor %d)\n", on, NEUTRON_FD_FLOOR );
++    }
++    return on;
++}
++
++/* move a descriptor Wine keeps for itself out of the select() range; keeps the original if that fails,
++ * e.g. when RLIMIT_NOFILE is at or below the floor */
++static int neutron_fd_raise( int fd )
++{
++    static BOOL warned;
++    int high;
++
++    if (fd < 0 || fd >= NEUTRON_FD_FLOOR || !neutron_fd_high()) return fd;
++    if ((high = fcntl( fd, F_DUPFD_CLOEXEC, NEUTRON_FD_FLOOR )) == -1)
++    {
++        if (!warned)
++        {
++            warned = TRUE;
++            ERR( "neutron-fdhigh: cannot place fds at %d and up (errno %d), keeping low ones\n", NEUTRON_FD_FLOOR, errno );
++        }
++        return fd;
++    }
++    close( fd );
++    return high;
++}
+ static int initial_cwd = -1;
+ static pid_t server_pid;
+ pthread_mutex_t fd_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+@@ -1041,7 +1083,7 @@
+ #endif
+             }
+             if (fd != -1) fcntl( fd, F_SETFD, FD_CLOEXEC ); /* in case MSG_CMSG_CLOEXEC is not supported */
+-            return fd;
++            return neutron_fd_raise( fd );
+         }
+         if (!ret) break;
+         if (errno == EINTR) continue;
+@@ -1305,7 +1347,7 @@
+ 
+     if (have_pipe2)
+     {
+-        if (!(ret = pipe2( fd, O_CLOEXEC ))) return ret;
++        if (!(ret = pipe2( fd, O_CLOEXEC ))) goto done;
+         if (errno == ENOSYS || errno == EINVAL) have_pipe2 = FALSE;  /* don't try again */
+     }
+ #endif
+@@ -1314,6 +1356,12 @@
+         fcntl( fd[0], F_SETFD, FD_CLOEXEC );
+         fcntl( fd[1], F_SETFD, FD_CLOEXEC );
+     }
++    else return ret;
++#ifdef HAVE_PIPE2
++done:
++#endif
++    fd[0] = neutron_fd_raise( fd[0] );
++    fd[1] = neutron_fd_raise( fd[1] );
+     return ret;
+ }
+ 
