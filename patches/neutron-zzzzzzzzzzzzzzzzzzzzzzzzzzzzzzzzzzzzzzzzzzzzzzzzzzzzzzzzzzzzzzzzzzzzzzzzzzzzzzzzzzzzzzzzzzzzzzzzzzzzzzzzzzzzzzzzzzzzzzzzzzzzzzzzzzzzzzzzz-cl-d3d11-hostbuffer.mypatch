@@ -1,0 +1,386 @@
+opencl: cl_khr_d3d11_sharing copies through OpenCL-owned host memory, never the D3D11 mapping (Neutron#47 on ROCm)
+
+What the reporter saw (Neutron#47, AMD RX 7600 XT, RADV + ROCm OpenCL "gfx1102", runtime 11.10-172.1 = 172 + 135): with the
+sharing on, After Effects shows no layer controls and a black Draft 3D. On the reporter's machine our conformance exe (82 checks)
+gave 66 pass / 16 fail: every image check fails in both directions and every format (first wrong texel 0,0; frames
+"row 0 stale or wrong"; Texture3D both ways); every buffer check and every error-code check passes.
+
+Mechanism (INFERRED -- not reproduced in the lab, see below):
+- 135's acquire handed the pointer from ID3D11DeviceContext::Map of a staging resource (memory of the Vulkan driver
+  behind DXVK, here RADV on the same GPU) and D3D11's RowPitch straight to a blocking clEnqueueWriteImage; release
+  did the same with clEnqueueReadImage. That is legal OpenCL (blocking_write CL_TRUE: the implementation copies the
+  data at ptr before returning; input_row_pitch may be any value >= width * element size). What an implementation
+  does with such a pointer is its own business. ROCm's runtime (ROCclr, from its design, not traced on the reporter's machine)
+  pins host pointers for image transfers and falls back to a staged path when it cannot; another driver's BO mapping
+  cannot be pinned, so our transfers and the application's own likely took different ROCm paths. In the reporter's output every
+  failing check has a host image transfer in it, while the kernel-only round trip (acquire -> kernel -> release) of the
+  4-channel formats was right except row 0 (the 1-channel ones prove nothing there: that kernel's output ignores them).
+- Not the 135 hypotheses: no non-blocking transfer on a mapped pointer (all were CL_TRUE), no USE_HOST_PTR /
+  COPY_HOST_PTR images, and the events returned are markers after the completed copies.
+
+Windows: AMD's and Intel's drivers implement the extension natively (the shared object IS the D3D11 resource); the
+copies are ours, so the rule is ours to choose: the OpenCL implementation only ever touches memory it allocated.
+
+Fix (dlls/opencl/pe_d3d11.c, PE side only):
+- every shared object gets a host buffer (clCreateBuffer CL_MEM_ALLOC_HOST_PTR, tightly packed, element size from
+  CL_IMAGE_ELEMENT_SIZE), created on first use, freed with the object.
+- acquire: D3D11 resource -> staging (CopySubresourceRegion + Map READ, as before) -> CPU copy row by row (D3D11
+  pitches) into the host buffer mapped with a blocking clEnqueueMapBuffer(CL_MAP_WRITE_INVALIDATE_REGION) -> unmap ->
+  clEnqueueCopyBufferToImage / clEnqueueCopyBuffer into the shared object, after the application's wait list AND the
+  unmap's event (so out-of-order queues are right: a buffer mapped for writing must be unmapped before a command reads
+  it) -> wait for the copy.
+- release: clEnqueueCopyImageToBuffer / clEnqueueCopyBuffer after the application's wait list -> blocking map
+  (CL_MAP_READ) that waits for that copy -> CPU copy into the D3D11 mapping (its pitches) -> Unmap +
+  CopySubresourceRegion back (DYNAMIC: Map WRITE_DISCARD directly, as before) -> unmap the host buffer, waited.
+- both still complete when the call returns (also covers CL_CONTEXT_INTEROP_USER_SYNC), so nothing else changes:
+  the returned event is the same marker, the host buffer is idle between calls.
+- Kill switch NEUTRON_CL_D3D11_DIRECT_COPY=1: 135's direct transfers (for an A/B on one build).
+
+Not covered: the lab has no AMD GPU, so this is proven correct on two other implementations, not proven to fix ROCm.
+If plain OpenCL images are wrong on the reporter's ROCm under Wine as well (no sharing code involved), that is a separate bug:
+conformance exe v2 (cl11b/test) has "control:" checks for exactly that, plus `ab` (both copy paths in one run).
+Zero copy (Vulkan external memory) is still a later step.
+
+Lab evidence (cl11b, 11-06):
+- No repro of the failure: 135's copies pass on NVIDIA 615.78 (RTX 5070) and on Mesa 26.2.6 rusticl (llvmpipe, device
+  type forced GPU) + DXVK on lavapipe in a GPU-less container: clcore conformance 82/82, n=2 each, same build.
+- This patch, runtime 11.10-172.3t (= 172.1 + this opencl.dll), same build A/B: clcore conformance (82 checks) fix 82/82
+  x2 and kill switch 82/82 x2 on NVIDIA; fix 82/82 x2 and kill 82/82 x2 on rusticl. Conformance v2 (93 checks: + 5
+  plain-image controls + 6 kernel-read checks, validated against a deliberately broken build: 7 FAIL) with `ab`: 93/93
+  both arms, NVIDIA x2 (and on 172.1), rusticl x2.
+- After Effects 26.5 Advanced 3D on the OpenCL spoof (claex method, AeB1, 182x1 + this lab dll), fix vs kill on one
+  build, n=1 each: CALDER-SUPPORTED, renderer stays Calder, renders pixel-identical to 135's (mean |d| 0.00, 0% px),
+  viewer fix vs kill 0.00% px; 400 acquires + 400 releases, no errors.
+- Cost (AE, same build): acquire avg 3.13 ms vs 2.46 ms, release 2.01 ms vs 1.51 ms => ~10.3 vs ~7.9 ms per displayed
+  frame (2 acquires + 2 releases). Conformance 1080p RGBA8 acquire 2.0 vs 1.6 ms (NVIDIA), 3.7 vs 2.4 ms (rusticl);
+  with another thread hammering the immediate context 23 vs 11 ms (NVIDIA).
+
+--- a/dlls/opencl/pe_d3d11.c	2026-11-06 15:52:26.969916287 -0500
++++ b/dlls/opencl/pe_d3d11.c	2026-11-06 15:52:26.970916322 -0500
+@@ -28,6 +28,12 @@
+  * - a shared memory object is a host buffer or image of the same size and format as the D3D11 (sub)resource;
+  * - acquire copies the D3D11 contents into it (through a staging resource on the application's D3D11 device) and
+  *   release copies them back, both complete when the call returns, which also covers CL_CONTEXT_INTEROP_USER_SYNC;
++ * - the OpenCL implementation only ever sees memory it allocated itself: the D3D11 mapping is copied into (or out of)
++ *   a host buffer of the shared object's context (CL_MEM_ALLOC_HOST_PTR, tightly packed, mapped with
++ *   clEnqueueMapBuffer), and that buffer is copied to the shared object on the device. A D3D11 Map pointer is memory
++ *   of the Vulkan driver behind D3D11; handing it to clEnqueueWriteImage/ReadImage (with D3D11's row pitch) is legal
++ *   OpenCL but leaves the result to how each implementation pins or stages foreign host memory, and ROCm (Neutron#47)
++ *   got every image transfer wrong that way. NEUTRON_CL_D3D11_DIRECT_COPY=1 goes back to the direct transfers;
+  * - OpenCL devices are matched to DXGI adapters by PCI location (Vulkan, through DXVK's interop interface, against
+  *   cl_khr_pci_bus_info or the vendor's own device queries), then by device UUID, then by vendor.
+  *
+@@ -113,6 +119,8 @@
+     UINT subresource;
+     size_t size, width, height, depth;
+     ID3D11Resource *staging;
++    cl_mem host_buffer;           /* CL_MEM_ALLOC_HOST_PTR, tightly packed copy of the object, see copy_to_host */
++    size_t element_size;          /* bytes per texel (1 for buffers) */
+     BOOL acquired;
+     BOOL released;
+ };
+@@ -190,6 +198,20 @@
+     return enabled;
+ }
+ 
++/* the copies of 135 straight from and to the D3D11 mapping, for an A/B on one build */
++static BOOL direct_copy_enabled(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv( "NEUTRON_CL_D3D11_DIRECT_COPY" );
++        enabled = env && *env == '1';
++        if (enabled) WARN( "NEUTRON_CL_D3D11_DIRECT_COPY: transfers straight from and to the D3D11 mapping\n" );
++    }
++    return enabled;
++}
++
+ static cl_int host_device_info( cl_device_id device, cl_device_info name, size_t size, void *value )
+ {
+     struct clGetDeviceInfo_params params = { device, name, size, value, NULL };
+@@ -462,6 +484,7 @@
+     {
+         TRACE( "freeing memory object %p\n", mem->mem );
+         if (mem->staging) ID3D11Resource_Release( mem->staging );
++        if (mem->host_buffer) host_release_mem( mem->host_buffer );
+         ID3D11Resource_Release( mem->resource );
+         host_release_mem( mem->mem );
+         InterlockedDecrement( &d3d11_objects );
+@@ -835,6 +858,14 @@
+     if (!ret && !handle_mem) ret = CL_OUT_OF_RESOURCES;
+     if (ret) goto done;
+ 
++    mem->element_size = 1;
++    if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        struct clGetImageInfo_params params = { handle_mem, CL_IMAGE_ELEMENT_SIZE, sizeof(mem->element_size),
++                                                &mem->element_size, NULL };
++        if ((ret = OPENCL_CALL( clGetImageInfo, &params ))) goto done;
++    }
++
+     {
+         /* the reference that keeps the object, and our record of it, alive until we free it */
+         struct clRetainMemObject_params params = { handle_mem };
+@@ -998,8 +1029,9 @@
+     }
+ }
+ 
+-/* acquire: D3D11 resource -> staging -> host object */
+-static cl_int copy_to_host( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events, const cl_event *events )
++/* NEUTRON_CL_D3D11_DIRECT_COPY=1 (135's copies) -- acquire: D3D11 resource -> staging -> host object */
++static cl_int copy_to_host_direct( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events,
++                                   const cl_event *events )
+ {
+     struct d3d11_context *context = mem->context;
+     D3D11_MAPPED_SUBRESOURCE map;
+@@ -1027,8 +1059,9 @@
+     return ret;
+ }
+ 
+-/* release: host object -> staging -> D3D11 resource; a dynamic resource takes the data directly */
+-static cl_int copy_from_host( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events, const cl_event *events )
++/* NEUTRON_CL_D3D11_DIRECT_COPY=1 (135's copies) -- release: host object -> staging -> D3D11 resource */
++static cl_int copy_from_host_direct( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events,
++                                     const cl_event *events )
+ {
+     struct d3d11_context *context = mem->context;
+     BOOL dynamic = mem->usage == D3D11_USAGE_DYNAMIC;
+@@ -1061,6 +1094,236 @@
+     return ret;
+ }
+ 
++static size_t host_buffer_size( const struct d3d11_mem *mem )
++{
++    if (mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER) return mem->size;
++    return mem->width * mem->height * mem->depth * mem->element_size;
++}
++
++static cl_int create_host_buffer( struct d3d11_mem *mem )
++{
++    cl_int ret = CL_SUCCESS;
++    struct clCreateBuffer_params params = { &mem->host_buffer, mem->context->context,
++                                            CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, host_buffer_size( mem ), NULL,
++                                            &ret };
++
++    OPENCL_CALL( clCreateBuffer, &params );
++    if (!ret && !mem->host_buffer) ret = CL_OUT_OF_RESOURCES;
++    if (ret)
++    {
++        ERR( "failed to create a host buffer of %Iu bytes for %p, error %d\n", host_buffer_size( mem ),
++             mem->app_resource, ret );
++        mem->host_buffer = NULL;
++    }
++    return ret;
++}
++
++static void release_event( cl_event event )
++{
++    struct clReleaseEvent_params params = { event };
++    if (event) OPENCL_CALL( clReleaseEvent, &params );
++}
++
++/* waits for the command, then drops our reference to its event */
++static cl_int wait_event( cl_event event )
++{
++    struct clWaitForEvents_params wait = { 1, &event };
++    cl_int status = CL_COMPLETE, ret;
++    struct clGetEventInfo_params info = { event, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(status), &status, NULL };
++
++    ret = OPENCL_CALL( clWaitForEvents, &wait );
++    if (!ret && !OPENCL_CALL( clGetEventInfo, &info ) && status < 0) ret = status;
++    release_event( event );
++    return ret;
++}
++
++/* blocking map of the whole host buffer, after the command of event (if any); the host buffer is idle otherwise:
++ * every command on it is complete before acquire or release returns */
++static void *map_host_buffer( cl_command_queue queue, struct d3d11_mem *mem, cl_map_flags flags, cl_event event,
++                              cl_int *ret )
++{
++    void *ptr = NULL;
++    struct clEnqueueMapBuffer_params params = { &ptr, queue, mem->host_buffer, CL_TRUE, flags, 0,
++                                                host_buffer_size( mem ), event ? 1 : 0, event ? &event : NULL,
++                                                NULL, ret };
++
++    OPENCL_CALL( clEnqueueMapBuffer, &params );
++    if (!*ret && !ptr) *ret = CL_MAP_FAILURE;
++    return *ret ? NULL : ptr;
++}
++
++static cl_int unmap_host_buffer( cl_command_queue queue, struct d3d11_mem *mem, void *ptr, cl_event *event )
++{
++    struct clEnqueueUnmapMemObject_params params = { queue, mem->host_buffer, ptr, 0, NULL, event };
++
++    return OPENCL_CALL( clEnqueueUnmapMemObject, &params );
++}
++
++/* the D3D11 mapping has its own row and depth pitches, the host buffer is tightly packed */
++static void copy_rows( const struct d3d11_mem *mem, const D3D11_MAPPED_SUBRESOURCE *map, BYTE *host, BOOL to_host )
++{
++    size_t row_size = mem->width * mem->element_size, y, z;
++    BYTE *d3d11, *cl;
++
++    if (mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        if (to_host) memcpy( host, map->pData, mem->size );
++        else memcpy( map->pData, host, mem->size );
++        return;
++    }
++    for (z = 0; z < mem->depth; z++)
++    {
++        for (y = 0; y < mem->height; y++)
++        {
++            d3d11 = (BYTE *)map->pData + z * map->DepthPitch + y * map->RowPitch;
++            cl = host + (z * mem->height + y) * row_size;
++            if (to_host) memcpy( cl, d3d11, row_size );
++            else memcpy( d3d11, cl, row_size );
++        }
++    }
++}
++
++/* host buffer -> shared object on the device, after the application's wait list and the unmap of the host buffer;
++ * complete when this returns */
++static cl_int copy_host_buffer_to_mem( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events,
++                                       const cl_event *events, cl_event unmapped )
++{
++    size_t origin[3] = {0, 0, 0}, region[3] = {mem->width, mem->height, mem->depth};
++    cl_event event = NULL, *wait;
++    cl_int ret;
++
++    if (!(wait = malloc( (num_events + 1) * sizeof(*wait) ))) return CL_OUT_OF_HOST_MEMORY;
++    if (num_events) memcpy( wait, events, num_events * sizeof(*wait) );
++    wait[num_events] = unmapped;
++
++    if (mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        struct clEnqueueCopyBuffer_params params = { queue, mem->host_buffer, mem->mem, 0, 0, mem->size,
++                                                     num_events + 1, wait, &event };
++        ret = OPENCL_CALL( clEnqueueCopyBuffer, &params );
++    }
++    else
++    {
++        struct clEnqueueCopyBufferToImage_params params = { queue, mem->host_buffer, mem->mem, 0, origin, region,
++                                                            num_events + 1, wait, &event };
++        ret = OPENCL_CALL( clEnqueueCopyBufferToImage, &params );
++    }
++    free( wait );
++    if (ret) return ret;
++    return wait_event( event );
++}
++
++/* shared object -> host buffer, after the application's wait list */
++static cl_int copy_mem_to_host_buffer( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events,
++                                       const cl_event *events, cl_event *event )
++{
++    size_t origin[3] = {0, 0, 0}, region[3] = {mem->width, mem->height, mem->depth};
++
++    if (mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
++    {
++        struct clEnqueueCopyBuffer_params params = { queue, mem->mem, mem->host_buffer, 0, 0, mem->size,
++                                                     num_events, events, event };
++        return OPENCL_CALL( clEnqueueCopyBuffer, &params );
++    }
++    else
++    {
++        struct clEnqueueCopyImageToBuffer_params params = { queue, mem->mem, mem->host_buffer, origin, region, 0,
++                                                            num_events, events, event };
++        return OPENCL_CALL( clEnqueueCopyImageToBuffer, &params );
++    }
++}
++
++/* acquire: D3D11 resource -> staging -> (CPU) host buffer -> (device copy) shared object */
++static cl_int copy_to_host( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events, const cl_event *events )
++{
++    struct d3d11_context *context = mem->context;
++    D3D11_MAPPED_SUBRESOURCE map;
++    cl_event unmapped = NULL;
++    cl_int ret;
++    void *host;
++    HRESULT hr;
++
++    if (direct_copy_enabled()) return copy_to_host_direct( queue, mem, num_events, events );
++    if (!mem->staging && FAILED(create_staging( mem ))) return CL_OUT_OF_RESOURCES;
++    if (!mem->host_buffer && (ret = create_host_buffer( mem ))) return ret;
++
++    if (!(host = map_host_buffer( queue, mem, CL_MAP_WRITE_INVALIDATE_REGION, NULL, &ret )))
++    {
++        ERR( "failed to map the host buffer of %p, error %d\n", mem->app_resource, ret );
++        return ret;
++    }
++
++    lock_d3d11( context );
++    ID3D11DeviceContext_CopySubresourceRegion( context->immediate, mem->staging, 0, 0, 0, 0,
++                                               mem->resource, mem->subresource, NULL );
++    hr = ID3D11DeviceContext_Map( context->immediate, mem->staging, 0, D3D11_MAP_READ, 0, &map );
++    unlock_d3d11( context );
++    if (SUCCEEDED(hr))
++    {
++        copy_rows( mem, &map, host, TRUE );
++        lock_d3d11( context );
++        ID3D11DeviceContext_Unmap( context->immediate, mem->staging, 0 );
++        unlock_d3d11( context );
++    }
++    else ERR( "failed to map the staging resource of %p, hr %#lx\n", mem->app_resource, hr );
++
++    if ((ret = unmap_host_buffer( queue, mem, host, &unmapped ))) return ret;
++    if (SUCCEEDED(hr)) ret = copy_host_buffer_to_mem( queue, mem, num_events, events, unmapped );
++    else ret = CL_OUT_OF_RESOURCES;
++    /* the copy ran after the unmap; without a copy, wait for the unmap itself */
++    if (ret) wait_event( unmapped );
++    else release_event( unmapped );
++    return ret;
++}
++
++/* release: shared object -> (device copy) host buffer -> (CPU) staging -> D3D11 resource; a dynamic resource takes
++ * the data directly */
++static cl_int copy_from_host( cl_command_queue queue, struct d3d11_mem *mem, cl_uint num_events, const cl_event *events )
++{
++    struct d3d11_context *context = mem->context;
++    BOOL dynamic = mem->usage == D3D11_USAGE_DYNAMIC;
++    ID3D11Resource *target = dynamic ? mem->resource : mem->staging;
++    UINT target_sub = dynamic ? mem->subresource : 0;
++    D3D11_MAPPED_SUBRESOURCE map;
++    cl_event copied = NULL, unmapped = NULL;
++    cl_int ret;
++    void *host;
++    HRESULT hr;
++
++    if (direct_copy_enabled()) return copy_from_host_direct( queue, mem, num_events, events );
++    if (!target) return CL_OUT_OF_RESOURCES;
++    if (!mem->host_buffer && (ret = create_host_buffer( mem ))) return ret;
++
++    if ((ret = copy_mem_to_host_buffer( queue, mem, num_events, events, &copied ))) return ret;
++    /* blocking: the copy is complete when the map returns */
++    host = map_host_buffer( queue, mem, CL_MAP_READ, copied, &ret );
++    release_event( copied );
++    if (!host)
++    {
++        ERR( "failed to map the host buffer of %p, error %d\n", mem->app_resource, ret );
++        return ret;
++    }
++
++    lock_d3d11( context );
++    hr = ID3D11DeviceContext_Map( context->immediate, target, target_sub,
++                                  dynamic ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE, 0, &map );
++    unlock_d3d11( context );
++    if (SUCCEEDED(hr))
++    {
++        copy_rows( mem, &map, host, FALSE );
++        lock_d3d11( context );
++        ID3D11DeviceContext_Unmap( context->immediate, target, target_sub );
++        if (!dynamic)
++            ID3D11DeviceContext_CopySubresourceRegion( context->immediate, mem->resource, mem->subresource, 0, 0, 0,
++                                                       mem->staging, 0, NULL );
++        unlock_d3d11( context );
++    }
++    else ERR( "failed to map %p for writing, hr %#lx\n", mem->app_resource, hr );
++
++    if (!(ret = unmap_host_buffer( queue, mem, host, &unmapped ))) ret = wait_event( unmapped );
++    return FAILED(hr) ? CL_OUT_OF_RESOURCES : ret;
++}
++
+ static cl_int enqueue_d3d11_objects( cl_command_queue queue, cl_uint num_objects, const cl_mem *mem_objects,
+                                      cl_uint num_events, const cl_event *events, cl_event *event, BOOL acquire )
+ {
