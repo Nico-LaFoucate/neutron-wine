@@ -1,0 +1,81 @@
+dcomp: read a FLIP_DISCARD swap chain's frame from buffer 0
+
+Topaz Photo 1.7.1 (app list batch 1) logged "D3D11: GetImage: Invalid buffer ID" about 28 times a
+second (11,870 lines in one session). Its Qt 6 RHI window presents a FLIP_DISCARD swap chain with
+BufferCount 2. Since patch 112 (WebView2 window-hosted) the bridge reads back BufferCount - 1 for
+both flip effects; DXVK keeps BufferCount buffers, and rotates the presented one to the last index,
+only for SEQUENTIAL and FLIP_SEQUENTIAL. A DISCARD or FLIP_DISCARD chain has the one buffer 0, so
+GetBuffer(1) failed with DXGI_ERROR_UNSUPPORTED on every readback (lab trace: dcomp.dll+0x2953,
+the blit thread, buf=1, effect=4, count=2, DXVK size 1) and nothing was read back for any
+FLIP_DISCARD chain since 11.10-174.
+
+Windows: IDXGISwapChain::GetBuffer documents readable buffers above zero for the SEQUENTIAL effects
+only (DISCARD: buffer 0 only; FLIP_SEQUENTIAL: consistent indices). The bridge now asks
+BufferCount - 1 for FLIP_SEQUENTIAL (patch 112 unchanged: WebView2 and Chromium composition chains
+are FLIP_SEQUENTIAL, swapeffect=3 in the Photoshop/Premiere logs) and buffer 0 for every other
+effect, which in DXVK holds the frame just presented.
+
+Visible effect: none in Topaz's main window (an HWND chain DXVK shows itself). A FLIP_DISCARD
+COMPOSITION chain (Qt RHI with an alpha surface uses CreateSwapChainForComposition + FLIP_DISCARD)
+reaches the screen only through the bridge and would have stayed empty; not seen in a lab app yet
+(INFERRED). Not covered: blt-model SEQUENTIAL chains with BufferCount > 1 still read buffer 0.
+
+Lab (11.10-182d, Topaz sign-in screen, 30 s windows): 0 "Invalid buffer ID" and readbacks
+succeeding (2,249 / 2,868 per run) on 2 of 2 runs; NEUTRON_DCOMP_FLIP_DISCARD_BUF0=0 on the same
+build: 1,132 and 1,797 per 30 s, every readback failed. Before (182h, 182 + diag): 11,870 and 3,028
+per run. Live (SEQUENTIAL, count 1) unchanged. Photoshop 2026 (Home + Chepino Valley) and Premiere
+2026 (Home + Waterfalls project) draw; Photoshop document pixel-identical to the switch-off run.
+
+Kill switch NEUTRON_DCOMP_FLIP_DISCARD_BUF0=0.
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -380,6 +380,29 @@
+     return v;
+ }
+ 
++/* NEUTRON 2026-11-05: which buffer holds the frame a swapchain last presented. DXGI makes buffers above
++ * zero readable only for the SEQUENTIAL effects (IDXGISwapChain::GetBuffer); DXVK keeps BufferCount
++ * buffers and rotates the presented one to the last index for those alone, and a DISCARD or FLIP_DISCARD
++ * chain has the one buffer 0, which still holds the presented frame. Asking a FLIP_DISCARD chain for
++ * BufferCount - 1 failed (DXGI_ERROR_UNSUPPORTED and DXVK's "GetImage: Invalid buffer ID" on every
++ * readback: Qt 6 RHI windows, e.g. Topaz Photo, about 28 a second) and nothing was read back.
++ * Kill switch NEUTRON_DCOMP_FLIP_DISCARD_BUF0=0 (asks FLIP_DISCARD for BufferCount - 1 again). */
++static UINT neutron_presented_buffer(const DXGI_SWAP_CHAIN_DESC *desc)
++{
++    static int flip_discard_buf0 = -1;
++
++    if (flip_discard_buf0 < 0)
++    {
++        char b[8];
++        flip_discard_buf0 = (GetEnvironmentVariableA("NEUTRON_DCOMP_FLIP_DISCARD_BUF0", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_FLIP_DISCARD_BUF0 = %d\n", flip_discard_buf0);
++    }
++    if (desc->BufferCount <= 1) return 0;
++    if (desc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL) return desc->BufferCount - 1;
++    if (desc->SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD && !flip_discard_buf0) return desc->BufferCount - 1;
++    return 0;
++}
++
+ /* NEUTRON bounded-acquire handshake (round 32). Private DXVK interface --
+  * must match INeutronBoundedAcquire in dxvk's dxgi_interfaces.h. We stamp
+  * every swapchain we readback-blit so DXVK bounds its otherwise-infinite WSI
+@@ -620,14 +643,13 @@
+              * presented frame is the last one (DXGI's read-only front buffer; DXVK's RotateBackBuffers
+              * moves the presented storage there). Buffer 0 is the frame from BufferCount presents ago --
+              * never drawn at all after a first Present, which is the "blank flip rotation" the filters
+-             * below were written around, and the only frame a static page ever presents (WebView2). */
++             * below were written around, and the only frame a static page ever presents (WebView2).
++             * A FLIP_DISCARD chain has no such buffer: see neutron_presented_buffer. */
+             {
+                 DXGI_SWAP_CHAIN_DESC scd;
+                 UINT index = 0;
+-                if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchain, &scd)) && scd.BufferCount > 1
+-                        && (scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL
+-                            || scd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD))
+-                    index = scd.BufferCount - 1;
++                if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchain, &scd)))
++                    index = neutron_presented_buffer(&scd);
+                 hr = IDXGISwapChain_GetBuffer(swapchain, index, &IID_ID3D11Texture2D, (void **)&backbuffer);
+             }
+             if (FAILED(hr))

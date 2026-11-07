@@ -1,0 +1,130 @@
+From: Neutron lab (team agent live2) 2026-11-05
+Subject: [PATCH] win32u: Measure menu bar items through WM_UAHMEASUREMENUITEM.
+
+What was seen (lab, Ableton Live 12.4.16 trial): Live's main window opens with no title bar and no menu bar, so
+File/Edit/Options cannot be reached; the bottom of Live's UI (status bar) is cut off below the screen. Same as
+WineHQ bug 57955 ("Ableton Live 12.1.10: Main interface is unusable").
+
+Mechanism: Live gives its main window (WS_OVERLAPPEDWINDOW) a Win32 menu bar and themes it with the undocumented
+UAH messages: its window procedure handles WM_UAHDRAWMENU (0x91), WM_UAHDRAWMENUITEM (0x92) and
+WM_UAHMEASUREMENUITEM (0x94). In 0x94 it calls DefWindowProc, then adds 4 px x scale to every item's height of
+its own menu bar (and 1 px x scale to the first item's width). Its frame helper (AdjustWindowRectExForDpi with
+the menu, then top -= dpi/24) sizes the window for that taller bar, and its WM_WINDOWPOSCHANGED handler resizes
+the window to client + that frame. Wine never sent 0x94, so the bar stayed 7 px (at 168 dpi) shorter than Live
+expects: every WM_WINDOWPOSCHANGED grew the window by 7 px (65 resizes per launch), until it was taller than the
+screen; Live then returns client = window from WM_NCCALCSIZE and the caption and menu bar are gone.
+(Static RE of Live 12.4.16: frame helper rva 0x335d920, window message switch rva 0x3360437, 0x94 handler rva
+0x3360b64.)
+
+Windows behavior: Windows 10/11's themed menu bar sends WM_UAHMEASUREMENUITEM to the window for each menu bar
+item and lays it out at the size the window leaves (Live is built against that; it is the known-good platform).
+The prefilled values and the exact set of items are not documented; probe uahmenu.exe (team/live2/probe) prints
+them on Windows and is waiting for a run on the Windows test machine.
+
+Fix: calc_menu_item_size() sends WM_UAHMEASUREMENUITEM (MEASUREITEMSTRUCT + UAHMENU {hmenu, hdc} + UAHMENUITEM
+{position}) for each menu bar item that is not the MDI system-menu item, prefilled with Wine's default size, and
+uses the width/height the window leaves. Only when the owner window belongs to the current thread (no
+cross-thread send from a measure). The message's struct is copied to and back from the callback like
+WM_MEASUREITEM. DefWindowProc leaves it alone (unknown message -> 0), so apps that do not handle it are unchanged.
+Kill switch: NEUTRON_UAH_MENU=0 (process environment).
+
+Not covered: WM_UAHDRAWMENU / WM_UAHDRAWMENUITEM are still not sent, so Live's menu bar is drawn by Wine in the
+prefix palette (dark gray, readable) instead of Live's own theme colors; popup menus get no UAH messages. A
+32-bit app under new-style WoW64 would need a thunk for the struct (Neutron's runtime is old-style WoW64; the
+i386 win32u.so is built from the same source).
+Every Win32 menu bar now gets the message: an app that handles it (Photoshop/Illustrator/Premiere have Win32 menu
+bars) sizes its bar as on Windows. No Adobe regression pass was run in this lab session; run one before shipping.
+
+Lab evidence (runtime 11.10-182n = 182j + this win32u.so x86_64/i386; fresh copy of the installed lab prefix per
+run; WINEDEBUG=+win; out/w-*.png):
+  182n on:                    n1, n2  2/2: 1 app resize, window 2115 px tall, nonclient top 90 (caption + 39 px
+                              bar), title bar + menu bar (File Edit Create Playback View Navigate Options Help)
+                              shown, status bar on screen. +menu: "uah measure pos 0: 49x32 -> 50x39".
+  182n NEUTRON_UAH_MENU=0:    k1, k2  2/2: 65 app resizes, window 2346 px tall, client = window (no caption/menu).
+  182j (unpatched):           lv1, b1 2/2: same runaway as the switch-off runs.
+
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -123,6 +123,18 @@
+ extern USHORT map_scan_to_kbd_vkey( USHORT scan, HKL layout );
+ 
+ /* menu.c */
++
++/* NEUTRON neutron-uah-menu-measure: Windows' themed menu bar measures each menu bar item through the
++ * (undocumented) WM_UAHMEASUREMENUITEM message, so a window can change the item's size. Layout as
++ * apps declare it (MEASUREITEMSTRUCT, then UAHMENU, then UAHMENUITEM). */
++#define WM_UAHMEASUREMENUITEM 0x0094
++struct uah_measure_menu_item
++{
++    MEASUREITEMSTRUCT mis;
++    struct { HMENU hmenu; HDC hdc; DWORD flags; } um;
++    struct { int position; DWORD item_metrics[8]; DWORD popup_metrics[5]; } umi;
++};
++
+ extern UINT draw_nc_menu_bar( HDC hdc, RECT *rect, HWND hwnd );
+ extern void end_menu( HWND hwnd );
+ extern HMENU get_menu( HWND hwnd );
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -2150,6 +2150,39 @@
+     {
+         item_height = max( item_height, get_system_metrics( SM_CYMENU ) - 1 );
+     }
++
++    /* NEUTRON neutron-uah-menu-measure: on Windows 10/11 the themed menu bar sends each menu bar item
++     * to the window as WM_UAHMEASUREMENUITEM with its default size, and lays the item out at the size
++     * the window leaves in it. Ableton Live 12 makes every item 4 px (x scale) taller there and sizes
++     * its window for that taller bar; with no message the bar stayed short, every WM_WINDOWPOSCHANGED
++     * grew the window by the difference until it reached the screen size, and Live then dropped its
++     * title bar and menu bar. Only for the window's own thread (no cross-thread send from a measure).
++     * Kill switch: NEUTRON_UAH_MENU=0. */
++    if (menu_bar && !(item->fType & MF_SYSMENU) && is_current_thread_window( owner ))
++    {
++        static int uah = -1;
++        if (uah < 0) { const char *e = getenv( "NEUTRON_UAH_MENU" ); uah = !(e && e[0] == '0'); }
++        if (uah)
++        {
++            struct uah_measure_menu_item mi;
++
++            memset( &mi, 0, sizeof(mi) );
++            mi.mis.CtlType    = ODT_MENU;
++            mi.mis.itemID     = item->wID;
++            mi.mis.itemWidth  = item->rect.right - item->rect.left;
++            mi.mis.itemHeight = item_height;
++            mi.mis.itemData   = item->dwItemData;
++            mi.um.hmenu       = menu->handle;
++            mi.um.hdc         = hdc;
++            mi.umi.position   = item - menu->items;
++            send_message( owner, WM_UAHMEASUREMENUITEM, 0, (LPARAM)&mi );
++            TRACE( "uah measure pos %d: %dx%d -> %ux%u\n", mi.umi.position, (int)(item->rect.right - item->rect.left),
++                   item_height, mi.mis.itemWidth, mi.mis.itemHeight );
++            if ((int)mi.mis.itemWidth > 0) item->rect.right = item->rect.left + mi.mis.itemWidth;
++            if ((int)mi.mis.itemHeight > 0) item_height = mi.mis.itemHeight;
++        }
++    }
++
+     item->rect.bottom += item_height;
+     TRACE( "%s\n", wine_dbgstr_rect( &item->rect ));
+ }
+--- a/dlls/win32u/message.c
++++ b/dlls/win32u/message.c
+@@ -1723,6 +1723,9 @@
+     case WM_MEASUREITEM:
+         size = sizeof(MEASUREITEMSTRUCT);
+         break;
++    case WM_UAHMEASUREMENUITEM: /* NEUTRON neutron-uah-menu-measure: menu.c sends it to the window's own thread */
++        size = sizeof(struct uah_measure_menu_item);
++        break;
+     case WM_DELETEITEM:
+         size = sizeof(DELETEITEMSTRUCT);
+         break;
+@@ -2032,6 +2035,9 @@
+     case WM_MEASUREITEM:
+         copy_size = sizeof(MEASUREITEMSTRUCT);
+         break;
++    case WM_UAHMEASUREMENUITEM: /* NEUTRON neutron-uah-menu-measure: the window may change the size */
++        copy_size = sizeof(struct uah_measure_menu_item);
++        break;
+     case WM_WINDOWPOSCHANGING:
+         copy_size = sizeof(WINDOWPOS);
+         break;

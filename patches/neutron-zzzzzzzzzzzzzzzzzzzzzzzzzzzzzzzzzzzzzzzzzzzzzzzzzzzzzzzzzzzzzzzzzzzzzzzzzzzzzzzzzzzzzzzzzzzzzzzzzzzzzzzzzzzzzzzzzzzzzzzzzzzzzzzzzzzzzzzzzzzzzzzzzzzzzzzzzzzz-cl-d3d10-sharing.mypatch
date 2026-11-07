@@ -1,0 +1,626 @@
+opencl: implement cl_khr_d3d10_sharing on 135's cl_khr_d3d11_sharing machinery, so Affinity's raster engine uses the GPU
+
+What was seen / why (app list, batch 1): Affinity 3.3.3 (Canva)
+lists the GPU's OpenCL device and then "(Skipping unsupported device)"; Settings > Performance shows "Enable OpenCL
+compute acceleration" switched off with no device, Help > Benchmark has no GPU scores: all raster work runs on the CPU.
+
+Mechanism (SOLID, libraster.dll disassembly 0x1804fc8dc.. and 0x1804f9ad0..): libraster delay-loads OpenCL.dll and uses
+a device only when its version is >= 1.2, its CL_DEVICE_EXTENSIONS list cl_khr_d3d10_sharing, and
+clGetDeviceIDsFromD3D10KHR(platform, CL_D3D10_DXGI_ADAPTER_KHR, <its DXGI adapter>, CL_PREFERRED_DEVICES_FOR_D3D10_KHR)
+returns it ("Could not get OpenCL devices for DXGI adapter!" otherwise). It never creates D3D10-shared objects: its
+OpenCL work is plain buffers. Wine filtered the extension out and had no such entry point; 135 added only the D3D11 one.
+
+Windows: NVIDIA's, AMD's and Intel's Windows OpenCL drivers list cl_khr_d3d10_sharing on GPU devices.
+
+Fix (dlls/opencl/pe_d3d11.c, pe_wrappers.c, opencl_private.h), the same design as 135 because DXVK's Direct3D 10 device
+and resources are views of its Direct3D 11 ones (QueryInterface goes both ways):
+- cl_khr_d3d10_sharing is listed next to cl_khr_d3d11_sharing for GPU devices and platforms that have one;
+  clGetExtensionFunctionAddress(ForPlatform) return clGetDeviceIDsFromD3D10KHR, clCreateFromD3D10Buffer/Texture2D/
+  Texture3DKHR, clEnqueueAcquire/ReleaseD3D10ObjectsKHR.
+- clGetDeviceIDsFromD3D10KHR: CL_D3D10_DEVICE_KHR (its IDXGIDevice's adapter) or CL_D3D10_DXGI_ADAPTER_KHR, then 135's
+  adapter matching (PCI location via DXVK's interop adapter, UUID, vendor).
+- CL_CONTEXT_D3D10_DEVICE_KHR: the D3D11 device behind the D3D10 one is kept with the context (CL_INVALID_D3D10_DEVICE_KHR
+  for anything else; D3D10 + D3D11 devices together: CL_INVALID_OPERATION). Shared objects, acquire/release copies and
+  lifetime are 135's; D3D10 objects need a D3D10 context and vice versa; CL_MEM_D3D10_RESOURCE_KHR /
+  CL_IMAGE_D3D10_SUBRESOURCE_KHR answered; D3D10 error codes (-1002..-1005).
+Kill switch: NEUTRON_DISABLE_CL_D3D10_SHARING=1 (only the D3D10 part; NEUTRON_DISABLE_CL_D3D11_SHARING keeps its meaning).
+
+Not covered: everything 135 lists (copies, not zero copy; markers for events; ...); CL_CONTEXT_D3D10_PREFER_SHARED_
+RESOURCES_KHR; cl_nv_d3d10_sharing names; clSVMAlloc/clSVMFree are still not exported (libraster delay-imports them:
+a call would end in c06d007f; not seen on any lab path); 32-bit built, untested (no 32-bit host OpenCL here).
+
+Lab evidence (11-06, desk z, NVIDIA RTX 5070 / driver 615.78 / OpenCL 3.0 CUDA 13.4.96; lab runtime 11.10-183c =
+183rc + this opencl.dll + the mscms change; prefix PgI-acA; logs in team/affcolor/logs, seq2.txt, docab.txt):
+- Conformance (test/cl-d3d10-11-conformance.c = clcore's 82 D3D11 checks + 27 D3D10 checks: both extension strings, the
+  six entry points, device match by DXGI adapter (Affinity's call) and by D3D10 device, wrong set/device/both-API errors,
+  D3D10 interop context, buffer D3D10 -> acquire -> CL -> kernel -> release -> D3D10, Texture2D RGBA8 67x33 both ways,
+  D3D10 queries, -1004/-1005, cross-API refusals, device reference dropped): this build 109/109 n=2; kill switch 82 pass,
+  D3D10 part absent (= 183rc, 82 pass, absent).
+- Affinity: Log.txt "(Skipping unsupported device)" 0/0/0 on this build (o1-o3) vs 4/4 kill switch (ok1, ok2) and 4 on
+  183rc; Settings > Performance "Enable OpenCL compute acceleration / NVIDIA GeForce RTX 5070" ON 3/3 vs OFF without a
+  device 2/2 kill + 1/1 183rc; Help > Benchmark Raster (Single GPU) 28531 / 21916 / 28348, Combined (Single GPU)
+  7987 / 7479 / 7850 vs N/A 2/2 kill. No crash, no c06d007f (0/5). New document view: this build vs kill switch
+  pixel-identical 2/2 (docab).
+- After Effects (claex's run.sh, lab spoof: runtime 11.10-183cs = 183c + this opencl.dll + clcore's NEUTRON_LAB spoof,
+  fresh reflink AeX-acz of claex's AeX1): run 1 calder_ok 1 / CALDER-SUPPORTED (Advanced 3D offered), but a modal "After
+  Effects warning: Direct2D Drawbot error. HRESULT: -2003238911" (0x88990001) sat over a black viewer, "ready" only after
+  541 s (claex 12 s) and the render step never ran. Kill-switch arm: stuck behind "Crash Repair Options" from run 1's
+  teardown (rig) -> NO A/B. AE is NOT verified for this patch (see report).
+
+--- a/dlls/opencl/opencl_private.h
++++ b/dlls/opencl/opencl_private.h
+@@ -32,6 +32,10 @@
+ 
+ BOOL extension_is_supported( const char *name, size_t len );
+ 
++/* NEUTRON: the D3D sharing extensions pe_d3d11.c implements (bit mask) */
++#define D3D_SHARING_D3D11 1
++#define D3D_SHARING_D3D10 2
++
+ #define OPENCL_CALL( func, params ) WINE_UNIX_CALL( unix_ ## func, params )
+ 
+ #endif
+--- a/dlls/opencl/pe_d3d11.c
++++ b/dlls/opencl/pe_d3d11.c
+@@ -31,7 +31,13 @@
+  * - OpenCL devices are matched to DXGI adapters by PCI location (Vulkan, through DXVK's interop interface, against
+  *   cl_khr_pci_bus_info or the vendor's own device queries), then by device UUID, then by vendor.
+  *
+- * NEUTRON_DISABLE_CL_D3D11_SHARING=1 turns all of it off: the extension is not advertised again. */
++ * NEUTRON_DISABLE_CL_D3D11_SHARING=1 turns all of it off: the extension is not advertised again.
++ *
++ * cl_khr_d3d10_sharing is the same machinery for Direct3D 10 (Affinity's raster engine only uses an OpenCL device it
++ * can map to its DXGI adapter through clGetDeviceIDsFromD3D10KHR). DXVK's Direct3D 10 device and resources are views
++ * of its Direct3D 11 ones (QueryInterface goes both ways), so a D3D10 interop context keeps the D3D11 device behind the
++ * D3D10 one and its objects run through the D3D11 paths; only the entry points, the property, the queries and the
++ * error codes are the D3D10 ones. NEUTRON_DISABLE_CL_D3D10_SHARING=1 turns that part off. */
+ 
+ #include <stdarg.h>
+ #include <string.h>
+@@ -61,6 +67,18 @@
+ #define CL_MEM_D3D11_RESOURCE_KHR               0x401E
+ #define CL_IMAGE_D3D11_SUBRESOURCE_KHR          0x401F
+ 
++#define CL_INVALID_D3D10_DEVICE_KHR             -1002
++#define CL_INVALID_D3D10_RESOURCE_KHR           -1003
++#define CL_D3D10_RESOURCE_ALREADY_ACQUIRED_KHR  -1004
++#define CL_D3D10_RESOURCE_NOT_ACQUIRED_KHR      -1005
++#define CL_D3D10_DEVICE_KHR                     0x4010
++#define CL_D3D10_DXGI_ADAPTER_KHR               0x4011
++#define CL_PREFERRED_DEVICES_FOR_D3D10_KHR      0x4012
++#define CL_ALL_DEVICES_FOR_D3D10_KHR            0x4013
++#define CL_CONTEXT_D3D10_DEVICE_KHR             0x4014
++#define CL_MEM_D3D10_RESOURCE_KHR               0x4015
++#define CL_IMAGE_D3D10_SUBRESOURCE_KHR          0x4016
++
+ #define CL_DEVICE_UUID_KHR                      0x106A
+ #define CL_DEVICE_PCI_BUS_INFO_KHR              0x410F
+ #define CL_DEVICE_TOPOLOGY_AMD                  0x4037
+@@ -94,7 +112,8 @@
+ {
+     struct list entry;
+     cl_context context;           /* holds one host reference of ours */
+-    ID3D11Device *device;
++    ID3D11Device *device;         /* for a D3D10 context, the D3D11 device behind the application's D3D10 one */
++    BOOL d3d10;                   /* created with CL_CONTEXT_D3D10_DEVICE_KHR */
+     ID3D11DeviceContext *immediate;
+     ID3D11Multithread *multithread;
+     LONG mems;                    /* shared memory objects still alive */
+@@ -190,6 +209,19 @@
+     return enabled;
+ }
+ 
++BOOL d3d10_sharing_enabled(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv( "NEUTRON_DISABLE_CL_D3D10_SHARING" );
++        enabled = !(env && *env == '1');
++        if (!enabled) WARN( "cl_khr_d3d10_sharing disabled by NEUTRON_DISABLE_CL_D3D10_SHARING\n" );
++    }
++    return enabled;
++}
++
+ static cl_int host_device_info( cl_device_id device, cl_device_info name, size_t size, void *value )
+ {
+     struct clGetDeviceInfo_params params = { device, name, size, value, NULL };
+@@ -385,15 +417,54 @@
+     return adapter;
+ }
+ 
++static cl_int get_adapter_devices( cl_platform_id platform, IDXGIAdapter *adapter, cl_uint num_entries,
++                                   cl_device_id *devices, cl_uint *num_devices );
++
++static IDXGIAdapter *get_d3d10_device_adapter( ID3D10Device *device )
++{
++    IDXGIAdapter *adapter = NULL;
++    IDXGIDevice *dxgi_device;
++
++    if (SUCCEEDED(ID3D10Device_QueryInterface( device, &IID_IDXGIDevice, (void **)&dxgi_device )))
++    {
++        if (FAILED(IDXGIDevice_GetAdapter( dxgi_device, &adapter ))) adapter = NULL;
++        IDXGIDevice_Release( dxgi_device );
++    }
++    return adapter;
++}
++
++static cl_int WINAPI clGetDeviceIDsFromD3D10KHR( cl_platform_id platform, cl_uint source, void *object, cl_uint set,
++                                                 cl_uint num_entries, cl_device_id *devices, cl_uint *num_devices )
++{
++    IDXGIAdapter *adapter = NULL;
++    ID3D10Device *device;
++
++    TRACE( "(%p, %#x, %p, %#x, %u, %p, %p)\n", platform, source, object, set, num_entries, devices, num_devices );
++
++    if (set != CL_PREFERRED_DEVICES_FOR_D3D10_KHR && set != CL_ALL_DEVICES_FOR_D3D10_KHR) return CL_INVALID_VALUE;
++    if ((!num_entries && devices) || (!devices && !num_devices) || !object) return CL_INVALID_VALUE;
++
++    if (source == CL_D3D10_DEVICE_KHR)
++    {
++        if (FAILED(IUnknown_QueryInterface( (IUnknown *)object, &IID_ID3D10Device, (void **)&device )))
++            return CL_INVALID_VALUE;
++        adapter = get_d3d10_device_adapter( device );
++        ID3D10Device_Release( device );
++    }
++    else if (source == CL_D3D10_DXGI_ADAPTER_KHR)
++    {
++        if (FAILED(IUnknown_QueryInterface( (IUnknown *)object, &IID_IDXGIAdapter, (void **)&adapter )))
++            adapter = NULL;
++    }
++    if (!adapter) return CL_INVALID_VALUE;
++    return get_adapter_devices( platform, adapter, num_entries, devices, num_devices );
++}
++
+ static cl_int WINAPI clGetDeviceIDsFromD3D11KHR( cl_platform_id platform, cl_uint source, void *object, cl_uint set,
+                                                  cl_uint num_entries, cl_device_id *devices, cl_uint *num_devices )
+ {
+     IDXGIAdapter *adapter = NULL;
+-    cl_device_id *all;
+     ID3D11Device *device;
+-    struct gpu_id id;
+-    cl_uint count, i, found = 0;
+-    cl_int ret;
+ 
+     TRACE( "(%p, %#x, %p, %#x, %u, %p, %p)\n", platform, source, object, set, num_entries, devices, num_devices );
+ 
+@@ -413,6 +484,18 @@
+             adapter = NULL;
+     }
+     if (!adapter) return CL_INVALID_VALUE;
++    return get_adapter_devices( platform, adapter, num_entries, devices, num_devices );
++}
++
++/* the host devices of PLATFORM on ADAPTER (consumes the reference) */
++static cl_int get_adapter_devices( cl_platform_id platform, IDXGIAdapter *adapter, cl_uint num_entries,
++                                   cl_device_id *devices, cl_uint *num_devices )
++{
++    cl_device_id *all;
++    struct gpu_id id;
++    cl_uint count, i, found = 0;
++    cl_int ret;
++
+     get_adapter_id( adapter, &id );
+     IDXGIAdapter_Release( adapter );
+ 
+@@ -572,9 +655,9 @@
+     cl_context context = NULL;
+     cl_int ret = CL_SUCCESS;
+     size_t i, n = 0;
+-    BOOL seen = FALSE;
++    BOOL seen = FALSE, d3d10 = FALSE;
+ 
+-    if (d3d11_sharing_enabled() && properties)
++    if ((d3d11_sharing_enabled() || d3d10_sharing_enabled()) && properties)
+     {
+         for (i = 0; properties[i]; i += 2) ;
+         if (!(host_properties = malloc( (i + 1) * sizeof(*host_properties) )))
+@@ -584,15 +667,43 @@
+         }
+         for (i = 0; properties[i]; i += 2)
+         {
+-            if (properties[i] == CL_CONTEXT_D3D11_DEVICE_KHR)
++            if ((properties[i] == CL_CONTEXT_D3D11_DEVICE_KHR && d3d11_sharing_enabled()) ||
++                (properties[i] == CL_CONTEXT_D3D10_DEVICE_KHR && d3d10_sharing_enabled()))
+             {
++                BOOL is_d3d10 = properties[i] == CL_CONTEXT_D3D10_DEVICE_KHR;
++
+                 if (seen)
+                 {
+-                    ret = CL_INVALID_PROPERTY;
++                    /* one D3D device per context; both APIs at once is interop with two graphics APIs */
++                    ret = is_d3d10 == d3d10 ? CL_INVALID_PROPERTY : CL_INVALID_OPERATION;
+                     goto done;
+                 }
+                 seen = TRUE;
+-                if (properties[i + 1] && FAILED(IUnknown_QueryInterface( (IUnknown *)properties[i + 1],
++                d3d10 = is_d3d10;
++                if (d3d10 && properties[i + 1])
++                {
++                    ID3D10Device *d3d10_device;
++                    HRESULT hr;
++
++                    if (FAILED(IUnknown_QueryInterface( (IUnknown *)properties[i + 1], &IID_ID3D10Device,
++                                                        (void **)&d3d10_device )))
++                    {
++                        WARN( "%p is not a D3D10 device\n", (void *)properties[i + 1] );
++                        ret = CL_INVALID_D3D10_DEVICE_KHR;
++                        goto done;
++                    }
++                    /* the D3D11 device a D3D10 device is a view of (DXVK) */
++                    hr = ID3D10Device_QueryInterface( d3d10_device, &IID_ID3D11Device, (void **)&device );
++                    ID3D10Device_Release( d3d10_device );
++                    if (FAILED(hr))
++                    {
++                        WARN( "no D3D11 device behind D3D10 device %p, hr %#lx\n", (void *)properties[i + 1], hr );
++                        device = NULL;
++                        ret = CL_INVALID_D3D10_DEVICE_KHR;
++                        goto done;
++                    }
++                }
++                else if (!d3d10 && properties[i + 1] && FAILED(IUnknown_QueryInterface( (IUnknown *)properties[i + 1],
+                                                                          &IID_ID3D11Device, (void **)&device )))
+                 {
+                     WARN( "%p is not a D3D11 device\n", (void *)properties[i + 1] );
+@@ -624,12 +735,16 @@
+ 
+     if (!(adapter = get_d3d11_device_adapter( device )))
+     {
+-        ret = CL_INVALID_D3D11_DEVICE_KHR;
++        ret = d3d10 ? CL_INVALID_D3D10_DEVICE_KHR : CL_INVALID_D3D11_DEVICE_KHR;
+         goto done;
+     }
+     get_adapter_id( adapter, &id );
+     IDXGIAdapter_Release( adapter );
+-    if ((ret = check_context_devices( context, &id ))) goto done;
++    if ((ret = check_context_devices( context, &id )))
++    {
++        if (d3d10 && ret == CL_INVALID_D3D11_DEVICE_KHR) ret = CL_INVALID_D3D10_DEVICE_KHR;
++        goto done;
++    }
+ 
+     if (!(record = calloc( 1, sizeof(*record) )))
+     {
+@@ -638,6 +753,7 @@
+     }
+     record->context = context;
+     record->device = device;
++    record->d3d10 = d3d10;
+     ID3D11Device_GetImmediateContext( device, &record->immediate );
+     /* our copies go through the application's immediate context, possibly from another thread than its own
+      * D3D11 work: turn on the D3D11 runtime's own locking (ID3D11Multithread) and take it around each use */
+@@ -652,7 +768,7 @@
+     EnterCriticalSection( &d3d11_cs );
+     list_add_tail( &d3d11_contexts, &record->entry );
+     LeaveCriticalSection( &d3d11_cs );
+-    TRACE( "context %p shares with D3D11 device %p\n", context, device );
++    TRACE( "context %p shares with D3D%u device %p\n", context, d3d10 ? 10 : 11, device );
+     device = NULL;
+ 
+ done:
+@@ -692,8 +808,9 @@
+ }
+ 
+ static cl_mem create_d3d11_mem( cl_context handle, cl_mem_flags flags, void *app_resource,
+-                                D3D11_RESOURCE_DIMENSION dimension, UINT subresource, cl_int *errcode_ret )
++                                D3D11_RESOURCE_DIMENSION dimension, UINT subresource, BOOL d3d10, cl_int *errcode_ret )
+ {
++    const cl_int invalid_resource = d3d10 ? CL_INVALID_D3D10_RESOURCE_KHR : CL_INVALID_D3D11_RESOURCE_KHR;
+     const cl_image_format *format = NULL;
+     struct d3d11_context *context;
+     ID3D11Resource *resource = NULL;
+@@ -708,7 +825,9 @@
+     release_unused_objects();
+ 
+     EnterCriticalSection( &d3d11_cs );
+-    if ((context = find_context( handle ))) context->mems++;
++    /* a D3D10 object needs a D3D10 context, a D3D11 one a D3D11 context */
++    if ((context = find_context( handle )) && context->d3d10 != d3d10) context = NULL;
++    if (context) context->mems++;
+     LeaveCriticalSection( &d3d11_cs );
+     if (!context)
+     {
+@@ -725,7 +844,7 @@
+                                                          (void **)&resource )))
+     {
+         resource = NULL;
+-        ret = CL_INVALID_D3D11_RESOURCE_KHR;
++        ret = invalid_resource;
+         goto done;
+     }
+     ID3D11Resource_GetType( resource, &type );
+@@ -738,7 +857,7 @@
+     ID3D11Device_Release( resource_device );
+     if (type != dimension)
+     {
+-        ret = CL_INVALID_D3D11_RESOURCE_KHR;
++        ret = invalid_resource;
+         goto done;
+     }
+ 
+@@ -772,7 +891,7 @@
+         mem->usage = texture_desc.Usage;
+         if (texture_desc.SampleDesc.Count > 1)
+         {
+-            ret = CL_INVALID_D3D11_RESOURCE_KHR;
++            ret = invalid_resource;
+             goto done;
+         }
+         if (subresource >= texture_desc.MipLevels * texture_desc.ArraySize)
+@@ -810,7 +929,7 @@
+     }
+     if (mem->usage == D3D11_USAGE_IMMUTABLE)
+     {
+-        ret = CL_INVALID_D3D11_RESOURCE_KHR;
++        ret = invalid_resource;
+         goto done;
+     }
+ 
+@@ -872,21 +991,46 @@
+                                                  cl_int *errcode_ret )
+ {
+     TRACE( "(%p, %s, %p, %p)\n", context, wine_dbgstr_longlong(flags), resource, errcode_ret );
+-    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_BUFFER, 0, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_BUFFER, 0, FALSE, errcode_ret );
+ }
+ 
+ static cl_mem WINAPI clCreateFromD3D11Texture2DKHR( cl_context context, cl_mem_flags flags, ID3D11Texture2D *resource,
+                                                     UINT subresource, cl_int *errcode_ret )
+ {
+     TRACE( "(%p, %s, %p, %u, %p)\n", context, wine_dbgstr_longlong(flags), resource, subresource, errcode_ret );
+-    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE2D, subresource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE2D, subresource, FALSE,
++                             errcode_ret );
+ }
+ 
+ static cl_mem WINAPI clCreateFromD3D11Texture3DKHR( cl_context context, cl_mem_flags flags, ID3D11Texture3D *resource,
+                                                     UINT subresource, cl_int *errcode_ret )
+ {
+     TRACE( "(%p, %s, %p, %u, %p)\n", context, wine_dbgstr_longlong(flags), resource, subresource, errcode_ret );
+-    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE3D, subresource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE3D, subresource, FALSE,
++                             errcode_ret );
++}
++
++static cl_mem WINAPI clCreateFromD3D10BufferKHR( cl_context context, cl_mem_flags flags, ID3D10Buffer *resource,
++                                                 cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %p)\n", context, wine_dbgstr_longlong(flags), resource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_BUFFER, 0, TRUE, errcode_ret );
++}
++
++static cl_mem WINAPI clCreateFromD3D10Texture2DKHR( cl_context context, cl_mem_flags flags, ID3D10Texture2D *resource,
++                                                    UINT subresource, cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %u, %p)\n", context, wine_dbgstr_longlong(flags), resource, subresource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE2D, subresource, TRUE,
++                             errcode_ret );
++}
++
++static cl_mem WINAPI clCreateFromD3D10Texture3DKHR( cl_context context, cl_mem_flags flags, ID3D10Texture3D *resource,
++                                                    UINT subresource, cl_int *errcode_ret )
++{
++    TRACE( "(%p, %s, %p, %u, %p)\n", context, wine_dbgstr_longlong(flags), resource, subresource, errcode_ret );
++    return create_d3d11_mem( context, flags, resource, D3D11_RESOURCE_DIMENSION_TEXTURE3D, subresource, TRUE,
++                             errcode_ret );
+ }
+ 
+ static void lock_d3d11( struct d3d11_context *context )
+@@ -1062,8 +1206,12 @@
+ }
+ 
+ static cl_int enqueue_d3d11_objects( cl_command_queue queue, cl_uint num_objects, const cl_mem *mem_objects,
+-                                     cl_uint num_events, const cl_event *events, cl_event *event, BOOL acquire )
++                                     cl_uint num_events, const cl_event *events, cl_event *event, BOOL acquire,
++                                     BOOL d3d10 )
+ {
++    const cl_int already_acquired = d3d10 ? CL_D3D10_RESOURCE_ALREADY_ACQUIRED_KHR : CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR;
++    const cl_int not_acquired = d3d10 ? CL_D3D10_RESOURCE_NOT_ACQUIRED_KHR : CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
++    struct d3d11_context *context;
+     struct clGetCommandQueueInfo_params info = { queue, CL_QUEUE_CONTEXT, sizeof(cl_context), NULL, NULL };
+     struct d3d11_mem **mems = NULL;
+     cl_context handle;
+@@ -1077,15 +1225,15 @@
+     if (num_objects && !(mems = calloc( num_objects, sizeof(*mems) ))) return CL_OUT_OF_HOST_MEMORY;
+ 
+     EnterCriticalSection( &d3d11_cs );
+-    if (!find_context( handle )) ret = CL_INVALID_CONTEXT;
++    if (!(context = find_context( handle )) || context->d3d10 != d3d10) ret = CL_INVALID_CONTEXT;
+     for (i = 0; !ret && i < num_objects; i++)
+     {
+-        if (!(mems[i] = find_mem( mem_objects[i] ))) ret = CL_INVALID_MEM_OBJECT;
++        if (!(mems[i] = find_mem( mem_objects[i] )) || mems[i]->context->d3d10 != d3d10) ret = CL_INVALID_MEM_OBJECT;
+         else if (mems[i]->context->context != handle) ret = CL_INVALID_CONTEXT;
+-        else if (acquire && mems[i]->acquired) ret = CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR;
+-        else if (!acquire && !mems[i]->acquired) ret = CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
++        else if (acquire && mems[i]->acquired) ret = already_acquired;
++        else if (!acquire && !mems[i]->acquired) ret = not_acquired;
+         for (j = 0; !ret && j < i; j++)
+-            if (mems[j] == mems[i]) ret = acquire ? CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR : CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
++            if (mems[j] == mems[i]) ret = acquire ? already_acquired : not_acquired;
+     }
+     /* no other acquire or release of these objects can start until we are done */
+     for (i = 0; !ret && i < num_objects; i++) mems[i]->acquired = !mems[i]->acquired;
+@@ -1131,7 +1279,7 @@
+                                                       const cl_event *events, cl_event *event )
+ {
+     TRACE( "(%p, %u, %p, %u, %p, %p)\n", queue, num_objects, mem_objects, num_events, events, event );
+-    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, TRUE );
++    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, TRUE, FALSE );
+ }
+ 
+ static cl_int WINAPI clEnqueueReleaseD3D11ObjectsKHR( cl_command_queue queue, cl_uint num_objects,
+@@ -1139,7 +1287,23 @@
+                                                       const cl_event *events, cl_event *event )
+ {
+     TRACE( "(%p, %u, %p, %u, %p, %p)\n", queue, num_objects, mem_objects, num_events, events, event );
+-    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, FALSE );
++    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, FALSE, FALSE );
++}
++
++static cl_int WINAPI clEnqueueAcquireD3D10ObjectsKHR( cl_command_queue queue, cl_uint num_objects,
++                                                      const cl_mem *mem_objects, cl_uint num_events,
++                                                      const cl_event *events, cl_event *event )
++{
++    TRACE( "(%p, %u, %p, %u, %p, %p)\n", queue, num_objects, mem_objects, num_events, events, event );
++    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, TRUE, TRUE );
++}
++
++static cl_int WINAPI clEnqueueReleaseD3D10ObjectsKHR( cl_command_queue queue, cl_uint num_objects,
++                                                      const cl_mem *mem_objects, cl_uint num_events,
++                                                      const cl_event *events, cl_event *event )
++{
++    TRACE( "(%p, %u, %p, %u, %p, %p)\n", queue, num_objects, mem_objects, num_events, events, event );
++    return enqueue_d3d11_objects( queue, num_objects, mem_objects, num_events, events, event, FALSE, TRUE );
+ }
+ 
+ static cl_int return_pointer( void *ptr, size_t size, void *value, size_t *ret_size )
+@@ -1151,19 +1315,24 @@
+     return CL_SUCCESS;
+ }
+ 
+-/* CL_MEM_D3D11_RESOURCE_KHR and CL_IMAGE_D3D11_SUBRESOURCE_KHR; FALSE for every other query */
++/* CL_MEM_D3D1x_RESOURCE_KHR and CL_IMAGE_D3D1x_SUBRESOURCE_KHR; FALSE for every other query */
+ BOOL d3d11_get_mem_info( cl_mem handle, cl_uint name, size_t size, void *value, size_t *ret_size, cl_int *ret )
+ {
+     struct d3d11_mem *mem;
++    BOOL d3d10;
+ 
+-    if (!d3d11_sharing_enabled()) return FALSE;
+-    if (name != CL_MEM_D3D11_RESOURCE_KHR && name != CL_IMAGE_D3D11_SUBRESOURCE_KHR) return FALSE;
++    if (d3d11_sharing_enabled() && (name == CL_MEM_D3D11_RESOURCE_KHR || name == CL_IMAGE_D3D11_SUBRESOURCE_KHR))
++        d3d10 = FALSE;
++    else if (d3d10_sharing_enabled() && (name == CL_MEM_D3D10_RESOURCE_KHR || name == CL_IMAGE_D3D10_SUBRESOURCE_KHR))
++        d3d10 = TRUE;
++    else return FALSE;
+ 
+     EnterCriticalSection( &d3d11_cs );
+-    if (!(mem = find_mem( handle )) || (name == CL_IMAGE_D3D11_SUBRESOURCE_KHR
+-                                        && mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER))
+-        *ret = CL_INVALID_D3D11_RESOURCE_KHR;
+-    else if (name == CL_MEM_D3D11_RESOURCE_KHR)
++    if (!(mem = find_mem( handle )) || mem->context->d3d10 != d3d10
++        || ((name == CL_IMAGE_D3D11_SUBRESOURCE_KHR || name == CL_IMAGE_D3D10_SUBRESOURCE_KHR)
++            && mem->dimension == D3D11_RESOURCE_DIMENSION_BUFFER))
++        *ret = d3d10 ? CL_INVALID_D3D10_RESOURCE_KHR : CL_INVALID_D3D11_RESOURCE_KHR;
++    else if (name == CL_MEM_D3D11_RESOURCE_KHR || name == CL_MEM_D3D10_RESOURCE_KHR)
+         *ret = return_pointer( mem->app_resource, size, value, ret_size );
+     else
+     {
+@@ -1194,30 +1363,50 @@
+         {"clEnqueueAcquireD3D11ObjectsKHR", clEnqueueAcquireD3D11ObjectsKHR},
+         {"clEnqueueReleaseD3D11ObjectsKHR", clEnqueueReleaseD3D11ObjectsKHR},
+         {"clGetDeviceIDsFromD3D11KHR", clGetDeviceIDsFromD3D11KHR},
++    },
++    d3d10_functions[] =
++    {
++        {"clCreateFromD3D10BufferKHR", clCreateFromD3D10BufferKHR},
++        {"clCreateFromD3D10Texture2DKHR", clCreateFromD3D10Texture2DKHR},
++        {"clCreateFromD3D10Texture3DKHR", clCreateFromD3D10Texture3DKHR},
++        {"clEnqueueAcquireD3D10ObjectsKHR", clEnqueueAcquireD3D10ObjectsKHR},
++        {"clEnqueueReleaseD3D10ObjectsKHR", clEnqueueReleaseD3D10ObjectsKHR},
++        {"clGetDeviceIDsFromD3D10KHR", clGetDeviceIDsFromD3D10KHR},
+     };
+     unsigned int i;
+ 
+-    if (!name || !d3d11_sharing_enabled()) return NULL;
+-    for (i = 0; i < ARRAY_SIZE(functions); i++)
+-        if (!strcmp( name, functions[i].name )) return functions[i].func;
++    if (!name) return NULL;
++    if (d3d11_sharing_enabled())
++        for (i = 0; i < ARRAY_SIZE(functions); i++)
++            if (!strcmp( name, functions[i].name )) return functions[i].func;
++    if (d3d10_sharing_enabled())
++        for (i = 0; i < ARRAY_SIZE(d3d10_functions); i++)
++            if (!strcmp( name, d3d10_functions[i].name )) return d3d10_functions[i].func;
+     return NULL;
+ }
+ 
+-/* cl_khr_d3d11_sharing is listed for GPU devices, and for platforms that have one */
+-BOOL d3d11_device_has_sharing( cl_device_id device )
++static unsigned int sharing_extensions(void)
++{
++    return (d3d11_sharing_enabled() ? D3D_SHARING_D3D11 : 0) | (d3d10_sharing_enabled() ? D3D_SHARING_D3D10 : 0);
++}
++
++/* cl_khr_d3d11_sharing and cl_khr_d3d10_sharing are listed for GPU devices, and for platforms that have one */
++unsigned int d3d11_device_has_sharing( cl_device_id device )
+ {
+     cl_device_type type = 0;
+ 
+-    if (!d3d11_sharing_enabled()) return FALSE;
+-    return !host_device_info( device, CL_DEVICE_TYPE, sizeof(type), &type ) && (type & CL_DEVICE_TYPE_GPU);
++    if (!sharing_extensions()) return 0;
++    if (host_device_info( device, CL_DEVICE_TYPE, sizeof(type), &type ) || !(type & CL_DEVICE_TYPE_GPU)) return 0;
++    return sharing_extensions();
+ }
+ 
+-BOOL d3d11_platform_has_sharing( cl_platform_id platform )
++unsigned int d3d11_platform_has_sharing( cl_platform_id platform )
+ {
+     struct clGetDeviceIDs_params params = { platform, CL_DEVICE_TYPE_GPU, 0, NULL, NULL };
+     cl_uint count = 0;
+ 
+-    if (!d3d11_sharing_enabled()) return FALSE;
++    if (!sharing_extensions()) return 0;
+     params.num_devices = &count;
+-    return !OPENCL_CALL( clGetDeviceIDs, &params ) && count;
++    if (OPENCL_CALL( clGetDeviceIDs, &params ) || !count) return 0;
++    return sharing_extensions();
+ }
+--- a/dlls/opencl/pe_wrappers.c
++++ b/dlls/opencl/pe_wrappers.c
+@@ -26,8 +26,8 @@
+ WINE_DEFAULT_DEBUG_CHANNEL(opencl);
+ 
+ /* cl_khr_d3d11_sharing, pe_d3d11.c */
+-extern BOOL d3d11_device_has_sharing( cl_device_id device );
+-extern BOOL d3d11_platform_has_sharing( cl_platform_id platform );
++extern unsigned int d3d11_device_has_sharing( cl_device_id device );
++extern unsigned int d3d11_platform_has_sharing( cl_platform_id platform );
+ extern void *d3d11_get_extension_function( const char *name );
+ extern cl_context d3d11_create_context( const cl_context_properties *properties, cl_uint num_devices,
+         const cl_device_id *devices, cl_device_type device_type, BOOL from_type,
+@@ -37,8 +37,10 @@
+ extern BOOL d3d11_get_mem_info( cl_mem mem, cl_uint name, size_t size, void *value, size_t *ret_size, cl_int *ret );
+ 
+ static const char d3d11_sharing[] = "cl_khr_d3d11_sharing";
++static const char d3d10_sharing[] = "cl_khr_d3d10_sharing";
+ 
+-static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size, BOOL d3d11 )
++/* d3d11: D3D_SHARING_D3D11 and/or D3D_SHARING_D3D10, the sharing extensions we add */
++static cl_int filter_extensions( const char *unix_exts, SIZE_T size, char *win_exts, size_t *ret_size, unsigned int d3d11 )
+ {
+     char *p = win_exts;
+     const char *ext;
+@@ -60,7 +62,8 @@
+         if (*end == ' ') ++end;
+         ext = end;
+     }
+-    if (d3d11) win_size += sizeof(d3d11_sharing);
++    if (d3d11 & D3D_SHARING_D3D11) win_size += sizeof(d3d11_sharing);
++    if (d3d11 & D3D_SHARING_D3D10) win_size += sizeof(d3d10_sharing);
+ 
+     if (ret_size) *ret_size = win_size;
+     if (!win_exts) return CL_SUCCESS;
+@@ -86,12 +89,18 @@
+         if (*end == ' ') ++end;
+         ext = end;
+     }
+-    if (d3d11)
++    if (d3d11 & D3D_SHARING_D3D11)
+     {
+         if (p != win_exts) *p++ = ' ';
+         memcpy( p, d3d11_sharing, sizeof(d3d11_sharing) - 1 );
+         p += sizeof(d3d11_sharing) - 1;
+     }
++    if (d3d11 & D3D_SHARING_D3D10)
++    {
++        if (p != win_exts) *p++ = ' ';
++        memcpy( p, d3d10_sharing, sizeof(d3d10_sharing) - 1 );
++        p += sizeof(d3d10_sharing) - 1;
++    }
+     *p = 0;
+ 
+     TRACE( "returning extension string %s\n", debugstr_a(win_exts) );

@@ -1,0 +1,581 @@
+mscms: answer the Windows Color System queries (WcsGetDefaultColorProfile, WcsEnumColorProfiles, ...) and the color-directory/standard-profile size queries as Windows 11 does
+
+What was seen (app batch 1, the request: "Let's start with these. I can make the accounts. Once we get these solid, we can
+move onto the rest."): Affinity 3.3.3 (Canva) logs at every start, once per monitor, "WcsGetUsePerUserProfiles error 120 -
+Call not implemented", "GetStandardColorSpaceProfile error 122 - Insufficient buffer", "WcsOpenColorProfile error 3 -
+Path not found", then "WcsEnumColorProfilesSize error 120" for both scopes (8 ColourProfileManager errors): it cannot list
+the installed color profiles, cannot pick up a display profile, and opens "" as the display's profile.
+
+Mechanism (SOLID: +mscms trace, and the disassembly of Serif.Interop.Persona.dll's ColourProfileManager): per monitor
+(device = the monitor's DeviceKey "\Registry\Machine\System\CurrentControlSet\Control\Class\{4D36E96E-...}\000N") it calls
+WcsGetUsePerUserProfiles(dev, CLASS_MONITOR), then WcsGetDefaultColorProfileSize/WcsGetDefaultColorProfile(scope, dev,
+CPT_ICC, CPST_RGB_WORKING_SPACE). A failure there is its expected path (not logged): it falls back to
+GetStandardColorSpaceProfileW(NULL, LCS_sRGB, NULL, &size) with size = 0, IGNORES the return value and uses the size the
+call wrote (size == 0: logs the error and returns ""), makes a string of size/2 - 1 characters, calls again with it, takes
+PathFindFileNameW of the result and opens it with WcsOpenColorProfileW. An ICC profile ('acsp') is used directly; only a
+WCS device model profile ('cdmp', CMM 'wcs1') goes through WcsCreateIccProfile(h, WCS_ICCONLY). Then
+WcsGetDefaultRenderingIntent and WcsEnumColorProfilesSize/WcsEnumColorProfiles for SYSTEM_WIDE and CURRENT_USER. Wine
+answered ERROR_CALL_NOT_IMPLEMENTED to every Wcs* query (WcsEnumColorProfiles and WcsCreateIccProfile were `stub` entries:
+a call raised), and its GetStandardColorSpaceProfileW size query left the size untouched, so the fallback opened "".
+
+Windows (the Windows 11 measurement, build 26200, a display with no associated profile; probes wcsprobe in the affcolor
+lab folder and wcsprobe2 in the affcolor2 lab folder):
+- GetStandardColorSpaceProfileW(LCS_sRGB or LCS_WINDOWS_COLOR_SPACE): a NULL or short buffer fails with
+  ERROR_INSUFFICIENT_BUFFER and writes the size, counting the terminator; id 0 fails with ERROR_FILE_NOT_FOUND. Affinity's
+  fallback, replayed step by step, opens the sRGB ICC profile. GetColorDirectoryW's NULL-buffer query: the same error, the
+  size counting the terminator.
+- WcsGetUsePerUserProfiles: TRUE, use FALSE, for a monitor key, its adapter name, its device ID or "" with CLASS_MONITOR
+  and for CLASS_SCANNER on the monitor key; TRUE for CLASS_PRINTER there; ERROR_INVALID_PARAMETER for class 0 or 'abcd'
+  and for a NULL name.
+- WcsGetDefaultColorProfile(Size): ERROR_FILE_NOT_FOUND for the display (CPST_RGB_WORKING_SPACE, CPST_NONE, CPST_PERCEPTUAL
+  per user, scope 5, subtype 99, CPT_DMP/CAMP/GMMP), for its adapter name, device ID or "" (CPST_RGB_WORKING_SPACE), and
+  for a NULL device with CPST_RGB_WORKING_SPACE;
+  ERROR_INVALID_PARAMETER for type 9, a NULL device with CPT_DMP, CPST_NONE or CPST_PERCEPTUAL, a NULL buffer or a NULL
+  size pointer. A NULL device with CPT_CAMP / CPT_GMMP names Windows' shipped D65.camp / Photo.gmmp.
+- WcsGetDefaultRenderingIntent: TRUE, INTENT_PERCEPTUAL for both scopes.
+- WcsEnumColorProfiles: the same MULTI_SZ of file names for CURRENT_USER as for SYSTEM_WIDE (there 30 ICC + 8 WCS
+  profiles; 17 for ET_DEVICECLASS / ET_CLASS 'mntr' and ET_DATACOLORSPACE RGB); ET_DEVICENAME of the display: none, both
+  scopes; a buffer 2 bytes short: ERROR_INSUFFICIENT_BUFFER; a bad version, size, scope or a NULL record:
+  ERROR_INVALID_PARAMETER.
+- GetColorProfileFromHandle's NULL-buffer size query: ERROR_INSUFFICIENT_BUFFER.
+- WcsCreateIccProfile: NULL, ERROR_INVALID_PARAMETER for an ICC handle (WcsOpenColorProfileW or OpenColorProfileW, either
+  option) and for NULL; it succeeds only for a WCS profile handle.
+
+Fix (dlls/mscms/profile.c, mscms.spec), on the store Wine already has -- the color directory (installed profiles) and the
+per-class associations AssociateColorProfileWithDevice writes under HKLM\...\ICM\<class>, which gdi32's GetICMProfile
+reads for a display:
+- GetStandardColorSpaceProfileW and GetColorDirectoryW: the size counts the terminator (the old count let a buffer of
+  exactly that size be overrun by one character); a NULL or short buffer fails with ERROR_INSUFFICIENT_BUFFER and gets
+  the size. OpenColorProfileW's own color-directory size query follows (it relied on ERROR_MORE_DATA).
+- WcsGetDefaultColorProfile(Size): unknown type, or a NULL device with CPT_DMP or an ICC subtype other than the working
+  spaces: ERROR_INVALID_PARAMETER. A device's CPT_ICC default = its class's first association (device class from the
+  name: monitor DeviceKey / MONITOR\ device ID / \\.\DISPLAY, printer, image class GUIDs), scope and subtype not checked;
+  everything else ERROR_FILE_NOT_FOUND (Wine records no device-independent defaults: WcsSetDefaultColorProfile is a stub;
+  no WCS-format profiles). Size in bytes with the terminator; name only, which OpenColorProfile resolves in the color
+  directory.
+- WcsEnumColorProfiles(Size): every installed .icm/.icc whose header matches the ENUMTYPE (ET_DEVICECLASS compared with the
+  profile class), with ET_DEVICENAME the device class's associations; the same list for both scopes. Exported for real.
+- WcsGetUsePerUserProfiles: FALSE (Wine keeps no per-user association lists); a NULL name/pointer or a class other than
+  monitor/printer/scanner is ERROR_INVALID_PARAMETER.
+- WcsGetDefaultRenderingIntent: INTENT_PERCEPTUAL (nothing can change it: WcsSetDefaultRenderingIntent is a stub).
+- WcsCreateIccProfile: NULL, ERROR_INVALID_PARAMETER (every profile Wine opens is ICC; it was a raising stub).
+- WcsOpenColorProfileW: the "no WCS support" FIXME only when CAMP/GMMP data is really given.
+- GetColorProfileFromHandle: the NULL-buffer size query also sets ERROR_INSUFFICIENT_BUFFER.
+Kill switch: NEUTRON_DISABLE_WCS_PROFILES=1 (every Wcs* answers ERROR_CALL_NOT_IMPLEMENTED again, the size queries behave
+as before).
+
+INFERRED (not measured): CPST_CUSTOM_WORKING_SPACE with a NULL device is treated like CPST_RGB_WORKING_SPACE (the other
+working space); GetColorDirectoryW's short (non-NULL) buffer error is taken from GetStandardColorSpaceProfileW's.
+
+Not covered, and what still differs from the Windows 11 measurement because of installed files: Windows ships and lists
+WCS-format profiles (8, e.g. wsRGB.cdmp) and names D65.camp / Photo.gmmp as the device-independent CAMP / GMMP defaults;
+Wine ships none and cannot open them (no WCS support), so it lists none and answers ERROR_FILE_NOT_FOUND there; profile
+counts, list sizes and the sRGB profile's size (3144 vs 3024 bytes) depend on the installed files; the standard profile's
+name keeps the lowercase "srgb color space profile.icm" that wine.inf installs (Windows: "sRGB Color Space Profile.icm").
+Also: per-user association lists and WcsSet* (still stubs); Wine never fills ICM\mntr from the Linux side, so a display has
+no default profile unless something associates one (the KDE/colord profile is not bridged) and Affinity uses sRGB through
+the fallback, as Windows does for a display without a profile; EnumColorProfilesW keeps its "*icm" glob; the newer
+ColorProfileGetDisplay* (advanced color) API. Affinity's Settings > Color combo boxes do not drop down under the lab's
+synthetic input (affcolor on 11.10-183c; not chased, not tried by hand).
+
+Lab evidence (runtime 11.10-183c2 = 11.10-183rc + this mscms, lab prefix PgI-ac2, nested desk, +mscms trace):
+- Affinity Log.txt (written fresh at each start), ColourProfileManager error lines: this build 0, 0 (g1, g2); kill switch
+  on the same build 8, 8 (j1, j2), the same 8 lines as 11.10-183rc (affcolor: 8, 8). The only other error line
+  ([DXCore] "Failed to get factory") is in every arm. The previous revision of this patch: 0, 0, 0 vs 8, 8, 8.
+- +mscms on this build, per monitor: WcsGetDefaultColorProfileSize -> ERROR_FILE_NOT_FOUND (no association, as on
+  Windows), GetStandardColorSpaceProfileW size query -> 138 bytes, second call, WcsOpenColorProfileW("srgb color space
+  profile.icm") -> opened and read; WcsEnumColorProfiles = 2 profiles for both scopes (sRGB + a lab test profile
+  NeutronLab1.icc in the color directory); no Wcs FIXME.
+- Display profile pickup (a3, n=1): with NeutronLab1.icc associated to class mntr (the value AssociateColorProfileWithDevice
+  writes) WcsGetDefaultColorProfile returns NeutronLab1.icc for both monitors, Affinity opens it, no fallback call, Log.txt
+  0 errors; association removed after.
+- Settings > Color opens (s3) with RGB "sRGB IEC61966-2.1", 32-bit RGB, CMYK, Greyscale, LAB profiles and rendering intent
+  filled; Log.txt still 0 errors after.
+- wcsprobe and wcsprobe2 on this build: every line the same as the Windows 11 measurement except the installed-file lines
+  listed above. Same answers from the i386 build (32-bit probes). Kill switch: every Wcs* query ERROR_CALL_NOT_IMPLEMENTED.
+- Wine's own dlls/mscms/tests/profile.c (mingw build): 212 tests, 0 failures on this build, on its kill switch and on
+  11.10-183rc.
+- Adobe (affcolor's scan): Photoshop/LrC import the classic mscms calls, GetColorDirectoryW among them (now with the
+  Windows size convention); Photoshop's ACE.dll looks WcsCreateIccProfile up by name, for WCS-format profiles (none in
+  Wine's store; it was a raising stub before). No Adobe run on this build.
+
+--- a/dlls/mscms/profile.c
++++ b/dlls/mscms/profile.c
+@@ -53,6 +53,8 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mscms);
+ 
++static BOOL wcs_enabled(void);
++
+ /******************************************************************************
+  * AssociateColorProfileWithDeviceA               [MSCMS.@]
+  */
+@@ -281,6 +283,10 @@
+     lstrcatW( colordir, L"\\spool\\drivers\\color" );
+ 
+     len = lstrlenW( colordir ) * sizeof(WCHAR);
++    /* NEUTRON: as on Windows (the Windows 11 measurement), the size counts the terminator and the size query (NULL
++     * buffer) fails with ERROR_INSUFFICIENT_BUFFER; a short buffer gets the same error, as GetStandardColorSpaceProfile's
++     * does there. The old count let a buffer of exactly that size be overrun by one character. */
++    if (wcs_enabled()) len += sizeof(WCHAR);
+ 
+     if (buffer && len <= *size)
+     {
+@@ -289,7 +295,7 @@
+         return TRUE;
+     }
+ 
+-    SetLastError( ERROR_MORE_DATA );
++    SetLastError( wcs_enabled() ? ERROR_INSUFFICIENT_BUFFER : ERROR_MORE_DATA );
+     *size = len;
+     return FALSE;
+ }
+@@ -409,6 +415,9 @@
+     {
+         *size = header.phSize;
+         release_object( &profile->hdr );
++        /* NEUTRON: the size query fails with ERROR_INSUFFICIENT_BUFFER, as on Windows (the Windows 11 measurement);
++         * Affinity logged "GetColorProfileFromHandle error 0" without it */
++        if (wcs_enabled()) SetLastError( ERROR_INSUFFICIENT_BUFFER );
+         return FALSE;
+     }
+ 
+@@ -570,7 +579,7 @@
+         return FALSE;
+     }
+ 
+-    if (!profile)
++    if (!profile && !wcs_enabled())
+     {
+         SetLastError( ERROR_INSUFFICIENT_BUFFER );
+         return FALSE;
+@@ -585,10 +594,24 @@
+             lstrcatW( rgbprofile, L"\\srgb color space profile.icm" );
+             len = lstrlenW( rgbprofile ) * sizeof(WCHAR);
+ 
++            /* NEUTRON: as on Windows (the Windows 11 measurement), the size counts the terminator, and the size query
++             * (NULL buffer) fails with ERROR_INSUFFICIENT_BUFFER but reports that size: Affinity sizes its buffer from it
++             * (ignoring the return value) when a display has no default profile, and opened "" without it */
++            if (wcs_enabled())
++            {
++                len += sizeof(WCHAR);
++                if (!profile)
++                {
++                    *size = len;
++                    SetLastError( ERROR_INSUFFICIENT_BUFFER );
++                    return FALSE;
++                }
++            }
++
+             if (*size < len)
+             {
+                 *size = len;
+-                SetLastError( ERROR_MORE_DATA );
++                SetLastError( wcs_enabled() ? ERROR_INSUFFICIENT_BUFFER : ERROR_MORE_DATA );
+                 return FALSE;
+             }
+ 
+@@ -1345,7 +1368,8 @@
+         {
+             WCHAR *path;
+ 
+-            if (!GetColorDirectoryW( NULL, NULL, &size ) && GetLastError() == ERROR_MORE_DATA)
++            size = 0;
++            if (!GetColorDirectoryW( NULL, NULL, &size ) && size)
+             {
+                 size += (lstrlenW( profile->pProfileData ) + 2) * sizeof(WCHAR);
+                 if (!(path = malloc( size ))) return NULL;
+@@ -1437,14 +1461,234 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON: the Windows Color System queries, answered from Wine's own profile store: the profiles installed in the
++ * color directory (EnumColorProfiles) and the per-class associations AssociateColorProfileWithDevice records under
++ * HKLM\Software\Microsoft\Windows NT\CurrentVersion\ICM, the same store gdi32's GetICMProfile reads for a display.
++ * Affinity (Canva) builds its color profile lists and picks up the display profile only through these; every call
++ * failed with ERROR_CALL_NOT_IMPLEMENTED. The answers follow the Windows 11 measurement: a device without an associated
++ * profile, and a NULL device, have no default (ERROR_FILE_NOT_FOUND; the caller falls back to
++ * GetStandardColorSpaceProfile), both scopes enumerate the same installed profiles, nobody uses per-user lists.
++ * Wine keeps no per-user association lists, no device-independent defaults and no WCS-format (DMP/CAMP/GMMP) profiles.
++ * NEUTRON_DISABLE_WCS_PROFILES=1 brings back the old answers (ERROR_CALL_NOT_IMPLEMENTED). */
++static BOOL wcs_enabled(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv( "NEUTRON_DISABLE_WCS_PROFILES" );
++        enabled = !(env && *env == '1');
++        if (!enabled) WARN( "WCS profile queries disabled by NEUTRON_DISABLE_WCS_PROFILES\n" );
++    }
++    return enabled;
++}
++
++static BOOL wcs_not_implemented(void)
++{
++    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++    return FALSE;
++}
++
++/* the device class of a device name: a display's monitor device key, device ID or adapter name, a printer or an
++ * image (scanner) device key; 0 when the name says nothing about its class */
++static DWORD device_class( const WCHAR *name )
++{
++    if (!name) return 0;
++    if (StrStrIW( name, L"{4D36E96E-E325-11CE-BFC1-08002BE10318}" ) || !StrCmpNIW( name, L"\\\\.\\DISPLAY", 11 ) ||
++        !StrCmpNIW( name, L"MONITOR\\", 8 ))
++        return CLASS_MONITOR;
++    if (StrStrIW( name, L"{4D36E979-E325-11CE-BFC1-08002BE10318}" )) return CLASS_PRINTER;
++    if (StrStrIW( name, L"{6BDD1FC6-810F-11D0-BEC7-08002BE2092F}" )) return CLASS_SCANNER;
++    return 0;
++}
++
++static HKEY open_class_key( DWORD class )
++{
++    WCHAR path[MAX_PATH];
++    HKEY key;
++
++    swprintf( path, ARRAY_SIZE(path), L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\%c%c%c%c",
++              (class >> 24) & 0xff, (class >> 16) & 0xff, (class >> 8) & 0xff, class & 0xff );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return NULL;
++    return key;
++}
++
++/* the default profile of a device class: its first association (what GetICMProfile reports); none without one */
++static BOOL get_class_default_profile( DWORD class, WCHAR *name, DWORD len )
++{
++    DWORD size = len;
++    BOOL ret = FALSE;
++    HKEY key;
++
++    if ((key = open_class_key( class )))
++    {
++        ret = !RegEnumValueW( key, 0, name, &size, NULL, NULL, NULL, NULL );
++        RegCloseKey( key );
++    }
++    return ret;
++}
++
++static BOOL wcs_default_profile( WCS_PROFILE_MANAGEMENT_SCOPE scope, const WCHAR *device, COLORPROFILETYPE type,
++                                 COLORPROFILESUBTYPE subtype, WCHAR *name, DWORD len )
++{
++    DWORD class;
++
++    /* the Windows 11 measurement: an unknown profile type is an invalid parameter; device-independent defaults (NULL
++     * device) exist for the CAMP and GMMP types and the ICC working spaces only, so a NULL device with CPT_DMP or another
++     * ICC subtype is an invalid parameter too; for a device the scope and subtype are not checked */
++    if ((type != CPT_ICC && type != CPT_DMP && type != CPT_CAMP && type != CPT_GMMP) ||
++        (!device && (type == CPT_DMP || (type == CPT_ICC && subtype != CPST_RGB_WORKING_SPACE &&
++                                         subtype != CPST_CUSTOM_WORKING_SPACE))))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    /* Windows names its shipped WCS defaults here (D65.camp, Photo.gmmp); Wine has no WCS-format profiles to name */
++    if (type == CPT_CAMP || type == CPT_GMMP) FIXME( "no WCS (type %d) profiles in Wine's profile store\n", type );
++    /* a device's ICC default is its class's first association (no per-user lists: the same for both scopes). Without
++     * one there is no default, and Wine records no device-independent defaults (WcsSetDefaultColorProfile is a stub):
++     * ERROR_FILE_NOT_FOUND, what Windows answers for a display without an association and for a NULL device without a
++     * default */
++    if (!device || type != CPT_ICC || !(class = device_class( device )) ||
++        !get_class_default_profile( class, name, len ))
++    {
++        TRACE( "no default profile for %s, scope %d type %d subtype %d\n", debugstr_w(device), scope, type, subtype );
++        SetLastError( ERROR_FILE_NOT_FOUND );
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static BOOL is_profile_file( const WCHAR *name )
++{
++    const WCHAR *ext = PathFindExtensionW( name );
++    return !wcsicmp( ext, L".icm" ) || !wcsicmp( ext, L".icc" );
++}
++
++static BOOL add_profile_name( WCHAR ***names, DWORD *count, DWORD *bytes, const WCHAR *name )
++{
++    WCHAR **tmp, *copy;
++
++    if (!(tmp = realloc( *names, (*count + 1) * sizeof(**names) ))) return FALSE;
++    *names = tmp;
++    if (!(copy = wcsdup( name ))) return FALSE;
++    (*names)[(*count)++] = copy;
++    *bytes += (wcslen( name ) + 1) * sizeof(WCHAR);
++    return TRUE;
++}
++
++static BOOL profile_matches( ENUMTYPEW *record, const WCHAR *name )
++{
++    ENUMTYPEW rest = *record;
++    PROFILEHEADER header;
++
++    if (!header_from_file( name, &header )) return FALSE;
++    if ((record->dwFields & ET_DEVICECLASS) && record->dwDeviceClass != header.phClass) return FALSE;
++    rest.dwFields &= ~(ET_DEVICENAME | ET_DEVICECLASS);
++    return match_profile( &rest, &header );
++}
++
++/* the MULTI_SZ list of profile names for WcsEnumColorProfiles(Size): every installed profile that matches the
++ * record, or with ET_DEVICENAME the profiles associated with that device's class */
++static BOOL wcs_enum_profiles( WCS_PROFILE_MANAGEMENT_SCOPE scope, ENUMTYPEW *record, BYTE *buffer, DWORD size,
++                               DWORD *needed, DWORD *number )
++{
++    WCHAR colordir[MAX_PATH], glob[MAX_PATH + 4], name[MAX_PATH], **names = NULL;
++    DWORD i, len = sizeof(colordir), count = 0, bytes = sizeof(WCHAR);
++    WIN32_FIND_DATAW data;
++    BOOL ret = FALSE;
++    HANDLE find;
++    HKEY key;
++
++    if ((scope != WCS_PROFILE_MANAGEMENT_SCOPE_SYSTEM_WIDE && scope != WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER) ||
++        !record || record->dwSize != sizeof(ENUMTYPEW) || record->dwVersion != ENUM_TYPE_VERSION)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    TRACE( "scope %d fields %#lx device %s class %s profile class %s color space %s\n", scope, record->dwFields,
++           record->dwFields & ET_DEVICENAME ? debugstr_w(record->pDeviceName) : "-",
++           record->dwFields & ET_DEVICECLASS ? debugstr_fourcc(record->dwDeviceClass) : "-",
++           record->dwFields & ET_CLASS ? debugstr_fourcc(record->dwClass) : "-",
++           record->dwFields & ET_DATACOLORSPACE ? debugstr_fourcc(record->dwDataColorSpace) : "-" );
++
++    /* both scopes list the same installed profiles (the Windows 11 measurement); Wine keeps no per-user associations */
++    if (record->dwFields & ET_DEVICENAME)
++    {
++        DWORD class = device_class( record->pDeviceName );
++
++        if (class && (key = open_class_key( class )))
++        {
++            for (i = 0; ; i++)
++            {
++                len = ARRAY_SIZE(name);
++                if (RegEnumValueW( key, i, name, &len, NULL, NULL, NULL, NULL )) break;
++                if (profile_matches( record, name ) && !add_profile_name( &names, &count, &bytes, name )) break;
++            }
++            RegCloseKey( key );
++        }
++        goto done;
++    }
++
++    if (!GetColorDirectoryW( NULL, colordir, &len )) goto exit;
++    swprintf( glob, ARRAY_SIZE(glob), L"%s\\*", colordir );
++    if ((find = FindFirstFileW( glob, &data )) != INVALID_HANDLE_VALUE)
++    {
++        do
++        {
++            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || !is_profile_file( data.cFileName )) continue;
++            if (!profile_matches( record, data.cFileName )) continue;
++            TRACE( "matching profile: %s\n", debugstr_w(data.cFileName) );
++            if (!add_profile_name( &names, &count, &bytes, data.cFileName )) break;
++        } while (FindNextFileW( find, &data ));
++        FindClose( find );
++    }
++
++done:
++    if (needed) *needed = bytes;
++    if (buffer)
++    {
++        WCHAR *p = (WCHAR *)buffer;
++
++        if (size < bytes)
++        {
++            SetLastError( ERROR_INSUFFICIENT_BUFFER );
++            goto exit;
++        }
++        for (i = 0; i < count; i++)
++        {
++            wcscpy( p, names[i] );
++            p += wcslen( names[i] ) + 1;
++        }
++        *p = 0;
++        if (number) *number = count;
++    }
++    TRACE( "%lu profile(s), %lu bytes\n", count, bytes );
++    ret = TRUE;
++
++exit:
++    for (i = 0; i < count; i++) free( names[i] );
++    free( names );
++    return ret;
++}
++
+ /******************************************************************************
+  * WcsGetUsePerUserProfiles               [MSCMS.@]
+  */
+ BOOL WINAPI WcsGetUsePerUserProfiles( const WCHAR* name, DWORD class, BOOL* use_per_user_profile )
+ {
+-    FIXME( "%s %s %p\n", debugstr_w(name), debugstr_fourcc(class), use_per_user_profile );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    TRACE( "%s %s %p\n", debugstr_w(name), debugstr_fourcc(class), use_per_user_profile );
++
++    if (!wcs_enabled()) return wcs_not_implemented();
++    if (!name || !use_per_user_profile ||
++        (class != CLASS_MONITOR && class != CLASS_PRINTER && class != CLASS_SCANNER))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    /* Wine keeps no per-user association lists, nobody can have chosen one */
++    *use_per_user_profile = FALSE;
++    return TRUE;
+ }
+ 
+ /******************************************************************************
+@@ -1452,9 +1696,32 @@
+  */
+ BOOL WINAPI WcsEnumColorProfilesSize( WCS_PROFILE_MANAGEMENT_SCOPE scope, ENUMTYPEW *record, DWORD *size )
+ {
+-    FIXME( "%d %p %p\n", scope, record, size );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    TRACE( "%d %p %p\n", scope, record, size );
++
++    if (!wcs_enabled()) return wcs_not_implemented();
++    if (!size)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    return wcs_enum_profiles( scope, record, NULL, 0, size, NULL );
++}
++
++/******************************************************************************
++ * WcsEnumColorProfiles               [MSCMS.@]
++ */
++BOOL WINAPI WcsEnumColorProfiles( WCS_PROFILE_MANAGEMENT_SCOPE scope, ENUMTYPEW *record, BYTE *buffer, DWORD size,
++                                  DWORD *number )
++{
++    TRACE( "%d %p %p %lu %p\n", scope, record, buffer, size, number );
++
++    if (!wcs_enabled()) return wcs_not_implemented();
++    if (!buffer)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    return wcs_enum_profiles( scope, record, buffer, size, NULL, number );
+ }
+ 
+ /******************************************************************************
+@@ -1464,9 +1731,27 @@
+                                        COLORPROFILETYPE type, COLORPROFILESUBTYPE subtype,
+                                        DWORD profile_id, DWORD size, LPWSTR name )
+ {
+-    FIXME( "%d, %s, %d, %d, %lu, %lu, %p\n", scope, debugstr_w(device_name), type, subtype, profile_id, size, name );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    WCHAR profile[MAX_PATH];
++    DWORD needed;
++
++    TRACE( "%d, %s, %d, %d, %lu, %lu, %p\n", scope, debugstr_w(device_name), type, subtype, profile_id, size, name );
++
++    if (!wcs_enabled()) return wcs_not_implemented();
++    if (!name)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!wcs_default_profile( scope, device_name, type, subtype, profile, ARRAY_SIZE(profile) )) return FALSE;
++    needed = (wcslen( profile ) + 1) * sizeof(WCHAR);
++    if (size < needed)
++    {
++        SetLastError( ERROR_INSUFFICIENT_BUFFER );
++        return FALSE;
++    }
++    wcscpy( name, profile );
++    TRACE( "-> %s\n", debugstr_w(name) );
++    return TRUE;
+ }
+ 
+ /******************************************************************************
+@@ -1476,9 +1761,19 @@
+                                            COLORPROFILETYPE type, COLORPROFILESUBTYPE subtype,
+                                            DWORD profile_id, PDWORD profile_size)
+ {
+-    FIXME( "%d, %s, %d, %d, %lu, %p\n", scope, debugstr_w(device_name), type, subtype, profile_id, profile_size );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    WCHAR profile[MAX_PATH];
++
++    TRACE( "%d, %s, %d, %d, %lu, %p\n", scope, debugstr_w(device_name), type, subtype, profile_id, profile_size );
++
++    if (!wcs_enabled()) return wcs_not_implemented();
++    if (!profile_size)
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    if (!wcs_default_profile( scope, device_name, type, subtype, profile, ARRAY_SIZE(profile) )) return FALSE;
++    *profile_size = (wcslen( profile ) + 1) * sizeof(WCHAR);
++    return TRUE;
+ }
+ 
+ /******************************************************************************
+@@ -1486,9 +1781,38 @@
+  */
+ BOOL WINAPI WcsGetDefaultRenderingIntent( WCS_PROFILE_MANAGEMENT_SCOPE scope, PDWORD intent)
+ {
+-    FIXME( "%d %p\n", scope, intent );
+-    SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
+-    return FALSE;
++    TRACE( "%d %p\n", scope, intent );
++
++    if (!wcs_enabled()) return wcs_not_implemented();
++    if (!intent ||
++        (scope != WCS_PROFILE_MANAGEMENT_SCOPE_SYSTEM_WIDE && scope != WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER))
++    {
++        SetLastError( ERROR_INVALID_PARAMETER );
++        return FALSE;
++    }
++    /* nothing ever changes it (WcsSetDefaultRenderingIntent is not implemented): the system default, perceptual */
++    *intent = INTENT_PERCEPTUAL;
++    return TRUE;
++}
++
++/******************************************************************************
++ * WcsCreateIccProfile               [MSCMS.@]
++ */
++HPROFILE WINAPI WcsCreateIccProfile( HPROFILE source, DWORD options )
++{
++    TRACE( "%p, %#lx\n", source, options );
++
++    if (!wcs_enabled())
++    {
++        SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
++        return NULL;
++    }
++    /* it makes an ICC profile from a WCS one (DMP + CAMP + GMMP). Every profile Wine opens is an ICC profile, which
++     * Windows refuses (the Windows 11 measurement: NULL, ERROR_INVALID_PARAMETER); Affinity calls it only for a WCS
++     * device model profile */
++    WARN( "%p: not a WCS profile\n", source );
++    SetLastError( ERROR_INVALID_PARAMETER );
++    return NULL;
+ }
+ 
+ /******************************************************************************
+@@ -1522,7 +1846,8 @@
+                                       DWORD creation, DWORD flags )
+ {
+     TRACE( "%p, %p, %p, %#lx, %#lx, %#lx, %#lx\n", cdm, camp, gmmp, access, sharing, creation, flags );
+-    FIXME("no support for WCS profiles\n" );
++    /* an ICC profile in cdm needs neither of the others; WCS (DMP/CAMP/GMMP) contents are not supported */
++    if ((camp && camp->pProfileData) || (gmmp && gmmp->pProfileData)) FIXME( "no support for WCS profiles\n" );
+ 
+     return OpenColorProfileW( cdm, access, sharing, creation );
+ }
+--- a/dlls/mscms/mscms.spec
++++ b/dlls/mscms/mscms.spec
+@@ -86,9 +86,9 @@
+ @ stdcall UnregisterCMMW(wstr long)
+ @ stub WcsAssociateColorProfileWithDevice
+ @ stub WcsCheckColors
+-@ stub WcsCreateIccProfile
++@ stdcall WcsCreateIccProfile(ptr long)
+ @ stub WcsDisassociateColorProfileFromDevice
+-@ stub WcsEnumColorProfiles
++@ stdcall WcsEnumColorProfiles(long ptr ptr long ptr)
+ @ stdcall WcsEnumColorProfilesSize(long ptr ptr)
+ @ stdcall WcsGetCalibrationManagementState(ptr)
+ @ stdcall WcsGetDefaultColorProfile(long wstr long long long long wstr)

@@ -1,0 +1,62 @@
+From: Neutron
+Subject: [PATCH] dxgi: WaitForVBlank sleeps until the vertical blank instead of spinning
+
+Mister Horse Product Manager 3.7.7 (JUCE 8) kept 40% of a core busy while idle on its Welcome screen. JUCE 8 runs a
+vblank thread that calls IDXGIOutput::WaitForVBlank in a loop. DXVK emulates the wait with Sleep::sleepUntil, which
+spins for the last 4 timer periods plus a sixth of the wait: Wine reports a 1 ms timer, so 4 ms + 2.8 ms of every
+16.7 ms frame were a busy loop (41% of a core at 60 Hz).
+
+Windows blocks WaitForVBlank in the kernel until the vertical blank (D3DKMTWaitForVerticalBlankEvent); the waiting
+thread uses no CPU. The emulated wait now computes the same target time and sleeps the whole wait with
+NtDelayExecution; Wine wakes it well within a millisecond. The target (the next refresh boundary after the last
+mode change) is unchanged.
+
+Lab, 11.10-183m (183rc + this + dxvk 0007), Product Manager idle, 15-20 s windows: ProductManager.exe 0.6%, 0.7%,
+1.0% of a core (3 runs); NEUTRON_DXVK_VBLANK_SPIN=1 on the same build: 40.7% (1 run; mhpm on 182/183rc: 39-40%,
+4 runs). Topaz Photo 1.7.1 at its sign-in screen calls WaitForVBlank too: 21.0% here (n=1), 56% on 183rc (smoke183,
+n=2; attribution to this patch INFERRED, no kill-switch arm). Not covered: the wait is still an estimate from the
+mode's refresh rate, not the display's real vblank.
+
+Kill switch NEUTRON_DXVK_VBLANK_SPIN=1 (the spinning wait). build-external.sh's dxgi_switches must list it.
+
+diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
+index 8814f5cb..a60f0620 100644
+--- a/src/dxgi/dxgi_output.cpp
++++ b/src/dxgi/dxgi_output.cpp
+@@ -487,8 +487,34 @@ namespace dxvk {
+ 
+     m_monitorInfo->ReleaseMonitorData();
+ 
+-    // Sleep until the given time point
+-    Sleep::sleepUntil(t1, t2);
++    // NEUTRON: Windows blocks WaitForVBlank in the kernel until the vertical blank; the thread uses no CPU.
++    // Sleep::sleepUntil spins for the last 4 timer periods plus a sixth of the wait (4 ms + 2.8 ms of each
++    // 16.7 ms frame under Wine's 1 ms timer), and an app with a vblank thread (JUCE 8: Mister Horse Product
++    // Manager) kept 40% of a core busy while idle. Sleep the whole wait instead; Wine's NtDelayExecution wakes
++    // well within a millisecond. Kill switch NEUTRON_DXVK_VBLANK_SPIN=1 (the spinning wait).
++    static const bool s_spin = env::getEnvVar("NEUTRON_DXVK_VBLANK_SPIN") == "1";
++
++    if (s_spin) {
++      Sleep::sleepUntil(t1, t2);
++      return S_OK;
++    }
++
++    using NtDelayExecutionProc = LONG (WINAPI*)(BOOLEAN, PLARGE_INTEGER);
++    static auto s_delay = reinterpret_cast<NtDelayExecutionProc>(reinterpret_cast<void*>(
++      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution")));
++
++    auto now = dxvk::high_resolution_clock::now();
++
++    if (t2 > now) {
++      LARGE_INTEGER ticks;
++      ticks.QuadPart = -std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - now).count() / 100);
++
++      if (s_delay)
++        s_delay(FALSE, &ticks);
++      else
++        Sleep::sleepUntil(now, t2);
++    }
++
+     return S_OK;
+   }
+   

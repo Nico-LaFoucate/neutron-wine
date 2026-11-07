@@ -1,0 +1,264 @@
+# neutron-icons-font
+#
+# Touches: fonts/Makefile.in, fonts/neutron-icons.sfd (new). BINARY, not in this diff: fonts/neutron-icons.ttf -- copy
+# fonts2/font/neutron-icons.ttf (sha256 e9b2ca43cb59f39340e31ae32a663daafc5778555a7dc06532f665832e232575) next to the
+# .sfd; the build uses the committed .ttf when FONTFORGE is empty (it is in the wine-tkg build), like marlett/tahoma.
+# Pairs with the CLI change cli-icon-font.diff (Replacements "Segoe MDL2 Assets" -> "Neutron Icons"; "Segoe Fluent Icons"
+# deliberately NOT mapped: no lab app asks it for these glyphs, and Chromium/Qt pick their own drawing when it is absent).
+#
+# WHAT HAPPENED (lab, 11-05, Topaz Photo 1.7.1): its minimize/maximize/close buttons showed wrong symbols.
+# MECHANISM: Topaz's caption buttons are QML text in "Segoe MDL2 Assets" (U+E921 minimize, U+E922 maximize, U+E923 restore,
+# U+E8BB close; U+E73E check mark elsewhere) -- read from the compiled QML in Topaz Photo.exe. Wine has no such font, so
+# DirectWrite font fallback picked whatever host font has glyphs at those private-use code points (in the lab a Nerd Font).
+# FIX: "Neutron Icons", a font of our own with ONLY those 5 glyphs, drawn by fonts2/font/mkfont.py (params-measured.json) from geometric
+# primitives (bars, square rings, a mitred polyline); no outline, hint or table from any other font. Installed with Wine's
+# fonts (#pragma makedep install -> share/wine/fonts), registered by `neutron prefix provision`/`fonts repair`
+# (register_prefix_fonts), reached through HKCU\Software\Wine\Fonts\Replacements, which dwrite and GDI apply only while
+# the real font is absent. License LGPL-2.1-or-later, as Wine's own fonts. Microsoft's font is not shipped or copied.
+# WINDOWS (v0.2, the Windows test machine 11-06, probe mdl2metrics): Segoe MDL2 Assets em 2048, ascent 2048, descent 0, advance 2048.
+# Caption glyphs on a 10x10 grid of the em (unit 204.8): minimize = full-width bar y 1024..1229; maximize = ring of
+# the em, stroke 205; restore = front ring 0..1638 (inner 205..1434) + back ring 410..2048 (inner 614..1843), only its
+# uncovered part; close = X across the em, perpendicular stroke 205 (edges meet the sides 145 from the corners).
+# CheckMark = centre line (256,1024)-(768,512)-(1792,1536) on a 16-unit grid, stroke 128, butt ends, mitred join.
+# Only these sizes/positions come from Windows (font/params-measured.json); mkfont.py draws every outline itself (the X
+# is now one 12-point union outline computed from the stroke, like Windows' glyph). Output coordinates = Windows'.
+# NOT COVERED: any other MDL2 code point and all of Segoe Fluent Icons (fall back as before); QWindowsIconEngine theme icons (qwindows.dll), Qt's
+# Windows 11 style (Fluent Icons), Chromium fluent scrollbars -- no app in the lab was seen drawing those.
+#
+# LAB EVIDENCE v0.2 (11.10-183f, desk l, Topaz prefixes from PgV-tz1 provisioned with smallgaps' CLI, 168 dpi):
+#   mapping present 2/2; captures vs Windows' measured outlines rendered at the same em (fonts2/scripts/strokes.py,
+#   coverage centroids): normal 2/2 (tzI1-a, tzI2-c) minimize bar centre 0.463 em (Windows 0.456), close bars at 0.329/
+#   0.693 em (0.308/0.695); maximized 2/2 (tzI1-b, tzI2-b) restore strokes 0.094/0.754/0.945 (0.049/0.746/0.954) and
+#   0.064/0.251/0.910 (0.049/0.249/0.953) -- within ~1 px at a 25-28 px em (desk shot = 1.75 output resampled to 2).
+#   All strokes equal (bar 2.48, ring 2.46, X 2.55 px; Windows: one stroke for all); shots/icons-vs-windows.png.
+#   v0.1 lab evidence (smallgaps, 183g): mapped right glyphs 2/2 + restore 2/2; unmapped wrong glyphs 2/2.
+#   Check mark (E73E) not seen in Topaz before sign-in.
+# Kill switch: remove the Replacements value (or `fonts check` shows icon-font "warn" until repaired).
+--- a/fonts/Makefile.in
++++ b/fonts/Makefile.in
+@@ -7,6 +7,7 @@
+ 	marlett.sfd \
+ 	ms_sans_serif.sfd \
+ 	msyh.sfd \
++	neutron-icons.sfd \
+ 	small_fonts.sfd \
+ 	small_fonts_jp.sfd \
+ 	symbol.sfd \
+--- a/fonts/neutron-icons.sfd
++++ b/fonts/neutron-icons.sfd
+@@ -0,0 +1,215 @@
++SplineFontDB: 3.2
++FontName: NeutronIcons-Regular
++FullName: Neutron Icons
++FamilyName: Neutron Icons
++Weight: Book
++UComments: "#pragma makedep install"
++Copyright: Copyright 2026 the Neutron project. Drawn from geometric primitives by mkfont.py.
++Version: 0.2
++ItalicAngle: 0
++UnderlinePosition: 0
++UnderlineWidth: 0
++Ascent: 2048
++Descent: 0
++InvalidEm: 0
++sfntRevision: 0x00003333
++LayerCount: 2
++Layer: 0 1 "Back" 1
++Layer: 1 1 "Fore" 0
++XUID: [1021 455 -1115845592 14206921]
++StyleMap: 0x0040
++FSType: 0
++OS2Version: 4
++OS2_WeightWidthSlopeOnly: 0
++OS2_UseTypoMetrics: 0
++CreationTime: 1793923200
++ModificationTime: 1793923200
++PfmFamily: 81
++TTFWeight: 400
++TTFWidth: 5
++LineGap: 0
++VLineGap: 0
++Panose: 0 0 0 0 0 0 0 0 0 0
++OS2TypoAscent: 2048
++OS2TypoAOffset: 0
++OS2TypoDescent: 0
++OS2TypoDOffset: 0
++OS2TypoLinegap: 0
++OS2WinAscent: 2048
++OS2WinAOffset: 0
++OS2WinDescent: 0
++OS2WinDOffset: 0
++HheadAscent: 2048
++HheadAOffset: 0
++HheadDescent: 0
++HheadDOffset: 0
++OS2SubXSize: 0
++OS2SubYSize: 0
++OS2SubXOff: 0
++OS2SubYOff: 0
++OS2SupXSize: 0
++OS2SupYSize: 0
++OS2SupXOff: 0
++OS2SupYOff: 0
++OS2StrikeYSize: 0
++OS2StrikeYPos: 0
++OS2Vendor: 'NTRN'
++OS2CodePages: 00000000.00000000
++OS2UnicodeRanges: 00000000.10000000.00000000.00000000
++DEI: 91125
++ShortTable: maxp 16
++  1
++  0
++  6
++  24
++  6
++  0
++  0
++  2
++  0
++  0
++  0
++  0
++  0
++  0
++  0
++  0
++EndShort
++LangName: 1033 "" "" "" "NeutronIcons-Regular-0.2" "" "Version 0.2" "" "" "" "" "Window-button and check-mark symbols at the private-use code points Windows programs ask an icon font for. Not a Microsoft font." "" "" "GNU Lesser General Public License, version 2.1 or later (as Wine's fonts)." "https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html"
++Encoding: UnicodeBmp
++UnicodeInterp: none
++NameList: AGL For New Fonts
++DisplaySize: -48
++AntiAlias: 1
++FitToEm: 0
++BeginChars: 65537 6
++
++StartChar: .notdef
++Encoding: 65536 -1 0
++Width: 2048
++GlyphClass: 1
++Flags: W
++LayerCount: 2
++EndChar
++
++StartChar: uniE73E
++Encoding: 59198 59198 1
++Width: 2048
++GlyphClass: 1
++Flags: W
++LayerCount: 2
++Fore
++SplineSet
++301 1069 m 1,0,-1
++ 768 603 l 1,1,-1
++ 1747 1581 l 1,2,-1
++ 1837 1491 l 1,3,-1
++ 768 421 l 1,4,-1
++ 211 979 l 1,5,-1
++ 301 1069 l 1,0,-1
++EndSplineSet
++EndChar
++
++StartChar: uniE8BB
++Encoding: 59579 59579 2
++Width: 2048
++GlyphClass: 1
++Flags: W
++LayerCount: 2
++Fore
++SplineSet
++1169 1024 m 1,0,-1
++ 2048 145 l 1,1,-1
++ 1903 0 l 1,2,-1
++ 1024 879 l 1,3,-1
++ 145 0 l 1,4,-1
++ 0 145 l 1,5,-1
++ 879 1024 l 1,6,-1
++ 0 1903 l 1,7,-1
++ 145 2048 l 1,8,-1
++ 1024 1169 l 1,9,-1
++ 1903 2048 l 1,10,-1
++ 2048 1903 l 1,11,-1
++ 1169 1024 l 1,0,-1
++EndSplineSet
++EndChar
++
++StartChar: uniE921
++Encoding: 59681 59681 3
++Width: 2048
++GlyphClass: 1
++Flags: W
++LayerCount: 2
++Fore
++SplineSet
++0 1024 m 1,0,-1
++ 0 1229 l 1,1,-1
++ 2048 1229 l 1,2,-1
++ 2048 1024 l 1,3,-1
++ 0 1024 l 1,0,-1
++EndSplineSet
++EndChar
++
++StartChar: uniE922
++Encoding: 59682 59682 4
++Width: 2048
++GlyphClass: 1
++Flags: W
++LayerCount: 2
++Fore
++SplineSet
++0 0 m 1,0,-1
++ 0 2048 l 1,1,-1
++ 2048 2048 l 1,2,-1
++ 2048 0 l 1,3,-1
++ 0 0 l 1,0,-1
++1843 205 m 1,4,-1
++ 1843 1843 l 1,5,-1
++ 205 1843 l 1,6,-1
++ 205 205 l 1,7,-1
++ 1843 205 l 1,4,-1
++EndSplineSet
++EndChar
++
++StartChar: uniE923
++Encoding: 59683 59683 5
++Width: 2048
++GlyphClass: 1
++Flags: W
++LayerCount: 2
++Fore
++SplineSet
++0 0 m 1,0,-1
++ 0 1638 l 1,1,-1
++ 1638 1638 l 1,2,-1
++ 1638 0 l 1,3,-1
++ 0 0 l 1,0,-1
++1434 205 m 1,4,-1
++ 1434 1434 l 1,5,-1
++ 205 1434 l 1,6,-1
++ 205 205 l 1,7,-1
++ 1434 205 l 1,4,-1
++410 1843 m 1,8,-1
++ 410 2048 l 1,9,-1
++ 2048 2048 l 1,10,-1
++ 2048 1843 l 1,11,-1
++ 410 1843 l 1,8,-1
++1843 410 m 1,12,-1
++ 1843 1843 l 1,13,-1
++ 2048 1843 l 1,14,-1
++ 2048 410 l 1,15,-1
++ 1843 410 l 1,12,-1
++410 1638 m 1,16,-1
++ 410 1843 l 1,17,-1
++ 614 1843 l 1,18,-1
++ 614 1638 l 1,19,-1
++ 410 1638 l 1,16,-1
++1638 410 m 1,20,-1
++ 1638 614 l 1,21,-1
++ 1843 614 l 1,22,-1
++ 1843 410 l 1,23,-1
++ 1638 410 l 1,20,-1
++EndSplineSet
++EndChar
++EndChars
++EndSplineFont

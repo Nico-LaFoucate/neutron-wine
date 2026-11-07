@@ -1,0 +1,103 @@
+dcomp: keep copying a same-process window swap chain when the window composites with alpha
+
+CapCut 9.7 on lab runtime 11.10-183rc: opening the settings-gear menu drew the menu, but the whole rest
+of the screen turned dark gray (#202020) and hid CapCut's main window until the menu closed (the old
+"black screen with a menu open" bug, now gray). 182 shows the main window around the menu.
+
+Mechanism: every CapCut menu is a screen-sized Qt translucent popup (WS_POPUP, WS_EX_LAYERED|
+WS_EX_TOOLWINDOW, LWA_ALPHA 255, DwmEnableBlurBehindWindow, its own CreateSwapChainForHwnd chain,
+DXGI_SWAP_EFFECT_DISCARD, 1 buffer), transparent except for the menu. Patch 117 + dxvk 0006 made such a
+window composite with its pixels' alpha: dwmapi marks it __wine_dwm_alpha, winewayland gives its window
+surface the pixels' alpha, DXVK presents its chain PRE_MULTIPLIED. dcomp-hwnd-chain-direct (183rc) stopped
+the bridge's copy of a same-process window chain into the window's GDI surface on the premise that DXVK's
+Vulkan subsurface hides that surface. For a marked window it does not: the subsurface is see-through
+wherever the frame is, and the GDI surface underneath still held the popup's unreplaced #202020 fill
+(GDI pixels stay opaque), which until 183rc the copy overwrote with the frame (alpha 0 around the menu).
+With NEUTRON_DXVK_PREMULTIPLIED=0 the same area is black instead of gray: the gray is under the subsurface.
+
+Windows: a bitblt-model Present (DISCARD / SEQUENTIAL) copies the back buffer into the window's DWM
+redirection surface, the surface GDI also draws to ("DXGI flip model", Microsoft Learn: "In the bitblt
+model, contents of the back buffer are copied into the redirection surface on each call to Present1"),
+and with blur-behind DWM blends that surface by its alpha channel ("DWM Blur Behind Overview"). Nothing
+of the earlier GDI fill survives under the frame. The bridge's copy is Wine's version of that copy, so a
+window carrying __wine_dwm_alpha (the same mark DXVK reads to choose PRE_MULTIPLIED) keeps it. Windows
+without the mark keep the direct path and its savings. One log line per window that keeps the copy
+("neutron-hwnd-direct: ... still copied").
+
+The mark is read at every Present (one GetPropW for same-process window chains only; Topaz and Live
+numbers below include it). Not covered: a fully transparent frame (all pixels 0) is still skipped by the
+bridge's uniform-black guard and leaves the GDI fill showing (as in 182). The frame's alpha is applied twice where the copy and the subsurface overlap
+(menu shadow), as in 182 (menu box incl. shadow pixel-identical to 182, max difference 1). Flip-model
+blur-behind windows also keep the copy (none seen; Windows shows only the frame there, which the copy
+approximates better than the bare GDI surface).
+
+Lab (desk v, hand-paced: wait for the Pro promo, close it with its X, wait, click the gear; menu open
+verified in every capture): 183rc gray 2/2, 182 main window visible 2/2 (fresh copies); on 183rc only
+NEUTRON_DCOMP_HWND_CHAIN_COPY=1 brings the main window back (2/2; FLIP_DISCARD_BUF0=0, OWNER_TOPMOST=0,
+OWNED_RECONF_KEEPZ=0 stay gray 2/2 each). Lab runtime 11.10-183v (183rc + this dcomp): main window visible
+2/2 on fresh copies, 3 windows per run keep the copy (main, promo, menu; effect 0, 1 buffer); kill switch
+NEUTRON_DCOMP_DWM_ALPHA_COPY=0 on the same build: gray 2/2. The savings stay: Topaz Photo sign-in screen
+53.7% / 53.6% of a core, 0 copies (main window not marked) vs 76.2% with NEUTRON_DCOMP_HWND_CHAIN_COPY=1;
+Ableton Live 12 Welcome 12.8% / 12.9%, 0 copies vs 56.4%. CapCut itself copies only changed frames (91 in a run).
+
+Applies after dcomp-flip-discard-buffer0 and dcomp-hwnd-chain-direct (same file). Kill switch
+NEUTRON_DCOMP_DWM_ALPHA_COPY=0.
+
+--- a/dlls/dcomp/device.c	2026-11-05 20:25:32.147562657 -0500
++++ b/dlls/dcomp/device.c	2026-11-05 22:44:04.398987105 -0500
+@@ -403,6 +403,30 @@
+     return 0;
+ }
+ 
++/* NEUTRON 2026-11-05 (capcut183): the direct path below is right only while DXVK's Vulkan subsurface hides
++ * the window's GDI surface, i.e. while DXVK presents it OPAQUE. A window that called
++ * DwmEnableBlurBehindWindow carries the __wine_dwm_alpha mark (dwmapi); DXVK then composites its present
++ * PRE_MULTIPLIED and winewayland gives the window surface its pixels' alpha, so the GDI surface shows
++ * wherever the frame is not opaque. On Windows nothing is underneath: a bitblt-model Present copies the
++ * frame into the window's redirection surface, the very surface GDI draws to, and DWM blends that by its
++ * alpha (docs: "DXGI flip model", bitblt vs flip). The bridge's copy is Wine's version of that copy, so
++ * it stays for marked windows. CapCut 9.7: every menu is a screen-sized Qt translucent popup
++ * (WS_EX_LAYERED|WS_EX_TOOLWINDOW, blur-behind, its own swap chain); without the copy the area around the
++ * menu showed the popup's unreplaced GDI fill (#202020) over the whole work area.
++ * Kill switch NEUTRON_DCOMP_DWM_ALPHA_COPY=0 (skip the copy for marked windows too, as 183rc did). */
++static BOOL neutron_dwm_alpha_copy(HWND hwnd)
++{
++    static int gate = -1;
++
++    if (gate < 0)
++    {
++        char b[8];
++        gate = (GetEnvironmentVariableA("NEUTRON_DCOMP_DWM_ALPHA_COPY", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_DWM_ALPHA_COPY = %d\n", gate);
++    }
++    return gate && GetPropW(hwnd, L"__wine_dwm_alpha");
++}
++
+ /* NEUTRON 2026-11-05: a swap chain created for a window (CreateSwapChainForHwnd) reaches the screen through
+  * that window on Windows -- DWM composes it, nothing copies it anywhere else. DXVK presents it into the
+  * window's own Vulkan client surface, which winewayland shows above the window's GDI surface (unless
+@@ -426,7 +450,23 @@
+     }
+     if (copy || suppress || !hwnd) return FALSE;
+     if (FAILED(IDXGISwapChain_GetDesc(swapchain, &scd))) return FALSE;
+-    return scd.OutputWindow == hwnd && scd.Windowed;
++    if (scd.OutputWindow != hwnd || !scd.Windowed) return FALSE;
++    if (neutron_dwm_alpha_copy(hwnd))
++    {
++        static HWND logged[16]; /* one line per window (this runs on every Present) */
++        static unsigned int nlogged;
++        unsigned int i;
++
++        for (i = 0; i < nlogged; i++) if (logged[i] == hwnd) break;
++        if (i == nlogged && nlogged < ARRAY_SIZE(logged))
++        {
++            logged[nlogged++] = hwnd;
++            ERR("neutron-hwnd-direct: hwnd=%p effect=%u buffers=%u blur-behind -> still copied (its window "
++                "surface shows through DXVK's pre-multiplied present)\n", hwnd, scd.SwapEffect, scd.BufferCount);
++        }
++        return FALSE;
++    }
++    return TRUE;
+ }
+ 
+ /* NEUTRON bounded-acquire handshake (round 32). Private DXVK interface --

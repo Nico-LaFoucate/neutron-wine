@@ -1,0 +1,78 @@
+# neutron-msi-enumproductsex-squash
+#
+# Touches: dlls/msi/registry.c.
+#
+# WHAT HAPPENED (lab, 11-05, Topaz Photo 1.7.1 for the app list -- the #42 poster's top pick; community note: "under
+# Wine the MSI install hangs, kill msiexec and run repair")
+# `neutron programs install TopazPhoto-1.7.1.msi` on 11.10-182: after the files copy, "Topaz Photo Setup Wizard ended
+# prematurely because of an error. Your system has not been modified." msiexec exit 1603 (the CLI shows 67), everything
+# rolled back. It is not a hang under Neutron: the wizard ends on its own and waits for Finish. Verbose MSI log:
+#   Action start CachePackage.
+#   Unable to enumerate products for {C50718C0-3550-41A5-B834-A471CFDE3568}: 259
+#   Action ended CachePackage. Return value 0.   -> InstallFinalize fails -> rollback
+#
+# MECHANISM
+# CachePackage is a deferred custom action in Topaz's ModelDownloader.dll (CacheInstaller). Disassembly: it calls
+# MsiEnumProductsExA(ProductCode, "s-1-1-0", MSIINSTALLCONTEXT_ALL, 0, ...) for its own, just-published product, then
+# MsiGetProductInfoExA(..., "LocalPackage"). fetch_machine_product()/fetch_user_product() compare the caller's code with
+# the registry key NAMES under ...\Installer\Products, which are the SQUASHED product codes, so a "{GUID}" never matches
+# and every product-filtered call returns ERROR_NO_MORE_ITEMS (259). Wine's tests only pass a product that does not exist.
+# Fix: squash the code before the walk. A code that does not squash matches nothing, as before.
+#
+# WINDOWS: MsiEnumProductsEx(szProductCode, ...) enumerates the instances of that product in the given context (the API
+# contract; and Topaz ships this installer, which needs the call to succeed on Windows). Not probed on the Windows test machine.
+# NOT COVERED: the "s-1-1-0" SID is compared case-sensitively with "S-1-1-0" in fetch_user_product (irrelevant for this
+# per-machine product, untouched).
+#
+# LAB EVIDENCE (Topaz Photo 1.7.1 MSI through `neutron programs install`, copies of lab prefix Prg1, nested KWin desk h, 175%):
+#   11.10-182 (no fix):                         2/2 installs rolled back at CachePackage (runs PgI-topaz, PgI-topaz2)
+#   11.10-182h, fix on (default):               2/2 installs completed, CachePackage "Return value 1", program recorded and
+#                                               menu entry written (PgI-topaz3 clean, PgI-topaz5 with models pre-seeded)
+#   11.10-182h, NEUTRON_MSI_ENUM_SQUASH=0:      1/1 rolled back at CachePackage, same 259 (PgI-topaz4), same build
+# Kill switch: NEUTRON_MSI_ENUM_SQUASH=0.
+--- a/dlls/msi/registry.c
++++ b/dlls/msi/registry.c
+@@ -2305,6 +2305,18 @@
+     return r;
+ }
+ 
++/* Neutron: kill switch NEUTRON_MSI_ENUM_SQUASH=0 restores matching the caller's product code as given. */
++static BOOL neutron_enum_squash(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        WCHAR buf[8];
++        enabled = !(GetEnvironmentVariableW( L"NEUTRON_MSI_ENUM_SQUASH", buf, ARRAY_SIZE(buf) ) && buf[0] == '0');
++    }
++    return enabled;
++}
++
+ UINT WINAPI MsiEnumProductsExW( const WCHAR *product, const WCHAR *usersid, DWORD ctx, DWORD index,
+                                 WCHAR installed_product[GUID_SIZE], MSIINSTALLCONTEXT *installed_ctx, WCHAR *sid,
+                                 DWORD *sid_len )
+@@ -2312,6 +2324,7 @@
+     UINT r;
+     DWORD idx = 0;
+     static DWORD last_index;
++    WCHAR squashed[SQUASHED_GUID_SIZE];
+ 
+     TRACE( "%s, %s, %#lx, %lu, %p, %p, %p, %p\n", debugstr_w(product), debugstr_w(usersid), ctx, index,
+            installed_product, installed_ctx, sid, sid_len );
+@@ -2324,6 +2337,16 @@
+ 
+     if (!index) last_index = 0;
+ 
++    /* Neutron: the product keys enum_products() walks are named by the SQUASHED product code, so a caller's
++     * "{GUID}" never matched one and every product-filtered call returned ERROR_NO_MORE_ITEMS. Topaz Photo's
++     * CachePackage custom action asks for its own product this way during InstallFinalize; the failure rolled the
++     * whole install back. A code that does not squash matches nothing, as before. */
++    if (product && neutron_enum_squash())
++    {
++        squash_guid( product, squashed );
++        product = squashed;
++    }
++
+     r = enum_products( product, usersid, ctx, index, &idx, installed_product, installed_ctx,
+                        sid, sid_len );
+     if (r == ERROR_SUCCESS)

@@ -150,9 +150,16 @@ if [ -f "$_ART_TB" ] || [ -f "$_ART_SH" ]; then
     done
     # Strip any previously injected hook first, so this is idempotent and a changed hook actually
     # replaces the old one instead of running alongside it.
-    sed -i '/gen_toolbar_icons\.py\|gen_shell_icons\.py/d' "$TKGDIR/non-makepkg-build.sh"
+    sed -i '/gen_toolbar_icons\.py\|gen_shell_icons\.py\|build\/overlay/d' "$TKGDIR/non-makepkg-build.sh"
     _HOOK="      python3 \"$_ART_TB\" \"\$_where/src/wine-git/dlls/comctl32\" || exit 6
       python3 \"$_ART_SH\" \"\$_where/src/wine-git/dlls/shell32/resources\" || exit 6"
+    # Binary files a patch cannot carry land the same way: build/overlay/<path> -> src/wine-git/<path>, after _prepare
+    # (which would delete them) and before ./configure. Today: the two .ttf fonts of patches 154 (MS Sans Serif strikes)
+    # and 155 (Neutron Icons). Wine turns .sfd into .ttf only in maintainer mode, so the built .ttf ships beside its .sfd.
+    if [ -d "$REPO/build/overlay" ]; then
+        _HOOK="$_HOOK
+      cp -a \"$REPO/build/overlay/.\" \"\$_where/src/wine-git/\" || exit 6"
+    fi
     awk -v hook="$_HOOK" '
         { print }
         /^      _prepare$/ && !done { print hook; done=1 }
@@ -164,6 +171,11 @@ if [ -f "$_ART_TB" ] || [ -f "$_ART_SH" ]; then
     grep -qF "gen_toolbar_icons.py" "$TKGDIR/non-makepkg-build.sh" \
         && grep -qF "gen_shell_icons.py" "$TKGDIR/non-makepkg-build.sh" \
         || { echo "build.sh: FAILED to inject the artwork steps into non-makepkg-build.sh" >&2; exit 6; }
+    if [ -d "$REPO/build/overlay" ]; then
+        grep -qF "build/overlay/." "$TKGDIR/non-makepkg-build.sh" \
+            || { echo "build.sh: FAILED to inject the build/overlay copy into non-makepkg-build.sh" >&2; exit 6; }
+        echo "overlay step injected ($(find "$REPO/build/overlay" -type f | wc -l) files, run after _prepare)"
+    fi
     echo "artwork steps injected (toolbar + shell icons, run after _prepare)"
 fi
 

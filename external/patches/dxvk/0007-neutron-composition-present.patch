@@ -1,0 +1,232 @@
+From: Neutron
+Subject: [PATCH] d3d11: a composition swap chain's Present completes without a Vulkan surface
+
+Mister Horse Product Manager 3.7.7 (JUCE 8; the app Animation Composer is installed with) drew its first frame and
+never another: buttons did not hover, Next did not leave the Welcome screen, a maximized window kept the old frame.
+JUCE 8 draws through a swap chain from CreateSwapChainForComposition with DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_
+WAITABLE_OBJECT (FLIP_SEQUENTIAL, 2 buffers) and waits on the waitable object before every paint.
+
+DXVK gives a composition swap chain (no window) its own hidden dummy window and presents to a Vulkan swap chain on
+it. A FIFO frame's completion is a present-wait on that surface, and a window that is never shown never shows the
+frame: the presenter's frame thread called vkWaitForPresentKHR(presentId 17, 100 ms) 250 times in 30 s for the one
+frame JUCE presented, so the frame latency fence was never signaled and the semaphore behind the waitable object
+(initial count 1) was never released (WINEDEBUG=+sync: 0 NtReleaseSemaphore all session). The app's second wait
+never returned.
+
+On Windows a composition swap chain's Present hands the buffer to the compositor; Present completes, the frame is
+counted and the waitable object is released once per presented frame, paced by DWM. Here the compositor's side is
+Wine's dcomp bridge, which reads the presented buffer back (GetBuffer) and copies it to the visual's window. So a
+swap chain whose surface factory owns DXVK's dummy window (DXVKDUMMYWNDCLASS: CreateSwapChainForComposition is the
+one way to get one) now has no Vulkan presenter at all, as the GDI-present chains already have none: Present flushes,
+rotates the buffers as before, counts the frame and signals the latency fence, so the waitable object is released
+per frame. SyncInterval > 0 is paced to the display's refresh (EnumDisplaySettings), sleeping outside the immediate
+context lock, never spinning. The bridge's fallback window for an unmatched Present stays the dummy window
+(dcomp_set_pending_hwnd, which DxgiSurfaceFactory::CreateSurface called for the presenter that is no longer made).
+Color spaces other than sRGB are reported unsupported for such chains (there is no surface to ask). Logged once per
+chain: "neutron-comp-present".
+
+Not covered: D3D12 composition swap chains (vkd3d-proton's own swap chain); the pacing uses the primary display's
+refresh, not the monitor the visual is on.
+
+Lab, 11.10-183m (183rc + this + dxvk-dxgi 0005), NVIDIA 615.78, Wayland. Product Manager, Welcome -> hover -> Next:
+fix 2/2 (f1, kf2): hover repaints the button (present 2 -> 3), Next shows the sign-in screen (window luma 238 -> 36,
+presents 5), and 2/2 sign-in runs drew and showed the app's dialog after a link (g1, g2).
+NEUTRON_DXVK_COMPOSITION_PRESENT=0 on the same build: 1 present all session and Next changes nothing, 2/2 (kA1, kA2).
+Other programs, all composition swap chains enabled (CLI change of the same day), n=1 each, all draw: FL Studio 2026
+(WebView2 chain 639x1858: its GPU process 39.1% / 47.6% of a core vs 67.2% with the kill switch; all processes
+97 / 113% vs 107%), Ableton Live 12 (one composition chain, 19.3% total), CapCut, Topaz Photo, Affinity, Cavalry
+(no composition chain: unaffected).
+Adobe (the Adobe confs give every exe composition chains), this build vs 183rc's DXVK on the same prefix copy, n=1
+each: Photoshop 2026 Home (WebView2, 2 composition chains through this path) and a recent document draw the same;
+blits 15 vs 14, 0 'Invalid buffer ID', 9.9% vs 9.9% of a core. Premiere 2026 Home + the Waterfalls project
+(program monitor, timeline, thumbnails) draw the same; blits 21 vs 22, 0 'Invalid buffer ID', 11.2% vs 20.4%.
+
+Kill switch NEUTRON_DXVK_COMPOSITION_PRESENT=0 (the Vulkan presenter on the dummy window).
+
+diff --git a/src/d3d11/d3d11_swapchain.cpp b/src/d3d11/d3d11_swapchain.cpp
+index aecf5275..cd668ba9 100644
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -79,6 +79,8 @@ namespace dxvk {
+       m_gdiPresent = env::getEnvVar("NEUTRON_GDI_PRESENT") == "1";
+     }
+ 
++    InitCompositionPresent();
++
+     if (m_gdiPresent) {
+       HWND hwnd = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
+       Logger::warn(str::format("neutron-gdi-present: hwnd=", (void*)hwnd,
+@@ -306,8 +308,8 @@ namespace dxvk {
+       if (hr != S_OK)
+         return hr;
+ 
+-      if (m_gdiPresent)
+-        return S_OK; /* neutron N2: GDI path is never occluded-blocked */
++      if (m_gdiPresent || m_compPresent)
++        return S_OK; /* neutron N2: GDI path is never occluded-blocked; nor is a composition chain */
+       VkResult status = m_presenter->checkSwapChainStatus();
+       return status == VK_SUCCESS ? S_OK : DXGI_STATUS_OCCLUDED;
+     }
+@@ -326,6 +328,13 @@ namespace dxvk {
+       hr = E_FAIL;
+     }
+ 
++    // NEUTRON composition present: the frame is complete once its buffers rotated. Pace it outside the
++    // immediate context lock, then signal it (SyncFrameLatency below releases the waitable object).
++    if (m_compPresent && hr == S_OK) {
++      PaceCompositionPresent(SyncInterval);
++      m_frameLatencySignal->signal(m_frameId);
++    }
++
+     // Ensure to synchronize and release the frame latency semaphore
+     // even if presentation failed with STATUS_OCCLUDED, or otherwise
+     // applications using the semaphore may deadlock. This works because
+@@ -353,7 +362,7 @@ namespace dxvk {
+ 
+     VkColorSpaceKHR vkColorSpace = ConvertColorSpace(ColorSpace);
+ 
+-    if (m_gdiPresent) /* neutron N2: sRGB only */
++    if (m_gdiPresent || m_compPresent) /* neutron N2: sRGB only (composition: no surface to ask) */
+       return (vkColorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+         ? DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT : 0;
+ 
+@@ -368,7 +377,7 @@ namespace dxvk {
+           DXGI_COLOR_SPACE_TYPE     ColorSpace) {
+     VkColorSpaceKHR colorSpace = ConvertColorSpace(ColorSpace);
+ 
+-    if (m_gdiPresent) { /* neutron N2 */
++    if (m_gdiPresent || m_compPresent) { /* neutron N2 */
+       if (colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+         return E_INVALIDARG;
+       m_colorSpace = colorSpace;
+@@ -784,6 +793,16 @@ namespace dxvk {
+     if (m_gdiPresent)
+       return PresentImageGdi();
+ 
++    // NEUTRON composition present: no Vulkan swap chain; the dcomp bridge reads back the presented buffer.
++    if (m_compPresent) {
++      if (m_backBuffers.size() > 1u)
++        RotateBackBuffers(immediateContext);
++
++      immediateContext->FlushCsChunk();
++      m_frameId += 1;
++      return S_OK;
++    }
++
+     m_presenter->setSyncInterval(SyncInterval);
+ 
+     // Presentation semaphores and WSI swap chain image
+@@ -874,6 +893,75 @@ namespace dxvk {
+   }
+ 
+ 
++  void D3D11SwapChain::InitCompositionPresent() {
++    // CreateSwapChainForComposition is the one way to a DxgiSurfaceFactory without an app window: it then
++    // owns DXVK's dummy window. The bit-blt GDI path stays as it was (NEUTRON_GDI_PRESENT=1).
++    static const bool enabled = env::getEnvVar("NEUTRON_DXVK_COMPOSITION_PRESENT") != "0";
++
++    HWND hwnd = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
++    wchar_t cls[32] = { };
++
++    if (!enabled || m_gdiPresent || !hwnd || !::GetClassNameW(hwnd, cls, 32) || wcscmp(cls, L"DXVKDUMMYWNDCLASS"))
++      return;
++
++    m_compPresent = true;
++
++    DEVMODEW mode = { };
++    mode.dmSize = sizeof(mode);
++    uint32_t hz = ::EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1u
++      ? uint32_t(mode.dmDisplayFrequency) : 60u;
++    m_compRefreshPeriod = std::chrono::duration_cast<dxvk::high_resolution_clock::duration>(
++      std::chrono::nanoseconds(1000000000ull / hz));
++
++    // The dcomp bridge's fallback window for a Present it cannot match to a visual is the one DXVK last made a
++    // surface for (DxgiSurfaceFactory::CreateSurface), for a composition chain the dummy window. No surface is
++    // made now, so record it here as before.
++    using DcompSetPendingProc = void (*)(HWND);
++    HMODULE dcomp = ::GetModuleHandleA("dcomp.dll");
++
++    if (dcomp) {
++      auto setPending = reinterpret_cast<DcompSetPendingProc>(
++        reinterpret_cast<void*>(::GetProcAddress(dcomp, "dcomp_set_pending_hwnd")));
++
++      if (setPending)
++        setPending(hwnd);
++    }
++
++    Logger::info(str::format("neutron-comp-present: composition swap chain ", m_desc.Width, "x", m_desc.Height,
++      " effect=", m_desc.SwapEffect, " buffers=", m_desc.BufferCount, " flags=", m_desc.Flags,
++      ": presents complete without a Vulkan surface, paced at ", hz, " Hz"));
++  }
++
++
++  void D3D11SwapChain::PaceCompositionPresent(UINT SyncInterval) {
++    auto now = dxvk::high_resolution_clock::now();
++
++    if (SyncInterval) {
++      auto interval = m_compRefreshPeriod * SyncInterval;
++      auto due = m_compLastPresent + interval;
++
++      // Sleep, never spin: DWM's pacing costs the app no CPU on Windows.
++      if (due > now && due - now <= interval) {
++        using NtDelayExecutionProc = LONG (WINAPI*)(BOOLEAN, PLARGE_INTEGER);
++        static auto delay = reinterpret_cast<NtDelayExecutionProc>(reinterpret_cast<void*>(
++          ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution")));
++
++        LARGE_INTEGER ticks;
++        ticks.QuadPart = -std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(due - now).count() / 100);
++
++        if (delay)
++          delay(FALSE, &ticks);
++        else
++          ::Sleep(DWORD(std::chrono::duration_cast<std::chrono::milliseconds>(due - now).count()));
++
++        now = due;
++      }
++    }
++
++    m_compLastPresent = now;
++  }
++
++
+   void D3D11SwapChain::RotateBackBuffers(D3D11ImmediateContext* ctx) {
+     small_vector<Rc<DxvkImage>, 4> images;
+ 
+@@ -985,8 +1073,8 @@ namespace dxvk {
+ 
+   void D3D11SwapChain::CreatePresenter() {
+     // neutron round-38 N2: GDI-present chains have NO Vulkan presenter at all
+-    // (no vk swapchain, no wayland subsurface, no latency tracker).
+-    if (m_gdiPresent)
++    // (no vk swapchain, no wayland subsurface, no latency tracker). Nor do composition chains.
++    if (m_gdiPresent || m_compPresent)
+       return;
+ 
+     PresenterDesc presenterDesc = { };
+diff --git a/src/d3d11/d3d11_swapchain.h b/src/d3d11/d3d11_swapchain.h
+index 5b25ee6a..30da77a6 100644
+--- a/src/d3d11/d3d11_swapchain.h
++++ b/src/d3d11/d3d11_swapchain.h
+@@ -133,6 +133,22 @@ namespace dxvk {
+ 
+     HRESULT PresentImageGdi();
+ 
++    // NEUTRON composition present: a swap chain made by CreateSwapChainForComposition has no window. DXVK
++    // gives it a hidden dummy window, and a Vulkan swap chain on that window never shows a frame, so a FIFO
++    // frame's present-wait never completed and the frame latency fence (and the app's waitable object) was
++    // never signaled after the first frame: JUCE 8 (Mister Horse Product Manager) waits on it before every
++    // paint and drew one frame. On Windows a composition chain's buffers go to the compositor, which Present
++    // hands them to; here the dcomp bridge reads the presented buffer back (GetBuffer). So such a chain has no
++    // presenter: Present completes (buffers rotate, the frame is signaled), paced to the display's refresh when
++    // SyncInterval > 0 as DWM paces it. Kill switch NEUTRON_DXVK_COMPOSITION_PRESENT=0.
++    bool m_compPresent = false;
++    dxvk::high_resolution_clock::time_point m_compLastPresent = { };
++    dxvk::high_resolution_clock::duration   m_compRefreshPeriod = { };
++
++    void InitCompositionPresent();
++
++    void PaceCompositionPresent(UINT SyncInterval);
++
+     DXGI_SWAP_CHAIN_DESC1     m_desc;
+ 
+     Rc<DxvkDevice>            m_device;

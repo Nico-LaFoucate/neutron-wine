@@ -1,0 +1,69 @@
+From: Neutron lab (team agent live2) 2026-11-05
+Subject: [PATCH] kernelbase: Issue an overlapped TransactNamedPipe as STATUS_PENDING.
+
+What was seen (lab, Ableton Live 12.4.16 trial installer, Inno Setup 6.4.0): the install log says "Exception while
+communicating with helper: Internal error: Helper: Response message has wrong size", "Helper process exited with
+failure code: 0x700E8", "Failed to set permissions on directory (31)" for C:\ProgramData\Ableton\Live 12 Trial,
+every run. Any Inno Setup 6 installer that uses its 64-bit helper (permissions, 64-bit COM/typelib registration)
+hits the same path.
+
+Mechanism: Inno's 32-bit Setup talks to its 64-bit helper over a message-mode named pipe. It zeroes an OVERLAPPED,
+calls TransactNamedPipe(overlapped) (ERROR_IO_PENDING) and, when it has no message pump to run, goes straight to
+GetOverlappedResult(wait=TRUE) (Setup.Helper.pas InternalCall). Wine's TransactNamedPipe, unlike its ReadFile,
+WriteFile, DeviceIoControl and ConnectNamedPipe, did not set OVERLAPPED.Internal to STATUS_PENDING, and ntdll leaves
+the IOSB alone while the transaction waits for the answer. GetOverlappedResult saw Internal 0 (success), returned
+TRUE with 0 bytes at once, Inno raised "wrong size" and closed the pipe; the helper's WriteFile of its answer then
+failed with ERROR_NO_DATA (232): exit code MAKELONG(232, 7) = 0x700E8, as logged.
+
+Windows behavior: OVERLAPPED.Internal is documented as set to STATUS_PENDING when the request is issued; kernel32's
+pipe tests (dlls/kernel32/tests/pipe.c) show Windows' ReadFile/WriteFile setting Internal and leaving InternalHigh.
+Inno's code works on Windows (known-good). The probe team/live2/probe/pipeprobe32.exe + pipeprobe64.exe replays
+the protocol (optional; not needed to settle this).
+
+Fix: set overlapped->Internal = STATUS_PENDING before NtFsControlFile(FSCTL_PIPE_TRANSCEIVE), Internal only.
+Kill switch: NEUTRON_TRANSACT_PENDING=0 (process environment).
+
+Not covered: the "Need to restart Windows? Yes" at the end of the same install (VC++ 2013's Burn 3.7 elevated
+engine scheduling the delete of its own running image; same on Windows, no change).
+
+Lab evidence (runtime 11.10-182n = 182j + win32u (uah-menu-measure) + this kernelbase.dll x86_64/i386):
+  probe pipeprobe32 (4 transactions, 2 without a message wait):
+    182j:                         2/4 transactions read 0 bytes, helper exit 0x700e8
+    182n on:                      4/4 read 16 bytes, helper exit 0 (2 runs)
+    182n NEUTRON_TRANSACT_PENDING=0: 2/4 read 0 bytes (2 runs)
+  full silent install of the Ableton installer into fresh copies of the lab prefix (Inno log):
+    182n on:                      t3, t4 (final build) and t1, t2 (first build, also set InternalHigh=0): "Helper
+                                  process exited.", no error, permissions set
+    182n NEUTRON_TRANSACT_PENDING=0: x1, x2, x3 3/3 "Response message has wrong size", helper 0x700E8, "Failed to set
+                                  permissions on directory (31)"
+    182n before this dll (i1) and 182/182j (the ableton agent's ab1, ab2): same failure
+
+--- a/dlls/kernelbase/sync.c
++++ b/dlls/kernelbase/sync.c
+@@ -1656,9 +1656,26 @@
+ 
+     if (overlapped)
+     {
++        static int preset = -1;
++
+         event = overlapped->hEvent;
+         iosb = (IO_STATUS_BLOCK *)overlapped;
+         if (((ULONG_PTR)event & 1) == 0) cvalue = overlapped;
++
++        /* NEUTRON neutron-transact-pending: issue the request as STATUS_PENDING, as ReadFile and WriteFile
++         * do (kernel32's pipe tests show Windows setting Internal, not InternalHigh) and as Windows documents
++         * for OVERLAPPED.Internal. The transaction completes only when the other end answers; until then
++         * ntdll leaves the IOSB alone, so a caller that zeroed its OVERLAPPED and went straight to
++         * GetOverlappedResult(wait) got "done, 0 bytes" at once. Inno Setup's 64-bit helper call does that
++         * ("Helper: Response message has wrong size", directory permissions not set).
++         * Kill switch: NEUTRON_TRANSACT_PENDING=0. */
++        if (preset < 0)
++        {
++            WCHAR value[2];
++            preset = !(GetEnvironmentVariableW( L"NEUTRON_TRANSACT_PENDING", value, ARRAY_SIZE(value) ) == 1
++                       && value[0] == '0');
++        }
++        if (preset) overlapped->Internal = STATUS_PENDING;
+     }
+     else
+     {

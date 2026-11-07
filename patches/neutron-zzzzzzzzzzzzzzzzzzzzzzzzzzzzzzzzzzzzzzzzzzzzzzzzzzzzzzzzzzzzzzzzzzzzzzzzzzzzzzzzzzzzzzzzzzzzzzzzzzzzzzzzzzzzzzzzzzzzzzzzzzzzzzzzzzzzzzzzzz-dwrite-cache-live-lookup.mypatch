@@ -1,0 +1,137 @@
+# neutron-dwrite-cache-live-lookup
+#
+# Touches: dlls/dwrite/dwrite_private.h, dlls/dwrite/font.c, dlls/dwrite/main.c. Applies after zzz6 (keep-alive).
+#
+# WHAT HAPPENED (lab, 11-05, Affinity 3.3.3 bring-up for the app list; not reported by a user yet)
+# Affinity died at startup about one launch in three-four on 11.10-182: no window, a crashpad dump. Dump: a call through a
+# NULL vtable slot right after DWrite+0x297fd = factory_keepalive_touch() evicting a face and calling
+# IDWriteFontFace5_Release on it. The face's lpVtbl was a HEAP address, not dwrite's vtable: the face had already been freed
+# while it sat in the zzz6 keep-alive list. Thread: Affinity's font enumeration (libkernel -> gdiinterop_CreateFontFromLOGFONT
+# -> create_fontface -> factory_get_cached_fontface), which runs on several threads at once.
+#
+# MECHANISM
+# dwritefontface_Release() drops the count to zero BEFORE it takes factory->cs to unlink the face from the factory's fontface
+# cache. In that window a lookup on another thread (factory_get_cached_fontface, under factory->cs) still finds the face,
+# QueryInterface brings it back from zero, and zzz6 AddRefs it into the keep-alive list. The releasing thread then frees it:
+# the caller and the keep-alive both hold a dangling pointer. The race is upstream's too (any app creating faces on several
+# threads); the keep-alive makes it bite, since the last Release now often happens on another thread at eviction.
+# Fix: the lookup takes its reference only while the count is still above zero (compare-exchange); a face at zero is
+# skipped -- its own Release unlinks it and the caller creates a fresh face. The lookup's reference is dropped after the
+# lock, as the destructor takes that lock. The keep-alive is only touched when a face was really handed out.
+#
+# WINDOWS: DirectWrite does not hand out a destroyed face; no app-visible behavior changes besides not crashing.
+# NOT COVERED: other caches that store fontfaces without a reference (none found in main.c besides this list).
+#
+# LAB EVIDENCE (Affinity 3.3.3 MSIX payload, prefix PgI-affinity = Prg1 + .NET 4.8, nested KWin desk g, 175%):
+#   11.10-182 (zzz6 on, no fix):                2/7 launches crashed at the eviction Release (dumps 16:28, 16:34)
+#   11.10-182af, fix on (default):              0/11 crashed; 1 run logged "neutron-dwlive: skipped dying fontface" (the
+#                                               race window hit and was handled)
+#   11.10-182af, NEUTRON_DWRITE_LIVE_LOOKUP=0:  1/6 crashed (same font worker thread, now inside the app's own code: the app
+#                                               was handed the dead face), alternating arms, same build
+#   (NEUTRON_DWRITE_FACE_KEEPALIVE=0 on 182: 2/2 launches fine -- consistent, not a fix.)
+# Kill switch: NEUTRON_DWRITE_LIVE_LOOKUP=0.
+--- a/dlls/dwrite/dwrite_private.h	2026-11-05 16:49:58.363250205 -0500
++++ b/dlls/dwrite/dwrite_private.h	2026-11-05 16:50:15.453853435 -0500
+@@ -459,6 +459,7 @@
+ extern HRESULT get_fontsig_from_fontface(IDWriteFontFace*,FONTSIGNATURE*);
+ extern HRESULT create_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 **interop);
+ extern void fontface_detach_from_cache(IDWriteFontFace5 *fontface);
++extern BOOL fontface_addref_if_alive(IDWriteFontFace5 *fontface);
+ extern void factory_lock(IDWriteFactory7 *factory);
+ extern void factory_unlock(IDWriteFactory7 *factory);
+ extern HRESULT create_inmemory_fileloader(IDWriteInMemoryFontFileLoader **loader);
+--- a/dlls/dwrite/font.c	2026-11-05 16:49:58.359250064 -0500
++++ b/dlls/dwrite/font.c	2026-11-05 16:50:15.456559680 -0500
+@@ -931,6 +931,30 @@
+     return refcount;
+ }
+ 
++/* NEUTRON: a reference for the factory's fontface cache lookup, taken only while the face is still
++ * alive. dwritefontface_Release drops the count to zero BEFORE it takes the factory lock to unlink
++ * the face from that cache, so a lookup on another thread can still find a face whose last
++ * reference is already gone. AddRef'ing it then brings a dying face back from zero: the releasing
++ * thread goes on to free it, and whoever was handed it -- the app, and our zzz6 keep-alive list --
++ * holds a dangling pointer. Affinity 3.3 enumerates fonts on several threads at startup and died
++ * calling Release through the freed face's vtable when the keep-alive later evicted it. A face at
++ * zero is skipped instead; its own Release unlinks it and the caller creates a fresh one.
++ * Returns FALSE (no reference taken) for a face at zero. */
++BOOL fontface_addref_if_alive(IDWriteFontFace5 *iface)
++{
++    struct dwrite_fontface *fontface = impl_from_IDWriteFontFace5(iface);
++    LONG refcount = fontface->refcount;
++
++    for (;;)
++    {
++        LONG prev;
++        if (refcount <= 0) return FALSE;
++        prev = InterlockedCompareExchange(&fontface->refcount, refcount + 1, refcount);
++        if (prev == refcount) return TRUE;
++        refcount = prev;
++    }
++}
++
+ static ULONG WINAPI dwritefontface_Release(IDWriteFontFace5 *iface)
+ {
+     struct dwrite_fontface *fontface = impl_from_IDWriteFontFace5(iface);
+--- a/dlls/dwrite/main.c	2026-11-05 16:49:58.352249817 -0500
++++ b/dlls/dwrite/main.c	2026-11-05 16:50:15.460853682 -0500
+@@ -1261,11 +1261,24 @@
+     return TRUE;
+ }
+ 
++static BOOL neutron_live_lookup(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        DWORD n = GetEnvironmentVariableA("NEUTRON_DWRITE_LIVE_LOOKUP", buf, sizeof(buf));
++        v = (n && n < sizeof(buf) && buf[0] == '0') ? 0 : 1;
++    }
++    return v;
++}
++
+ HRESULT factory_get_cached_fontface(IDWriteFactory7 *iface, IDWriteFontFile * const *font_files, UINT32 index,
+         DWRITE_FONT_SIMULATIONS simulations, struct list **cached_list, REFIID riid, void **obj)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+     struct fontfacecached *cached;
++    IDWriteFontFace5 *held = NULL;
+     IDWriteFontFileLoader *loader;
+     struct list *fontfaces;
+     UINT32 key_size;
+@@ -1324,16 +1337,33 @@
+ 
+         if (cached_key_size == key_size && !memcmp(cached_key, key, key_size))
+         {
++            /* NEUTRON: never hand out (or keep alive) a face whose last reference is being
++             * released on another thread -- see fontface_addref_if_alive(). Kill switch
++             * NEUTRON_DWRITE_LIVE_LOOKUP=0. */
++            if (neutron_live_lookup())
++            {
++                if (!fontface_addref_if_alive(cached->fontface))
++                {
++                    static LONG skipped;
++                    LONG n = InterlockedIncrement(&skipped);
++                    if (n <= 20 || !(n % 1000))
++                        ERR("neutron-dwlive: skipped dying fontface %p in the cache (n=%ld)\n", cached->fontface, n);
++                    continue;
++                }
++                held = cached->fontface;
++            }
+             if (FAILED(hr = IDWriteFontFace5_QueryInterface(cached->fontface, riid, obj)))
+                 WARN("Failed to get %s from fontface, hr %#lx.\n", debugstr_guid(riid), hr);
+ 
+             TRACE("returning cached fontface %p\n", cached->fontface);
+-            factory_keepalive_touch(factory, cached->fontface);
++            if (*obj) factory_keepalive_touch(factory, cached->fontface);
+             break;
+         }
+     }
+ 
+     LeaveCriticalSection(&factory->cs);
++    /* the lookup's own reference; outside the lock, as the face's destructor takes it */
++    if (held) IDWriteFontFace5_Release(held);
+ 
+     return *obj ? S_OK : S_FALSE;
+ }

@@ -1,0 +1,75 @@
+# neutron-wininet-redirect-keeps-connect
+#
+# Touches: dlls/wininet/http.c.
+#
+# WHAT HAPPENED (lab, 11-05, Topaz Photo 1.7.1 installer through `neutron programs install`)
+# The installer's model downloader (ModelDownloader.dll) asks each model's size with a HEAD request on ONE connect
+# handle to image-models.topazlabs.com. Under 11.10-182 the first HEAD answered 200 and the other 95 of 96 answered
+# "HTTP/1.1 400 Bad Request" ("Couldn't get content length ... Error: 12150"), so the installer had no sizes to check.
+#
+# MECHANISM
+# The first HEAD is redirected (302) to a presigned *.r2.cloudflarestorage.com URL. HTTP_HandleRedirect writes the
+# redirect host into the CONNECT handle (session->hostName/hostPort) besides the request (request->server, Host header).
+# Every later HttpOpenRequest on that handle (get_server(session->hostName, ...)) then went to the storage host with the
+# original path and that host's Host header -> 400. +wininet trace: request 2 = "HEAD /v1/wbc-...tz2", "Host:
+# 6fe4...r2.cloudflarestorage.com", "open_http_connection <-- reusing ... netconn".
+# Fix: a redirect retargets only its own request; the connect handle keeps the server the app connected to.
+#
+# WINDOWS: not probed yet. Probe probe/headtest.exe (two HEADs on one connect handle against the same CDN, prints status
+# and Content-Length per request) is ready; Windows is expected to print 200 for all three lines (INFERRED from the
+# installer relying on it: it logs "Length Header" per model).
+# NOT COVERED: session->userName is still cleared/replaced on a cross-host redirect (credentials of later requests on
+# that handle); the InternetErrorDlg auth dialog (dialogs.c) still shows session->hostName (now the original host).
+#
+# LAB EVIDENCE (same build 11.10-182h, probe/headtest.exe HEAD x3 on one handle, image-models.topazlabs.com):
+#   fix on (default):                                2/2 runs 200 / 200 / 200 (Content-Length on all)
+#   NEUTRON_WININET_REDIRECT_KEEPS_CONNECT=0:        2/2 runs 200 / 400 / 400, alternating arms
+#   11.10-182 (no fix):                              1/1 probe 200 / 400 / 400; installer 95/96 HEADs 400 (run PgI-topaz3)
+#   Installer on 182h with the fix (PgI-topaz5): 0 HEAD failures.
+#   Wine's own wininet local-server http tests (test_http_connection incl. test_redirect, offline netns): 182 and 182h
+#   identical output, 0 failures (logs/wtest-182*.txt).
+# Kill switch: NEUTRON_WININET_REDIRECT_KEEPS_CONNECT=0.
+--- a/dlls/wininet/http.c
++++ b/dlls/wininet/http.c
+@@ -4258,6 +4258,19 @@
+ }
+ 
+ 
++/* Neutron: kill switch NEUTRON_WININET_REDIRECT_KEEPS_CONNECT=0 (see HTTP_HandleRedirect). */
++static BOOL neutron_redirect_keeps_connect(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        WCHAR buf[8];
++        enabled = !(GetEnvironmentVariableW( L"NEUTRON_WININET_REDIRECT_KEEPS_CONNECT", buf, ARRAY_SIZE(buf) )
++                    && buf[0] == '0');
++    }
++    return enabled;
++}
++
+ /***********************************************************************
+  *           HTTP_HandleRedirect (internal)
+  */
+@@ -4310,10 +4323,18 @@
+             custom_port = urlComponents.nPort != INTERNET_DEFAULT_HTTPS_PORT;
+         }
+ 
+-        free(session->hostName);
++        /* Neutron: the redirect target is this request's (request->server and its Host header, below). Writing it
++         * into the connect handle as well sent every LATER request opened on that handle to the redirect host with
++         * the original path: Topaz Photo's installer HEADs each model on image-models.topazlabs.com, the first one
++         * redirects to an R2 storage host, and the other 95 got "400 Bad Request" from R2. Kill switch:
++         * NEUTRON_WININET_REDIRECT_KEEPS_CONNECT=0 restores the old retargeting. */
++        if (!neutron_redirect_keeps_connect())
++        {
++            free(session->hostName);
+ 
+-        session->hostName = strndupW(urlComponents.lpszHostName, urlComponents.dwHostNameLength);
+-        session->hostPort = urlComponents.nPort;
++            session->hostName = strndupW(urlComponents.lpszHostName, urlComponents.dwHostNameLength);
++            session->hostPort = urlComponents.nPort;
++        }
+ 
+         free(session->userName);
+         session->userName = NULL;

@@ -1,0 +1,103 @@
+From: Neutron lab (team agent ableton) 2026-11-05
+Subject: [PATCH] ntoskrnl: Store no hardware/compatible IDs value for an empty ID list.
+
+What was seen (lab, Ableton Live 12.4.16 trial installer, default "Install USB Audio Driver" task): a Wine
+"Program Error: tlsetupfx.exe has encountered a serious problem" dialog mid-install; the USB audio driver
+MSI (audiodriver_x64.msi /quiet) then exits 1603 and is rolled back. (WineHQ 58926 reports the same crash.)
+
+Mechanism: tlsetupfx (Thesycon driver setup) enumerates every device (SetupDiGetClassDevs ALLCLASSES) and reads
+SPDRP_HARDWAREID. winebth answers BusQueryHardwareIDs for its radio and remote devices with append_id(L""),
+a lone terminator, and install_device_driver stored sizeof_multiszW() of it: a 2-byte REG_MULTI_SZ. tlsetupfx
+allocates required+4, checks the list's double terminator at end-4, i.e. before its buffer, and falls into a
+crash path (tlsetupfx+0x95e41, a load from address 0). Only hosts with a BlueZ adapter have these devices.
+hidclass's empty compatible-ID list was stored the same way (2 bytes) for every HID collection.
+
+Fix: an empty ID list stores no value, and removes the one an earlier start stored. Raw devices (no driver,
+like winebth's) run install_device_driver on every start, so existing prefixes heal on their next start.
+
+Windows behavior: a device without hardware/compatible IDs has no such property; SetupDiGetDeviceRegistryProperty
+fails with ERROR_INVALID_DATA (13). Wine already reports that for its ROOT\WINE\* devices' compatible IDs.
+Windows probe probe/hwidsum.exe (counts only) is waiting for a run on the Windows test machine to confirm that no Windows device returns a
+<=2-byte list.
+
+Not covered: stale empty CompatibleIDs values of devices that already have a driver installed (HID collections
+in existing prefixes; install_device_driver does not run again for them; no known app reads them). winebth still
+reports no hardware IDs at all (Windows' BTHENUM devices have some; not guessed here).
+
+Lab evidence (runtime 11.10-182j = 182 + this ntoskrnl.exe x86_64/i386; standalone tlsetupfx PrepareInstall, the
+MSI's own command line, in fresh copies of an installed prefix holding the stale values):
+  182j on:           4/4 no crash, task result SUCCESS, WINEBTH devices' HardwareID -> err 13 (absent)
+  182j switch=0:     2/2 crash (rc 5, 2 access violations), HardwareID 2 bytes
+  unpatched 182:     2/2 crash, same
+  full installer through `neutron programs install` on 182j: no Program Error, audiodriver_x64.msi exit 0
+  (was 1603 on 182), program recorded, menu entry written.
+
+Kill switch: NEUTRON_PNP_EMPTY_IDS=0. It is read in winedevice.exe, whose environment services.exe builds from
+the registry (CreateEnvironmentBlock), so set it in the prefix's system environment
+(HKLM\System\CurrentControlSet\Control\Session Manager\Environment); a launch variable does not reach it.
+
+--- a/dlls/ntoskrnl.exe/pnp.c	2026-11-05 17:23:17.097186578 -0500
++++ b/dlls/ntoskrnl.exe/pnp.c	2026-11-05 17:23:17.098186613 -0500
+@@ -265,6 +265,42 @@
+     return p + 1 - str;
+ }
+ 
++/* Neutron: kill switch NEUTRON_PNP_EMPTY_IDS=0 for set_device_ids() below. */
++static BOOL pnp_empty_ids_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        WCHAR v[8];
++        on = !(GetEnvironmentVariableW( L"NEUTRON_PNP_EMPTY_IDS", v, ARRAY_SIZE(v) ) && v[0] == '0');
++        ERR( "neutron-gateresolved: NEUTRON_PNP_EMPTY_IDS = %d\n", on );
++    }
++    return on;
++}
++
++/* Neutron: store a device's hardware or compatible IDs. A bus driver that has none of them returns an empty list
++ * (only the terminator; winebth's radio and remote devices, hidclass's compatible IDs). Windows has no value for
++ * a device without such IDs, so SetupDiGetDeviceRegistryProperty fails with ERROR_INVALID_DATA. Wine stored a
++ * 2-byte REG_MULTI_SZ instead, which is no list Windows ever returns: Thesycon's USB audio driver setup
++ * (tlsetupfx.exe, run by Ableton Live's installer) checked that value's double terminator before the start of its
++ * buffer and crashed on Wine's Bluetooth devices, failing the driver install. So an empty list stores no value,
++ * and removes the one an earlier start stored. */
++static void set_device_ids( HDEVINFO set, SP_DEVINFO_DATA *sp_device, DWORD property, const WCHAR *ids )
++{
++    WCHAR path[ARRAY_SIZE(L"System\\CurrentControlSet\\Enum\\") + MAX_DEVICE_ID_LEN];
++
++    if (*ids || !pnp_empty_ids_on())
++    {
++        SetupDiSetDeviceRegistryPropertyW( set, sp_device, property, (const BYTE *)ids,
++                sizeof_multiszW( ids ) * sizeof(WCHAR) );
++        return;
++    }
++    wcscpy( path, L"System\\CurrentControlSet\\Enum\\" );
++    if (SetupDiGetDeviceInstanceIdW( set, sp_device, path + wcslen( path ), MAX_DEVICE_ID_LEN, NULL ))
++        RegDeleteKeyValueW( HKEY_LOCAL_MACHINE, path,
++                            property == SPDRP_HARDWAREID ? L"HardwareId" : L"CompatibleIDs" );
++}
++
+ /* This does almost the same thing as UpdateDriverForPlugAndPlayDevices(),
+  * except that we don't know the INF path beforehand. */
+ static BOOL install_device_driver( DEVICE_OBJECT *device, HDEVINFO set, SP_DEVINFO_DATA *sp_device )
+@@ -292,8 +328,7 @@
+         return FALSE;
+     }
+ 
+-    SetupDiSetDeviceRegistryPropertyW( set, sp_device, SPDRP_HARDWAREID, (BYTE *)ids,
+-            sizeof_multiszW( ids ) * sizeof(WCHAR) );
++    set_device_ids( set, sp_device, SPDRP_HARDWAREID, ids );
+     ExFreePool( ids );
+ 
+     if ((status = get_device_id( device, BusQueryCompatibleIDs, &ids )) || !ids)
+@@ -302,8 +337,7 @@
+         return FALSE;
+     }
+ 
+-    SetupDiSetDeviceRegistryPropertyW( set, sp_device, SPDRP_COMPATIBLEIDS, (BYTE *)ids,
+-            sizeof_multiszW( ids ) * sizeof(WCHAR) );
++    set_device_ids( set, sp_device, SPDRP_COMPATIBLEIDS, ids );
+     ExFreePool( ids );
+ 
+     /* Set the config flags. setupapi won't do this for us if we couldn't find

@@ -1,0 +1,480 @@
+winewayland: show a cross-process DComp target above its top-level's own swap chain (WebView2 in a GPU-drawn window)
+
+Ableton Live 12.4.16 on lab runtime 11.10-183rc: View > Learn View opened the panel, but it stayed flat gray
+(165,165,165) for good, although WebView2 was found and running (msedgewebview2 up, the page loaded: the browser
+window is titled "Learn View 12").
+
+Mechanism. Live hosts WebView2 with the plain HWND controller (CreateCoreWebView2Controller). When the panel opens it
+reparents the WebView's Chrome_WidgetWin_0 into AbletonPlatformViewHost, a WS_CHILD of its main window, at the panel
+rect; under it sit the browser's Chrome_WidgetWin_1 and the GPU process's "Intermediate D3D Window", whose DComp
+target our dcomp bridge reads back (cross_proc=1, FIRST-DELIVER(direct) the moment the panel opens). The owner-side
+consumer (dllmain.c) draws those frames through GDI into the MAIN window's window surface. That is right for FL
+Studio, whose main window is GDI. Live's main window presents its own D3D11 swap chain, which winewayland shows as a
+client subsurface ABOVE the window surface over the whole client area -- so it covered the frames, and the panel
+showed Live's own gray. Proof: NEUTRON_DCOMP_SUPPRESS_CLIENT=1 (client surface dropped, the bridge copies Live's frame
+into GDI) made the Learn View content appear (n=1).
+
+Windows. DWM composes a DComp target's visual tree above the window's own redirected content and above its
+ancestors' (IDCompositionDevice::CreateTargetForHwnd); a child's DComp content is never under its parent's swap chain.
+
+Fix. Only when the target's top-level has a mapped client surface of its own, the consumer hands each new frame to a
+new unix call (px_overlay), which shows it as its own wl_subsurface of the top-level, placed just above that client
+surface, at the target's client rect clipped to its ancestors (neutron_ancestor_clip), scaled with wp_viewport, with
+an empty input region (input unchanged); it is hidden as soon as the target is not visible (Live closes the panel by
+reparenting the WebView into a hidden helper window). Without such a client surface (FL Studio, Adobe CEP hosts) the
+call returns STATUS_NOT_SUPPORTED and the GDI path runs exactly as before. 32-bit processes keep the GDI path.
+
+Not covered: Win32 siblings overlapping the target inside the same top-level (the GDI path clipped them, DWM would
+too); a client surface of ANOTHER child (not the top-level's own) under the target; Live's PiP/modal web views were not
+exercised.
+
+Lab (11.10-183y = 183rc + x86_64 winewayland.so/.drv from this patch; fresh copies of the 183rc-provisioned PgV-ab2;
+Save/Export Disabled -> View > Learn View; panel crop stats):
+  183y           f1 f2 f3 f4: Learn View content ("Learn Live", topics, videos) 4/4, sd 94, 2768 colors
+  183y + NEUTRON_WV2_OVERLAY=0  k1 k2 k3: flat gray 3/3 (165, sd 0, 1 color)
+  183rc          lv1 b2: flat gray 2/2
+  Closing the panel (f3): overlay gone, Live's mixer shows there.
+  FL Studio Browser > SOUNDS: 183y 2/2 drawn == 183rc (13 and 837 of 1.58M panel px differ), 0 overlay lines.
+  CPU (40 s settle, 20 s top): Live Welcome 183y 23.9/19.5% vs 183rc 33.5%; Topaz sign-in 183y 54.2/57.6% vs 183rc
+  58.7%; Live with Learn View open 183y 17.4% vs kill switch 27.7% (n=1).
+Kill switch: NEUTRON_WV2_OVERLAY=0 (process environment of the program whose window hosts the WebView).
+
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -128,7 +128,8 @@
+ #define NEUTRON_REG_MAX 64
+ struct neutron_registry { LONG count; DWORD hwnds[NEUTRON_REG_MAX]; };
+ 
+-struct neutron_consumer_slot { HWND hwnd; HANDLE map; struct neutron_px_shbuf *view; LONG last_seq; unsigned since_blit; };
++struct neutron_consumer_slot { HWND hwnd; HANDLE map; struct neutron_px_shbuf *view; LONG last_seq; unsigned since_blit;
++                                BOOL overlay; /* NEUTRON wv2-overlay: shown as its own subsurface */ };
+ static struct neutron_consumer_slot neutron_slots[NEUTRON_REG_MAX];
+ /* Force a refresh blit at least this often (ticks of ~16ms) even when the content seq is unchanged, to
+  * restore any repaint that clobbered the child region in the toplevel surface. ~30 ticks ~= 0.5s. */
+@@ -155,6 +156,34 @@
+     return neutron_slots[free_i].view;
+ }
+ 
++/* NEUTRON wv2-overlay: kill switch NEUTRON_WV2_OVERLAY=0 -- every frame goes through GDI into the top-level's window
++ * surface, as before (see neutron_px_overlay in wayland_surface.c). */
++static BOOL neutron_wv2_overlay_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        WCHAR v[4];
++        on = !(GetEnvironmentVariableW(L"NEUTRON_WV2_OVERLAY", v, ARRAY_SIZE(v)) && v[0] == '0');
++    }
++    return on;
++}
++
++/* NEUTRON wv2-overlay: take the overlay of a target that is no longer presented here off screen */
++static void neutron_consumer_hide(HWND hwnd)
++{
++    struct waylanddrv_px_overlay_params params = {0};
++    int i;
++    for (i = 0; i < NEUTRON_REG_MAX; i++)
++    {
++        if (neutron_slots[i].hwnd != hwnd || !neutron_slots[i].overlay) continue;
++        params.hwnd = (UINT64)(ULONG_PTR)hwnd;
++        WAYLANDDRV_UNIX_CALL(px_overlay, &params);
++        neutron_slots[i].overlay = FALSE;
++        neutron_slots[i].last_seq = 0;
++    }
++}
++
+ static void neutron_consumer_present(HWND hwnd)
+ {
+     struct neutron_px_shbuf *sh = neutron_consumer_open(hwnd);
+@@ -166,6 +195,37 @@
+     if (!sh) return;
+     seq = sh->seq;
+     for (i = 0; i < NEUTRON_REG_MAX; i++) if (neutron_slots[i].hwnd == hwnd) break;
++    /* NEUTRON wv2-overlay: when the top-level presents a swap chain of its own, its client subsurface covers the
++     * window surface this GDI blit draws into (Ableton Live's Learn View stayed gray); show the frame above it, as
++     * DWM composes a DComp target above its window's ancestors. Called every tick: a frame only when CEF presented
++     * a new one, otherwise just the position (the panel may have moved). */
++    if (i < NEUTRON_REG_MAX && neutron_wv2_overlay_on())
++    {
++        struct waylanddrv_px_overlay_params params;
++        BOOL fresh = !neutron_slots[i].overlay || neutron_slots[i].last_seq != seq;
++        LONG fw = sh->width, fh = sh->height, act = sh->active;
++
++        params.hwnd = (UINT64)(ULONG_PTR)hwnd;
++        params.pixels = 0;
++        params.width = fw;
++        params.height = fh;
++        params.show = 1;
++        if (fresh && fw > 0 && fh > 0 && fw <= NEUTRON_PX_MAXW && fh <= NEUTRON_PX_MAXH)
++            params.pixels = (UINT64)(ULONG_PTR)((const BYTE *)sh->pixels + ((act == 1) ? NEUTRON_PX_SLOT : 0));
++        if (!WAYLANDDRV_UNIX_CALL(px_overlay, &params))
++        {
++            neutron_slots[i].overlay = TRUE;
++            neutron_slots[i].last_seq = seq;
++            neutron_slots[i].since_blit = 0;
++            return;
++        }
++        if (neutron_slots[i].overlay)
++        {
++            /* back to GDI (the top-level stopped presenting): draw the current frame now */
++            neutron_slots[i].overlay = FALSE;
++            neutron_slots[i].last_seq = seq - 1;
++        }
++    }
+     /* Blit when CEF presented a new frame (seq changed); otherwise only refresh occasionally to
+      * restore any repaint that clobbered the child region -- not a full 7.6MB blit every 16ms. */
+     if (i < NEUTRON_REG_MAX && neutron_slots[i].last_seq == seq)
+@@ -261,6 +321,8 @@
+                  * tabbed-away/hidden panel that still renders); only present the on-screen one. */
+                 if ((pid == self || root_pid == self) && IsWindow(hwnd) && IsWindowVisible(hwnd))
+                     neutron_consumer_present(hwnd);
++                else
++                    neutron_consumer_hide(hwnd);
+             }
+         }
+         Sleep(16);
+--- a/dlls/winewayland.drv/unixlib.h
++++ b/dlls/winewayland.drv/unixlib.h
+@@ -33,9 +33,24 @@
+     waylanddrv_unix_func_rpc_epoch,
+     /* NEUTRON sni-tray: explorer's thread that services the tray icons' D-Bus connections */
+     waylanddrv_unix_func_sni_run,
++    /* NEUTRON wv2-overlay: show a cross-process DComp target's frame as its own subsurface (see dllmain.c) */
++    waylanddrv_unix_func_px_overlay,
+     waylanddrv_unix_func_count,
+ };
+ 
++/* NEUTRON wv2-overlay: waylanddrv_unix_func_px_overlay. hwnd = the DComp target window (may belong to another
++ * process); pixels = its last frame (32 bpp, top-down, width*4 bytes per row) or 0 when unchanged since the last
++ * call; show = 0 hides the overlay. STATUS_NOT_SUPPORTED: no overlay is needed (or possible) here -- the caller
++ * draws the frame through GDI as before. */
++struct waylanddrv_px_overlay_params
++{
++    UINT64 hwnd;
++    UINT64 pixels;
++    INT width;
++    INT height;
++    UINT show;
++};
++
+ /* NEUTRON round-43 RPC transport (verified cross-module, in-tree precedent =
+  * the CEF __neutron_dcomp_px section): winewayland.drv exports nothing and is a
+  * USER driver (GDI ExtEscape does not reach it), so DXVK cannot call its unixlib
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -822,6 +822,8 @@
+ void wayland_keyboard_release_destroyed_focus(void);
+ BOOL wayland_pointer_release_destroyed_on(void);
+ NTSTATUS waylanddrv_unix_sni_run(void *arg);
++NTSTATUS waylanddrv_unix_px_overlay(void *arg);
++NTSTATUS waylanddrv_unix_px_overlay_wow64(void *arg);
+ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags);
+ void WAYLAND_SetWindowIcons(HWND hwnd, HICON icon, const ICONINFO *ii, HICON icon_small, const ICONINFO *ii_small);
+ void WAYLAND_SetWindowStyle(HWND hwnd, INT offset, STYLESTRUCT *style);
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -188,6 +188,7 @@
+     waylanddrv_unix_init_clipboard,
+     waylanddrv_unix_rpc_epoch,
+     waylanddrv_unix_sni_run,
++    waylanddrv_unix_px_overlay,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
+@@ -201,6 +202,7 @@
+     waylanddrv_unix_init_clipboard,
+     waylanddrv_unix_rpc_epoch,
+     waylanddrv_unix_sni_run,
++    waylanddrv_unix_px_overlay_wow64,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -30,6 +30,8 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+ 
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
+ #include "waylanddrv.h"
+ #include "unixlib.h"
+ #include "wine/debug.h"
+@@ -4669,3 +4671,277 @@
+                                               surface->xdg_toplevel, surface->xdg_toplevel_icon);
+     }
+ }
++
++/**********************************************************************
++ *          NEUTRON wv2-overlay: a cross-process DComp target as its own layer
++ *
++ * A WebView2 hosted in a program's window presents through DirectComposition in Chromium's GPU process, into a
++ * target on its "Intermediate D3D Window" (a child of the browser's window, itself inside the program's window).
++ * On Windows DWM composes a DComp target's visual tree ABOVE the window's own redirected content and above its
++ * ancestors' (IDCompositionDevice::CreateTargetForHwnd; a child's DComp content is never covered by its parent's
++ * swap chain). Our dcomp bridge hands those frames to the process that owns the top-level window (dllmain.c,
++ * neutron_consumer_present), which drew them through GDI into the top-level's window surface. That works while
++ * the top-level's own content is GDI (FL Studio), but when the top-level presents a swap chain of its own, that
++ * swap chain is a client subsurface ABOVE the window surface and covers the frame: Ableton Live's Learn View
++ * stayed flat gray (its D3D11 UI covers the panel) while the frames were delivered underneath.
++ *
++ * So, only when the top-level has a mapped client surface of its own, show the frame the way DWM does: as its own
++ * subsurface of the top-level, stacked just above that client surface, at the target's client rect clipped to
++ * its ancestors (neutron_ancestor_clip), scaled with wp_viewport. Otherwise STATUS_NOT_SUPPORTED and the caller
++ * keeps the GDI path. Not covered: Win32 siblings overlapping the target inside the same top-level (the GDI path
++ * clipped those; DWM would too); a client surface of ANOTHER child under the target. Input is unchanged (empty
++ * input region: the pointer goes to the windows underneath, as it did). Kill switch NEUTRON_WV2_OVERLAY=0 (in the
++ * PE caller). */
++
++#define NEUTRON_OVL_BUFS 3
++
++struct neutron_px_overlay
++{
++    struct list entry;
++    HWND hwnd;
++    struct wl_surface *wl_surface;
++    struct wl_surface *parent;       /* the top-level wl_surface this is a subsurface of */
++    struct wl_subsurface *wl_subsurface;
++    struct wp_viewport *wp_viewport;
++    struct wayland_shm_buffer *buf[NEUTRON_OVL_BUFS];
++    LONG busy[NEUTRON_OVL_BUFS];     /* set at attach, cleared by wl_buffer.release */
++    int x, y, dst_w, dst_h;          /* last position/destination sent (surface coordinates) */
++    BOOL mapped, have_frame;
++};
++
++static struct list neutron_overlays = LIST_INIT(neutron_overlays);
++/* inner to win_data_mutex when both are held */
++static pthread_mutex_t neutron_ovl_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static void neutron_ovl_buffer_release(void *data, struct wl_buffer *wl_buffer)
++{
++    InterlockedExchange((LONG *)data, 0);
++}
++
++static const struct wl_buffer_listener neutron_ovl_buffer_listener = { neutron_ovl_buffer_release };
++
++/* caller holds neutron_ovl_mutex */
++static struct neutron_px_overlay *neutron_ovl_find(HWND hwnd)
++{
++    struct neutron_px_overlay *ov;
++    LIST_FOR_EACH_ENTRY(ov, &neutron_overlays, struct neutron_px_overlay, entry)
++        if (ov->hwnd == hwnd) return ov;
++    return NULL;
++}
++
++/* caller holds neutron_ovl_mutex */
++static void neutron_ovl_destroy_surface(struct neutron_px_overlay *ov)
++{
++    int i;
++    if (ov->wp_viewport) wp_viewport_destroy(ov->wp_viewport);
++    if (ov->wl_subsurface) wl_subsurface_destroy(ov->wl_subsurface);
++    if (ov->wl_surface) wl_surface_destroy(ov->wl_surface);
++    for (i = 0; i < NEUTRON_OVL_BUFS; i++)
++    {
++        if (ov->buf[i]) wayland_shm_buffer_unref(ov->buf[i]);
++        ov->buf[i] = NULL;
++        ov->busy[i] = 0;
++    }
++    ov->wp_viewport = NULL;
++    ov->wl_subsurface = NULL;
++    ov->wl_surface = NULL;
++    ov->parent = NULL;
++    ov->mapped = ov->have_frame = FALSE;
++}
++
++/* caller holds neutron_ovl_mutex */
++static void neutron_ovl_hide(struct neutron_px_overlay *ov)
++{
++    if (!ov || !ov->wl_surface || !ov->mapped) return;
++    wl_surface_attach(ov->wl_surface, NULL, 0, 0);
++    wl_surface_commit(ov->wl_surface);
++    ov->mapped = FALSE;
++    ov->have_frame = FALSE;
++    wl_display_flush(process_wayland.wl_display);
++    TRACE("hwnd=%p hidden\n", ov->hwnd);
++}
++
++static NTSTATUS neutron_px_overlay(HWND hwnd, const BYTE *pixels, int width, int height, UINT show)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++    struct wayland_client_surface *client;
++    struct neutron_px_overlay *ov;
++    HWND toplevel;
++    RECT rect = {0}, vis = {0}, clip;
++    UINT dpi;
++    int origin_x, origin_y, wx, wy, wx2, wy2, x, y, x2, y2, i;
++    double scale, sx, sy, sx2, sy2;
++    BOOL visible = FALSE, moved;
++
++    /* Phase A: win32 queries, before win_data_mutex (round-34 lock order) */
++    toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
++    if (show && toplevel && toplevel != hwnd)
++    {
++        dpi = NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI);
++        NtUserGetClientRect(hwnd, &rect, dpi);
++        NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, dpi);
++        vis = rect;
++        if (neutron_ancestor_clip(hwnd, toplevel, dpi, &clip) && !intersect_rect(&vis, &rect, &clip))
++            SetRectEmpty(&vis);
++        visible = !IsRectEmpty(&vis) && !IsRectEmpty(&rect);
++    }
++
++    /* Phase B: wayland, under win_data_mutex, no user-lock calls */
++    if (!toplevel || !(data = wayland_win_data_get(toplevel)))
++    {
++        pthread_mutex_lock(&neutron_ovl_mutex);
++        neutron_ovl_hide(neutron_ovl_find(hwnd));
++        pthread_mutex_unlock(&neutron_ovl_mutex);
++        return show ? STATUS_NOT_SUPPORTED : STATUS_SUCCESS;
++    }
++    pthread_mutex_lock(&neutron_ovl_mutex);
++    ov = neutron_ovl_find(hwnd);
++    surface = data->wayland_surface;
++    client = data->client_surface;
++    /* needed only when the top-level's own client surface is up and covers its client area */
++    if (!surface || !surface->wl_surface || !client || !client->wl_surface || !client->wl_subsurface ||
++        client->toplevel_wl_surface != surface->wl_surface || client->place_below || client->clipped_out ||
++        !process_wayland.wp_viewporter)
++    {
++        neutron_ovl_hide(ov);
++        pthread_mutex_unlock(&neutron_ovl_mutex); wayland_win_data_release(data);
++        return show ? STATUS_NOT_SUPPORTED : STATUS_SUCCESS;
++    }
++    if (!show || !visible || (!pixels && !(ov && ov->have_frame)))
++    {
++        neutron_ovl_hide(ov);
++        pthread_mutex_unlock(&neutron_ovl_mutex); wayland_win_data_release(data);
++        return STATUS_SUCCESS;
++    }
++
++    if (!ov)
++    {
++        if (!(ov = calloc(1, sizeof(*ov)))) { pthread_mutex_unlock(&neutron_ovl_mutex); wayland_win_data_release(data); return STATUS_NO_MEMORY; }
++        ov->hwnd = hwnd;
++        list_add_tail(&neutron_overlays, &ov->entry);
++    }
++    if (ov->wl_surface && ov->parent != surface->wl_surface) neutron_ovl_destroy_surface(ov);
++    if (!ov->wl_surface)
++    {
++        struct wl_region *empty;
++
++        ov->wl_surface = wl_compositor_create_surface(process_wayland.wl_compositor);
++        if (ov->wl_surface)
++            ov->wl_subsurface = wl_subcompositor_get_subsurface(process_wayland.wl_subcompositor,
++                                                                ov->wl_surface, surface->wl_surface);
++        if (ov->wl_subsurface)
++            ov->wp_viewport = wp_viewporter_get_viewport(process_wayland.wp_viewporter, ov->wl_surface);
++        if (!ov->wp_viewport)
++        {
++            ERR("neutron-wv2-overlay: hwnd=%p could not create its subsurface\n", hwnd);
++            neutron_ovl_destroy_surface(ov);
++            pthread_mutex_unlock(&neutron_ovl_mutex); wayland_win_data_release(data);
++            return STATUS_NOT_SUPPORTED;
++        }
++        wl_subsurface_set_desync(ov->wl_subsurface);
++        if ((empty = wl_compositor_create_region(process_wayland.wl_compositor)))
++        {
++            wl_surface_set_input_region(ov->wl_surface, empty);
++            wl_region_destroy(empty);
++        }
++        ov->parent = surface->wl_surface;
++        ov->x = ov->y = INT_MIN;
++        ERR("neutron-wv2-overlay: hwnd=%p toplevel=%p gets its own subsurface above the top-level's client surface\n",
++            hwnd, toplevel);
++    }
++
++    /* position: the visible rect in window pixels, edges rounded outward like client surfaces
++     * (wayland_surface_reconfigure_client) */
++    wayland_surface_content_origin(surface, &origin_x, &origin_y);
++    wx = vis.left + surface->window.client_rect.left - surface->window.rect.left - origin_x;
++    wy = vis.top + surface->window.client_rect.top - surface->window.rect.top - origin_y;
++    wx2 = wx + vis.right - vis.left;
++    wy2 = wy + vis.bottom - vis.top;
++    scale = surface->window.scale > 0 ? surface->window.scale : 1.0;
++    x = (int)floor(wx / scale); y = (int)floor(wy / scale);
++    x2 = (int)ceil(wx2 / scale); y2 = (int)ceil(wy2 / scale);
++    if (x2 <= x) x2 = x + 1;
++    if (y2 <= y) y2 = y + 1;
++    moved = x != ov->x || y != ov->y || x2 - x != ov->dst_w || y2 - y != ov->dst_h || !ov->mapped;
++
++    if (pixels && width > 0 && height > 0)
++    {
++        struct wayland_shm_buffer *buf = NULL;
++        int slot = -1;
++
++        for (i = 0; i < NEUTRON_OVL_BUFS; i++)
++        {
++            if (ov->buf[i] && (ov->buf[i]->width != width || ov->buf[i]->height != height) && !ov->busy[i])
++            {
++                wayland_shm_buffer_unref(ov->buf[i]);
++                ov->buf[i] = NULL;
++            }
++            if (slot < 0 && !ov->busy[i] && (!ov->buf[i] || ov->buf[i]->width == width)) slot = i;
++        }
++        if (slot >= 0 && !ov->buf[slot])
++        {
++            if ((ov->buf[slot] = wayland_shm_buffer_create(width, height, WL_SHM_FORMAT_XRGB8888)))
++                wl_buffer_add_listener(ov->buf[slot]->wl_buffer, &neutron_ovl_buffer_listener, &ov->busy[slot]);
++        }
++        if (slot >= 0) buf = ov->buf[slot];
++        if (buf)
++        {
++            memcpy(buf->map_data, pixels, (size_t)width * height * 4);
++            InterlockedExchange(&ov->busy[slot], 1);
++            wl_surface_attach(ov->wl_surface, buf->wl_buffer, 0, 0);
++            wl_surface_damage_buffer(ov->wl_surface, 0, 0, width, height);
++            ov->have_frame = TRUE;
++        }
++        /* all buffers still held by the compositor: keep the frame on screen, take the next one */
++    }
++
++    /* source: the part of the frame inside the visible rect (the frame spans the target's whole client rect) */
++    if (ov->buf[0] || ov->buf[1] || ov->buf[2])
++    {
++        int fw = width, fh = height;
++        if (!pixels)
++            for (i = 0; i < NEUTRON_OVL_BUFS; i++) if (ov->buf[i]) { fw = ov->buf[i]->width; fh = ov->buf[i]->height; break; }
++        sx = (double)(vis.left - rect.left) * fw / (rect.right - rect.left);
++        sy = (double)(vis.top - rect.top) * fh / (rect.bottom - rect.top);
++        sx2 = (double)(vis.right - rect.left) * fw / (rect.right - rect.left);
++        sy2 = (double)(vis.bottom - rect.top) * fh / (rect.bottom - rect.top);
++        sx = max(0.0, min(sx, (double)fw)); sx2 = max(0.0, min(sx2, (double)fw));
++        sy = max(0.0, min(sy, (double)fh)); sy2 = max(0.0, min(sy2, (double)fh));
++        if (sx2 - sx >= 1.0 && sy2 - sy >= 1.0)
++            wp_viewport_set_source(ov->wp_viewport, wl_fixed_from_double(sx), wl_fixed_from_double(sy),
++                                   wl_fixed_from_double(sx2 - sx), wl_fixed_from_double(sy2 - sy));
++    }
++    wp_viewport_set_destination(ov->wp_viewport, x2 - x, y2 - y);
++    wl_surface_commit(ov->wl_surface);
++    ov->mapped = TRUE;
++
++    if (moved)
++    {
++        /* parent state: applied by the top-level's next commit, which we make now */
++        wl_subsurface_set_position(ov->wl_subsurface, x, y);
++        wl_subsurface_place_above(ov->wl_subsurface, client->wl_surface);
++        wl_surface_commit(surface->wl_surface);
++        if (ov->x == INT_MIN || ov->dst_w != x2 - x || ov->dst_h != y2 - y)
++            ERR("neutron-wv2-overlay: hwnd=%p at %d,%d %dx%d (window px %s, scale %.3f)\n",
++                hwnd, x, y, x2 - x, y2 - y, wine_dbgstr_rect(&vis), scale);
++        ov->x = x; ov->y = y; ov->dst_w = x2 - x; ov->dst_h = y2 - y;
++    }
++    wl_display_flush(process_wayland.wl_display);
++    pthread_mutex_unlock(&neutron_ovl_mutex); wayland_win_data_release(data);
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS waylanddrv_unix_px_overlay(void *arg)
++{
++    struct waylanddrv_px_overlay_params *params = arg;
++
++    return neutron_px_overlay((HWND)(ULONG_PTR)params->hwnd, (const BYTE *)(ULONG_PTR)params->pixels,
++                              params->width, params->height, params->show);
++}
++
++/* 32-bit callers keep the GDI path */
++NTSTATUS waylanddrv_unix_px_overlay_wow64(void *arg)
++{
++    return STATUS_NOT_SUPPORTED;
++}

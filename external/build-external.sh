@@ -206,7 +206,9 @@ rows.append(("neutron/x86_64-unix/amfrt64.dll", "amfrt64", "amfrt64", "native", 
 
 # Our changes must be in the patched DLLs, and nowhere else.
 must = {
-    "dxvk/x86_64-windows/d3d11.dll": [b"NEUTRON_GDI_PRESENT", b"NEUTRON_DXVK_EXPORT_TEXTURES"],
+    "dxvk/x86_64-windows/d3d11.dll": [b"NEUTRON_GDI_PRESENT", b"NEUTRON_DXVK_EXPORT_TEXTURES",
+                                      b"NEUTRON_DXVK_COMPOSITION_PRESENT",    # 0007, 11.10-185
+                                      b"NEUTRON_DISABLE_INLINE_COPY_SKIP"],   # 0008, 11.10-185
     "dxvk/x86_64-windows/dxgi.dll": [b"dcomp_register_external", b"dcomp_set_pending_hwnd"],
     "vkd3d-proton/x86_64-windows/d3d12core.dll": [b"NEUTRON_DISABLE_BTW", b"NEUTRON_VKD3D_RT_PROBE",
                                                   b"NEUTRON_VKD3D_SHARED_BUFFERS",    # 0002, 11.10-122
@@ -227,8 +229,9 @@ dxgi_never = [b"\xa1\xf6\xd0\xb5\x4e\x7c\x2a\x4d\x9b\x8e\x3f\x5a\x2c\x1d\x0e\x9f
               b"neutron-acq", b"neutron-sctrace", b"GetBackgroundColor -> S_OK",
               b"BackgroundColor"]
 # ...and no NEUTRON_ switch but the ones a dxvk-dxgi patch declares: 0004 (11.10-183) logs the bridge's PresentBase line
-# once per swap chain, NEUTRON_DXVK_PRESENT_LOG=1 brings back the per-Present line.
-dxgi_switches = {b"NEUTRON_DXVK_PRESENT_LOG"}
+# once per swap chain, NEUTRON_DXVK_PRESENT_LOG=1 brings back the per-Present line; 0005 (11.10-185) makes WaitForVBlank
+# sleep instead of spin, NEUTRON_DXVK_VBLANK_SPIN=1 brings back the spin.
+dxgi_switches = {b"NEUTRON_DXVK_PRESENT_LOG", b"NEUTRON_DXVK_VBLANK_SPIN"}
 home_needles = [home.encode() + b"/", (home + "/").encode("utf-16-le"),
                 home.replace("/", "\\").encode(), home.replace("/", "\\").encode("utf-16-le")]
 # DXVK's version is `git describe --dirty=+`; the hash abbreviation length varies by clone.

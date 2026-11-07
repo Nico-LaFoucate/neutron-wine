@@ -1,0 +1,62 @@
+dxgi: log the DirectComposition bridge hook once per swap chain, not on every Present
+
+Topaz Photo 1.7.1 and Ableton Live 12.4.16 (app list batch 1) filled their logs with one
+"err: dcomp-hook PresentBase m_window=..." line per frame: 2,511 a minute in Topaz, 7,525 in
+3 minutes of Live, 200-600 per Premiere session. The line is our own diagnostic from 0001 (the hook
+that hands every Present to Wine's dcomp bridge); it printed as an error on every Present, wrote a
+formatted line on the app's present thread each frame and buried real errors. Nothing was drawn
+wrong because of it.
+
+Now the line is printed once per swap chain, at info level. NEUTRON_DXVK_PRESENT_LOG=1 prints it on
+every Present again (debugging). The dcomp export is looked up once; when it is missing (a native
+dcomp.dll) every Present used to repeat LoadLibraryA + GetProcAddress.
+
+Not covered: the per-surface "dcomp-bridge SET" line stays (once per Vulkan surface).
+
+Lab (runtime 11.10-182d = 182 + this dxgi + the dcomp patches, desk q, 30 s windows):
+Topaz sign-in screen: 0 lines per 30 s (1 per run) on 2 of 2 runs; NEUTRON_DXVK_PRESENT_LOG=1 on
+the same build: 1,142 and 1,800 per 30 s. Live welcome dialog over the main window: 0 per 30 s
+(3 per run, one per swap chain) 2 of 2; switch on: 1,578 and 1,591. Present-thread CPU difference
+not measurable (Live 62-68% vs 63-64%). Photoshop 2026 (Home, Chepino Valley) and Premiere 2026
+(Home, Waterfalls project) draw with it.
+
+--- a/src/dxgi/dxgi_swapchain.cpp
++++ b/src/dxgi/dxgi_swapchain.cpp
+@@ -349,11 +349,23 @@
+ 
+     {
+       static void (*dcomp_reg)(HWND, IUnknown*) = nullptr;
+-      Logger::err(str::format("dcomp-hook PresentBase m_window=", (void*)m_window, " is_d3d12=", m_is_d3d12));
+-      if (!dcomp_reg) {
++      static std::atomic<bool> dcomp_looked_up = { false };
++      /* NEUTRON: this hook runs on every Present. It logged an err line each time (7,525 lines in
++       * 3 minutes of Ableton Live, 2,511 a minute in Topaz Photo), costing the present thread a
++       * formatted write per frame and burying real errors. Log it once per swap chain;
++       * NEUTRON_DXVK_PRESENT_LOG=1 brings back the line on every Present for debugging. */
++      static const bool s_logEvery = env::getEnvVar("NEUTRON_DXVK_PRESENT_LOG") == "1";
++      if (s_logEvery || !m_dcompHookLogged) {
++        m_dcompHookLogged = true;
++        Logger::info(str::format("dcomp-hook PresentBase m_window=", (void*)m_window, " is_d3d12=", m_is_d3d12));
++      }
++      /* Look the export up once: without it (a native dcomp.dll) every Present repeated
++       * LoadLibraryA + GetProcAddress. */
++      if (!dcomp_looked_up.load(std::memory_order_acquire)) {
+         HMODULE h = ::GetModuleHandleA("dcomp.dll");
+         if (!h) h = ::LoadLibraryA("dcomp.dll");
+         if (h) dcomp_reg = reinterpret_cast<void(*)(HWND, IUnknown*)>(::GetProcAddress(h, "dcomp_register_external"));
++        dcomp_looked_up.store(true, std::memory_order_release);
+       }
+       /* gluon-present-register: do NOT require m_window here. Composition swapchains
+        * have m_window == 0; the dcomp side falls back to the pending hwnd (the real
+--- a/src/dxgi/dxgi_swapchain.h
++++ b/src/dxgi/dxgi_swapchain.h
+@@ -213,6 +213,9 @@
+     uint32_t                        m_globalHDRStateSerial = 0;
+     bool                            m_hasLatencyControl = false;
+ 
++    /* NEUTRON: the dcomp bridge hook in PresentBase logs once per swap chain, not once per frame. */
++    bool                            m_dcompHookLogged = false;
++
+     D3DDestructionNotifier          m_destructionNotifier;
+     
+     HRESULT EnterFullscreenMode(

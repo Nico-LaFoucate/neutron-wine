@@ -1,0 +1,162 @@
+# neutron-dwrite-gdiinterop-lock
+#
+# Touches: dlls/dwrite/dwrite_private.h, dlls/dwrite/gdiinterop.c, dlls/dwrite/main.c. Applies after
+# dwrite-cache-live-lookup (team/affinity), which touches the same files.
+#
+# WHAT HAPPENED (lab, 11-05, Affinity 3.3.3 bring-up for the app list; not reported by a user yet)
+# Affinity sometimes died at startup with no window: crashpad dumps at libkernel.dll+0x218c3a (read of address 0) and
+# libkernel.dll+0x218fec (call through a non-canonical address), on 182 and on builds that already had
+# dwrite-cache-live-lookup (winrtmeta: 2 of 9 launches). Both are Affinity's font worker (libkernel+0x218b60..): shared
+# DWriteCreateFactory -> IDWriteFactory::GetGdiInterop (vtable +0x88) -> IDWriteGdiInterop::CreateFontFaceFromHdc (+0x30)
+# -> IDWriteFontFace::GetFiles -> Release(face), Release(interop), running on several threads at once.
+#   +0x218c3a: GetGdiInterop returned S_OK and a NULL interop (rax = rcx = 0 at the deref right after the call).
+#   +0x218fec: Release(interop) through a freed object: its lpVtbl is a heap address, the slot a non-canonical value.
+#   (one more of the family in this lab: DWrite+0x3016a inside CreateFontFaceFromHdc, returning to libkernel+0x218c48.)
+#
+# MECHANISM
+# dwritefactory_GetGdiInterop is unlocked, and a shared factory is used from many threads. The factory keeps a weak
+# pointer to its interop (the interop holds the factory). Two first calls both create one, and create_gdiinterop()'s
+# "*ret = NULL" on &factory->gdiinterop lets the other caller read NULL and return S_OK with it. And a lookup can AddRef
+# an interop whose last Release has already dropped the count to zero: both threads then hold an object that the
+# releasing thread frees (use after free, double free). Upstream Wine has the same code.
+# Fix: look up and store under factory->cs; hand out an interop only while its count is still above zero
+# (compare-exchange, gdiinterop_addref_if_alive); a dying one is skipped (a fresh one is made) and clears the factory's
+# pointer only while that pointer is still its own. ERR "neutron-gdilock: skipped dying gdi interop" marks a hit window.
+#
+# WINDOWS: Wine's own test (dlls/dwrite/tests/font.c test_GetGdiInterop) encodes what this keeps: the same interop
+# for repeated calls on one factory while it is held, a separate one per isolated factory, the interop keeping its
+# factory alive. tools/gdistress (team/affinity2) is a self-stopping probe of the threaded case for a Windows run.
+#
+# NOT COVERED: other DirectWrite objects shared across threads without a lock (none other with a weak factory pointer
+# found in main.c). A rarer unhandled std::filesystem::filesystem_error at Affinity startup (1 of 40, main thread,
+# no font code on the stack) is a different crash.
+#
+# LAB EVIDENCE (11.10-182k = 182 + this + live-lookup, nested KWin desk k, 175%)
+#   Probe gdistress (2 threads GetGdiInterop/Release, or 4 threads + CreateFontFaceFromHdc), same build:
+#     NEUTRON_DWRITE_GDIINTEROP_LOCK=0: 23 runs, 21 bad -- 15 hung or workers stuck (heap state gone), 6 returned S_OK
+#                                       with a NULL interop (1 to 326 times per run); 2 clean
+#     fix on (default):                 22 of 22 clean (finished, 0 NULL interops)
+#   Affinity startup, 4 arms x 10 launches interleaved, same build and prefix:
+#     both kill switches (= 182's dwrite):            1/10 died (DWrite+0x3016a, the interop family)
+#     live-lookup only (= 182af's dwrite):            0/10
+#     both fixes:                                     0/10 font-worker deaths (1 filesystem_error, see above)
+#     this fix only:                                  0/10; "skipped dying gdi interop" logged in 3 of 20 runs with it on
+#   The startup base rate was low this session; the Affinity counts alone do not separate the arms, the probe does.
+# Kill switch: NEUTRON_DWRITE_GDIINTEROP_LOCK=0.
+--- a/dlls/dwrite/dwrite_private.h
++++ b/dlls/dwrite/dwrite_private.h
+@@ -458,6 +458,7 @@
+ extern HRESULT get_fontsig_from_font(IDWriteFont*,FONTSIGNATURE*);
+ extern HRESULT get_fontsig_from_fontface(IDWriteFontFace*,FONTSIGNATURE*);
+ extern HRESULT create_gdiinterop(IDWriteFactory7 *factory, IDWriteGdiInterop1 **interop);
++extern BOOL gdiinterop_addref_if_alive(IDWriteGdiInterop1 *iface);
+ extern void fontface_detach_from_cache(IDWriteFontFace5 *fontface);
+ extern BOOL fontface_addref_if_alive(IDWriteFontFace5 *fontface);
+ extern void factory_lock(IDWriteFactory7 *factory);
+--- a/dlls/dwrite/gdiinterop.c
++++ b/dlls/dwrite/gdiinterop.c
+@@ -682,6 +682,22 @@
+     return refcount;
+ }
+ 
++/* NEUTRON gdiinterop-lock: take a reference only while the count is still above zero; called by the
++ * factory under its lock, which a dying interop needs (factory_detach_gdiinterop) before it is freed. */
++BOOL gdiinterop_addref_if_alive(IDWriteGdiInterop1 *iface)
++{
++    struct gdiinterop *interop = impl_from_IDWriteGdiInterop1(iface);
++    LONG count = ReadNoFence(&interop->refcount);
++
++    while (count > 0)
++    {
++        LONG prev = InterlockedCompareExchange(&interop->refcount, count + 1, count);
++        if (prev == count) return TRUE;
++        count = prev;
++    }
++    return FALSE;
++}
++
+ static HRESULT WINAPI gdiinterop_CreateFontFromLOGFONT(IDWriteGdiInterop1 *iface,
+     LOGFONTW const *logfont, IDWriteFont **font)
+ {
+--- a/dlls/dwrite/main.c
++++ b/dlls/dwrite/main.c
+@@ -1589,6 +1589,19 @@
+     return create_typography(typography);
+ }
+ 
++/* NEUTRON: kill switch NEUTRON_DWRITE_GDIINTEROP_LOCK=0 (see dwritefactory_GetGdiInterop) */
++static BOOL neutron_gdiinterop_lock(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char buf[8];
++        DWORD n = GetEnvironmentVariableA("NEUTRON_DWRITE_GDIINTEROP_LOCK", buf, sizeof(buf));
++        v = (n && n < sizeof(buf) && buf[0] == '0') ? 0 : 1;
++    }
++    return v;
++}
++
+ static HRESULT WINAPI dwritefactory_GetGdiInterop(IDWriteFactory7 *iface, IDWriteGdiInterop **gdi_interop)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+@@ -1596,6 +1609,39 @@
+ 
+     TRACE("%p, %p.\n", iface, gdi_interop);
+ 
++    /* NEUTRON gdiinterop-lock: the factory keeps a weak pointer to its interop (the interop holds the
++     * factory, not the other way round), and a shared factory is used from many threads at once.
++     * Unlocked, two first calls both created an interop and create_gdiinterop()'s "*ret = NULL" on
++     * factory->gdiinterop let the other caller return S_OK with a NULL interop; and a lookup could
++     * AddRef an interop whose last Release had already dropped the count to zero, so both threads
++     * then held a freed object. Affinity 3.3's font worker (GetGdiInterop -> CreateFontFaceFromHdc
++     * -> Release, on several threads) died at startup either way: a NULL deref after S_OK, or a call
++     * through the freed interop's vtable. Look up and store under factory->cs, hand out only an
++     * interop that is still alive, and let a dying one clear the pointer only while it is its own.
++     * Kill switch NEUTRON_DWRITE_GDIINTEROP_LOCK=0. */
++    if (neutron_gdiinterop_lock())
++    {
++        IDWriteGdiInterop1 *interop;
++
++        EnterCriticalSection(&factory->cs);
++        if (!(interop = factory->gdiinterop) || !gdiinterop_addref_if_alive(interop))
++        {
++            if (interop)
++            {
++                static LONG skipped;
++                LONG n = InterlockedIncrement(&skipped);
++                if (n <= 20 || !(n % 1000))
++                    ERR("neutron-gdilock: skipped dying gdi interop %p (n=%ld)\n", interop, n);
++            }
++            if (SUCCEEDED(hr = create_gdiinterop(iface, &interop)))
++                factory->gdiinterop = interop;
++        }
++        LeaveCriticalSection(&factory->cs);
++
++        *gdi_interop = (IDWriteGdiInterop *)interop;
++        return hr;
++    }
++
+     if (factory->gdiinterop)
+         IDWriteGdiInterop1_AddRef(factory->gdiinterop);
+     else
+@@ -2631,7 +2677,18 @@
+ void factory_detach_gdiinterop(IDWriteFactory7 *iface, IDWriteGdiInterop1 *interop)
+ {
+     struct dwritefactory *factory = impl_from_IDWriteFactory7(iface);
+-    factory->gdiinterop = NULL;
++
++    /* NEUTRON gdiinterop-lock: another thread may already have stored a fresh interop here
++     * (dwritefactory_GetGdiInterop skips one whose count reached zero); clear only our own. */
++    if (neutron_gdiinterop_lock())
++    {
++        EnterCriticalSection(&factory->cs);
++        if (factory->gdiinterop == interop)
++            factory->gdiinterop = NULL;
++        LeaveCriticalSection(&factory->cs);
++    }
++    else
++        factory->gdiinterop = NULL;
+     IDWriteFactory7_Release(iface);
+ }
+ 

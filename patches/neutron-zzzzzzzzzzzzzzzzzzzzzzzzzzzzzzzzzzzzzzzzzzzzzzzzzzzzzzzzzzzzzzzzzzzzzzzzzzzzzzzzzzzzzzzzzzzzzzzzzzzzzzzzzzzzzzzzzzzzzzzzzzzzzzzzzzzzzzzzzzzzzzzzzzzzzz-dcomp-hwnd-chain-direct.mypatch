@@ -1,0 +1,103 @@
+dcomp: do not copy a same-process swap chain into the window it already presents to
+
+Ableton Live 12.4.16 and Topaz Photo 1.7.1 (app list batch 1): the dcomp bridge read back every
+frame of the app's own window swap chain (CreateSwapChainForHwnd) on its 16 ms thread -- copy to a
+staging texture, Map (waits for the GPU), StretchDIBits into the window's GDI surface. DXVK already
+presents that chain into the window's Vulkan client surface, which winewayland shows ABOVE the GDI
+surface (it is placed below only with NEUTRON_DCOMP_SUPPRESS_CLIENT=1, which nothing sets), so the
+copy lands underneath where nobody sees it. Premiere, After Effects, Media Encoder and Audition never
+paid it (NEUTRON_DCOMP_NATIVE=1); Photoshop, Illustrator, Animate, Lightroom Classic, InDesign and
+every program did.
+
+Windows: a swap chain made for a window reaches the screen through that window; DWM composes it and
+nothing copies it elsewhere. The bridge now leaves a same-process chain alone when its DXGI desc
+OutputWindow is the registered window itself (windowed) and the client surface is not suppressed.
+Composition chains (OutputWindow NULL: Qt alpha windows, WebView2, CEF) and every window of another
+process still go through the bridge, which is how they reach the screen. Registration, the
+__wine_dcomp_blit mark and the bounded-acquire stamp are unchanged.
+
+Not covered / not checked: Illustrator, Animate, Lightroom Classic, InDesign, and earlier programs
+(CapCut, Filmora, FL Studio, VSDC, vMix, Affinity, Cavalry). A window whose Vulkan client surface is
+not shown (none found) would lose the copy that showed under it: NEUTRON_DCOMP_HWND_CHAIN_COPY=1.
+
+Lab (11.10-182d, 30 s windows, app process CPU of one core): Live (welcome dialog over the main
+window) 15.8% / 29.7%, 0 readbacks, 2 of 2; NEUTRON_DCOMP_HWND_CHAIN_COPY=1 on the same build
+61.8% / 59.1%, 2,358 / 2,458 readbacks. Topaz sign-in screen 57.6% / 56.8% vs 77.6% / 76.3%.
+Both draw the same in every run. Photoshop 2026: Home and the opened Chepino Valley document drawn,
+the document pixel-identical (0 px) to the run with this switch off; Premiere 2026 Home + Waterfalls
+project drawn (Premiere is NEUTRON_DCOMP_NATIVE, unaffected).
+
+Applies after dcomp-flip-discard-buffer0 (same file). Kill switch NEUTRON_DCOMP_HWND_CHAIN_COPY=1.
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -403,6 +403,32 @@
+     return 0;
+ }
+ 
++/* NEUTRON 2026-11-05: a swap chain created for a window (CreateSwapChainForHwnd) reaches the screen through
++ * that window on Windows -- DWM composes it, nothing copies it anywhere else. DXVK presents it into the
++ * window's own Vulkan client surface, which winewayland shows above the window's GDI surface (unless
++ * NEUTRON_DCOMP_SUPPRESS_CLIENT=1 hides it for the bridge). The bridge nevertheless read back every frame of
++ * such a chain in the app's own process and StretchDIBits'd it into that GDI surface, underneath, where
++ * nobody sees it: Ableton Live 12 spent 62-68% of a core with the copy and 20% without it, Topaz Photo
++ * 81% and 62% (lab, 11-05). Composition swap chains (no window of their own: DXGI desc OutputWindow is
++ * NULL) and windows of another process still go through the bridge, which is how they reach the screen.
++ * Kill switch NEUTRON_DCOMP_HWND_CHAIN_COPY=1 (copy them again). */
++static BOOL neutron_hwnd_chain_direct(IDXGISwapChain *swapchain, HWND hwnd)
++{
++    static int copy = -1, suppress = -1;
++    DXGI_SWAP_CHAIN_DESC scd;
++
++    if (copy < 0)
++    {
++        char b[8];
++        copy = (GetEnvironmentVariableA("NEUTRON_DCOMP_HWND_CHAIN_COPY", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++        suppress = (GetEnvironmentVariableA("NEUTRON_DCOMP_SUPPRESS_CLIENT", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_HWND_CHAIN_COPY = %d (suppress_client %d)\n", copy, suppress);
++    }
++    if (copy || suppress || !hwnd) return FALSE;
++    if (FAILED(IDXGISwapChain_GetDesc(swapchain, &scd))) return FALSE;
++    return scd.OutputWindow == hwnd && scd.Windowed;
++}
++
+ /* NEUTRON bounded-acquire handshake (round 32). Private DXVK interface --
+  * must match INeutronBoundedAcquire in dxvk's dxgi_interfaces.h. We stamp
+  * every swapchain we readback-blit so DXVK bounds its otherwise-infinite WSI
+@@ -1228,7 +1254,7 @@
+     IDXGISwapChain *swapchain = NULL;
+     struct presentation *p;
+     HWND host, target;
+-    BOOL target_cross_proc = FALSE;
++    BOOL target_cross_proc = FALSE, hwnd_direct;
+ 
+     if (!hwnd || !content)
+         return;
+@@ -1399,6 +1425,9 @@
+         }
+     }
+ 
++    /* NEUTRON 2026-11-05: a same-process swap chain made for this very window is on screen already. */
++    hwnd_direct = !target_cross_proc && target == hwnd && neutron_hwnd_chain_direct(swapchain, hwnd);
++
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
+     EnterCriticalSection(&presentations_cs);
+@@ -1408,7 +1437,7 @@
+         {
+             p->present_hwnd = target;
+             p->cross_proc = target_cross_proc;
+-            p->no_blit = (neutron_dcomp_native() && !target_cross_proc); /* round-35 native */
++            p->no_blit = (neutron_dcomp_native() && !target_cross_proc) || hwnd_direct; /* round-35 native */
+             /* NEUTRON M4: this function is the per-Present hook -> mark a blit pending so
+              * the 16ms blit thread only reads back windows that actually presented. */
+             InterlockedExchange(&p->pending_blit, TRUE);
+@@ -1440,7 +1469,7 @@
+         p->hwnd = hwnd;
+         p->present_hwnd = target;
+         p->cross_proc = target_cross_proc;
+-        p->no_blit = (neutron_dcomp_native() && !target_cross_proc); /* round-35 native */
++        p->no_blit = (neutron_dcomp_native() && !target_cross_proc) || hwnd_direct; /* round-35 native */
+         p->swapchain = swapchain; /* take QI ref */
+         p->content_id = content; /* NEUTRON M4: fast-path identity */
+         p->pending_blit = TRUE; /* NEUTRON M4: fresh present -> blit once */

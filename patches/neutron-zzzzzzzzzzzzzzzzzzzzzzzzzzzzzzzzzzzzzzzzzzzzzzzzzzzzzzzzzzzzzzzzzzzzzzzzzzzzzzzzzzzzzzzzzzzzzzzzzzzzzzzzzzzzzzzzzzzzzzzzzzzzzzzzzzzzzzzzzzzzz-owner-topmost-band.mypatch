@@ -1,0 +1,144 @@
+# neutron-owner-topmost-band
+#
+# Touches: dlls/win32u/window.c, server/window.c.
+#
+# WHAT HAPPENED (lab, 11-05, Affinity 3.3.3; not reported by a user yet)
+# When the Canva sign-in comes back to Affinity, its "License activation failed / Canva login failed" message box opened
+# hidden UNDER the sign-in dialog, so the app looked stuck (both owned by the main window). EnumWindows after the callback:
+# sign-in dialog WS_EX_TOPMOST on top, the box below it, Welcome panel, main window -- none of them should be topmost.
+#
+# MECHANISM
+# Affinity's callback path (Serif.Affinity.Application.ActivateMainWindow, IL) does MainWindow.Activate();
+# MainWindow.Topmost = true; MainWindow.Topmost = false -- WPF's bring-to-front idiom, i.e. SetWindowPos(main,
+# HWND_TOPMOST) then SetWindowPos(main, HWND_NOTOPMOST). swp_owner_popups (upstream code) handled neither for an owner:
+#   HWND_TOPMOST: only the first owned window went HWND_TOPMOST; the next owned windows and the owner itself were linked
+#     after it, and the server keeps a window inserted between a topmost and a non-topmost one non-topmost. Result: the
+#     owner never became topmost, one owned window did.
+#   HWND_NOTOPMOST: the owned windows, being topmost, were skipped and stayed topmost.
+# Net: the dialog stayed topmost for good and every later owned window (the box) opened under it. The Wayland stacker
+# mirrors the Win32 order faithfully, so this is the order on screen too.
+# Fix: an owner joining the topmost band takes its owned windows along (lowest first, each through the server's own
+# HWND_TOPMOST, then the owner linked right below the lowest; server link_window puts an owner placed right below its own
+# topmost owned window in the band); an owner leaving it goes first and its owned windows follow (HWND_NOTOPMOST each,
+# lowest first), so they end above it in the order they had. The nested calls skip swp_owner_popups' keep-above-owner
+# step, which otherwise pins an owned window to the band its owner had.
+#
+# WINDOWS (SetWindowPos documentation, Remarks): "When a non-topmost window is made topmost, its owned windows are also
+# made topmost. Its owners, however, are not changed." / "When a topmost window is made non-topmost, its owners and its
+# owned windows are also made non-topmost windows." / "A non-topmost window can own a topmost window, but the reverse
+# cannot occur." tools/topmost/topmost.exe (team/affinity2) is a self-stopping probe of exactly this for a Windows run.
+#
+# NOT COVERED: the OWNERS of a window made non-topmost (the docs say they lose topmost too; unchanged here). Windows of
+# other threads in the owner group are moved synchronously as before. No Adobe regression pass run (Photoshop and
+# Lightroom use topmost owned windows; this only acts when an OWNER changes band and has owned windows above it).
+#
+# LAB EVIDENCE (11.10-182k = 182 + this win32u.so + wineserver, nested KWin desk k, 175%)
+#   probe topmost.exe, same build:   fix on: owner HWND_TOPMOST -> owner, o1, o2 all topmost, order o1>o2>owner;
+#                                    HWND_NOTOPMOST -> none topmost, order kept; a new owned window shows on top.
+#                                    NEUTRON_OWNER_TOPMOST=0: after TOPMOST only o1 topmost (owner not); after NOTOPMOST
+#                                    o1 still topmost; the new owned window shows UNDER o1 (the Affinity bug).
+#   Affinity callback test (sign in -> browser hand-off -> "affinity://canva/authorize?...error=access_denied" via a
+#   second Affinity.exe), alternating arms, same build and prefix:
+#     fix on:                    box on top, dialog not topmost 4/4 (EnumWindows), box visible on screen (screenshots)
+#     NEUTRON_OWNER_TOPMOST=0:   dialog topmost over the box 4/4, box hidden on screen
+#     (2 of each with the first build of the fix, which made the owner topmost by a nested call; 2 of each with this one)
+# Kill switch: NEUTRON_OWNER_TOPMOST=0 (read by win32u and by wineserver).
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4973,14 +4973,77 @@
+  *
+  * FIXME: hide/show owned popups when owner visibility changes.
+  */
++/* NEUTRON owner-topmost: SetWindowPos documents that "when a non-topmost window is made topmost, its owned windows
++ * are also made topmost" and "when a topmost window is made non-topmost, its owners and its owned windows are also
++ * made non-topmost windows". The chain below did neither: for HWND_TOPMOST only the first owned window became topmost
++ * (the next ones and the owner itself were linked after it, and the server keeps a window inserted between a topmost
++ * and a non-topmost one non-topmost); for HWND_NOTOPMOST the owned windows, being topmost, were skipped and stayed
++ * topmost. WPF's bring-to-front idiom (Window.Topmost = true; Window.Topmost = false; Affinity 3.3 does it when its
++ * Canva sign-in comes back) thus left the owned sign-in dialog topmost for good, and the "Canva login failed" message
++ * box, owned by the main window and not topmost, opened hidden under it. With the switch on, an owner going topmost
++ * takes its owned windows along (owned ones above it, their order kept; server/window.c link_window keeps the owner in
++ * the band), and an owner leaving the topmost band brings its owned windows down with it. Owners of a window made
++ * non-topmost are not changed (not covered).
++ * Kill switch NEUTRON_OWNER_TOPMOST=0. */
++static BOOL neutron_owner_topmost(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_OWNER_TOPMOST" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static __thread HWND neutron_owner_topmost_self;  /* the window whose band is being changed by a nested call */
++
++/* each window goes to the top of its new band through the server's own HWND_TOPMOST / HWND_NOTOPMOST handling (the
++ * nested call skips swp_owner_popups, whose keep-above-the-owner step would otherwise pin an owned window to the band
++ * its owner had): the owner first, then its owned windows, lowest first, so they end above it in the order they had. */
++static void neutron_swp_band( HWND hwnd, HWND band )
++{
++    neutron_owner_topmost_self = hwnd;
++    NtUserSetWindowPos( hwnd, band, 0, 0, 0, 0,
++                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_DEFERERASE );
++    neutron_owner_topmost_self = 0;
++}
++
++static HWND neutron_swp_owner_topmost( HWND hwnd, HWND after, BOOL *done )
++{
++    HWND *list, owned[64];
++    BOOL topmost = (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TOPMOST) != 0;
++    unsigned int i, count = 0;
++
++    *done = FALSE;
++    if (!neutron_owner_topmost()) return after;
++    if (!(after == HWND_TOPMOST && !topmost) && !(after == HWND_NOTOPMOST && topmost)) return after;
++    if (!(list = list_window_children( 0 ))) return after;
++    /* its owned windows above it, top to bottom */
++    for (i = 0; list[i] && list[i] != hwnd && count < ARRAY_SIZE(owned); i++)
++        if (get_window_relative( list[i], GW_OWNER ) == hwnd) owned[count++] = list[i];
++    free( list );
++    if (!count) return after;
++
++    TRACE( "%p made %s with %u owned window(s)\n", hwnd, after == HWND_TOPMOST ? "topmost" : "non-topmost", count );
++    /* leaving the band: the owner goes first, so its owned windows are not pinned above it (they stay above it
++     * throughout). Joining it: the owned windows go first and the owner is linked right below the lowest of them,
++     * which the server puts in the topmost band (link_window), so it never covers them on the way, as on Windows. */
++    if (after == HWND_NOTOPMOST) neutron_swp_band( hwnd, after );
++    for (i = count; i-- > 0;) neutron_swp_band( owned[i], after );
++    *done = TRUE;
++    return owned[count - 1];
++}
++
+ static HWND swp_owner_popups( HWND hwnd, HWND after )
+ {
+     HWND owner, *list = NULL;
+     unsigned int i;
++    BOOL done;
+ 
+     TRACE( "(%p) after = %p\n", hwnd, after );
+ 
+     if (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) return after;
++    if (hwnd == neutron_owner_topmost_self) return after;   /* NEUTRON owner-topmost: its nested band change */
++
++    after = neutron_swp_owner_topmost( hwnd, after, &done );
++    if (done) return after;
+ 
+     if ((owner = get_window_relative( hwnd, GW_OWNER )))
+     {
+--- a/server/window.c
++++ b/server/window.c
+@@ -493,6 +493,16 @@
+         {
+             struct window *next = get_next_window( win );
+             if (next && (next->ex_style & WS_EX_TOPMOST)) win->ex_style |= WS_EX_TOPMOST;
++            /* NEUTRON owner-topmost: an owner placed right below its own topmost owned window is in the topmost
++             * band too -- win32u (swp_owner_popups) moves the owned windows of a window made topmost first and then
++             * links the window after the lowest of them; "when a non-topmost window is made topmost, its owned
++             * windows are also made topmost" (SetWindowPos). Kill switch NEUTRON_OWNER_TOPMOST=0. */
++            else if (previous->owner == win->handle && is_desktop_window( win->parent ))
++            {
++                static int on = -1;
++                if (on < 0) { const char *e = getenv( "NEUTRON_OWNER_TOPMOST" ); on = !(e && e[0] == '0'); }
++                if (on) win->ex_style |= WS_EX_TOPMOST;
++            }
+         }
+     }
+ 

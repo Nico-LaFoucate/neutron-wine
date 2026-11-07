@@ -1,0 +1,324 @@
+# neutron-owned-subsurface-reconf-keepz (revised 11-06, keepz2: + crop-origin resync)
+#
+# Touches: dlls/winewayland.drv/wayland_surface.c, dlls/winewayland.drv/waylanddrv.h.
+# Two behaviors, two kill switches: NEUTRON_OWNED_RECONF_KEEPZ (z-order, unchanged from affinity2) and
+# NEUTRON_CROP_ORIGIN_RESYNC (positions, new). Replaces affinity2/owned-subsurface-reconf-keepz.mypatch in the batch order.
+#
+# PART 1 -- OWNED-WINDOW Z-ORDER (affinity2, unchanged code)
+# WHAT HAPPENED (lab, 11-05, Affinity 3.3.3; not reported by a user yet): Welcome panel > "Sign In..." opens a modal
+# "Log in or sign up" dialog (WPF, owned by the main window). It was placed right but drawn BEHIND the Welcome panel
+# (another owned window of the same main window), and the whole app was blocked by the invisible modal. Win32 z-order had
+# the dialog on top, and so did the stacker's own log line (NT-EV restack ... order-bottom-to-top: main, welcome, dialog).
+# MECHANISM: wayland_surface_reconfigure_subsurface() ran wl_subsurface_place_above(toplevel or its client surface) on
+# every move/resize of an owned subsurface. That drops it to just above its parent, beneath every sibling owned window,
+# and the stacker (neutron_restack_apply) then saw an unchanged Win32 order in its order cache and never repaired it.
+# Fix: with the owned z-order mirror on (NEUTRON_OWNED_ZORDER), reconfigure sets the position only and leaves ordering
+# to the stacker. A new wl_subsurface starts on top and the stacker orders it on show, as before.
+# WINDOWS: a newly shown/activated owned window is above its owner's other owned windows (it is on top in Win32 here).
+# Kill switch NEUTRON_OWNED_RECONF_KEEPZ=0.
+#
+# PART 2 -- CROP-ORIGIN RESYNC (new)
+# WHAT HAPPENED (lab regression pass of 183rc, 11-05): "after restoring a maximized Photoshop 2026 window by
+# double-clicking its caption, 183rc draws the canvas about 3 logical px off diagonally ((+6,+6) device px, 39,005 px
+# changed) and keeps it there until the next input".
+# NOT CAUSED BY PART 1: for Photoshop part 1 changes no Wayland request at all (its main window has no client surface of
+# its own and NEUTRON_SUBSURFACE_NO_DEMOTE is on, so the old branch did nothing either), and 182 -- which has no part 1 --
+# shows the same offset today. It is a race that both builds lose some of the time.
+# MECHANISM: a maximized window whose frame hangs off its monitor is shown cropped (frame-spill crop): surface-local
+# (0,0) is window (content_x, content_y) = (5,4) device px on the lab desk. Every subsurface of the window -- the client
+# (GPU) surfaces of its child windows (Photoshop's canvas) and its owned windows (the Type Bar) -- is positioned against
+# that origin. The origin changes only in wayland_surface_attach_shm, when the first buffer of the new state is attached.
+# Win32 moves the children BEFORE that (logged: the canvas re-placed 9 times with the old origin 5,4 in the 170 ms before
+# the restored buffer was attached), so they keep the old origin's position -- 3 logical px up and left -- until
+# something places them again. If Photoshop presents the canvas once more after the attach (kd1: 5 ms after) it lands
+# right; if not, it stays off until the next input.
+# FIX: neutron_resync_crop_origin(), called at the end of attach_shm when the crop origin changed (both callers hold
+# win_data_mutex and commit the surface right after): re-place every client subsurface on this wl_surface (from the client
+# rect / ancestor clip it was last placed from, now remembered in wayland_client_surface) and every owned subsurface
+# (wayland_surface_reconfigure_subsurface's arithmetic, factored out as neutron_subsurface_position) with the NEW origin.
+# A wl_subsurface position is parent state, so it lands in the same commit as the new crop. A client whose viewport
+# changes too (its edges round differently against the new origin: Photoshop's canvas 1521x971 -> 1521x972 logical) is
+# committed in sync mode and the parent committed there, as wayland_client_surface_attach_rect does, so its size lands in
+# the same frame instead of at its next present (a first build without this left the canvas 1 px short until then).
+# No place_above/below: the order stays the stacker's. One ERR line per origin change ("neutron-crop-resync: ...").
+# WINDOWS: a restored (or maximized) window's contents -- child windows and owned windows -- land at the new position in
+# the same frame as the window; nothing waits for the next input.
+# NOT COVERED: xdg popups (menus) open while the origin changes keep their position until they are re-shown;
+# a client surface that never went through reconfigure_client (no stored rect) is skipped.
+#
+# LAB EVIDENCE
+# Lab desk u (2 outputs: 175% + 200%), host NVIDIA 615.78 / Mesa 26.2.6 / kernel 7.3.1 (re-measured today), PgD-ps2 reflinks
+# provisioned on each arm's runtime. Ps sequence: open doc, type text, Esc, caption double-click = restore. Judge: canvas
+# position at the restore (offset.py; stale = 6,5 capture px = 3 logical up-left) and in-run Ctrl+H x2 (forces a canvas
+# present: a stale canvas jumps +6,+5 to the correct place; a correct one does not move).
+#   182 (no part 1 at all):                stale 2/2   (judge confirmed on the 2nd: Ctrl+H moved it to == the correct frame)
+#   183rc:                                 stale 1/2
+#   183rc NEUTRON_OWNED_RECONF_KEEPZ=0:    stale 0/2   (last night 182 0/1, kill 0/1, 183rc 2/2 = the same race)
+#   183rc + diag log (kd1):                correct; log: canvas placed 9x with origin 5,4 before the restored attach,
+#                                          re-placed with 0,0 by a present 5 ms after it
+#   11.10-183k2 (this patch):              offset 0/2 (g1, g2: max1 and max1+8 s full frames == the correct frame, 0 px;
+#                                          log "crop origin 5,4 -> 0,0: re-placed 1 client (1 resized) and 1 owned")
+#   11.10-183k2 NEUTRON_CROP_ORIGIN_RESYNC=0: stale 1/3 (h3 stale, judge moved it +6,+5; h2, h4 correct; h1 void: Ps GPU
+#                                          check dialog at start, no document)
+#   First build of part 2 (position only): position right 1/1 but the canvas 1 logical px short until the next present ->
+#                                          the sync-commit for a resized client (this version).
+# Affinity sign-in dialog (fake xdg-open logs the "Log in or sign up" click only if it reaches the dialog), 11.10-183k2:
+#   on: dialog on top, hand-off 2/2 (screenshot: dialog over the Welcome panel); NEUTRON_OWNED_RECONF_KEEPZ=0: hidden 2/2.
+# 11.10-183k2 vs 182, n=1: Premiere 2026 open project, seek, text, maximize: every frame 0 px (resync re-placed the Program
+#   Monitor client at the maximize; the restore double-click missed on both arms, no owned windows in that sequence).
+#   Photoshop Color panel dragged out to float: 0 px vs 182; moving it +200,+120: rect moved exactly, drawn at the new place,
+#   nothing left behind (183k2; the 182 rerun opened no document = void).
+# Kill switches: NEUTRON_OWNED_RECONF_KEEPZ=0 (part 1), NEUTRON_CROP_ORIGIN_RESYNC=0 (part 2).
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -373,6 +373,11 @@
+     /* NEUTRON: the window is entirely outside its ancestors' client areas (scrolled out of view), so it is
+      * shrunk to 1x1 inside the toplevel and placed below it -- kept MAPPED for the reason above. */
+     BOOL clipped_out;
++    /* NEUTRON crop-origin resync: the client rect and ancestor clip (toplevel client coordinates, which do not depend
++     * on the toplevel's frame-spill crop) this surface was last placed from, so it can be placed again when only the
++     * crop origin changes. */
++    RECT neutron_rect, neutron_clip;
++    BOOL neutron_rect_set, neutron_clip_set;
+     /* NEUTRON: the viewport state last sent (to send only changes), and whether it changed since the surface was
+      * last committed -- viewport state is double-buffered on the CLIENT surface, so without a commit it waits
+      * for the app's next present (forever, for a paused video). */
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -1258,12 +1258,15 @@
+     return on;
+ }
+ 
++static void neutron_resync_crop_origin(struct wayland_surface *surface, int old_x, int old_y);
++
+ void wayland_surface_attach_shm(struct wayland_surface *surface,
+                                 struct wayland_shm_buffer *shm_buffer,
+                                 HRGN surface_damage_region)
+ {
+     RGNDATA *surface_damage;
+     int win_width, win_height;
++    int old_content_x, old_content_y;
+     RECT spill;
+ 
+     TRACE("surface=%p shm_buffer=%p (%dx%d)\n",
+@@ -1310,6 +1313,8 @@
+      * the geometry as client-side shadow); cropping the wp_viewport source does.
+      * win_width/win_height are left at the full window size so content_width/height
+      * below stays a change-detection cookie against the full window rect. */
++    old_content_x = surface->content_x;
++    old_content_y = surface->content_y;
+     if (wayland_surface_get_frame_spill_rect(surface, &spill))
+     {
+         int sx = spill.left, sy = spill.top;
+@@ -1380,6 +1385,9 @@
+     surface->content_width = win_width;
+     surface->content_height = win_height;
+     surface->ever_had_content = TRUE;
++
++    if (surface->content_x != old_content_x || surface->content_y != old_content_y)
++        neutron_resync_crop_origin(surface, old_content_x, old_content_y);
+ }
+ 
+ /***********************************************************************
+@@ -2125,7 +2133,7 @@
+  */
+ static void wayland_surface_reconfigure_client(struct wayland_surface *surface,
+                                                struct wayland_client_surface *client,
+-                                               const RECT *client_rect, const RECT *clip)
++                                               const RECT *client_rect, const RECT *clip, BOOL resync)
+ {
+     struct wayland_window_config *window = &surface->window;
+     int client_x, client_y, x, y;
+@@ -2133,6 +2141,13 @@
+ 
+     int origin_x, origin_y;
+ 
++    if (!resync)
++    {
++        client->neutron_rect = *client_rect;
++        client->neutron_rect_set = TRUE;
++        if ((client->neutron_clip_set = !!clip)) client->neutron_clip = *clip;
++    }
++
+     /* The offset of the client area origin relatively to the window origin -- or, while the frame-spill crop
+      * is on, to the window position of surface-local (0,0) (NEUTRON, see wayland_surface_content_origin). */
+     wayland_surface_content_origin(surface, &origin_x, &origin_y);
+@@ -2339,7 +2354,11 @@
+          * that disconnects the client -> "Failed to read events -> terminating process"
+          * = the project-load crash). Placing above the confirmed parent is always
+          * valid; if it doesn't match, skip (attach will recreate it correctly). */
+-        if (client->toplevel_wl_surface == surface->wl_surface)
++        if (resync)
++        {
++            /* NEUTRON crop-origin resync: position only, see neutron_resync_crop_origin */
++        }
++        else if (client->toplevel_wl_surface == surface->wl_surface)
+         {
+             /* NEUTRON round-35 NATIVE mode: subsurface ordering belongs EXCLUSIVELY to
+              * neutron_restack_apply (win32-z-order mirror). Re-placing here on every
+@@ -2505,15 +2524,21 @@
+  * Reconfigures the subsurface as needed to match the latest requested
+  * state.
+  */
+-static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface, const RECT *content)
++static BOOL neutron_owned_zorder(void);
++
++static BOOL neutron_reconf_keepz(void)
+ {
+-    struct wayland_win_data *toplevel_data;
+-    struct wayland_surface *toplevel_surface;
+-    int local_x, local_y, x, y;
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_OWNED_RECONF_KEEPZ", TRUE);
++    return on;
++}
+ 
+-    if (surface->processing.serial && surface->processing.processed &&
+-        (toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) &&
+-        (toplevel_surface = toplevel_data->wayland_surface))
++/* NEUTRON: where an owned subsurface goes in its toplevel's surface-local coordinates (also used by
++ * neutron_resync_crop_origin). `content` is this window's own crop (see below), or NULL. */
++static void neutron_subsurface_position(struct wayland_surface *surface, struct wayland_surface *toplevel_surface,
++                                        const RECT *content, int *out_x, int *out_y)
++{
++    int local_x, local_y, x, y;
+     {
+         int origin_x, origin_y;
+ 
+@@ -2557,10 +2582,40 @@
+                 surface->mixed_y = parent_y + y;
+             }
+         }
++    }
++    *out_x = x;
++    *out_y = y;
++}
++
++static void wayland_surface_reconfigure_subsurface(struct wayland_surface *surface, const RECT *content)
++{
++    struct wayland_win_data *toplevel_data;
++    struct wayland_surface *toplevel_surface;
++    int x, y;
++
++    if (surface->processing.serial && surface->processing.processed &&
++        (toplevel_data = wayland_win_data_get_nolock(surface->toplevel_hwnd)) &&
++        (toplevel_surface = toplevel_data->wayland_surface))
++    {
++        neutron_subsurface_position(surface, toplevel_surface, content, &x, &y);
+ 
+         TRACE("hwnd=%p pos=%d,%d\n", surface->hwnd, x, y);
+ 
+         wl_subsurface_set_position(surface->wl_subsurface, x, y);
++        /* NEUTRON owned-reconf-keepz: with the Win32 z-order mirror on, the order of a toplevel's owned
++         * subsurfaces belongs to neutron_restack_apply alone, as it does for client surfaces in native
++         * mode (wayland_client_surface_update). Re-placing this one just above the toplevel (or its
++         * client surface) on every move/resize dropped it beneath every sibling owned window, and the
++         * stacker's order cache then saw an unchanged Win32 order and never repaired it. Affinity 3.3:
++         * the modal "Log in or sign up" dialog opened from the Welcome panel sat BEHIND that panel
++         * (Win32 z-order and the restack both had the dialog on top), so the sign-in looked dead.
++         * Position only here; a new wl_subsurface starts on top and the stacker orders it on show.
++         * Kill switch NEUTRON_OWNED_RECONF_KEEPZ=0. */
++        if (neutron_owned_zorder() && neutron_reconf_keepz())
++        {
++            /* ordering: neutron_restack_apply */
++        }
++        else
+         /* NEUTRON: place above the toplevel's client (Vulkan) surface ONLY when that
+          * client surface is genuinely a SIBLING — i.e. currently attached to THIS
+          * toplevel's wl_surface. During a reparent (a D2D-UI child hidden+reparented
+@@ -2581,6 +2636,85 @@
+ }
+ 
+ /**********************************************************************
++ *          neutron_resync_crop_origin
++ *
++ * NEUTRON crop-origin resync. While the frame-spill crop is on (a maximized window whose frame hangs off its monitor)
++ * surface-local (0,0) is window (content_x, content_y), and every subsurface of the window -- the client (GPU)
++ * surfaces of its child windows and its owned windows -- is positioned relative to that point. The crop origin
++ * changes only here, when the first buffer of the new state is attached, but those positions were set earlier, when
++ * Win32 moved the windows, still against the OLD origin, and nothing set them again until the next present or move.
++ * Photoshop 2026 restored from maximized by a caption double-click: its canvas (a child window's Vulkan surface) stayed
++ * 6 device px (3 logical) up and left of where it belongs until the next input. On Windows a restored window's
++ * contents land at the restored position at once. So when the origin changes, place them again now, before the
++ * commit that applies the new crop: a subsurface position is parent state and lands in that same commit. A client
++ * surface whose viewport changed too (its edges round differently against the new origin, 1 px) is committed in sync
++ * mode and the parent committed here, as wayland_client_surface_attach_rect does, so its size lands in the same frame
++ * instead of at its next present; runs last in attach_shm, when all of the parent's state for this frame is set, and
++ * the caller's own commit right after is then an empty one. Position and size only; their order stays as
++ * neutron_restack_apply left it. Caller holds win_data_mutex (no user-lock calls here).
++ * Kill switch NEUTRON_CROP_ORIGIN_RESYNC=0.
++ */
++static void neutron_resync_crop_origin(struct wayland_surface *surface, int old_x, int old_y)
++{
++    static int on = -1;
++    HWND hwnds[256];
++    struct wayland_client_surface *synced[64];
++    UINT i, n, nc, no = 0, ns = 0;
++
++    if (on < 0) on = neutron_gate("NEUTRON_CROP_ORIGIN_RESYNC", TRUE);
++    if (!on || !surface->wl_surface) return;
++
++    nc = n = wayland_client_subsurfaces_of(surface->wl_surface, hwnds, ARRAY_SIZE(hwnds));
++    for (i = 0; i < n; i++)
++    {
++        struct wayland_win_data *d = wayland_win_data_get_nolock(hwnds[i]);
++        struct wayland_client_surface *client = d ? d->client_surface : NULL;
++
++        if (!client || !client->neutron_rect_set || !client->wl_subsurface ||
++            client->toplevel_wl_surface != surface->wl_surface) continue;
++        wayland_surface_reconfigure_client(surface, client, &client->neutron_rect,
++                                           client->neutron_clip_set ? &client->neutron_clip : NULL, TRUE);
++        if (client->vp_dirty && client->client.buffer_width && ns < ARRAY_SIZE(synced) &&
++            !InterlockedCompareExchange(&client->client.present_busy, 1, 0))
++        {
++            wl_subsurface_set_sync(client->wl_subsurface);
++            wl_surface_commit(client->wl_surface);
++            InterlockedExchange(&client->vp_dirty, 0);
++            synced[ns++] = client;
++        }
++    }
++
++    n = wayland_owned_subsurfaces_of(surface->hwnd, hwnds, ARRAY_SIZE(hwnds));
++    for (i = 0; i < n; i++)
++    {
++        struct wayland_win_data *d = wayland_win_data_get_nolock(hwnds[i]);
++        struct wayland_surface *owned = d ? d->wayland_surface : NULL;
++        RECT own_crop;
++        int x, y;
++
++        if (!owned || owned->role != WAYLAND_SURFACE_ROLE_SUBSURFACE || !owned->wl_subsurface ||
++            owned->subsurface_parent != surface->wl_surface) continue;
++        SetRect(&own_crop, owned->content_x, owned->content_y, owned->content_x, owned->content_y);
++        neutron_subsurface_position(owned, surface, (owned->content_x || owned->content_y) ? &own_crop : NULL, &x, &y);
++        wl_subsurface_set_position(owned->wl_subsurface, x, y);
++        no++;
++    }
++
++    if (ns)
++    {
++        wl_surface_commit(surface->wl_surface);
++        for (i = 0; i < ns; i++)
++        {
++            wl_subsurface_set_desync(synced[i]->wl_subsurface);
++            InterlockedExchange(&synced[i]->client.present_busy, 0);
++        }
++    }
++
++    ERR("neutron-crop-resync: hwnd=%p crop origin %d,%d -> %d,%d: re-placed %u client (%u resized) and %u owned"
++        " subsurfaces\n", surface->hwnd, old_x, old_y, surface->content_x, surface->content_y, nc, ns, no);
++}
++
++/**********************************************************************
+  *          wayland_surface_reconfigure
+  *
+  * Reconfigures the wayland surface as needed to match the latest requested
+@@ -4451,7 +4585,7 @@
+             clip = &clip_rect;
+     }
+ 
+-    wayland_surface_reconfigure_client(surface, client, &client_rect, clip);
++    wayland_surface_reconfigure_client(surface, client, &client_rect, clip, FALSE);
+ 
+     /* NEUTRON: a viewport change (crop/size) is CLIENT-surface state and shows only when that surface commits; the
+      * position is parent state and shows with the commit below. Left to the app's next present, a container

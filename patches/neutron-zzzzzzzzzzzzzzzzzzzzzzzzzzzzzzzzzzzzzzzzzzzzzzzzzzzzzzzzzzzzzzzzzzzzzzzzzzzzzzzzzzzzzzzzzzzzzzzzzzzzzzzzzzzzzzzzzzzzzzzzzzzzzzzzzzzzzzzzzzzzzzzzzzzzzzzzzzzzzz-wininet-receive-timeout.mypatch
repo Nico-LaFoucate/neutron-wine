@@ -1,0 +1,283 @@
+# neutron-wininet-receive-timeout -- WinINet receive timeouts as Windows 11 reports and times them
+#
+# Touches: dlls/wininet/{netconnection.c,http.c,internet.c,internet.h}. REPLACES smallgaps'
+# wininet-receive-timeout-12002.mypatch (never apply both; they edit the same lines).
+#
+# WHAT HAPPENED (lab, 11-05, Topaz Photo 1.7.1 installer): the 7.1 GB model wonder-2-20260527-win.zip failed both
+# attempts: "Failed to receive file. Error code is: 12030" / "Network interrupted while downloading ...; queued one
+# retry", then the vendor box "AI model downloads did not finish". The CDN stalls near the installer's 15 s timeout.
+# Topaz (ModelDownloader.dll, static read): synchronous PRECONFIG session, RECEIVE_TIMEOUT and CONNECT_TIMEOUT 15000
+# on the session, InternetOpenUrlA per model, 512 KiB InternetReadFile; on 12002 it retries the read on the same
+# handle, any other code = whole-file re-download, a short file = SHA-512 retry.
+#
+# WINDOWS (the Windows 11 measurement, build 26200; probes rtmatrix 3 and rtphase 1 against local servers; a stall
+# before the response headers (H) or after 64 of 128 KiB (B); times = seconds into the stall):
+#  - error: 12002 for headers (HttpSendRequest / InternetOpenUrl) and body (InternetReadFile).
+#  - after a body 12002 the connection is gone: a retry on the same handle returns TRUE with 0 bytes (end of data).
+#    A 512 KiB sync read that already holds 64 KiB fails with 12002 and those 64 KiB are not handed over.
+#  - WHEN, a 4 s clock, not T: T=2 s -> 4.0, 5 -> 8.0, 10 -> 12.0, 15 -> 16.0, default 30 -> 32.0; a 3 s stall with
+#    T=2 completes; a 1 KiB/s trickle with T=2 never fires (idle time, reset by data).
+#    The clock is shared, not per request: in the busy 60-cell matrix, requests started 1..5 s late fire at
+#    3.0/2.0/5.0/4.0/3.0 s into their stall = the same absolute 4/8 s ticks as the rest.
+#    It starts over when a receive starts waiting while none is: a request 2.5 s after process start (wininet loaded
+#    at 0.7 s, InternetOpen at 1.5 s) fires at 4.0, not on a process/DLL/InternetOpen grid; a new request 9 s after
+#    all handles closed fires at 4.0 again, not on the old ticks; a request whose first read waits 3 s after the
+#    response fires 4.0 s after that read began waiting (7.0 into the stall), not on a clock started by the request.
+#    Rule: one clock per process, running while at least one receive waits; the receive fails at the first tick at
+#    or after "idle for T".
+#  - handles: copy at creation (session option set after InternetConnect does not reach the request);
+#    CONNECT_TIMEOUT and DATA_RECEIVE_TIMEOUT do not affect receives; async = sync; single-cell processes = busy.
+#  - defaults: NULL handle receive 30000, send 30000, connect 60000 ms; new session and request receive 30000.
+#
+# MECHANISM (stock Wine, same probes, offline lab, n=2 identical): the request's receive timeout is SO_RCVTIMEO, so a
+# receive fails at exactly T with WSAETIMEDOUT, reported as 12030 (headers, HTTPS) or raw winsock 10060 (plain HTTP
+# body); a 3 s stall with T=2 fails; defaults 60000 x3. Connection drop, lost 64 KiB, inheritance: already as Windows.
+#
+# FIX (kill switch NEUTRON_WININET_RECEIVE_TIMEOUT=0 = stock Wine in every point below):
+#  - a receive timeout is ERROR_INTERNET_TIMEOUT 12002 (NETCON_recv, both recvs of read_ssl_chunk incl. inside a TLS
+#    record; HttpSendRequest / HttpEndRequest pass it through). The connection is still dropped, as on Windows.
+#  - Windows' clock: NETCON_set_timeout (receive) stores T in the netconn. neutron_recv() counts the blocking
+#    receives under a receive timeout process-wide (SRW lock); the one that finds none waiting sets the clock's
+#    origin. When SO_RCVTIMEO ends a recv at T, WSAPoll waits on to the first 4 s tick (origin + 4k) at or after
+#    recv start + T; data before the tick is returned, none = 12002. Normal path cost: one QueryPerformanceCounter
+#    and two uncontended lock round trips per blocking recv.
+#  - defaults: receive and send 30000 at DLL attach (connect stays 60000).
+#
+# NOT COVERED / STAYS IMPERFECT:
+#  - "waiting" here = inside a blocking recv under a receive timeout; a recv that finds data returns at once and
+#    cannot move the clock while another receive waits (same effect as counting only receives that wait).
+#  - idle is counted from the start of the waiting recv; "from the last byte received" was not measured apart
+#    (equal in every measured cell).
+#  - a deadline that falls on a tick fires on either side by milliseconds: the rtmatrix "+2" cell (2.0 on Windows)
+#    misses the tick by 9-28 ms here (traced, two runs) and fires at the next one (6.0).
+#  - HTTPS on Windows was not measured (plain HTTP only); the timer sits below TLS, so the same rule is applied.
+#  - send / connect timeouts keep stock exact timing; FTP untouched; a TLS handshake run under an armed receive
+#    timeout (proxy CONNECT tunnel) keeps stock behavior.
+#
+# LAB EVIDENCE (offline user+net namespace, prefix W3-base, runtime 11.10-183w3 = 183rc + this wininet 64/32)
+#   rtmatrix 3, fix on, n=2, compared cell by cell with the Windows 11 output: 78 result cells, 75 identical in both
+#     runs; defaults line and all 20 q= values identical; whole run 32.1 s (Windows 32.1 s; stock 183rc 45.2 s).
+#     The 3 others, both runs: "+2" 6.0 vs 2.0 (tick tie, above); trickle completion 10.0 vs 10.1 (no timeout).
+#   rtphase 1, fix on, n=2 identical: A 12002 abs 6.5 / stall 4.0, B abs 19.5 / 4.0, C abs 31.0 / 7.0 -- Windows
+#     6.5 / 4.0, 19.5 / 4.0, 31.1 / 7.0 (C's request began 0.1 s later there; same stall time).
+#   NEUTRON_WININET_RECEIVE_TIMEOUT=0, same build, n=2: rtmatrix identical to each other and to stock 183rc; rtphase
+#     10060 at exactly 2.0 / 2.0 / 5.0.
+#   HTTPS stall server (T=2 s, 5 s stall, Topaz's 512 KiB reads + retry rule), n=2 x {between records, inside a
+#     record}: on 4/4 12002 at 4.0-4.1 s, retry = end of data; switch=0 4/4 12030 at 2.0-2.1 s.
+#   Wine's local http conformance test (http_local): 183rc / on / switch=0 identical output, including the same early
+#     stop at test_persistent_connection (exit 5, already in stock 183rc; the tests after it do not run in any arm).
+# Kill switch: NEUTRON_WININET_RECEIVE_TIMEOUT=0 (app environment).
+--- a/dlls/wininet/http.c
++++ b/dlls/wininet/http.c
+@@ -5152,10 +5152,12 @@
+             INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
+                                 INTERNET_STATUS_RECEIVING_RESPONSE, NULL, 0);
+ 
+-            if (HTTP_GetResponseHeaders(request, &responseLen))
++            if ((res = HTTP_GetResponseHeaders(request, &responseLen)))
+             {
+                 http_release_netconn(request, FALSE);
+-                res = ERROR_INTERNET_CONNECTION_ABORTED;
++                /* Neutron: no response within the receive timeout = ERROR_INTERNET_TIMEOUT */
++                if (res != ERROR_INTERNET_TIMEOUT || !neutron_rcvto_enabled())
++                    res = ERROR_INTERNET_CONNECTION_ABORTED;
+                 goto lend;
+             }
+             /* FIXME: We should know that connection is closed before sending
+@@ -5438,7 +5440,9 @@
+     INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
+                   INTERNET_STATUS_RECEIVING_RESPONSE, NULL, 0);
+ 
+-    if (HTTP_GetResponseHeaders(request, &responseLen) || !responseLen)
++    if ((res = HTTP_GetResponseHeaders(request, &responseLen)) == ERROR_INTERNET_TIMEOUT && neutron_rcvto_enabled())
++        ; /* Neutron: see HTTP_HttpSendRequestW */
++    else if (res || !responseLen)
+         res = ERROR_HTTP_HEADER_NOT_FOUND;
+ 
+     INTERNET_SendCallback(&request->hdr, request->hdr.dwContext,
+--- a/dlls/wininet/internet.c
++++ b/dlls/wininet/internet.c
+@@ -311,6 +311,11 @@
+             }
+ 
+             WININET_hModule = hinstDLL;
++
++            /* Neutron: Windows' defaults (Windows 11 measurement: NULL handle receive 30000, send 30000,
++             * connect 60000 ms; new sessions and requests inherit them). Stock Wine: 60000 for all three. */
++            if (neutron_rcvto_enabled())
++                receive_timeout = send_timeout = 30000;
+             break;
+ 
+         case DLL_THREAD_ATTACH:
+--- a/dlls/wininet/internet.h
++++ b/dlls/wininet/internet.h
+@@ -73,6 +73,7 @@
+     int socket;
+     BOOL secure;
+     BOOL is_blocking;
++    DWORD rcvto; /* Neutron: the receive timeout armed on the socket (SO_RCVTIMEO), 0 = none */
+     CtxtHandle ssl_ctx;
+     SecPkgContext_StreamSizes ssl_sizes;
+     server_t *server;
+@@ -412,6 +413,7 @@
+ LPCVOID NETCON_GetCert(netconn_t *connection);
+ int NETCON_GetCipherStrength(netconn_t*);
+ DWORD NETCON_set_timeout(netconn_t *connection, BOOL send, DWORD value);
++BOOL neutron_rcvto_enabled(void);
+ int sock_send(int fd, const void *msg, size_t len, int flags);
+ int sock_recv(int fd, void *msg, size_t len, int flags);
+ 
+--- a/dlls/wininet/netconnection.c
++++ b/dlls/wininet/netconnection.c
+@@ -40,6 +40,88 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(wininet);
+ 
++/* Neutron: receive timeouts as Windows reports them (measured on Windows 11, build 26200).
++ * - A receive that stays idle for the receive timeout T (INTERNET_OPTION_RECEIVE_TIMEOUT, armed per request as
++ *   SO_RCVTIMEO) fails with ERROR_INTERNET_TIMEOUT (12002). Stock Wine reported 12030 (headers, HTTPS) or the raw
++ *   winsock 10060 (plain HTTP body). The caller still drops the connection, as Windows does (a later
++ *   InternetReadFile on the handle returns TRUE with 0 bytes).
++ * - Windows checks for that timeout on one 4 s clock per process, not at T. The clock runs while at least one
++ *   receive is waiting and starts over when a receive starts waiting while none is; the failure comes at the first
++ *   tick at or after "idle for T". SO_RCVTIMEO ends our recv at T exactly, so neutron_recv() waits on, up to that
++ *   tick, and takes data that arrives before it.
++ * Kill switch: NEUTRON_WININET_RECEIVE_TIMEOUT=0 (stock Wine: exact T, 12030/10060, 60 s defaults). */
++BOOL neutron_rcvto_enabled(void)
++{
++    static LONG enabled = -1;
++    if (enabled == -1)
++    {
++        char v[8];
++        DWORD n = GetEnvironmentVariableA("NEUTRON_WININET_RECEIVE_TIMEOUT", v, sizeof(v));
++        enabled = !(n == 1 && v[0] == '0');
++        TRACE("receive-timeout handling %s\n", enabled ? "on" : "off (kill switch)");
++    }
++    return enabled;
++}
++
++#define NEUTRON_RCVTO_CHECK_MS 4000
++static SRWLOCK neutron_rcvto_lock = SRWLOCK_INIT;
++static LONG neutron_rcvto_waiting;    /* blocking receives under a receive timeout in progress, process-wide */
++static LONGLONG neutron_rcvto_origin; /* ms; when the current run of waiting receives began (the clock's phase) */
++
++static LONGLONG neutron_now_ms(void)
++{
++    LARGE_INTEGER count, freq;
++    QueryPerformanceCounter(&count);
++    QueryPerformanceFrequency(&freq);
++    return count.QuadPart / (freq.QuadPart / 1000);
++}
++
++/* sock_recv() for the receive paths that run under the receive timeout */
++static int neutron_recv(netconn_t *conn, void *buf, size_t len)
++{
++    LONGLONG start, origin, check, wait;
++    WSAPOLLFD pfd;
++    int ret, err;
++
++    if (!conn->is_blocking || !conn->rcvto || !neutron_rcvto_enabled())
++        return sock_recv(conn->socket, buf, len, 0);
++
++    AcquireSRWLockExclusive(&neutron_rcvto_lock);
++    start = neutron_now_ms();
++    if (!neutron_rcvto_waiting++) neutron_rcvto_origin = start; /* the clock starts over */
++    origin = neutron_rcvto_origin;
++    ReleaseSRWLockExclusive(&neutron_rcvto_lock);
++
++    ret = sock_recv(conn->socket, buf, len, 0);
++    err = WSAGetLastError();
++    if (ret == -1 && err == WSAETIMEDOUT)
++    {
++        /* the first tick at or after start + T; origin <= start, and the clock keeps running while we wait */
++        check = origin + (start + conn->rcvto - origin + NEUTRON_RCVTO_CHECK_MS - 1) / NEUTRON_RCVTO_CHECK_MS
++                * NEUTRON_RCVTO_CHECK_MS;
++        wait = check - neutron_now_ms();
++        TRACE("idle for the receive timeout (%lu ms), next tick in %I64d ms\n", conn->rcvto, wait);
++        if (wait > 0)
++        {
++            pfd.fd = conn->socket;
++            pfd.events = POLLRDNORM;
++            pfd.revents = 0;
++            if (WSAPoll(&pfd, 1, wait) > 0)
++            {
++                ret = sock_recv(conn->socket, buf, len, 0);
++                err = WSAGetLastError();
++                TRACE("data before the tick: %d\n", ret);
++            }
++        }
++    }
++
++    AcquireSRWLockExclusive(&neutron_rcvto_lock);
++    neutron_rcvto_waiting--;
++    ReleaseSRWLockExclusive(&neutron_rcvto_lock);
++    WSASetLastError(err);
++    return ret;
++}
++
+ static DWORD netconn_verify_cert(netconn_t *conn, PCCERT_CONTEXT cert, HCERTSTORE store)
+ {
+     BOOL ret;
+@@ -677,13 +759,17 @@
+     }
+ 
+     set_socket_blocking(conn, blocking && !buf_len);
+-    size = sock_recv(conn->socket, conn->ssl_buf+buf_len, ssl_buf_size-buf_len, 0);
++    size = neutron_recv(conn, conn->ssl_buf+buf_len, ssl_buf_size-buf_len);
+     if(size < 0) {
+         if(!buf_len) {
+             if(WSAGetLastError() == WSAEWOULDBLOCK) {
+                 TRACE("would block\n");
+                 return WSAEWOULDBLOCK;
+             }
++            if(WSAGetLastError() == WSAETIMEDOUT && neutron_rcvto_enabled()) {
++                TRACE("receive timeout\n");
++                return ERROR_INTERNET_TIMEOUT;
++            }
+             WARN("recv failed\n");
+             return ERROR_INTERNET_CONNECTION_ABORTED;
+         }
+@@ -718,7 +804,7 @@
+             assert(buf_len < ssl_buf_size);
+ 
+             set_socket_blocking(conn, blocking);
+-            size = sock_recv(conn->socket, conn->ssl_buf+buf_len, ssl_buf_size-buf_len, 0);
++            size = neutron_recv(conn, conn->ssl_buf+buf_len, ssl_buf_size-buf_len);
+             if(size < 1) {
+                 if(size < 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+                     TRACE("would block\n");
+@@ -732,6 +818,10 @@
+                     memcpy(conn->extra_buf, conn->ssl_buf, conn->extra_len);
+                     return WSAEWOULDBLOCK;
+                 }
++                if(size < 0 && WSAGetLastError() == WSAETIMEDOUT && neutron_rcvto_enabled()) {
++                    TRACE("receive timeout inside a TLS record\n");
++                    return ERROR_INTERNET_TIMEOUT;
++                }
+ 
+                 return ERROR_INTERNET_CONNECTION_ABORTED;
+             }
+@@ -789,7 +879,13 @@
+     if (!connection->secure)
+     {
+         set_socket_blocking(connection, blocking);
+-        *recvd = sock_recv(connection->socket, buf, len, 0);
++        *recvd = neutron_recv(connection, buf, len);
++        if (*recvd == -1 && WSAGetLastError() == WSAETIMEDOUT && neutron_rcvto_enabled())
++        {
++            TRACE("receive timeout\n");
++            *recvd = 0;
++            return ERROR_INTERNET_TIMEOUT;
++        }
+         return *recvd == -1 ? WSAGetLastError() :  ERROR_SUCCESS;
+     }
+     else
+@@ -870,6 +966,8 @@
+ {
+     int result;
+ 
++    if (!send && neutron_rcvto_enabled())
++        connection->rcvto = value;
+     result = setsockopt(connection->socket, SOL_SOCKET,
+                         send ? SO_SNDTIMEO : SO_RCVTIMEO, (void*)&value,
+                         sizeof(value));

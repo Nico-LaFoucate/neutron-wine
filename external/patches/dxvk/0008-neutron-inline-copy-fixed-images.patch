@@ -1,0 +1,78 @@
+From: Neutron
+Subject: [PATCH] dxvk: skip the in-render-pass copy for images that cannot be recreated
+
+What was seen (Neutron#47, AMD RX 7600 XT + ROCm OpenCL, After Effects 2026, cl_khr_d3d11_sharing on): no layer controls,
+Draft 3D black; the reporter's log carries "DxvkContext: Cannot relocate image" (Current usage 0x3, flags 0x8, 2 view formats;
+Requested usage 0x8, flags 0, 1 view format) once per displayed frame -- 922 in one run, 275/305 with
+NEUTRON_DXVK_EXPORT_TEXTURES=0. This patch does NOT fix the reporter's symptom; it removes a misleading error and a wasted
+render-pass end + barrier per frame, and settles what the error was.
+
+Mechanism (SOLID, source + lab diag): copyImage() first tries copyImageInline(), which folds a copy whose source is a
+bound color attachment into the active render pass by giving the destination STORAGE usage (source:
+INPUT_ATTACHMENT), recreating ("relocating") the image when it lacks them. The destination here is After Effects' own
+shared texture: 1280x564 R8G8B8A8_UNORM, BindFlags 0, MiscFlags SHARED_NTHANDLE|SHARED_KEYEDMUTEX (0x900), exported on
+its GPU device and opened on its display device; each frame AE copies its viewer render target into it. A shared
+(also an imported or host-mapped) image cannot be relocated, so ensureImageCompatibility ended the render pass,
+emitted a barrier, logged the error and returned false, and copyImage() did the regular copy. No write was dropped.
+BindFlags 0 implies no usage beyond transfer, so creating shared images "with every usage their bind flags imply"
+would not have avoided it; the forced exports (NEUTRON_DXVK_EXPORT_TEXTURES) are not involved (they carry STORAGE).
+
+Fix: before calling ensureImageCompatibility, copyImageInline checks whether either image would need recreating and
+cannot be recreated (DxvkImage::canRelocate); then it returns false at once and copyImage() takes the regular copy, as
+it did after the error. Images that can be recreated keep the fast path unchanged.
+
+Windows: no equivalent; the copy itself is unchanged.
+
+Not covered: why the reporter's machine draws no controls and a black Draft 3D with sharing on (AMD/RADV + ROCm; not reproduced on
+NVIDIA in any lab arm). Upstream DXVK has the same error path for any non-relocatable destination.
+
+Lab (ae47e, NVIDIA RTX, lab d3d11 = 3c6f508 + 0001-0006 + this + env-gated diag; same build, same prefix per pair,
+fix vs NEUTRON_DISABLE_INLINE_COPY_SKIP=1):
+- AMD-like arm (OpenCL spoof, nvcuda=d, no NVIDIA API, DirectX display, 96 dpi, CLI without the export gate), AeEf1 and
+  AeEf2: relocation errors 0 / 0 with the fix vs 47 / 47 with the kill switch (DirectX-display presents 47-49);
+  layer controls drawn (2D, Classic 3D, Advanced 3D, 1920x1080 comp at 33/50/100%) and Draft 3D not black in all 4;
+  viewer crops pixel-identical between the arms (0.00-0.02%; Advanced 3D Draft 0.12% = Calder noise, same vs step-1 runs).
+- NVIDIA CUDA arm (OpenGL display, what NVIDIA users run), AeEc1: relocation errors 0 / 0 vs 46 / 46; nvcuda
+  "REGISTERED 1280x564" 2 in every run (CUDA interop intact); controls drawn, Draft 3D not black; con2/coff2 crops
+  identical (0.00%). (con1 vs coff1 differ only by the viewer zoom the prefix remembered from the previous session.)
+
+Kill switch: NEUTRON_DISABLE_INLINE_COPY_SKIP=1.
+
+--- a/src/dxvk/dxvk_context.cpp
++++ b/src/dxvk/dxvk_context.cpp
+@@ -4709,6 +4709,35 @@
+         return false;
+     }
+ 
++    // NEUTRON (Neutron#47, 2026-11-06): this fast path folds the copy into the active render
++    // pass by giving the destination STORAGE usage (and the source INPUT_ATTACHMENT usage),
++    // recreating the image when it lacks them. A shared, imported or host-mapped image cannot be
++    // recreated, so ensureImageCompatibility ended the render pass, emitted a barrier and logged
++    // "DxvkContext: Cannot relocate image" before this function fell back to the regular copy in
++    // copyImage(). After Effects hits it once per displayed frame: it copies its viewer render
++    // target into its own SHARED_NTHANDLE|SHARED_KEYEDMUTEX texture (BindFlags 0) for the
++    // display. Ask first and take the regular copy at once.
++    // Kill switch: NEUTRON_DISABLE_INLINE_COPY_SKIP=1.
++    static const bool neutronSkipFixedImages = env::getEnvVar("NEUTRON_DISABLE_INLINE_COPY_SKIP") != "1";
++
++    if (neutronSkipFixedImages) {
++      auto fits = [] (const DxvkImage& image, const DxvkImageUsageInfo& usage) {
++        bool ok = (image.info().usage & usage.usage) == usage.usage
++               && (image.info().flags & usage.flags) == usage.flags;
++
++        for (uint32_t i = 0; i < usage.viewFormatCount && ok; i++)
++          ok = image.isViewCompatible(usage.viewFormats[i]);
++
++        return ok;
++      };
++
++      bool dstFixed = !fits(dstImage, dstUsage) && !dstImage.canRelocate();
++      bool srcFixed = !fits(srcImage, srcUsage) && !srcImage.canRelocate();
++
++      if (unlikely(dstFixed || srcFixed))
++        return false;
++    }
++
+     if (!ensureImageCompatibility(&dstImage, dstUsage)
+      || !ensureImageCompatibility(&srcImage, srcUsage))
+       return false;

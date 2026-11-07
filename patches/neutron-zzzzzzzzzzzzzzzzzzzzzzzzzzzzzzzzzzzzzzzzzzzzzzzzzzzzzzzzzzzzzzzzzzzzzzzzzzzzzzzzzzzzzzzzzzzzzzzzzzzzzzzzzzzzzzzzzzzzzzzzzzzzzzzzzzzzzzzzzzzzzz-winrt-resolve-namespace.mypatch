@@ -1,0 +1,313 @@
+# neutron-winrt-resolve-namespace
+#
+# Touches: dlls/wintypes/main.c, dlls/wintypes/tests/wintypes.c. Needs neutron-widl-winmd-complete (the metadata files).
+#
+# WHAT WAS SEEN (lab, 11-05, Affinity 3.3.3): Affinity dies when its Canva
+# sign-in link comes back, so nobody can sign in.
+#
+# MECHANISM
+# The browser hands affinity://canva/authorize?... to a second Affinity.exe, which passes it to the running one (mutex +
+# named pipe work). The running app's Application.ProcessCommandLineArguments references
+# Windows.ApplicationModel.DataTransfer.SharedStorageAccessManager (only used for affinity-open-file: arguments), so the
+# .NET Framework JIT must load that WinRT type to compile the method at all. The CLR's WinRT binder asks
+# RoResolveNamespace("Windows.ApplicationModel.DataTransfer") which file holds it; Wine's was a stub returning
+# RO_E_METADATA_NAME_NOT_FOUND, so every WinRT type was "Could not find Windows Runtime type" (TypeLoadException,
+# unhandled -> process gone). Fix: implement RoResolveNamespace against %windir%\System32\WinMetadata (Sysnative for a
+# 32-bit process on 64-bit, as Wine's own test records for Windows), the optional SDK directory and the package-graph
+# directories.
+#
+# WINDOWS (learn.microsoft.com):
+# - RoResolveNamespace: metaDataFilePaths = "absolute file paths of all metadata (.winmd) files that could possibly contain
+#   direct children of name"; windowsMetaDataDir empty -> "the default Windows metadata directory,
+#   %windir%\System32\WinMetadata"; subNamespaces "is a hint of other subnamespaces and is not necessarily complete";
+#   S_OK / RO_E_METADATA_NAME_NOT_FOUND / E_INVALIDARG exactly per the documented table (both outputs NULL; embedded NUL;
+#   empty name without subNamespaces; empty name with metaDataFilePaths).
+# - WinMD files: "every WinRT type's metadata must be stored in the WinMD file, with the longest name matching the
+#   namespace of the type" and a file N.winmd holds namespace N and its sub-namespaces. So the files that can hold direct
+#   children of X are those named X or a parent namespace of X; listed longest name first (order INFERRED, not documented).
+# - Wine's existing test (validated on Windows): Windows.Networking.Connectivity -> 1 file, windows.networking.winmd;
+#   Windows.Foundation -> windows.foundation.winmd. Now passes (todo_wine removed); added: DataTransfer -> 1 file,
+#   windows.applicationmodel.winmd; E_INVALIDARG and NOT_FOUND cases.
+#
+# NOT COVERED: RoGetMetaDataFile stays a stub (the CLR path does not call it). Sub-namespace hints come from file names only.
+# After this fix the next missing piece on the callback path is NOT Wine: the .NET 4.8 install (win7 mode, as winetricks)
+# has no System.Runtime.WindowsRuntime.dll (AsTask), which Windows 10's .NET 4.8 has in GAC_MSIL -- the callback then dies
+# with FileNotFoundException instead (1/1). Lab stand-in: that file from the same ndp48 package's Windows 10 cab.
+#
+# LAB EVIDENCE (Affinity 3.3.3, desk k, runtime 11.10-182wm = 182af + this + the winmd files, prefix PgI-winrt with the
+# System.Runtime.WindowsRuntime stand-in; callback = affinity://canva/authorize?exchangeId=<its own>&error=access_denied):
+#   fix on:                              Affinity alive after the callback 2/2; it shows its own message box
+#                                        "License activation failed / Canva login failed (access_denied)" (hidden BEHIND
+#                                        the sign-in dialog until that is hidden: owned-window z-order, separate)
+#   NEUTRON_RO_RESOLVE_NAMESPACE=0:      Affinity dead 2/2, wine log "Unhandled Exception: System.TypeLoadException: Could
+#                                        not find Windows Runtime type '...SharedStorageAccessManager'" + crash dump each
+#   .NET reflection probe (tools/rtest): FileAccessMode loads 1/1 on, TypeLoadException 1/1 kill switch.
+#   dlls/wintypes/tests: 182af wintypes 6 failures (5 RoResolveNamespace + line 113), this 1 failure (line 113,
+#   IDataWriterFactory "succeeded inside todo", same before -- not this patch). 1111 tests.
+# Kill switch: NEUTRON_RO_RESOLVE_NAMESPACE=0.
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -1812,19 +1812,210 @@
+     return S_OK;
+ }
+ 
++/* Neutron: kill switch NEUTRON_RO_RESOLVE_NAMESPACE=0 restores the old stub (always RO_E_METADATA_NAME_NOT_FOUND). */
++static BOOL resolve_namespace_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled == -1)
++    {
++        WCHAR buf[8];
++        enabled = !(GetEnvironmentVariableW( L"NEUTRON_RO_RESOLVE_NAMESPACE", buf, ARRAY_SIZE(buf) ) && buf[0] == '0');
++        if (!enabled) ERR( "neutron-rons: RoResolveNamespace disabled by NEUTRON_RO_RESOLVE_NAMESPACE=0\n" );
++    }
++    return enabled;
++}
++
++struct hstring_array
++{
++    HSTRING *items;
++    DWORD count, size;
++};
++
++static HRESULT hstring_array_add( struct hstring_array *array, const WCHAR *str, UINT32 len, BOOL unique )
++{
++    HSTRING *items;
++    DWORD i;
++
++    if (unique)
++        for (i = 0; i < array->count; i++)
++        {
++            UINT32 cur_len;
++            const WCHAR *cur = WindowsGetStringRawBuffer( array->items[i], &cur_len );
++            if (cur_len == len && !wcsnicmp( cur, str, len )) return S_OK;
++        }
++
++    if (array->count == array->size)
++    {
++        DWORD size = array->size ? array->size * 2 : 8;
++        if (!(items = CoTaskMemRealloc( array->items, size * sizeof(*items) ))) return E_OUTOFMEMORY;
++        array->items = items;
++        array->size = size;
++    }
++    return WindowsCreateString( str, len, &array->items[array->count++] );
++}
++
++static void hstring_array_free( struct hstring_array *array )
++{
++    while (array->count) WindowsDeleteString( array->items[--array->count] );
++    CoTaskMemFree( array->items );
++    array->items = NULL;
++    array->size = 0;
++}
++
++/* Scan one directory for *.winmd files. A WinMD file named N.winmd holds the types of namespace N and of its
++ * sub-namespaces, and a type lives in the file with the longest name matching its namespace, so the files that
++ * can hold direct children of "name" are the ones named "name" or one of its parent namespaces. Sub-namespace
++ * names are taken from the file names (Windows documents that list as a hint, not necessarily complete). */
++static HRESULT resolve_namespace_in_dir( const WCHAR *dir, const WCHAR *name, UINT32 name_len,
++                                         struct hstring_array *paths, struct hstring_array *subs )
++{
++    WCHAR *pattern, *path;
++    WIN32_FIND_DATAW data;
++    HRESULT hr = S_OK;
++    size_t dir_len = wcslen( dir );
++    HANDLE find;
++
++    if (!(pattern = malloc( (dir_len + 9) * sizeof(WCHAR) ))) return E_OUTOFMEMORY;
++    swprintf( pattern, dir_len + 9, L"%s\\*.winmd", dir );
++    find = FindFirstFileW( pattern, &data );
++    free( pattern );
++    if (find == INVALID_HANDLE_VALUE) return S_OK;
++
++    do
++    {
++        size_t len = wcslen( data.cFileName );
++        UINT32 stem_len;
++
++        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
++        if (len <= 6 || wcsicmp( data.cFileName + len - 6, L".winmd" )) continue;
++        stem_len = len - 6;
++
++        if (paths && name_len && stem_len <= name_len && !wcsnicmp( data.cFileName, name, stem_len ) &&
++            (stem_len == name_len || name[stem_len] == '.'))
++        {
++            size_t path_len = dir_len + 1 + len;
++            if (!(path = malloc( (path_len + 1) * sizeof(WCHAR) ))) { hr = E_OUTOFMEMORY; break; }
++            swprintf( path, path_len + 1, L"%s\\%s", dir, data.cFileName );
++            hr = hstring_array_add( paths, path, path_len, TRUE );
++            free( path );
++            if (FAILED(hr)) break;
++        }
++
++        if (subs)
++        {
++            const WCHAR *child = NULL, *end;
++
++            if (!name_len) child = data.cFileName;
++            else if (stem_len > name_len + 1 && !wcsnicmp( data.cFileName, name, name_len ) &&
++                     data.cFileName[name_len] == '.')
++                child = data.cFileName + name_len + 1;
++            if (child)
++            {
++                for (end = child; end < data.cFileName + stem_len && *end != '.'; end++) ;
++                if (end > child && FAILED(hr = hstring_array_add( subs, child, end - child, TRUE ))) break;
++            }
++        }
++    } while (FindNextFileW( find, &data ));
++
++    FindClose( find );
++    return hr;
++}
++
++static int __cdecl path_length_desc( const void *a, const void *b )
++{
++    UINT32 len_a, len_b;
++    WindowsGetStringRawBuffer( *(HSTRING *)a, &len_a );
++    WindowsGetStringRawBuffer( *(HSTRING *)b, &len_b );
++    return len_b > len_a ? 1 : len_b < len_a ? -1 : 0;
++}
++
+ HRESULT WINAPI RoResolveNamespace(HSTRING name, HSTRING windowsMetaDataDir,
+                                   DWORD packageGraphDirsCount, const HSTRING *packageGraphDirs,
+                                   DWORD *metaDataFilePathsCount, HSTRING **metaDataFilePaths,
+                                   DWORD *subNamespacesCount, HSTRING **subNamespaces)
+ {
+-    FIXME("name %s, windowsMetaDataDir %s, metaDataFilePaths %p, subNamespaces %p stub!\n",
+-            debugstr_hstring(name), debugstr_hstring(windowsMetaDataDir),
+-            metaDataFilePaths, subNamespaces);
++    struct hstring_array paths = {0}, subs = {0};
++    const WCHAR *name_str, *dir_str;
++    WCHAR default_dir[MAX_PATH];
++    UINT32 name_len, dir_len;
++    BOOL wow64 = FALSE;
++    HRESULT hr;
++    DWORD i;
++
++    TRACE("name %s, windowsMetaDataDir %s, packageGraphDirsCount %lu, packageGraphDirs %p, metaDataFilePaths %p, "
++          "subNamespaces %p\n", debugstr_hstring(name), debugstr_hstring(windowsMetaDataDir), packageGraphDirsCount,
++          packageGraphDirs, metaDataFilePaths, subNamespaces);
++
++    if (metaDataFilePathsCount) *metaDataFilePathsCount = 0;
++    if (metaDataFilePaths) *metaDataFilePaths = NULL;
++    if (subNamespacesCount) *subNamespacesCount = 0;
++    if (subNamespaces) *subNamespaces = NULL;
+ 
+     if (!metaDataFilePaths && !subNamespaces)
+         return E_INVALIDARG;
+ 
+-    return RO_E_METADATA_NAME_NOT_FOUND;
++    if (!resolve_namespace_enabled())
++        return RO_E_METADATA_NAME_NOT_FOUND;
++
++    name_str = WindowsGetStringRawBuffer( name, &name_len );
++    if (name_len && wcslen( name_str ) < name_len) return E_INVALIDARG; /* embedded NUL */
++    if (!name_len && (!subNamespaces || metaDataFilePaths)) return E_INVALIDARG;
++
++    dir_str = WindowsGetStringRawBuffer( windowsMetaDataDir, &dir_len );
++    if (!dir_len)
++    {
++        /* a 32-bit process on a 64-bit system gets the native directory through sysnative */
++        IsWow64Process( GetCurrentProcess(), &wow64 );
++        if (wow64)
++        {
++            GetWindowsDirectoryW( default_dir, MAX_PATH - 24 );
++            wcscat( default_dir, L"\\Sysnative\\WinMetadata" );
++        }
++        else
++        {
++            GetSystemDirectoryW( default_dir, MAX_PATH - 14 );
++            wcscat( default_dir, L"\\WinMetadata" );
++        }
++        dir_str = default_dir;
++    }
++
++    hr = resolve_namespace_in_dir( dir_str, name_str, name_len, metaDataFilePaths ? &paths : NULL,
++                                   subNamespaces ? &subs : NULL );
++    if (packageGraphDirs)
++        for (i = 0; SUCCEEDED(hr) && i < packageGraphDirsCount; i++)
++        {
++            const WCHAR *pkg = WindowsGetStringRawBuffer( packageGraphDirs[i], NULL );
++            if (pkg && *pkg) hr = resolve_namespace_in_dir( pkg, name_str, name_len,
++                                                            metaDataFilePaths ? &paths : NULL,
++                                                            subNamespaces ? &subs : NULL );
++        }
++
++    if (SUCCEEDED(hr) && !paths.count && !subs.count) hr = RO_E_METADATA_NAME_NOT_FOUND;
++    if (FAILED(hr))
++    {
++        hstring_array_free( &paths );
++        hstring_array_free( &subs );
++        TRACE("%s -> %#lx\n", debugstr_hstring(name), hr);
++        return hr;
++    }
++
++    /* the type itself lives in the file with the longest matching name; list that one first */
++    if (paths.count > 1) qsort( paths.items, paths.count, sizeof(*paths.items), path_length_desc );
++
++    for (i = 0; i < paths.count; i++) TRACE("file %s\n", debugstr_hstring(paths.items[i]));
++    for (i = 0; i < subs.count; i++) TRACE("subnamespace %s\n", debugstr_hstring(subs.items[i]));
++
++    if (metaDataFilePaths)
++    {
++        if (metaDataFilePathsCount) *metaDataFilePathsCount = paths.count;
++        *metaDataFilePaths = paths.items;
++    }
++    if (subNamespaces)
++    {
++        if (subNamespacesCount) *subNamespacesCount = subs.count;
++        *subNamespaces = subs.items;
++    }
++    return S_OK;
+ }
+ 
+ struct parse_type_context
+--- a/dlls/wintypes/tests/wintypes.c
++++ b/dlls/wintypes/tests/wintypes.c
+@@ -1083,7 +1083,7 @@
+ 
+         count = 0;
+         hr = RoResolveNamespace(name, NULL, 0, NULL, &count, &paths, 0, NULL);
+-        todo_wine ok(hr == S_OK, "got %#lx\n", hr);
++        ok(hr == S_OK, "got %#lx\n", hr);
+         if (hr == S_OK)
+         {
+             const WCHAR *str = WindowsGetStringRawBuffer(paths[0], NULL);
+@@ -1102,6 +1102,37 @@
+         winetest_pop_context();
+     }
+ 
++    /* sub-namespaces live in the file named after their parent namespace */
++    hr = WindowsCreateString(L"Windows.ApplicationModel.DataTransfer", wcslen(L"Windows.ApplicationModel.DataTransfer"), &name);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    count = 0;
++    paths = NULL;
++    hr = RoResolveNamespace(name, NULL, 0, NULL, &count, &paths, NULL, NULL);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    ok(count == 1, "got %lu\n", count);
++    if (hr == S_OK && count)
++    {
++        const WCHAR *str = WindowsGetStringRawBuffer(paths[0], NULL);
++        ok(!!wcsstr(str, L"\\") && !wcsicmp(wcsrchr(str, '\\') + 1, L"windows.applicationmodel.winmd"),
++           "got %s\n", wine_dbgstr_w(str));
++    }
++    for (i = 0; i < count; i++) WindowsDeleteString(paths[i]);
++    CoTaskMemFree(paths);
++
++    /* both outputs missing, or a file list asked for the empty namespace */
++    hr = RoResolveNamespace(name, NULL, 0, NULL, NULL, NULL, NULL, NULL);
++    ok(hr == E_INVALIDARG, "got %#lx\n", hr);
++    WindowsDeleteString(name);
++    hr = RoResolveNamespace(NULL, NULL, 0, NULL, &count, &paths, NULL, NULL);
++    ok(hr == E_INVALIDARG, "got %#lx\n", hr);
++
++    /* a namespace nothing holds */
++    hr = WindowsCreateString(L"Wine.NoSuchNamespace", wcslen(L"Wine.NoSuchNamespace"), &name);
++    ok(hr == S_OK, "got %#lx\n", hr);
++    hr = RoResolveNamespace(name, NULL, 0, NULL, &count, &paths, NULL, NULL);
++    ok(hr == RO_E_METADATA_NAME_NOT_FOUND, "got %#lx\n", hr);
++    WindowsDeleteString(name);
++
+     RoUninitialize();
+ }
+ 

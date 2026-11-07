@@ -1,0 +1,992 @@
+# neutron-widl-winmd-complete
+#
+# Touches: tools/widl/{metadata.c,parser.y,widl.c,widl.h,widltypes.h,typetree.c}, include/windows.foundation.idl,
+# include/windows.applicationmodel.idl, include/Makefile.in, loader/wine.inf.in. Build-time only (widl + the installed
+# winmd files); pairs with neutron-winrt-resolve-namespace, whose kill switch turns the whole path off at run time.
+#
+# WHAT WAS SEEN: Affinity dies when its Canva sign-in link comes back (see neutron-winrt-resolve-namespace).
+#
+# MECHANISM
+# Once RoResolveNamespace answers, the .NET Framework CLR reads Wine's generated winmd files, and they could not describe
+# SharedStorageAccessManager or what its signature uses:
+# - DataTransfer (and every sub-namespace IDL: Windows.Storage.Streams, ...) was never written into its root winmd; there
+#   was no windows.foundation.winmd at all (IAsyncOperation`1, IAsyncInfo, AsyncStatus, ...).
+# - generics were never written (templates skipped as "Unhandled type", instances and interface types written as Object),
+#   so RedeemTokenForFileAsync could not match Affinity's IAsyncOperation`1<StorageFile> reference.
+# - assembly name was the build path ("include/windows.storage"); MethodImpl class column sized from a ROW NUMBER used as
+#   a table index (garbage layout past 45 typedefs); SizeOfImage rounded to 8 KiB, not section end (BadImageFormat
+#   0x800700C1 past ~60 KiB); NULL deref for a class method whose interface has no contract (the reported segfault) and
+#   for types with neither version nor contract; 2nd+ [static] attributes pointed at MemberRef 0; a setter declared before
+#   its getter added the getter twice; types of other files scoped to this Module; sorting InterfaceImpl rows detached
+#   their DefaultAttribute rows.
+# Fix: write each root's sub-namespaces (types of imported IDLs under the file's namespace; the root IDL imports its
+# sub-namespace IDLs only when widl writes a winmd, __WIDL_WINMD__, so headers are unchanged), generic definitions
+# ("Name`N" + GenericParam rows, ELEMENT_TYPE_VAR), instances (GENERICINST; TypeSpec for InterfaceImpl, event types and the
+# MethodImpl parent, whose MemberRef carries the template's signature), interfaces as CLASS TypeRefs, plus the fixes above.
+# windows.foundation.winmd is built and installed (Makefile.in, wine.inf [WinmdFiles]); asyncinfo.idl/eventtoken.idl's
+# global-namespace IAsyncInfo, AsyncStatus, EventRegistrationToken go into it as Windows.Foundation types.
+#
+# WINDOWS (learn.microsoft.com/uwp/winrt-cref/winmd-files): file name = assembly name; a file holds its namespace and
+# sub-namespaces; "with the longest name matching the namespace of the type"; parameterized interfaces/delegates are
+# "Name`N" with one GenericParam row per parameter; instances are TypeSpecs/GENERICINST; interfaces are TypeRefs.
+#
+# DIFF OF THE GENERATED FILES (old 182af vs new, dumped with System.Reflection.Metadata): no type removed from any file;
+# added types: applicationmodel 26->183, foundation 0->76 (new file), globalization 15->24, networking 11->60, storage 36->69,
+# ui 11->14, ui.xaml 20->22, graphics/media/perception/system unchanged; changed method lines are signature corrections
+# (Object -> the interface or IAsyncOperation`1<...>); assembly names now "Windows.X".
+#
+# NOT COVERED: Wine ships winmds for 11 roots only (no Windows.Security, Devices, AI, Data, ...): e.g. DataPackage loads
+# but a method needs Windows.Security.EnterpriseData.* (not found); types Wine's IDLs lack (Windows.System.Launcher) stay
+# missing. Roots other than Foundation/ApplicationModel/Storage merge only the sub-namespace IDLs they already import.
+# AssemblyRef names for other files use the first two namespace parts (the CLR resolves WinRT refs by namespace; INFERRED).
+#
+# LAB EVIDENCE: .NET 4.8 reflection probe (Type.GetType(..., ContentType=WindowsRuntime), signatures printed):
+# SharedStorageAccessManager (RedeemTokenForFileAsync -> IAsyncOperation`1[StorageFile]), StorageFile, IAsyncOperation`1,
+# Package, Uri (projected to System.Uri), PropertySet, ValueSet, ApplicationData, StorageFolder, Calendar, HostName, Color,
+# SystemMediaTransportControls load (old files: StorageFile fails on Windows.Storage.Streams, DataTransfer absent).
+# Affinity callback: see neutron-winrt-resolve-namespace (alive 2/2 on, dead 2/2 with its kill switch, same build).
+# wineboot -u installs windows.foundation.winmd (byte-identical) into system32 and syswow64 winmetadata.
+--- a/tools/widl/metadata.c
++++ b/tools/widl/metadata.c
+@@ -141,11 +141,6 @@
+ 
+     put_data( &dos_header, sizeof(dos_header) );
+ 
+-    image_size += nt_header.OptionalHeader.SizeOfHeaders + sizeof(section_header);
+-    nt_header.OptionalHeader.SizeOfImage = (image_size + 0x1fff) & ~0x1fff;
+-
+-    put_data( &nt_header, sizeof(nt_header) );
+-
+     for (i = 0; i < WINMD_STREAM_MAX; i++)
+     {
+         if (!streams[i].data_size) continue;
+@@ -158,6 +153,13 @@
+     section_header.Misc.VirtualSize = sizeof(cor_header) + sizeof(metadata_header) + streams_size + 8;
+     section_header.SizeOfRawData = (section_header.Misc.VirtualSize + FILE_ALIGNMENT - 1) & ~(FILE_ALIGNMENT - 1);
+ 
++    /* the image ends with the section, rounded up to the section alignment; a smaller SizeOfImage makes the
++       loader reject the file (ERROR_BAD_EXE_FORMAT) once the metadata grows past 60 KiB */
++    nt_header.OptionalHeader.SizeOfImage = section_header.VirtualAddress +
++        ((section_header.Misc.VirtualSize + SECTION_ALIGNMENT - 1) & ~(SECTION_ALIGNMENT - 1));
++
++    put_data( &nt_header, sizeof(nt_header) );
++
+     put_data( &section_header, sizeof(section_header) );
+ 
+     for (i = 0; i < FILE_ALIGNMENT - sizeof(dos_header) - sizeof(nt_header) - sizeof(section_header); i++)
+@@ -802,6 +804,9 @@
+     }
+ }
+ 
++/* serialize_interfaceimpl_table sorts the rows; custom attributes that point at InterfaceImpl rows follow them */
++static UINT *interfaceimpl_remap;
++
+ struct interfaceimpl_row
+ {
+     UINT class;
+@@ -828,10 +833,19 @@
+ static void serialize_interfaceimpl_table( void )
+ {
+     const struct interfaceimpl_row *row = (const struct interfaceimpl_row *)tables[TABLE_INTERFACEIMPL].ptr;
+-    UINT i;
++    struct interfaceimpl_row *orig;
++    UINT i, j, count = tables[TABLE_INTERFACEIMPL].count;
+ 
++    /* remember where each row goes so that custom attributes on InterfaceImpl rows stay attached */
++    orig = xmalloc( count * sizeof(*orig) + 1 );
++    memcpy( orig, row, count * sizeof(*orig) );
+     qsort( tables[TABLE_INTERFACEIMPL].ptr, tables[TABLE_INTERFACEIMPL].count, sizeof(*row),
+            cmp_interfaceimpl_row );
++    interfaceimpl_remap = xmalloc( (count + 1) * sizeof(UINT) );
++    for (i = 0; i < count; i++)
++        for (j = 0; j < count; j++)
++            if (!memcmp( &orig[i], &row[j], sizeof(*orig) )) { interfaceimpl_remap[i + 1] = j + 1; break; }
++    free( orig );
+ 
+     for (i = 0; i < tables_idx[TABLE_INTERFACEIMPL].count; i++)
+     {
+@@ -841,6 +855,71 @@
+     }
+ }
+ 
++struct typespec_row
++{
++    UINT signature;
++};
++
++static UINT add_typespec_row( UINT signature )
++{
++    struct typespec_row row = { signature };
++    return add_row( TABLE_TYPESPEC, (const BYTE *)&row, sizeof(row) );
++}
++
++static void serialize_typespec_table( void )
++{
++    const struct typespec_row *row = (const struct typespec_row *)tables[TABLE_TYPESPEC].ptr;
++    UINT i;
++
++    for (i = 0; i < tables[TABLE_TYPESPEC].count; i++)
++    {
++        serialize_blob_idx( row->signature );
++        row++;
++    }
++}
++
++struct genericparam_row
++{
++    USHORT number;
++    USHORT flags;
++    UINT owner;
++    UINT name;
++};
++
++static UINT add_genericparam_row( USHORT number, UINT owner, UINT name )
++{
++    struct genericparam_row row = { number, 0, owner, name };
++    return add_row( TABLE_GENERICPARAM, (const BYTE *)&row, sizeof(row) );
++}
++
++static int cmp_genericparam_row( const void *a, const void *b )
++{
++    const struct genericparam_row *row = a, *row2 = b;
++    if (row->owner > row2->owner) return 1;
++    if (row->owner < row2->owner) return -1;
++    if (row->number > row2->number) return 1;
++    if (row->number < row2->number) return -1;
++    return 0;
++}
++
++/* sorted by owner, number */
++static void serialize_genericparam_table( void )
++{
++    const struct genericparam_row *row = (const struct genericparam_row *)tables[TABLE_GENERICPARAM].ptr;
++    UINT i;
++
++    qsort( tables[TABLE_GENERICPARAM].ptr, tables[TABLE_GENERICPARAM].count, sizeof(*row), cmp_genericparam_row );
++
++    for (i = 0; i < tables[TABLE_GENERICPARAM].count; i++)
++    {
++        serialize_ushort( row->number );
++        serialize_ushort( row->flags );
++        serialize_table_idx( row->owner, (row->owner & 1) ? TABLE_METHODDEF : TABLE_TYPEDEF );
++        serialize_string_idx( row->name );
++        row++;
++    }
++}
++
+ struct memberref_row
+ {
+     UINT class;
+@@ -935,6 +1014,13 @@
+     const struct customattribute_row *row = (const struct customattribute_row *)tables[TABLE_CUSTOMATTRIBUTE].ptr;
+     UINT i;
+ 
++    if (interfaceimpl_remap)
++    {
++        struct customattribute_row *ca = (struct customattribute_row *)tables[TABLE_CUSTOMATTRIBUTE].ptr;
++        for (i = 0; i < tables[TABLE_CUSTOMATTRIBUTE].count; i++)
++            if ((ca[i].parent & 0x1f) == 5) ca[i].parent = interfaceimpl_remap[ca[i].parent >> 5] << 5 | 5;
++    }
++
+     qsort( tables[TABLE_CUSTOMATTRIBUTE].ptr, tables[TABLE_CUSTOMATTRIBUTE].count, sizeof(*row),
+            cmp_customattribute_row );
+ 
+@@ -1183,7 +1269,7 @@
+ 
+     for (i = 0; i < tables[TABLE_METHODIMPL].count; i++)
+     {
+-        serialize_table_idx( row->class, row->class );
++        serialize_table_idx( row->class, TABLE_TYPEDEF );
+         serialize_table_idx( row->body, methoddef_or_ref_to_table(row->body) );
+         serialize_table_idx( row->declaration, methoddef_or_ref_to_table(row->declaration) );
+         row++;
+@@ -1468,6 +1554,64 @@
+ 
+ #define MAX_NAME        256
+ 
++/* formal parameters of the parameterized type whose definition is being written */
++static const typeref_list_t *generic_params;
++
++/* members of a generic instance that was only declared still use the template's parameters: substitute them */
++static const typeref_list_t *subst_params, *subst_args;
++
++static const type_t *get_subst_arg( const type_t *param )
++{
++    const typeref_t *ref, *arg;
++
++    if (!subst_params || !subst_args) return NULL;
++    arg = LIST_ENTRY( list_head( subst_args ), const typeref_t, entry );
++    LIST_FOR_EACH_ENTRY( ref, subst_params, const typeref_t, entry )
++    {
++        if (!arg) break;
++        if (ref->type == param || (ref->type->name && param->name && !strcmp( ref->type->name, param->name )))
++            return arg->type;
++        arg = LIST_ENTRY( list_next( subst_args, &arg->entry ), const typeref_t, entry );
++    }
++    return NULL;
++}
++
++static UINT generic_param_index( const type_t *param )
++{
++    const typeref_t *ref;
++    UINT i = 0;
++
++    if (generic_params) LIST_FOR_EACH_ENTRY( ref, generic_params, const typeref_t, entry )
++    {
++        if (ref->type == param || (ref->type->name && param->name && !strcmp( ref->type->name, param->name ))) return i;
++        i++;
++    }
++    error( "type parameter %s used outside of its parameterized type\n", param->name );
++    return 0;
++}
++
++/* the interface or delegate definition of a parameterized type template, with its winmd name "Name`N" */
++static type_t *get_template_definition( type_t *tmpl )
++{
++    type_t *def = tmpl->details.parameterized.type;
++
++    if (!def->winmd_short_name)
++    {
++        UINT count = tmpl->details.parameterized.params ? list_count( tmpl->details.parameterized.params ) : 0;
++        def->winmd_short_name = strmake( "%s`%u", tmpl->name, count );
++    }
++    if (!def->namespace) def->namespace = tmpl->namespace;
++    if (!def->attrs) def->attrs = tmpl->attrs; /* interface templates keep their attributes on the template */
++    return def;
++}
++
++/* a partial specialization (inside a template) points at its template; a template points at its definition */
++static BOOL is_partial_specialization( const type_t *type )
++{
++    return type_get_type_detect_alias( type ) == TYPE_PARAMETERIZED_TYPE &&
++           type_get_type_detect_alias( type->details.parameterized.type ) == TYPE_PARAMETERIZED_TYPE;
++}
++
+ /* create a type reference if needed and store it in the base type */
+ static void create_typeref( type_t *type )
+ {
+@@ -1481,6 +1625,29 @@
+ 
+     if (base_type->md.ref) return;
+ 
++    /* type parameters are encoded as ELEMENT_TYPE_VAR, they never get a reference */
++    if (type_get_type_detect_alias( base_type ) == TYPE_PARAMETER) return;
++
++    /* generic instances reference the generic type ("Name`N") plus their arguments */
++    if (is_partial_specialization( base_type ) || base_type->md.generic_tmpl)
++    {
++        type_t *tmpl = base_type->md.generic_tmpl ? base_type->md.generic_tmpl : base_type->details.parameterized.type;
++        typeref_list_t *args = base_type->md.generic_tmpl ? base_type->md.generic_args
++                                                          : base_type->details.parameterized.params;
++        type_t *def = get_template_definition( tmpl );
++        typeref_t *arg;
++
++        create_typeref( def );
++        if (args) LIST_FOR_EACH_ENTRY( arg, args, typeref_t, entry ) create_typeref( arg->type );
++        if (base_type->md.generic_tmpl) base_type->md.ref = def->md.ref;
++        return;
++    }
++    if (type_get_type_detect_alias( base_type ) == TYPE_PARAMETERIZED_TYPE)
++    {
++        create_typeref( get_template_definition( base_type ) );
++        return;
++    }
++
+     /* basic types don't get a reference */
+     if (!base_type->name) return;
+ 
+@@ -1506,7 +1673,13 @@
+     namespace_str = format_namespace( base_type->namespace, "", ".", NULL, NULL );
+     base_type->md.namespace = add_string( namespace_str );
+ 
+-    if (base_type->md.namespace && (import_name = get_assembly_import( namespace_str )))
++    if (base_type->md.namespace && base_type->md.in_file)
++    {
++        /* defined in this file: system metadata references it through a TypeRef scoped to the module */
++        scope = resolution_scope( TABLE_MODULE, MODULE_ROW );
++        base_type->md.ref = add_typeref_row( scope, base_type->md.name, base_type->md.namespace );
++    }
++    else if (base_type->md.namespace && (import_name = get_assembly_import( namespace_str )))
+     {
+         assemblyref = add_assemblyref_row( 0x200, 0, add_string(import_name) );
+         scope = resolution_scope( TABLE_ASSEMBLYREF, assemblyref );
+@@ -1515,13 +1688,24 @@
+     else if (!base_type->md.namespace) /* types without namespace are imported from Windows.Foundation */
+     {
+         namespace = add_string( "Windows.Foundation" );
+-        assemblyref = add_assemblyref_row( 0x200, 0, namespace );
+-        scope = resolution_scope( TABLE_ASSEMBLYREF, assemblyref );
++        base_type->md.namespace = namespace;
++        if (base_type->md.in_file) scope = resolution_scope( TABLE_MODULE, MODULE_ROW );
++        else
++        {
++            assemblyref = add_assemblyref_row( 0x200, 0, namespace );
++            scope = resolution_scope( TABLE_ASSEMBLYREF, assemblyref );
++        }
+         base_type->md.ref = add_typeref_row( scope, base_type->md.name, namespace );
+     }
+     else
+     {
+-        scope = resolution_scope( TABLE_MODULE, MODULE_ROW );
++        /* defined in another winmd: reference it through an assembly named after its file, the namespace
++           up to the second component (Windows.Foundation.Collections -> Windows.Foundation) */
++        char *assembly = xstrdup( namespace_str ), *dot;
++        if ((dot = strchr( assembly, '.' )) && (dot = strchr( dot + 1, '.' ))) *dot = 0;
++        assemblyref = add_assemblyref_row( 0x200, 0, add_string(assembly) );
++        free( assembly );
++        scope = resolution_scope( TABLE_ASSEMBLYREF, assemblyref );
+         base_type->md.ref = add_typeref_row( scope, base_type->md.name, base_type->md.namespace );
+     }
+ 
+@@ -1659,6 +1843,38 @@
+     return len;
+ }
+ 
++static UINT make_type_sig( const type_t *type, BYTE *buf );
++
++/* GENERICINST CLASS <generic type> <count> <arguments> (ECMA II.23.2.12) */
++static UINT make_generic_inst_sig( type_t *tmpl, typeref_list_t *args, BYTE *buf )
++{
++    type_t *def = get_template_definition( tmpl );
++    const typeref_t *arg;
++    UINT len = 0;
++
++    buf[len++] = ELEMENT_TYPE_GENERICINST;
++    buf[len++] = ELEMENT_TYPE_CLASS;
++    len += encode_int( typedef_or_ref(TABLE_TYPEREF, def->md.ref), buf + len );
++    len += encode_int( args ? list_count( args ) : 0, buf + len );
++    if (args) LIST_FOR_EACH_ENTRY( arg, args, const typeref_t, entry ) len += make_type_sig( arg->type, buf + len );
++    return len;
++}
++
++/* TypeDefOrRef token of a type used as an interface or event type: generic instances go through a TypeSpec */
++static UINT type_def_or_ref_token( const type_t *type )
++{
++    while (type_get_type( type ) == TYPE_POINTER) type = type_pointer_get_ref_type( type );
++    type = type_get_real_type( type );
++
++    if (type->md.generic_tmpl || is_partial_specialization( type ))
++    {
++        BYTE sig[256];
++        UINT size = make_type_sig( type, sig );
++        return typedef_or_ref( TABLE_TYPESPEC, add_typespec_row( add_blob(sig, size) ) );
++    }
++    return typedef_or_ref( TABLE_TYPEREF, type->md.ref );
++}
++
+ static UINT make_type_sig( const type_t *type, BYTE *buf )
+ {
+     UINT len = 0;
+@@ -1683,6 +1899,7 @@
+         case TYPE_DELEGATE:
+         case TYPE_INTERFACE:
+         case TYPE_RUNTIMECLASS:
++        case TYPE_PARAMETERIZED_TYPE:
+             skip_byref = TRUE;
+             break;
+         default:
+@@ -1698,14 +1915,40 @@
+         break;
+ 
+     case TYPE_INTERFACE:
+-        buf[len++] = ELEMENT_TYPE_OBJECT;
+-        break;
+-
++        if (!type->md.generic_tmpl && type->name && !strcmp( type->name, "IInspectable" ))
++        {
++            buf[len++] = ELEMENT_TYPE_OBJECT;
++            break;
++        }
++        /* fall through */
+     case TYPE_DELEGATE:
+     case TYPE_RUNTIMECLASS:
++        if (type->md.generic_tmpl)
++        {
++            len += make_generic_inst_sig( type->md.generic_tmpl, type->md.generic_args, buf + len );
++            break;
++        }
+         buf[len++] = ELEMENT_TYPE_CLASS;
+-        len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + 1 );
++        len += encode_int( typedef_or_ref(TABLE_TYPEREF, type->md.ref), buf + len );
++        break;
++
++    case TYPE_PARAMETERIZED_TYPE: /* partial specialization inside a parameterized type */
++        len += make_generic_inst_sig( type->details.parameterized.type, type->details.parameterized.params, buf + len );
++        break;
++
++    case TYPE_PARAMETER:
++    {
++        const type_t *arg;
++
++        if (!generic_params && (arg = get_subst_arg( type )))
++        {
++            len += make_type_sig( arg, buf + len );
++            break;
++        }
++        buf[len++] = ELEMENT_TYPE_VAR;
++        len += encode_int( generic_param_index( type ), buf + len );
+         break;
++    }
+ 
+     case TYPE_ENUM:
+     case TYPE_STRUCT:
+@@ -1927,6 +2170,8 @@
+     add_customattribute_row( parent, attr_type, add_blob(value, value_size) );
+ }
+ 
++static UINT version_attr_member;
++
+ static void add_version_attr_step1( const type_t *type )
+ {
+     static const BYTE sig[] = { SIG_TYPE_HASTHIS, 1, ELEMENT_TYPE_VOID, ELEMENT_TYPE_U4 };
+@@ -1940,7 +2185,9 @@
+ 
+     typeref = add_typeref_row( scope, add_string("VersionAttribute"), add_string("Windows.Foundation.Metadata") );
+     class = memberref_parent( TABLE_TYPEREF, typeref );
+-    attr->md_member = add_memberref_row( class, add_string(".ctor"), add_blob(sig, sizeof(sig)) );
++    /* types with neither version nor contract get the default version: no attr_t to hold the constructor */
++    version_attr_member = add_memberref_row( class, add_string(".ctor"), add_blob(sig, sizeof(sig)) );
++    if (attr) attr->md_member = version_attr_member;
+ }
+ 
+ static void add_version_attr_step2( const type_t *type )
+@@ -1952,7 +2199,7 @@
+     if (!(attr = get_attr( type->attrs, ATTR_VERSION )) && is_attr( type->attrs, ATTR_CONTRACT )) return;
+ 
+     parent = has_customattribute( TABLE_TYPEDEF, type->md.def );
+-    attr_type = customattribute_type( TABLE_MEMBERREF, attr->md_member );
++    attr_type = customattribute_type( TABLE_MEMBERREF, attr ? attr->md_member : version_attr_member );
+     value_size = make_version_value( attr, value );
+     add_customattribute_row( parent, attr_type, add_blob(value, value_size) );
+ }
+@@ -2327,12 +2574,19 @@
+ 
+     create_typeref( type );
+ 
+-    if ((class = type->details.iface->runtime_class)) add_runtimeclass_type_step1( class );
++    if ((class = type->details.iface->runtime_class) && class->md.in_file) add_runtimeclass_type_step1( class );
+ 
+     add_contract_attr_step1( type );
+     add_uuid_attr_step1( type );
+     add_exclusiveto_attr_step1( type );
+ 
++    if (type_iface_get_requires( type ))
++    {
++        const typeref_t *require;
++        LIST_FOR_EACH_ENTRY( require, type_iface_get_requires( type ), const typeref_t, entry )
++            create_typeref( require->type );
++    }
++
+     STATEMENTS_FOR_EACH_FUNC( stmt, type_iface_get_stmts(type) )
+     {
+         const var_t *method = stmt->u.var;
+@@ -2606,7 +2860,7 @@
+         type_t *arg_type = arg->declspec.type;
+ 
+         arg_type = type_pointer_get_ref_type( arg_type ); /* first arg must be a delegate pointer */
+-        event_type = typedef_or_ref( TABLE_TYPEREF, arg_type->md.ref );
++        event_type = type_def_or_ref_token( arg_type );
+         break;
+     }
+ 
+@@ -2646,15 +2900,19 @@
+ 
+     if (require_list) LIST_FOR_EACH_ENTRY( require, require_list, typeref_t, entry )
+     {
+-        interface = typedef_or_ref( TABLE_TYPEREF, require->type->md.ref );
++        interface = type_def_or_ref_token( require->type );
+         add_interfaceimpl_row( type->md.def, interface );
+     }
+ 
++    /* create the property rows first: a setter declared before its getter (IAsyncOperation<TResult>::Completed)
++       then finds the property and no longer adds the getter a second time */
++    STATEMENTS_FOR_EACH_FUNC( stmt, type_iface_get_stmts(type) )
++        add_property( NULL, type, stmt->u.var );
++
+     STATEMENTS_FOR_EACH_FUNC( stmt, type_iface_get_stmts(type) )
+     {
+         const var_t *method = stmt->u.var;
+ 
+-        add_property( NULL, type, method );
+         add_event( NULL, type, method );
+         add_method( NULL, type, method );
+ 
+@@ -2663,7 +2921,7 @@
+         add_overload_attr_step2( method );
+     }
+ 
+-    if ((class = type->details.iface->runtime_class)) add_runtimeclass_type_step2( class );
++    if ((class = type->details.iface->runtime_class) && class->md.in_file) add_runtimeclass_type_step2( class );
+ 
+     add_contract_attr_step2( type );
+     add_uuid_attr_step2( type );
+@@ -2795,8 +3053,32 @@
+     type_t *type = method->declspec.type;
+     BYTE sig[256];
+ 
+-    parent = memberref_parent( TABLE_TYPEREF, iface->md.ref );
+-    sig_size = make_method_sig( method, sig, FALSE );
++    if (iface->md.generic_tmpl)
++    {
++        /* the declaration is the generic interface's method: its signature uses the type parameters */
++        type_t *def = get_template_definition( iface->md.generic_tmpl );
++        const statement_t *stmt;
++        const var_t *method_def = method;
++        const typeref_list_t *saved = generic_params;
++        UINT token = type_def_or_ref_token( iface ), index = 0, i = 0;
++
++        parent = memberref_parent( TABLE_TYPESPEC, token >> 2 );
++        STATEMENTS_FOR_EACH_FUNC( stmt, type_iface_get_stmts(iface) )
++        {
++            if (stmt->u.var == method) break;
++            index++;
++        }
++        STATEMENTS_FOR_EACH_FUNC( stmt, type_iface_get_stmts(def) )
++            if (i++ == index) { method_def = stmt->u.var; break; }
++        generic_params = iface->md.generic_tmpl->details.parameterized.params;
++        sig_size = make_method_sig( method_def, sig, FALSE );
++        generic_params = saved;
++    }
++    else
++    {
++        parent = memberref_parent( TABLE_TYPEREF, iface->md.ref );
++        sig_size = make_method_sig( method, sig, FALSE );
++    }
+ 
+     memberref = add_memberref_row( parent, add_string(name), add_blob(sig, sig_size) );
+     free( name );
+@@ -2811,11 +3093,15 @@
+ {
+     UINT parent, attr_type, value_size;
+     BYTE value[MAX_NAME + sizeof(UINT) + 5];
+-    const attr_t *attr = get_attr( iface->attrs, ATTR_CONTRACT );
++    const attr_t *attr = get_attr( iface->attrs, ATTR_CONTRACT ), *class_attr = get_attr( class->attrs, ATTR_CONTRACT );
++
++    /* interfaces without a contract (version-only) take the class's; no contract at all, no attribute */
++    if (!attr || !attr->md_member) attr = class_attr;
++    if (!attr || !attr->md_member || !class_attr) return;
+ 
+     parent = has_customattribute( TABLE_METHODDEF, method->md.def );
+     attr_type = customattribute_type( TABLE_MEMBERREF, attr->md_member );
+-    value_size = make_contract_value( get_attr(class->attrs, ATTR_CONTRACT), value );
++    value_size = make_contract_value( class_attr, value );
+     add_customattribute_row( parent, attr_type, add_blob(value, value_size) );
+ 
+     if (method->md.class_property)
+@@ -2892,7 +3178,7 @@
+         if (attr->type != ATTR_STATIC) continue;
+ 
+         parent = has_customattribute( TABLE_TYPEDEF, type->md.def );
+-        attr_type = customattribute_type( TABLE_MEMBERREF, attr->md_member );
++        attr_type = customattribute_type( TABLE_MEMBERREF, get_attr( type->attrs, ATTR_STATIC )->md_member );
+         value_size = make_static_value( attr->u.pval, value );
+         add_customattribute_row( parent, attr_type, add_blob(value, value_size) );
+     }
+@@ -3202,11 +3488,14 @@
+ 
+         create_typeref( iface->type );
+ 
+-        interface = typedef_or_ref( TABLE_TYPEREF, iface->type->md.ref );
++        interface = type_def_or_ref_token( iface->type );
+         interfaceimpl_ref = add_interfaceimpl_row( class->md.def, interface );
+ 
+         if (is_attr( iface->attrs, ATTR_DEFAULT )) add_default_attr( interfaceimpl_ref );
+ 
++        subst_params = iface->type->md.generic_tmpl ? iface->type->md.generic_tmpl->details.parameterized.params : NULL;
++        subst_args = iface->type->md.generic_tmpl ? iface->type->md.generic_args : NULL;
++
+         /* add properties in reverse order like midlrt */
+         STATEMENTS_FOR_EACH_FUNC_REV( stmt, type_iface_get_stmts(iface->type) )
+         {
+@@ -3224,6 +3513,7 @@
+             add_method_impl( class, iface->type, method );
+             add_method_contract_attrs( class, iface->type, method->declspec.type );
+         }
++        subst_params = subst_args = NULL;
+     }
+ }
+ 
+@@ -3473,20 +3763,132 @@
+     add_contract_attr_step2( type );
+ }
+ 
++/* A WinMD file named N.winmd holds the types of namespace N and of its sub-namespaces (types live in the file
++   with the longest name matching their namespace). The file's own IDL imports the IDLs of its sub-namespaces,
++   so the types defined in imported files under N are written here too. */
++static BOOL namespace_in_root( const char *ns )
++{
++    size_t len = strlen( assembly_name );
++    return ns && !strncmp( ns, assembly_name, len ) && (!ns[len] || ns[len] == '.');
++}
++
++static BOOL type_in_root( const type_t *type )
++{
++    char *ns;
++    BOOL ret;
++
++    if (!type->namespace) return FALSE;
++    ns = format_namespace( type->namespace, "", ".", NULL, NULL );
++    ret = namespace_in_root( ns );
++    free( ns );
++    return ret;
++}
++
++static BOOL is_specialization( const type_t *type )
++{
++    return type->signature && !strncmp( type->signature, "pinterface", 10 );
++}
++
++static type_t **file_types;
++static UINT file_types_count, file_types_size;
++
++static void add_file_type( type_t *type )
++{
++    if (type->md.in_file) return;
++    type->md.in_file = 1;
++    if (type_get_type_detect_alias( type ) == TYPE_PARAMETERIZED_TYPE) get_template_definition( type )->md.in_file = 1;
++    if (file_types_count == file_types_size)
++    {
++        file_types_size = file_types_size ? file_types_size * 2 : 64;
++        file_types = xrealloc( file_types, file_types_size * sizeof(*file_types) );
++    }
++    file_types[file_types_count++] = type;
++}
++
++/* asyncinfo.idl and eventtoken.idl declare Windows.Foundation types (IAsyncInfo, AsyncStatus,
++   EventRegistrationToken) in the global namespace, like the SDK headers; their metadata belongs here */
++static BOOL is_global_foundation_type( const type_t *type )
++{
++    const char *file = type->where.input_name, *base;
++
++    if (strcmp( assembly_name, "Windows.Foundation" ) || !file) return FALSE;
++    if (type->namespace && !is_global_namespace( type->namespace )) return FALSE;
++    base = strrchr( file, '/' ) ? strrchr( file, '/' ) + 1 : file;
++    return !strcmp( base, "asyncinfo.idl" ) || !strcmp( base, "eventtoken.idl" );
++}
++
++static void collect_file_types( const statement_list_t *stmt_list )
++{
++    const statement_t *stmt;
++
++    if (stmt_list) LIST_FOR_EACH_ENTRY( stmt, stmt_list, const statement_t, entry )
++    {
++        if (stmt->type != STMT_TYPE || is_specialization( stmt->u.type )) continue;
++        add_file_type( stmt->u.type );
++    }
++    if (metadata_import_stmts) LIST_FOR_EACH_ENTRY( stmt, metadata_import_stmts, const statement_t, entry )
++    {
++        if (stmt->type == STMT_TYPEDEF && stmt->u.type_list)
++        {
++            const typeref_t *ref;
++            LIST_FOR_EACH_ENTRY( ref, stmt->u.type_list, const typeref_t, entry )
++            {
++                type_t *type = type_get_real_type( ref->type );
++                if ((type_get_type( type ) == TYPE_ENUM || type_get_type( type ) == TYPE_STRUCT) &&
++                    type->defined && is_global_foundation_type( type )) add_file_type( type );
++            }
++            continue;
++        }
++        if (stmt->type != STMT_TYPE || is_specialization( stmt->u.type )) continue;
++        if (!stmt->u.type->defined) continue;
++        if (!type_in_root( stmt->u.type ) && !is_global_foundation_type( stmt->u.type )) continue;
++        add_file_type( stmt->u.type );
++    }
++}
++
++static void add_parameterized_type_step1( type_t *type )
++{
++    type_t *def = get_template_definition( type );
++
++    generic_params = type->details.parameterized.params;
++    if (type_get_type( def ) == TYPE_DELEGATE) add_delegate_type_step1( def );
++    else add_interface_type_step1( def );
++    generic_params = NULL;
++}
++
++static void add_parameterized_type_step2( type_t *type )
++{
++    type_t *def = get_template_definition( type );
++    const typeref_t *param;
++    USHORT number = 0;
++
++    generic_params = type->details.parameterized.params;
++    if (type_get_type( def ) == TYPE_DELEGATE) add_delegate_type_step2( def );
++    else add_interface_type_step2( def );
++    generic_params = NULL;
++
++    /* one GenericParam row per type parameter, owner = the TypeDef (TypeOrMethodDef tag 0) */
++    if (type->details.parameterized.params)
++        LIST_FOR_EACH_ENTRY( param, type->details.parameterized.params, const typeref_t, entry )
++            add_genericparam_row( number++, def->md.def << 1, add_string(param->type->name) );
++}
++
+ static void build_tables( const statement_list_t *stmt_list )
+ {
+     const statement_t *stmt;
++    UINT i;
+ 
+     /* Adding a type involves two passes: the first creates various references and the second
+        uses those references to create the remaining rows. */
+ 
+     LIST_FOR_EACH_ENTRY( stmt, stmt_list, const statement_t, entry )
+-    {
+-        type_t *type = stmt->u.type;
+-
+         if (stmt->type == STMT_IMPORT) append_assembly_import( stmt->u.str );
+ 
+-        if (stmt->type != STMT_TYPE) continue;
++    collect_file_types( stmt_list );
++
++    for (i = 0; i < file_types_count; i++)
++    {
++        type_t *type = file_types[i];
+ 
+         switch (type->type_type)
+         {
+@@ -3497,11 +3899,6 @@
+             add_struct_type_step1( type );
+             break;
+         case TYPE_INTERFACE:
+-            if (type->signature && !strncmp( type->signature, "pinterface", 10 ))
+-            {
+-                /* fprintf( stderr, "Ignoring supported %s parameterized interface.\n", type->name ); */
+-                break;
+-            }
+             add_interface_type_step1( type );
+             break;
+         case TYPE_APICONTRACT:
+@@ -3513,17 +3910,18 @@
+         case TYPE_DELEGATE:
+             add_delegate_type_step1( type );
+             break;
++        case TYPE_PARAMETERIZED_TYPE:
++            add_parameterized_type_step1( type );
++            break;
+         default:
+             fprintf( stderr, "Unhandled type %u name '%s'.\n", type->type_type, type->name );
+             break;
+         }
+     }
+ 
+-    LIST_FOR_EACH_ENTRY( stmt, stmt_list, const statement_t, entry )
++    for (i = 0; i < file_types_count; i++)
+     {
+-        type_t *type = stmt->u.type;
+-
+-        if (stmt->type != STMT_TYPE) continue;
++        type_t *type = file_types[i];
+ 
+         switch (type->type_type)
+         {
+@@ -3534,11 +3932,6 @@
+             add_struct_type_step2( type );
+             break;
+         case TYPE_INTERFACE:
+-            if (type->signature && !strncmp( type->signature, "pinterface", 10 ))
+-            {
+-                /* fprintf( stderr, "Ignoring supported %s parameterized interface.\n", type->name ); */
+-                break;
+-            }
+             add_interface_type_step2( type );
+             break;
+         case TYPE_APICONTRACT:
+@@ -3550,12 +3943,47 @@
+         case TYPE_DELEGATE:
+             add_delegate_type_step2( type );
+             break;
++        case TYPE_PARAMETERIZED_TYPE:
++            add_parameterized_type_step2( type );
++            break;
+         default:
+             break;
+         }
+     }
+ }
+ 
++/* the assembly is named like the file, in the case of the namespace it holds ("Windows.Storage") */
++static char *get_assembly_name( const statement_list_t *stmt_list )
++{
++    const char *base = strrchr( metadata_name, '/' );
++    const statement_list_t *lists[2] = { stmt_list, metadata_import_stmts };
++    const statement_t *stmt;
++    char *name, *ptr;
++    size_t len;
++    UINT i;
++
++    name = xstrdup( base ? base + 1 : metadata_name );
++    if ((ptr = strrchr( name, '.' )) && !strcasecmp( ptr, ".winmd" )) *ptr = 0;
++    len = strlen( name );
++
++    for (i = 0; i < ARRAY_SIZE(lists); i++)
++    {
++        if (!lists[i]) continue;
++        LIST_FOR_EACH_ENTRY( stmt, lists[i], const statement_t, entry )
++        {
++            char *ns;
++            BOOL match;
++
++            if (stmt->type != STMT_TYPE || !stmt->u.type->namespace) continue;
++            ns = format_namespace( stmt->u.type->namespace, "", ".", NULL, NULL );
++            if ((match = !strncasecmp( ns, name, len ) && (!ns[len] || ns[len] == '.'))) memcpy( name, ns, len );
++            free( ns );
++            if (match) return name;
++        }
++    }
++    return name;
++}
++
+ static void build_table_stream( const statement_list_t *stmts )
+ {
+     static const GUID guid = { 0x9ddc04c6, 0x04ca, 0x04cc, { 0x52, 0x85, 0x4b, 0x50, 0xb2, 0x60, 0x1d, 0xa8 } };
+@@ -3569,12 +3997,13 @@
+     add_userstring( &space, sizeof(space) );
+     add_blob( NULL, 0 );
+ 
+-    assembly_name = xstrdup( metadata_name );
+-    if ((ptr = strrchr( assembly_name, '.' ))) *ptr = 0;
++    assembly_name = get_assembly_name( stmts );
++    ptr = strmake( "%s.winmd", assembly_name );
+ 
+     add_typedef_row( 0, add_string("<Module>"), 0, 0, 1, 1 );
+     add_assembly_row( add_string(assembly_name) );
+-    add_module_row( add_string(metadata_name), add_guid(&guid) );
++    add_module_row( add_string(ptr), add_guid(&guid) );
++    free( ptr );
+     add_assemblyref_row( 0, add_blob(token, sizeof(token)), add_string("mscorlib") );
+ 
+     build_tables( stmts );
+@@ -3606,8 +4035,10 @@
+     serialize_property_table();
+     serialize_methodsemantics_table();
+     serialize_methodimpl_table();
++    serialize_typespec_table();
+     serialize_assembly_table();
+     serialize_assemblyref_table();
++    serialize_genericparam_table();
+ }
+ 
+ static void build_streams( const statement_list_t *stmts )
+--- a/tools/widl/parser.y
++++ b/tools/widl/parser.y
+@@ -105,6 +105,9 @@
+ 
+ static typelib_t *current_typelib;
+ 
++/* statements of imported files, kept for the winmd writer (it merges sub-namespaces) */
++statement_list_t *metadata_import_stmts = NULL;
++
+ %}
+ 
+ %code requires
+@@ -521,7 +524,8 @@
+ 
+ import_start: tIMPORT aSTRING ';'		{ $$ = $2; push_import( $2, &yylloc ); }
+ 	;
+-import: import_start imp_statements aEOF	{ yylloc = pop_import(); }
++import: import_start imp_statements aEOF	{ yylloc = pop_import();
++						  if (do_metadata) metadata_import_stmts = append_statements( metadata_import_stmts, $2 ); }
+ 	;
+ 
+ importlib: tIMPORTLIB '(' aSTRING ')'
+--- a/tools/widl/widl.c
++++ b/tools/widl/widl.c
+@@ -837,6 +837,7 @@
+ 
+   add_widl_version_define();
+   wpp_add_cmdline_define("_WIN32=1");
++  if (do_metadata) wpp_add_cmdline_define("__WIDL_WINMD__=1");
+ 
+   atexit(rm_tempfile);
+   if (preprocess_only) exit( wpp_parse( input_name, stdout ) );
+--- a/tools/widl/widl.h
++++ b/tools/widl/widl.h
+@@ -60,6 +60,7 @@
+ extern char *local_stubs_name;
+ extern char *typelib_name;
+ extern char *metadata_name;
++extern statement_list_t *metadata_import_stmts;
+ extern char *dlldata_name;
+ extern char *proxy_name;
+ extern char *proxy_token;
+--- a/tools/widl/widltypes.h
++++ b/tools/widl/widltypes.h
+@@ -516,6 +516,10 @@
+     unsigned int class_event;
+     unsigned int iface_event;
+     unsigned int eventmap;
++    /* winmd: template (TYPE_PARAMETERIZED_TYPE) and arguments of a specialized parameterized type */
++    type_t *generic_tmpl;
++    typeref_list_t *generic_args;
++    unsigned int in_file;
+ };
+ 
+ struct _type_t {
+--- a/tools/widl/typetree.c
++++ b/tools/widl/typetree.c
+@@ -1544,6 +1544,8 @@
+     new_type->short_name = format_parameterized_type_short_name(type, params, "");
+     new_type->param_name = format_parameterized_type_c_name(type, params, "", "__C");
+     new_type->winmd_short_name = format_parameterized_type_winmd_short_name(type, params);
++    new_type->md.generic_tmpl = type;
++    new_type->md.generic_args = params;
+ 
+     if (new_type->type_type == TYPE_DELEGATE)
+     {
+--- a/include/windows.foundation.idl
++++ b/include/windows.foundation.idl
+@@ -17,6 +17,7 @@
+  */
+ 
+ #ifdef __WIDL__
++#pragma makedep header install winmd
+ #pragma winrt ns_prefix
+ #endif
+ 
+@@ -26,6 +27,11 @@
+ import "eventtoken.idl";
+ /* import "ivectorchangedeventargs.idl"; */
+ import "windows.foundation.collections.idl";
++#ifdef __WIDL_WINMD__
++/* Windows.Foundation.winmd holds the Windows.Foundation.* namespaces */
++import "windows.foundation.metadata.idl";
++import "windows.foundation.numerics.idl";
++#endif
+ 
+ namespace Windows.Foundation.Collections {
+     interface IPropertySet;
+--- a/include/windows.applicationmodel.idl
++++ b/include/windows.applicationmodel.idl
+@@ -26,6 +26,13 @@
+ import "windows.system.idl";
+ import "windows.applicationmodel.activation.idl";
+ import "windows.applicationmodel.core.idl";
++#ifdef __WIDL_WINMD__
++/* Windows.ApplicationModel.winmd holds the Windows.ApplicationModel.* namespaces */
++import "windows.applicationmodel.background.idl";
++import "windows.applicationmodel.datatransfer.idl";
++import "windows.applicationmodel.datatransfer.dragdrop.idl";
++import "windows.applicationmodel.datatransfer.dragdrop.core.idl";
++#endif
+ 
+ namespace Windows.ApplicationModel.Core {
+     runtimeclass AppListEntry;
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1260,6 +1260,7 @@
+ 
+ INSTALL_LIB = \
+ 	windows.applicationmodel.winmd \
++	windows.foundation.winmd \
+ 	windows.globalization.winmd \
+ 	windows.graphics.winmd \
+ 	windows.media.winmd \
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -1571,6 +1571,7 @@
+ 
+ [WinmdFiles]
+ windows.applicationmodel.winmd
++windows.foundation.winmd
+ windows.globalization.winmd
+ windows.graphics.winmd
+ windows.media.winmd
