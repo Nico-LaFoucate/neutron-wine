@@ -1,0 +1,1070 @@
+From: Neutron lab (team agent msi-rollback) 2026-11-08
+Subject: [PATCH] msi: Roll back only what the failed install did to files, folders and component registration.
+
+What was seen (lab, Adobe Acrobat Pro 26.002.22031, silent msiexec /i AcroPro.msi PATCH=AcrobatDCx64Upd2600222031.msp
+in a copy of a prefix that already holds other Adobe apps; the install fails at PatchFiles, 1603): the rollback
+deleted 261 files that were there before the install and that the install had left alone -- another app's
+Linguistics/Hunspell files, Acrobat ActiveX, ARM, and the VC++ runtime DLLs in system32/syswow64.
+
+Mechanism: Wine rolls back by re-running each standard action's inverse with every component and feature at its
+pre-install state. InstallFiles' inverse, RemoveFiles, then deletes every file of every component whose pre-install
+state is ABSENT -- which is the state of a component GUID registered to another product -- including files the
+install kept because they were newer, the same version or a hash match. Files it overwrote were never saved. Brand
+new components (state UNKNOWN) were skipped, so the files the install did create stayed (14 todo_wine checks in
+tests/install.c). ProcessComponents' inverse recounted SharedDLLs per feature and could drop below the value from
+before the install.
+
+Windows behavior (Microsoft, "Rollback Installation"): while it runs the installation script the installer
+"simultaneously generates a rollback script and saves a copy of every file deleted during the installation", keeps
+those copies in a hidden system folder, deletes them after success, and on failure returns the system to its
+original state.
+
+Fix, the same structure: the install records what it does and rollback undoes only that.
+- InstallFiles (cabinet and uncompressed paths) and PatchFiles record each target before writing it: missing ->
+  rollback deletes it; existing -> a copy is saved to C:\Config.Msi and rollback moves it back. The first write
+  to a path wins when several File rows target the same path. Files the install kept have no record and are left
+  alone. Saved copies are deleted when the package is freed.
+- create_folder() records each folder level it creates; rollback removes those, deepest first, only if empty.
+- ProcessComponents records the component key (existed, this product's client value, permanent value) and every
+  SharedDLLs value before writing them; rollback writes those values back instead of recounting.
+- Rollback RemoveFiles no longer runs the RemoveFile table or deletes by component state.
+
+Not covered (unchanged): registry values (RemoveRegistryValues by component state at rollback, same class of
+problem), files deleted by the forward RemoveFiles/RemoveFile table (not saved), DuplicateFiles and MoveFiles,
+GAC/WinSxS assemblies (with records, rollback no longer uninstalls them: a new one stays, a pre-existing one is no
+longer removed), files replaced through the in-use/at-reboot path, rollback after REINSTALL (still skipped).
+Restored files keep their contents; their times come back at 100 ns precision.
+
+Test: tests/install.c test_rollback: product 1 installs a SharedDllRefCount component; product 2 shares it, creates
+a file, finds an unversioned same-size file, a newer and an older versioned file, writes two paths twice, then a
+deferred custom action (custom.dll rb_fail) fails. Checked: product 2 not registered, created file gone, the other
+files byte-identical to before, SharedDLLs count still 1, product 1 still a client and product 2 not; uncompressed
+and cabinet. The 14 todo_wine checks of failed installs (test_continuouscabs, test_caborder, test_missingcab,
+test_sourcefolder) now pass and lose the marker.
+
+Lab evidence (runtime 11.10-185mr / 185amr = 185 / 185am + this msi.dll; tests cross-built with mingw):
+- install tests: x86_64 4669 tests 0 failures, i386 4759 0 failures (n=2 each); kill switch on the same build:
+  24 failures (n=2 each arch). The other 10 msi test files: same results as stock 185 on both arches.
+- Acrobat case (fresh copies of the same base prefix, n=2): every one of 162199 pre-existing files still present,
+  the 132 files the install had overwritten byte-identical to the base, no new file left under Acrobat DC, the
+  shared component key back to its pre-install state. Kill switch on the same build (n=2): 261 files missing and
+  the component left registered. SharedDLLs unchanged in all four runs.
+
+Kill switch: NEUTRON_MSI_NO_ROLLBACK_RECORD=1 (previous behavior; read once per process).
+
+--- a/dlls/msi/msipriv.h	2026-11-05 11:32:05.942818257 -0500
++++ b/dlls/msi/msipriv.h	2026-11-08 16:45:31.181196832 -0500
+@@ -416,6 +416,7 @@
+     struct list components;
+     struct list features;
+     struct list files;
++    struct list rollback_dirs; /* folders this install created, for rollback */
+     struct list filepatches;
+     struct list tempfiles;
+     struct list folders;
+@@ -545,6 +546,13 @@
+     LPWSTR AdvertiseString;
+     MSIASSEMBLY *assembly;
+     int num_clients;
++    /* rollback record: this component's registration before ProcessComponents changed it */
++    struct list rollback_shared_dlls;
++    WCHAR *rollback_client;
++    unsigned int rollback_recorded:1;
++    unsigned int rollback_key_existed:1;
++    unsigned int rollback_client_existed:1;
++    unsigned int rollback_permanent_existed:1;
+ 
+     unsigned int anyAbsent:1;
+     unsigned int hasAdvertisedFeature:1;
+@@ -606,6 +614,13 @@
+     msifs_hashmatch
+ } msi_file_state;
+ 
++enum file_rollback
++{
++    FILE_ROLLBACK_NONE,     /* not written by this install: rollback leaves it alone */
++    FILE_ROLLBACK_CREATED,  /* did not exist before: rollback deletes it */
++    FILE_ROLLBACK_REPLACED, /* existed before: rollback restores the saved copy */
++};
++
+ typedef struct tagMSIFILE
+ {
+     struct list entry;
+@@ -624,6 +639,8 @@
+     BOOL IsCompressed;
+     MSIFILEHASHINFO hash;
+     UINT disk_id;
++    enum file_rollback rollback;
++    WCHAR *rollback_backup;
+ } MSIFILE;
+ 
+ typedef struct tagMSIFILEPATCH
+@@ -1106,6 +1123,10 @@
+ extern HANDLE msi_find_first_file( MSIPACKAGE *, const WCHAR *, WIN32_FIND_DATAW * );
+ extern BOOL msi_find_next_file( MSIPACKAGE *, HANDLE, WIN32_FIND_DATAW * );
+ extern BOOL msi_move_file( MSIPACKAGE *, const WCHAR *, const WCHAR *, DWORD );
++extern BOOL msi_rollback_is_recorded( void );
++extern void msi_free_file_rollback( MSIPACKAGE *, MSIFILE * );
++extern void msi_free_shared_dll_rollback( struct list * );
++extern void msi_free_dir_rollback( MSIPACKAGE * );
+ extern BYTE *msi_get_file_version_info( MSIPACKAGE *, const WCHAR * );
+ extern BOOL msi_create_full_path( MSIPACKAGE *, const WCHAR * );
+ extern DWORD msi_get_disk_file_size( MSIPACKAGE *, const WCHAR * );
+--- a/dlls/msi/files.c	2026-11-05 11:32:10.387820731 -0500
++++ b/dlls/msi/files.c	2026-11-08 17:55:48.952878409 -0500
+@@ -148,6 +148,216 @@
+     return ret;
+ }
+ 
++/* Rollback, as Windows Installer does it: while the script runs, each file this install
++ * writes is recorded with what it was before (missing, or a copy saved under Config.Msi on
++ * the system drive); a failed install then undoes exactly those writes. Files the install
++ * kept (newer, same version or hash match, not scheduled) have no record and stay as they
++ * were. NEUTRON_MSI_NO_ROLLBACK_RECORD=1 restores the previous behavior (rollback removes
++ * every file of every component that was not installed before). */
++BOOL msi_rollback_is_recorded( void )
++{
++    static int recorded = -1;
++
++    if (recorded < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_MSI_NO_ROLLBACK_RECORD", buf, sizeof(buf) );
++        recorded = !(len && len < sizeof(buf) && buf[0] == '1');
++        if (!recorded) WARN( "rollback records disabled (NEUTRON_MSI_NO_ROLLBACK_RECORD)\n" );
++    }
++    return recorded;
++}
++
++static BOOL rollback_should_record( MSIPACKAGE *package )
++{
++    return msi_rollback_is_recorded() && !package->need_rollback &&
++           !msi_get_property_int( package->db, L"RollbackDisabled", 0 );
++}
++
++static WCHAR *create_rollback_backup_name( MSIPACKAGE *package )
++{
++    WCHAR dir[MAX_PATH], *name;
++    UINT len = GetWindowsDirectoryW( dir, MAX_PATH );
++
++    if (len < 3 || len >= MAX_PATH || dir[1] != ':') return NULL;
++    lstrcpyW( dir + 3, L"Config.Msi" );
++    if (CreateDirectoryW( dir, NULL ))
++        SetFileAttributesW( dir, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM );
++    if (!(name = malloc( MAX_PATH * sizeof(WCHAR) ))) return NULL;
++    if (!GetTempFileNameW( dir, L"rbf", 0, name ))
++    {
++        free( name );
++        return NULL;
++    }
++    return name;
++}
++
++/* called before this install writes file->TargetPath */
++static void record_file_rollback( MSIPACKAGE *package, MSIFILE *file )
++{
++    MSIFILE *other;
++    WCHAR *backup;
++
++    if (file->rollback != FILE_ROLLBACK_NONE || !rollback_should_record( package )) return;
++
++    /* the first write to a path records its state before the install; File rows that
++     * target the same path later must not record the intermediate state */
++    LIST_FOR_EACH_ENTRY( other, &package->files, MSIFILE, entry )
++    {
++        if (other != file && other->rollback != FILE_ROLLBACK_NONE && !wcsicmp( other->TargetPath, file->TargetPath ))
++        {
++            TRACE( "rollback record: %s already recorded\n", debugstr_w(file->TargetPath) );
++            return;
++        }
++    }
++
++    if (msi_get_file_attributes( package, file->TargetPath ) == INVALID_FILE_ATTRIBUTES)
++    {
++        TRACE( "rollback record: %s is new\n", debugstr_w(file->TargetPath) );
++        file->rollback = FILE_ROLLBACK_CREATED;
++        return;
++    }
++    if ((backup = create_rollback_backup_name( package )))
++    {
++        if (msi_copy_file( package, file->TargetPath, backup, FALSE ))
++        {
++            TRACE( "rollback record: %s saved as %s\n", debugstr_w(file->TargetPath), debugstr_w(backup) );
++            file->rollback = FILE_ROLLBACK_REPLACED;
++            file->rollback_backup = backup;
++            return;
++        }
++        DeleteFileW( backup );
++        free( backup );
++    }
++    WARN( "could not save %s for rollback (%lu)\n", debugstr_w(file->TargetPath), GetLastError() );
++}
++
++/* undo what this install did to its files; returns TRUE if records are in use */
++static BOOL rollback_files( MSIPACKAGE *package )
++{
++    MSIFILE *file;
++
++    if (!msi_rollback_is_recorded()) return FALSE;
++
++    LIST_FOR_EACH_ENTRY( file, &package->files, MSIFILE, entry )
++    {
++        switch (file->rollback)
++        {
++        case FILE_ROLLBACK_CREATED:
++            TRACE( "rollback: removing %s\n", debugstr_w(file->TargetPath) );
++            msi_set_file_attributes( package, file->TargetPath, FILE_ATTRIBUTE_NORMAL );
++            if (!msi_delete_file( package, file->TargetPath ) && GetLastError() != ERROR_FILE_NOT_FOUND)
++                WARN( "failed to delete %s (%lu)\n", debugstr_w(file->TargetPath), GetLastError() );
++            file->state = msifs_missing;
++            break;
++        case FILE_ROLLBACK_REPLACED:
++            TRACE( "rollback: restoring %s\n", debugstr_w(file->TargetPath) );
++            msi_set_file_attributes( package, file->TargetPath, FILE_ATTRIBUTE_NORMAL );
++            if (msi_move_file( package, file->rollback_backup, file->TargetPath,
++                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED ))
++            {
++                free( file->rollback_backup );
++                file->rollback_backup = NULL;
++            }
++            else
++            {
++                /* keep the saved copy on disk */
++                ERR( "failed to restore %s from %s (%lu)\n", debugstr_w(file->TargetPath),
++                     debugstr_w(file->rollback_backup), GetLastError() );
++                free( file->rollback_backup );
++                file->rollback_backup = NULL;
++            }
++            break;
++        default:
++            break;
++        }
++        file->rollback = FILE_ROLLBACK_NONE;
++    }
++    return TRUE;
++}
++
++struct dir_rollback
++{
++    struct list entry;
++    WCHAR *path;
++};
++
++/* called before this install creates path: remember each level of it that does not exist yet */
++static void record_dir_rollback( MSIPACKAGE *package, const WCHAR *path )
++{
++    struct dir_rollback *rec;
++    WCHAR *dir, *p;
++    int len;
++
++    if (!rollback_should_record( package ) || !(dir = wcsdup( path ))) return;
++    while ((len = lstrlenW( dir )) && dir[len - 1] == '\\') dir[len - 1] = 0;
++
++    while (lstrlenW( dir ) > 3 && msi_get_file_attributes( package, dir ) == INVALID_FILE_ATTRIBUTES)
++    {
++        BOOL known = FALSE;
++
++        LIST_FOR_EACH_ENTRY( rec, &package->rollback_dirs, struct dir_rollback, entry )
++            if (!wcsicmp( rec->path, dir )) known = TRUE;
++        if (!known && (rec = malloc( sizeof(*rec) )))
++        {
++            if ((rec->path = wcsdup( dir )))
++            {
++                TRACE( "rollback record: folder %s is new\n", debugstr_w(dir) );
++                list_add_tail( &package->rollback_dirs, &rec->entry );
++            }
++            else free( rec );
++        }
++        if (!(p = wcsrchr( dir, '\\' ))) break;
++        *p = 0;
++    }
++    free( dir );
++}
++
++/* remove the folders this install created, deepest first; a folder that is not empty stays */
++static void rollback_dirs( MSIPACKAGE *package )
++{
++    struct dir_rollback *rec, *deepest;
++
++    while (!list_empty( &package->rollback_dirs ))
++    {
++        deepest = NULL;
++        LIST_FOR_EACH_ENTRY( rec, &package->rollback_dirs, struct dir_rollback, entry )
++            if (!deepest || lstrlenW( rec->path ) > lstrlenW( deepest->path )) deepest = rec;
++
++        TRACE( "rollback: removing folder %s\n", debugstr_w(deepest->path) );
++        if (!msi_remove_directory( package, deepest->path ))
++            TRACE( "folder %s kept (%lu)\n", debugstr_w(deepest->path), GetLastError() );
++        list_remove( &deepest->entry );
++        free( deepest->path );
++        free( deepest );
++    }
++}
++
++void msi_free_dir_rollback( MSIPACKAGE *package )
++{
++    struct dir_rollback *rec, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( rec, next, &package->rollback_dirs, struct dir_rollback, entry )
++    {
++        list_remove( &rec->entry );
++        free( rec->path );
++        free( rec );
++    }
++}
++
++void msi_free_file_rollback( MSIPACKAGE *package, MSIFILE *file )
++{
++    /* install finished or rolled back: the saved copy is no longer needed */
++    if (file->rollback_backup)
++    {
++        SetFileAttributesW( file->rollback_backup, FILE_ATTRIBUTE_NORMAL );
++        DeleteFileW( file->rollback_backup );
++        free( file->rollback_backup );
++        file->rollback_backup = NULL;
++    }
++    file->rollback = FILE_ROLLBACK_NONE;
++}
++
+ static BOOL apply_filepatch( MSIPACKAGE *package, const WCHAR *patch, const WCHAR *old, const WCHAR *new )
+ {
+     BOOL ret;
+@@ -497,6 +707,7 @@
+     folder = msi_get_loaded_folder( package, dir );
+     if (folder->State == FOLDER_STATE_UNINITIALIZED)
+     {
++        record_dir_rollback( package, install_path );
+         msi_create_full_path( package, install_path );
+         folder->State = FOLDER_STATE_CREATED;
+     }
+@@ -534,6 +745,7 @@
+         if (!msi_is_global_assembly( file->Component ))
+         {
+             create_folder( package, file->Component->Directory );
++            record_file_rollback( package, file );
+         }
+         *path = wcsdup( file->TargetPath );
+         *attrs = file->Attributes;
+@@ -643,6 +855,7 @@
+             if (!is_global_assembly)
+             {
+                 create_folder(package, file->Component->Directory);
++                record_file_rollback( package, file );
+             }
+             rc = copy_install_file(package, file, source);
+             if (rc != ERROR_SUCCESS)
+@@ -723,6 +936,7 @@
+     if (!tmpfile) return ERROR_INSTALL_FAILURE;
+     if (apply_filepatch( package, patch->path, patch->File->TargetPath, tmpfile ))
+     {
++        if (!msi_is_global_assembly( patch->File->Component )) record_file_rollback( package, patch->File );
+         msi_delete_file( package, patch->File->TargetPath );
+         msi_move_file( package, tmpfile, patch->File->TargetPath, 0 );
+     }
+@@ -1549,6 +1763,12 @@
+     if (package->script == SCRIPT_NONE)
+         return msi_schedule_action(package, SCRIPT_INSTALL, L"RemoveFiles");
+ 
++    if (package->need_rollback && rollback_files( package ))
++    {
++        rollback_dirs( package );
++        return ERROR_SUCCESS;
++    }
++
+     r = MSI_DatabaseOpenViewW(package->db, L"SELECT * FROM `RemoveFile`", &view);
+     if (r == ERROR_SUCCESS)
+     {
+--- a/dlls/msi/action.c	2026-11-05 11:32:08.100900387 -0500
++++ b/dlls/msi/action.c	2026-11-08 16:37:45.235239969 -0500
+@@ -783,6 +783,7 @@
+         return ERROR_FUNCTION_FAILED;
+ 
+     list_add_tail( &package->components, &comp->entry );
++    list_init( &comp->rollback_shared_dlls );
+ 
+     /* fill in the data */
+     comp->Component = msi_dup_record_field( row, 1 );
+@@ -3217,6 +3218,43 @@
+     RegCloseKey(hkey);
+ }
+ 
++struct shared_dll_rollback
++{
++    struct list entry;
++    WCHAR *path;
++    DWORD count;
++    BOOL present;
++};
++
++/* remember a SharedDLLs value before ProcessComponents changes it */
++static void record_shared_dll( MSIPACKAGE *package, MSICOMPONENT *comp, const WCHAR *path )
++{
++    struct shared_dll_rollback *rec;
++    DWORD type, count, sz = sizeof(count);
++    HKEY hkey;
++
++    if (!comp->rollback_recorded || package->need_rollback || !path) return;
++    LIST_FOR_EACH_ENTRY( rec, &comp->rollback_shared_dlls, struct shared_dll_rollback, entry )
++        if (!wcsicmp( rec->path, path )) return;
++
++    if (!(rec = calloc( 1, sizeof(*rec) ))) return;
++    if (!(rec->path = wcsdup( path )))
++    {
++        free( rec );
++        return;
++    }
++    if ((hkey = open_shared_dlls_key( comp, FALSE, KEY_READ )))
++    {
++        if (!RegQueryValueExW( hkey, path, NULL, &type, (BYTE *)&count, &sz ))
++        {
++            rec->present = TRUE;
++            rec->count = count;
++        }
++        RegCloseKey( hkey );
++    }
++    list_add_tail( &comp->rollback_shared_dlls, &rec->entry );
++}
++
+ static void refcount_component( MSIPACKAGE *package, MSICOMPONENT *comp )
+ {
+     MSIFEATURE *feature;
+@@ -3273,7 +3311,10 @@
+         LIST_FOR_EACH_ENTRY( file, &package->files, MSIFILE, entry )
+         {
+             if (file->Component == comp)
++            {
++                record_shared_dll( package, comp, file->TargetPath );
+                 write_shared_dlls_count( comp, file->TargetPath, count );
++            }
+         }
+     }
+ 
+@@ -3284,7 +3325,80 @@
+     comp->RefCount = count;
+ 
+     if (write)
++    {
++        record_shared_dll( package, comp, comp->FullKeypath );
+         write_shared_dlls_count( comp, comp->FullKeypath, comp->RefCount );
++    }
++}
++
++void msi_free_shared_dll_rollback( struct list *entry )
++{
++    struct shared_dll_rollback *rec = LIST_ENTRY( entry, struct shared_dll_rollback, entry );
++    free( rec->path );
++    free( rec );
++}
++
++static const WCHAR *component_user_sid( MSIPACKAGE *package )
++{
++    return package->Context == MSIINSTALLCONTEXT_MACHINE ? L"S-1-5-18" : NULL;
++}
++
++/* remember the component's registration before ProcessComponents changes it */
++static void record_component( MSIPACKAGE *package, MSICOMPONENT *comp, const WCHAR *squashed_pc )
++{
++    HKEY hkey;
++
++    if (comp->rollback_recorded || package->need_rollback || !msi_rollback_is_recorded() ||
++        msi_get_property_int( package->db, L"RollbackDisabled", 0 )) return;
++
++    comp->rollback_recorded = 1;
++    if (MSIREG_OpenUserDataComponentKey( comp->ComponentId, component_user_sid( package ), &hkey, FALSE ))
++        return;
++
++    comp->rollback_key_existed = 1;
++    if ((comp->rollback_client = msi_reg_get_val_str( hkey, squashed_pc )))
++        comp->rollback_client_existed = 1;
++    if (!RegQueryValueExW( hkey, L"00000000000000000000000000000000", NULL, NULL, NULL, NULL ))
++        comp->rollback_permanent_existed = 1;
++    RegCloseKey( hkey );
++}
++
++/* rollback of ProcessComponents: put back what record_component and record_shared_dll saw */
++static void rollback_component( MSIPACKAGE *package, MSICOMPONENT *comp, const WCHAR *squashed_pc )
++{
++    struct shared_dll_rollback *rec, *next;
++    HKEY hkey;
++
++    LIST_FOR_EACH_ENTRY_SAFE( rec, next, &comp->rollback_shared_dlls, struct shared_dll_rollback, entry )
++    {
++        TRACE( "rollback: SharedDLLs %s -> %s %lu\n", debugstr_w(rec->path), rec->present ? "count" : "absent",
++               rec->count );
++        if ((hkey = open_shared_dlls_key( comp, rec->present, KEY_SET_VALUE )))
++        {
++            if (rec->present) msi_reg_set_val_dword( hkey, rec->path, rec->count );
++            else RegDeleteValueW( hkey, rec->path );
++            RegCloseKey( hkey );
++        }
++        list_remove( &rec->entry );
++        free( rec->path );
++        free( rec );
++    }
++
++    TRACE( "rollback: component %s key %s, client %s\n", debugstr_w(comp->Component),
++           comp->rollback_key_existed ? "kept" : "removed", debugstr_w(comp->rollback_client) );
++    if (!comp->rollback_key_existed)
++        MSIREG_DeleteUserDataComponentKey( comp->ComponentId, component_user_sid( package ) );
++    else if (!MSIREG_OpenUserDataComponentKey( comp->ComponentId, component_user_sid( package ), &hkey, TRUE ))
++    {
++        if (comp->rollback_client_existed) msi_reg_set_val_str( hkey, squashed_pc, comp->rollback_client );
++        else RegDeleteValueW( hkey, squashed_pc );
++        if (!comp->rollback_permanent_existed) RegDeleteValueW( hkey, L"00000000000000000000000000000000" );
++        RegCloseKey( hkey );
++    }
++    free( comp->rollback_client );
++    comp->rollback_client = NULL;
++    comp->rollback_recorded = comp->rollback_key_existed = 0;
++    comp->rollback_client_existed = comp->rollback_permanent_existed = 0;
+ }
+ 
+ static WCHAR *build_full_keypath( MSIPACKAGE *package, MSICOMPONENT *comp )
+@@ -3330,6 +3444,15 @@
+             continue;
+ 
+         squash_guid( comp->ComponentId, squashed_cc );
++
++        if (package->need_rollback && msi_rollback_is_recorded())
++        {
++            /* undo only what the forward run recorded */
++            if (comp->rollback_recorded) rollback_component( package, comp, squashed_pc );
++            continue;
++        }
++        record_component( package, comp, squashed_pc );
++
+         free( comp->FullKeypath );
+         comp->FullKeypath = build_full_keypath( package, comp );
+ 
+--- a/dlls/msi/package.c	2026-11-05 11:32:08.102900463 -0500
++++ b/dlls/msi/package.c	2026-11-08 16:45:31.181703326 -0500
+@@ -156,11 +156,14 @@
+         free_folder( folder );
+     }
+ 
++    msi_free_dir_rollback( package );
++
+     LIST_FOR_EACH_SAFE( item, cursor, &package->files )
+     {
+         MSIFILE *file = LIST_ENTRY( item, MSIFILE, entry );
+ 
+         list_remove( &file->entry );
++        msi_free_file_rollback( package, file );
+         free( file->File );
+         free( file->FileName );
+         free( file->ShortName );
+@@ -183,6 +186,13 @@
+         free( comp->Condition );
+         free( comp->KeyPath );
+         free( comp->FullKeypath );
++        free( comp->rollback_client );
++        while (!list_empty( &comp->rollback_shared_dlls ))
++        {
++            struct list *rec = list_head( &comp->rollback_shared_dlls );
++            list_remove( rec );
++            msi_free_shared_dll_rollback( rec );
++        }
+         if (comp->assembly) free_assembly( comp->assembly );
+         free( comp );
+     }
+@@ -918,6 +928,7 @@
+         list_init( &package->components );
+         list_init( &package->features );
+         list_init( &package->files );
++        list_init( &package->rollback_dirs );
+         list_init( &package->filepatches );
+         list_init( &package->tempfiles );
+         list_init( &package->folders );
+--- a/dlls/msi/tests/install.c	2026-11-05 11:32:08.103900501 -0500
++++ b/dlls/msi/tests/install.c	2026-11-08 17:55:48.955130995 -0500
+@@ -1258,6 +1258,145 @@
+     "UnpublishFeatures\t\t1950\n"
+     "InstallFinalize\t\t2000\n";
+ 
++static const char rb1_property_dat[] =
++    "Property\tValue\n"
++    "s72\tl0\n"
++    "Property\tProperty\n"
++    "INSTALLLEVEL\t3\n"
++    "ALLUSERS\t1\n"
++    "ProductCode\t{0D3B2E5A-6C1F-4B7A-9E21-5F0C8A1D7B01}\n"
++    "ProductName\tMSITEST_RB1\n"
++    "ProductVersion\t1.1.1\n"
++    "MSIFASTINSTALL\t1\n";
++
++static const char rb2_property_dat[] =
++    "Property\tValue\n"
++    "s72\tl0\n"
++    "Property\tProperty\n"
++    "INSTALLLEVEL\t3\n"
++    "ALLUSERS\t1\n"
++    "ProductCode\t{0D3B2E5A-6C1F-4B7A-9E21-5F0C8A1D7B02}\n"
++    "ProductName\tMSITEST_RB2\n"
++    "ProductVersion\t1.1.1\n"
++    "MSIFASTINSTALL\t1\n";
++
++static const char rb_media_dat[] =
++    "DiskId\tLastSequence\tDiskPrompt\tCabinet\tVolumeLabel\tSource\n"
++    "i2\ti4\tL64\tS255\tS32\tS72\n"
++    "Media\tDiskId\n"
++    "1\t7\t\t\tDISK1\t\n";
++
++static const char rb_cab_media_dat[] =
++    "DiskId\tLastSequence\tDiskPrompt\tCabinet\tVolumeLabel\tSource\n"
++    "i2\ti4\tL64\tS255\tS32\tS72\n"
++    "Media\tDiskId\n"
++    "1\t7\t\ttest1.cab\tDISK1\t\n";
++
++static const char rb1_file_dat[] =
++    "File\tComponent_\tFileName\tFileSize\tVersion\tLanguage\tAttributes\tSequence\n"
++    "s72\ts72\tl255\ti4\tS72\tS20\tI2\ti2\n"
++    "File\tFile\n"
++    "shared\tshared\tshared.txt\t1000\t\t\t8192\t1\n";
++
++static const char rb2_file_dat[] =
++    "File\tComponent_\tFileName\tFileSize\tVersion\tLanguage\tAttributes\tSequence\n"
++    "s72\ts72\tl255\ti4\tS72\tS20\tI2\ti2\n"
++    "File\tFile\n"
++    "shared\tshared\tshared.txt\t1000\t\t\t8192\t1\n"
++    "new\tnew\tnew.txt\t1000\t\t\t8192\t2\n"
++    "same\tsame\tsame.txt\t1000\t\t\t8192\t3\n"
++    "older\tolder\tolder.dll\t1000\t60000.0.0.0\t\t8192\t4\n"
++    "newer\tnewer\tnewer.dll\t1000\t1.0.0.0\t\t8192\t5\n"
++    "new2\tnew2\tnew.txt\t1000\t\t\t8192\t6\n"
++    "older2\tolder2\tolder.dll\t1000\t60001.0.0.0\t\t8192\t7\n";
++
++static const char rb2_cab_file_dat[] =
++    "File\tComponent_\tFileName\tFileSize\tVersion\tLanguage\tAttributes\tSequence\n"
++    "s72\ts72\tl255\ti4\tS72\tS20\tI2\ti2\n"
++    "File\tFile\n"
++    "shared\tshared\tshared.txt\t1000\t\t\t16384\t1\n"
++    "new\tnew\tnew.txt\t1000\t\t\t16384\t2\n"
++    "same\tsame\tsame.txt\t1000\t\t\t16384\t3\n"
++    "older\tolder\tolder.dll\t1000\t60000.0.0.0\t\t16384\t4\n"
++    "newer\tnewer\tnewer.dll\t1000\t1.0.0.0\t\t16384\t5\n"
++    "new2\tnew2\tnew.txt\t1000\t\t\t16384\t6\n"
++    "older2\tolder2\tolder.dll\t1000\t60001.0.0.0\t\t16384\t7\n";
++
++static const char rb1_component_dat[] =
++    "Component\tComponentId\tDirectory_\tAttributes\tCondition\tKeyPath\n"
++    "s72\tS38\ts72\ti2\tS255\tS72\n"
++    "Component\tComponent\n"
++    "shared\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F0}\tMSITESTDIR\t8\t\tshared\n";
++
++static const char rb2_component_dat[] =
++    "Component\tComponentId\tDirectory_\tAttributes\tCondition\tKeyPath\n"
++    "s72\tS38\ts72\ti2\tS255\tS72\n"
++    "Component\tComponent\n"
++    "shared\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F0}\tMSITESTDIR\t8\t\tshared\n"
++    "new\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F1}\tMSITESTDIR\t0\t\tnew\n"
++    "same\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F2}\tMSITESTDIR\t0\t\tsame\n"
++    "older\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F3}\tMSITESTDIR\t0\t\tolder\n"
++    "newer\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F4}\tMSITESTDIR\t0\t\tnewer\n"
++    "new2\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F5}\tMSITESTDIR\t0\t\tnew2\n"
++    "older2\t{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F6}\tMSITESTDIR\t0\t\tolder2\n";
++
++static const char rb1_feature_dat[] =
++    "Feature\tFeature_Parent\tTitle\tDescription\tDisplay\tLevel\tDirectory_\tAttributes\n"
++    "s38\tS38\tL64\tL255\tI2\ti2\tS72\ti2\n"
++    "Feature\tFeature\n"
++    "feature\t\t\t\t1\t2\tMSITESTDIR\t0\n";
++
++static const char rb2_feature_dat[] =
++    "Feature\tFeature_Parent\tTitle\tDescription\tDisplay\tLevel\tDirectory_\tAttributes\n"
++    "s38\tS38\tL64\tL255\tI2\ti2\tS72\ti2\n"
++    "Feature\tFeature\n"
++    "feature\t\t\t\t1\t2\tMSITESTDIR\t0\n"
++    "feature2\t\t\t\t2\t0\tMSITESTDIR\t0\n";
++
++static const char rb1_feature_comp_dat[] =
++    "Feature_\tComponent_\n"
++    "s38\ts72\n"
++    "FeatureComponents\tFeature_\tComponent_\n"
++    "feature\tshared\n";
++
++static const char rb2_feature_comp_dat[] =
++    "Feature_\tComponent_\n"
++    "s38\ts72\n"
++    "FeatureComponents\tFeature_\tComponent_\n"
++    "feature\tshared\n"
++    "feature\tnew\n"
++    "feature\tsame\n"
++    "feature\tolder\n"
++    "feature\tnewer\n"
++    "feature\tnew2\n"
++    "feature\tolder2\n"
++    "feature2\tshared\n";
++
++static const char rb_custom_action_dat[] =
++    "Action\tType\tSource\tTarget\n"
++    "s72\ti2\tS64\tS0\n"
++    "CustomAction\tAction\n"
++    "rb_fail\t1025\tcustom.dll\trb_fail\n";
++
++static const char rb_install_exec_seq_dat[] =
++    "Action\tCondition\tSequence\n"
++    "s72\tS255\tI2\n"
++    "InstallExecuteSequence\tAction\n"
++    "CostInitialize\t\t200\n"
++    "FileCost\t\t300\n"
++    "CostFinalize\t\t600\n"
++    "InstallValidate\t\t900\n"
++    "InstallInitialize\t\t1200\n"
++    "ProcessComponents\t\t1300\n"
++    "RemoveFiles\t\t1400\n"
++    "InstallFiles\t\t1500\n"
++    "rb_fail\tFAIL_INSTALL\t1600\n"
++    "RegisterProduct\t\t1700\n"
++    "PublishFeatures\t\t1800\n"
++    "PublishProduct\t\t1900\n"
++    "UnpublishFeatures\t\t1950\n"
++    "InstallFinalize\t\t2000\n";
++
+ static const char ft_file_dat[] =
+     "File\tComponent_\tFileName\tFileSize\tVersion\tLanguage\tAttributes\tSequence\n"
+     "s72\ts72\tl255\ti4\tS72\tS20\tI2\ti2\n"
+@@ -2036,6 +2175,45 @@
+     ADD_TABLE(shc_property)
+ };
+ 
++static const msi_table rb1_tables[] =
++{
++    ADD_TABLE(rb_media),
++    ADD_TABLE(directory),
++    ADD_TABLE(rb1_file),
++    ADD_TABLE(rb1_component),
++    ADD_TABLE(rb1_feature),
++    ADD_TABLE(rb1_feature_comp),
++    ADD_TABLE(rb_custom_action),
++    ADD_TABLE(rb_install_exec_seq),
++    ADD_TABLE(rb1_property)
++};
++
++static const msi_table rb2_tables[] =
++{
++    ADD_TABLE(rb_media),
++    ADD_TABLE(directory),
++    ADD_TABLE(rb2_file),
++    ADD_TABLE(rb2_component),
++    ADD_TABLE(rb2_feature),
++    ADD_TABLE(rb2_feature_comp),
++    ADD_TABLE(rb_custom_action),
++    ADD_TABLE(rb_install_exec_seq),
++    ADD_TABLE(rb2_property)
++};
++
++static const msi_table rb2_cab_tables[] =
++{
++    ADD_TABLE(rb_cab_media),
++    ADD_TABLE(directory),
++    ADD_TABLE(rb2_cab_file),
++    ADD_TABLE(rb2_component),
++    ADD_TABLE(rb2_feature),
++    ADD_TABLE(rb2_feature_comp),
++    ADD_TABLE(rb_custom_action),
++    ADD_TABLE(rb_install_exec_seq),
++    ADD_TABLE(rb2_property)
++};
++
+ static const msi_table shc2_tables[] =
+ {
+     ADD_TABLE(media),
+@@ -3091,10 +3269,10 @@
+     else
+     {
+         ok(r == ERROR_INSTALL_FAILURE, "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+-        todo_wine ok(!delete_pf("msitest\\augustus", TRUE), "File installed\n");
++        ok(!delete_pf("msitest\\augustus", TRUE), "File installed\n");
+         ok(!delete_pf("msitest\\caesar", TRUE), "File installed\n");
+-        todo_wine ok(!delete_pf("msitest\\maximus", TRUE), "File installed\n");
+-        todo_wine ok(!delete_pf("msitest", FALSE), "Directory created\n");
++        ok(!delete_pf("msitest\\maximus", TRUE), "File installed\n");
++        ok(!delete_pf("msitest", FALSE), "Directory created\n");
+     }
+ 
+     delete_cab_files();
+@@ -3152,11 +3330,8 @@
+     ok(r == ERROR_INSTALL_FAILURE, "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+     ok(!delete_pf("msitest\\augustus", TRUE), "File is installed\n");
+     ok(!delete_pf("msitest\\caesar", TRUE), "File is installed\n");
+-    todo_wine
+-    {
+-        ok(!delete_pf("msitest\\maximus", TRUE), "File is installed\n");
+-        ok(!delete_pf("msitest", FALSE), "Directory is created\n");
+-    }
++    ok(!delete_pf("msitest\\maximus", TRUE), "File is installed\n");
++    ok(!delete_pf("msitest", FALSE), "Directory is created\n");
+ 
+     delete_cab_files();
+ 
+@@ -3181,11 +3356,8 @@
+     ok(r == ERROR_INSTALL_FAILURE, "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+     ok(!delete_pf("msitest\\caesar", TRUE), "File is installed\n");
+     ok(!delete_pf("msitest", FALSE), "Directory is created\n");
+-    todo_wine
+-    {
+-        ok(!delete_pf("msitest\\augustus", TRUE), "File is installed\n");
+-        ok(!delete_pf("msitest\\maximus", TRUE), "File is installed\n");
+-    }
++    ok(!delete_pf("msitest\\augustus", TRUE), "File is installed\n");
++    ok(!delete_pf("msitest\\maximus", TRUE), "File is installed\n");
+ 
+     delete_cab_files();
+     DeleteFileA(msifile);
+@@ -3196,12 +3368,9 @@
+     r = MsiInstallProductA(msifile, NULL);
+     ok(!delete_pf("msitest\\caesar", TRUE), "File is installed\n");
+     ok(r == ERROR_INSTALL_FAILURE, "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+-    todo_wine
+-    {
+-        ok(!delete_pf("msitest\\augustus", TRUE), "File is installed\n");
+-        ok(!delete_pf("msitest\\maximus", TRUE), "File is installed\n");
+-        ok(!delete_pf("msitest", FALSE), "Directory is created\n");
+-    }
++    ok(!delete_pf("msitest\\augustus", TRUE), "File is installed\n");
++    ok(!delete_pf("msitest\\maximus", TRUE), "File is installed\n");
++    ok(!delete_pf("msitest", FALSE), "Directory is created\n");
+ 
+ error:
+     delete_cab_files();
+@@ -4013,11 +4182,8 @@
+ 
+     r = MsiInstallProductA(msifile, "GAIUS=1");
+     ok(r == ERROR_INSTALL_FAILURE, "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+-    todo_wine
+-    {
+-        ok(!delete_pf("msitest\\maximus", TRUE), "File installed\n");
+-        ok(!delete_pf("msitest\\augustus", TRUE), "File installed\n");
+-    }
++    ok(!delete_pf("msitest\\maximus", TRUE), "File installed\n");
++    ok(!delete_pf("msitest\\augustus", TRUE), "File installed\n");
+     ok(delete_pf("msitest\\caesar", TRUE), "File removed\n");
+     ok(compare_pf_data("msitest\\tiberius", "abcdefgh", sizeof("abcdefgh")), "Wrong file contents\n");
+     ok(delete_pf("msitest\\tiberius", TRUE), "File removed\n");
+@@ -4061,20 +4227,14 @@
+     ok(r == ERROR_INSTALL_FAILURE,
+        "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+     ok(!delete_pf("msitest\\augustus", TRUE), "File installed\n");
+-    todo_wine
+-    {
+-        ok(!delete_pf("msitest", FALSE), "Directory created\n");
+-    }
++    ok(!delete_pf("msitest", FALSE), "Directory created\n");
+     RemoveDirectoryA("msitest");
+ 
+     r = MsiInstallProductA(msifile, NULL);
+     ok(r == ERROR_INSTALL_FAILURE,
+        "Expected ERROR_INSTALL_FAILURE, got %u\n", r);
+     ok(!delete_pf("msitest\\augustus", TRUE), "File installed\n");
+-    todo_wine
+-    {
+-        ok(!delete_pf("msitest", FALSE), "Directory created\n");
+-    }
++    ok(!delete_pf("msitest", FALSE), "Directory created\n");
+ 
+ error:
+     DeleteFileA(msifile);
+@@ -6095,6 +6255,176 @@
+     DeleteFileA(msifile2);
+ }
+ 
++static void get_pf_path(const char *rel, char *path)
++{
++    sprintf(path, "%s\\%s", PROG_FILES_DIR, rel);
++}
++
++static BOOL pf_file_matches(const char *rel, const char *reference)
++{
++    char path[MAX_PATH], *a = NULL, *b = NULL;
++    HANDLE ha, hb;
++    DWORD sa, sb, read;
++    BOOL ret = FALSE;
++
++    get_pf_path(rel, path);
++    ha = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    hb = CreateFileA(reference, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++    if (ha != INVALID_HANDLE_VALUE && hb != INVALID_HANDLE_VALUE)
++    {
++        sa = GetFileSize(ha, NULL);
++        sb = GetFileSize(hb, NULL);
++        if (sa == sb && (a = malloc(sa)) && (b = malloc(sb)) &&
++            ReadFile(ha, a, sa, &read, NULL) && read == sa &&
++            ReadFile(hb, b, sb, &read, NULL) && read == sb)
++            ret = !memcmp(a, b, sa);
++    }
++    if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
++    if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
++    free(a);
++    free(b);
++    return ret;
++}
++
++static DWORD get_shared_dll_count(const char *rel)
++{
++    char path[MAX_PATH];
++    DWORD count = 0, size = sizeof(count);
++    HKEY hkey;
++
++    get_pf_path(rel, path);
++    if (!RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\SharedDLLs", 0,
++                       KEY_READ | KEY_WOW64_32KEY, &hkey))
++    {
++        if (RegQueryValueExA(hkey, path, NULL, NULL, (BYTE *)&count, &size)) count = 0;
++        RegCloseKey(hkey);
++    }
++    return count;
++}
++
++/* A failed install must leave the machine as it was: files it did not write stay, files it
++ * replaced come back, files it created go (also when two File rows write the same path), and a
++ * component shared with an installed product keeps that product's registration and SharedDLLs
++ * count. */
++static void test_rollback(void)
++{
++    static const char product1[] = "{0D3B2E5A-6C1F-4B7A-9E21-5F0C8A1D7B01}";
++    static const char product2[] = "{0D3B2E5A-6C1F-4B7A-9E21-5F0C8A1D7B02}";
++    static const char shared_comp[] = "{7F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F0}";
++    char sysdll[MAX_PATH], path[MAX_PATH];
++    INSTALLSTATE state;
++    DWORD count;
++    int pass;
++    UINT r;
++
++    if (!is_process_elevated())
++    {
++        skip("process is limited\n");
++        return;
++    }
++    GetSystemDirectoryA(sysdll, MAX_PATH);
++    lstrcatA(sysdll, "\\kernel32.dll");
++
++    MsiSetInternalUI(INSTALLUILEVEL_NONE, NULL);
++
++    for (pass = 0; pass < 2; pass++)
++    {
++        winetest_push_context(pass ? "cab" : "uncompressed");
++
++        CreateDirectoryA("msitest", NULL);
++        create_file("msitest\\shared.txt", 1000);
++        create_database_wordcount(msifile, rb1_tables, ARRAY_SIZE(rb1_tables),
++                                  100, 0, ";1033", "{2A6B1C3D-0E4F-4A5B-8C7D-9E0F1A2B3C41}");
++
++        r = MsiInstallProductA(msifile, NULL);
++        ok(r == ERROR_SUCCESS, "got %u\n", r);
++        ok(pf_exists("msitest\\shared.txt"), "file not installed\n");
++        count = get_shared_dll_count("msitest\\shared.txt");
++        ok(count == 1, "got count %lu\n", count);
++
++        /* files the second product finds in place */
++        create_file_data("same.ref", "pre-existing", 1000);
++        get_pf_path("msitest\\same.txt", path);
++        CopyFileA("same.ref", path, FALSE);
++        get_pf_path("msitest\\older.dll", path);
++        CopyFileA(sysdll, path, FALSE);
++        get_pf_path("msitest\\newer.dll", path);
++        CopyFileA(sysdll, path, FALSE);
++
++        if (pass)
++        {
++            create_file("shared", 1000);
++            create_file("new", 1000);
++            create_file("same", 1000);
++            create_file("older", 1000);
++            create_file("newer", 1000);
++            create_file("new2", 1000);
++            create_file("older2", 1000);
++            create_cab_file("test1.cab", MEDIA_SIZE, "shared\0new\0same\0older\0newer\0new2\0older2\0");
++            DeleteFileA("new2");
++            DeleteFileA("older2");
++            DeleteFileA("shared");
++            DeleteFileA("new");
++            DeleteFileA("same");
++            DeleteFileA("older");
++            DeleteFileA("newer");
++            create_database_wordcount(msifile2, rb2_cab_tables, ARRAY_SIZE(rb2_cab_tables),
++                                      100, 0, ";1033", "{2A6B1C3D-0E4F-4A5B-8C7D-9E0F1A2B3C43}");
++        }
++        else
++        {
++            create_file("msitest\\new.txt", 1000);
++            create_file("msitest\\same.txt", 1000);
++            create_file("msitest\\older.dll", 1000);
++            create_file("msitest\\newer.dll", 1000);
++            create_database_wordcount(msifile2, rb2_tables, ARRAY_SIZE(rb2_tables),
++                                      100, 0, ";1033", "{2A6B1C3D-0E4F-4A5B-8C7D-9E0F1A2B3C42}");
++        }
++
++        r = MsiInstallProductA(msifile2, "FAIL_INSTALL=1");
++        ok(r == ERROR_INSTALL_FAILURE, "got %u\n", r);
++
++        state = MsiQueryProductStateA(product2);
++        ok(state == INSTALLSTATE_UNKNOWN, "got state %d\n", state);
++        ok(!pf_exists("msitest\\new.txt"), "file created by the failed install not removed\n");
++        ok(pf_exists("msitest\\shared.txt"), "file of the shared component removed\n");
++        ok(pf_file_matches("msitest\\same.txt", "same.ref"), "unchanged file not kept\n");
++        ok(pf_file_matches("msitest\\newer.dll", sysdll), "newer file not kept\n");
++        ok(pf_file_matches("msitest\\older.dll", sysdll), "replaced file not restored\n");
++        count = get_shared_dll_count("msitest\\shared.txt");
++        ok(count == 1, "got count %lu\n", count);
++        state = MsiGetComponentPathA(product1, shared_comp, NULL, NULL);
++        ok(state == INSTALLSTATE_LOCAL, "got state %d\n", state);
++        state = MsiGetComponentPathA(product2, shared_comp, NULL, NULL);
++        ok(state == INSTALLSTATE_UNKNOWN, "got state %d\n", state);
++
++        r = MsiInstallProductA(msifile, "REMOVE=ALL");
++        ok(r == ERROR_SUCCESS, "got %u\n", r);
++        ok(!pf_exists("msitest\\shared.txt"), "file not removed\n");
++        count = get_shared_dll_count("msitest\\shared.txt");
++        ok(!count, "got count %lu\n", count);
++
++        delete_pf("msitest\\new.txt", TRUE);
++        delete_pf("msitest\\same.txt", TRUE);
++        delete_pf("msitest\\older.dll", TRUE);
++        delete_pf("msitest\\newer.dll", TRUE);
++        delete_pf("msitest\\shared.txt", TRUE);
++        delete_pf("msitest", FALSE);
++        DeleteFileA("msitest\\shared.txt");
++        DeleteFileA("msitest\\new.txt");
++        DeleteFileA("msitest\\same.txt");
++        DeleteFileA("msitest\\older.dll");
++        DeleteFileA("msitest\\newer.dll");
++        RemoveDirectoryA("msitest");
++        DeleteFileA("test1.cab");
++        DeleteFileA("same.ref");
++        DeleteFileA(msifile);
++        DeleteFileA(msifile2);
++
++        winetest_pop_context();
++    }
++}
++
+ static void test_remove_upgrade_code(void)
+ {
+     UINT r;
+@@ -6441,6 +6771,7 @@
+     test_mixed_package();
+     test_volume_props();
+     test_shared_component();
++    test_rollback();
+     test_remove_upgrade_code();
+     test_feature_tree();
+     test_deferred_action();
+--- a/dlls/msi/tests/custom.c	2026-11-05 11:32:08.103900501 -0500
++++ b/dlls/msi/tests/custom.c	2026-11-08 16:40:14.517305592 -0500
+@@ -2145,3 +2145,9 @@
+ 
+     return ERROR_SUCCESS;
+ }
++
++/* deferred action that fails, so the install rolls back */
++UINT WINAPI rb_fail(MSIHANDLE hinst)
++{
++    return ERROR_INSTALL_FAILURE;
++}
+--- a/dlls/msi/tests/custom.spec	2026-11-05 11:32:08.103900501 -0500
++++ b/dlls/msi/tests/custom.spec	2026-11-08 16:40:14.518115917 -0500
+@@ -60,3 +60,4 @@
+ @ stdcall tl_absent(long)
+ @ stdcall wrv_present(long)
+ @ stdcall wrv_absent(long)
++@ stdcall rb_fail(long)

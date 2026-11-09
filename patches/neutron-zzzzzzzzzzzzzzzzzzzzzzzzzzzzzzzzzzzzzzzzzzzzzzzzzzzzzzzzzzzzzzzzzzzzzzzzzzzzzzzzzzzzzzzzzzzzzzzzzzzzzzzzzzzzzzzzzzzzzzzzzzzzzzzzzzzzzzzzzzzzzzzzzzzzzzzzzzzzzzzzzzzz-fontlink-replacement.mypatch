@@ -1,0 +1,68 @@
+Neutron: font links reach a family that is present only as a Replacement.
+
+Bridge 2026's Label menu drew its rating stars (U+2605) as empty boxes. Bridge's menus are plain Win32 text menus drawn
+by win32u in the system menu font, and no font in the prefix's fallback chain had the star.
+Windows 11 (starprobe, 2026-11-07): the menu font is Segoe UI, which has no star. GDI takes the star through the font
+links: Segoe UI's SystemLink list (Tahoma, Meiryo UI, MS UI Gothic, ... Yu Gothic UI, Segoe UI Symbol) and Tahoma's list
+(MS UI Gothic, PMingLiU, SimSun, Gulim, Yu Gothic UI, JhengHei UI, YaHei UI, Malgun Gothic, Segoe UI Symbol) both reach a
+font that has it; the first is MS UI Gothic, and Segoe UI Symbol, last in both, has it too. DirectWrite maps the star to
+Segoe UI Symbol. Wine's wine.inf carries Tahoma's list exactly as Windows has it, and win32u appends Tahoma's and Microsoft
+Sans Serif's links to every font. But SystemLink entries are matched by FILE name, and a Neutron prefix has those families
+only as Replacements (HKCU\Software\Wine\Fonts\Replacements), whose stand-ins' files never carry Microsoft's names, so
+every link was dropped. A Replacement declares that the stand-in IS that family, so a link to a replaced family now
+resolves to the stand-in's regular face when no face has the named file. Real fonts and links to installed files are
+matched as before, in Windows' order.
+Needs the CLI to give "Segoe UI Symbol" a stand-in that has its glyphs (CLI branch starfont: REG_MULTI_SZ "Noto Sans
+Symbols 2", "DejaVu Sans", "Adobe Clean"). MS UI Gothic's stand-in is Adobe Clean (no star), so in a Neutron prefix the
+star comes from the Segoe UI Symbol stand-in, the last link, where Windows takes MS UI Gothic's.
+Not covered: Wine has no SystemLink entry for Segoe UI (Windows has one); it would change nothing here, since win32u looks
+links up by the realized face (Adobe Clean), not the requested Segoe UI. GDI+ text (Wine's gdiplus does no font linking
+and does not see Replacement families; Windows' GDI+ draws the star) and DirectWrite's system fallback (its 2600-26FF row
+names "Noto Sans Symbols2", not the installed "Noto Sans Symbols 2"); Bridge's menus use neither.
+Lab (runtime 11.10-185bf, Bridge 16.0.8, same win32u, same registry map, n=2 per arm): stars drawn 2/2 (B-F1, B-F2) and
+2/2 more with the menu change on (M-*); boxes 2/2 with NEUTRON_FONTLINK_REPLACEMENT=0 (B-K1, B-K2). With the map written by
+the starfont CLI through wine reg (C-cli1): stars, n=1. Path check: SystemLink entries pointing straight at DejaVu Sans
+drew stars, a DirectWrite-only name did not (B-X, B-Y).
+Kill switch NEUTRON_FONTLINK_REPLACEMENT=0.
+--- a/dlls/win32u/font.c
++++ b/dlls/win32u/font.c
+@@ -881,6 +881,13 @@
+     return NULL;
+ }
+ 
++static BOOL neutron_fontlink_replacement(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_FONTLINK_REPLACEMENT" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ static struct gdi_font_face *find_face_from_filename( const WCHAR *file_name, const WCHAR *family_name )
+ {
+     struct gdi_font_family *family;
+@@ -896,7 +903,24 @@
+     }
+ 
+     if (!(family = find_family_from_name( family_name ))) return NULL;
+-    return family_find_face_from_filename( family, file_name );
++    if ((face = family_find_face_from_filename( family, file_name ))) return face;
++    /* NEUTRON: a font link names Microsoft's file ("SEGUISYM.TTF,Segoe UI Symbol"). When that family
++       is only present as a Replacement (HKCU\Software\Wine\Fonts\Replacements), its stand-in's file
++       never has that name, so the link was dropped and a glyph Windows takes from the linked font
++       (U+2605 from Segoe UI Symbol) drew as a box. The Replacement says the stand-in IS that family:
++       link to its regular face. NEUTRON_FONTLINK_REPLACEMENT=0 restores file-only matching. */
++    if (family->replacement && neutron_fontlink_replacement())
++    {
++        LIST_FOR_EACH_ENTRY( face, get_family_face_list(family), struct gdi_font_face, entry )
++        {
++            if (!face->file || (face->ntmFlags & (NTM_ITALIC | NTM_BOLD))) continue;
++            face->refcount++;
++            TRACE( "link %s,%s -> replacement face %s\n", debugstr_w(file_name), debugstr_w(family_name),
++                   debugstr_w(face->full_name) );
++            return face;
++        }
++    }
++    return NULL;
+ }
+ 
+ static BOOL add_family_replacement( const WCHAR *new_name, const WCHAR *replace )

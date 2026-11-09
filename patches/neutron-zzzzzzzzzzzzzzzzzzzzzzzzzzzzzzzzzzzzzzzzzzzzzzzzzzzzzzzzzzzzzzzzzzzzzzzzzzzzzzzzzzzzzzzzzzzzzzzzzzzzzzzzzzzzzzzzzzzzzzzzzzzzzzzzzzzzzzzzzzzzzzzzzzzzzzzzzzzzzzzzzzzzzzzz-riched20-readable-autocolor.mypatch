@@ -1,0 +1,117 @@
+riched20: draw auto-colored text readably on a background the app chose (Acrobat comment text)
+
+Reported: in Adobe Acrobat Pro 21.001.20135, comment text (sticky-note pop-ups on the page and
+comment cards in the Comment pane, including a reply while it is typed and after it is posted) is drawn
+so faint it can barely be read.
+
+Mechanism (SOLID, +richedit + relay trace, lab log acrobat-at-1-20261107-153455.log): those are
+windowed RICHEDIT50W controls. Acrobat sets their background itself (EM_SETBKGNDCOLOR 0xf5f5f5 for
+the pop-up and posted card, 0xffffff for the card being edited), fills them through TOM
+(ITextSelection::SetText) and leaves the text CFE_AUTOCOLOR; it paints them via WM_PRINTCLIENT into
+its own buffer. riched20's draw_text resolves the auto color through the host's
+TxGetSysColor(COLOR_WINDOWTEXT) = GetSysColor(8) = 0xe0e0e0 under Neutron's dark palette and calls
+SetTextColor(0xe0e0e0): 224 gray on 245, contrast 1.21:1 (1.32:1 on white).
+
+Windows: CHARFORMAT's documentation says CFE_AUTOCOLOR text "is the return value of
+GetSysColor(COLOR_WINDOWTEXT)", so Windows with the same palette would draw the same faint text;
+Windows' default palette has COLOR_WINDOWTEXT black, which is what Acrobat is designed against. The
+dark palette is deliberate and shared by every Wine-drawn dialog and edit control, so the palette
+stays; the unreadable text is fixed instead (as user32's DrawTextExW does for Button/Static text).
+
+Fix: get_text_color() passes auto-colored text through readable_auto_color(): when it would have
+less than 2:1 contrast against the background this control paints under it (the run's own
+background color, else the host's COLOR_WINDOW, i.e. the EM_SETBKGNDCOLOR color), it is drawn black
+on a light background (Windows' default COLOR_WINDOWTEXT) or white on a dark one. Text that already
+reads is never touched; with Windows' default palette auto text on a light background always reads,
+so this acts only where the result was unreadable. Selected text, links and explicit text colors
+are unchanged; TOM's ITextFont::GetForeColor still reports COLOR_WINDOWTEXT.
+
+Not covered: a transparent windowless host (TXTBACK_TRANSPARENT) paints its own background, which
+riched20 cannot see, so auto text there is left alone. Text drawn by apps themselves (not rich edit)
+is out of scope.
+
+Lab evidence (runtime 11.10-185at = 185ao + this, desk at 168 dpi, fresh reflinks of AO-1, test PDF
+with one sticky note; kill-switch A/B on the same build, n=2 each arm, pixel contrast from
+captures, WCAG ratio):
+  pop-up note text      fix 14.0:1, 14.0:1   switch off 1.17:1, 1.17:1
+  comment card text     fix 20.3:1, 20.3:1   switch off 1.28:1, 1.28:1
+  reply being typed     fix 21:1 x2          switch off 224 on 255 (caret only dark)
+  posted reply          fix 21:1 x2          switch off 1.32:1 x2
+File menu and Tools page: 0 pixels differ between arms (n=2); Home page: only the "opened" time
+differs (n=1); document view: only the pop-up text line differs. Lightroom Classic (also uses rich
+edit; EM_SETBKGNDCOLOR 0 = black): identity plate and Metadata fields identical between arms (n=1).
+
+Kill switch: NEUTRON_RICHED_AUTOCOLOR=0.
+--- a/dlls/riched20/paint.c
++++ b/dlls/riched20/paint.c
+@@ -203,6 +203,60 @@
+     return offs;
+ }
+ 
++/* NEUTRON: auto-colored rich edit text on a background the app chose (Acrobat's comments).
++ *
++ * Text with CFE_AUTOCOLOR is drawn in GetSysColor(COLOR_WINDOWTEXT), as on Windows. Acrobat's
++ * sticky-note pop-ups and comment cards are rich edit controls with auto-colored text on a light
++ * background the app sets itself (EM_SETBKGNDCOLOR 0xf5f5f5 / 0xffffff). On Windows' default
++ * palette COLOR_WINDOWTEXT is black, so the text reads; Neutron's dark palette makes it 224 gray,
++ * and the comment text came out 224 on 245, about 1.2:1. The palette has to stay dark (every
++ * Wine-drawn edit control and dialog uses it), so fix the text, not the palette: when auto-colored
++ * text would have almost no contrast against the background this control itself paints under it,
++ * draw it black on a light background (Windows' default COLOR_WINDOWTEXT) or white on a dark one.
++ * Text that already reads is never touched, and on Windows' default palette auto text on a light
++ * background always reads, so this only acts where the result was unreadable. A transparent
++ * control's background is painted by its host and is unknown here, so it is left alone.
++ * NEUTRON_RICHED_AUTOCOLOR=0 turns this off. */
++static BOOL readable_auto_color_enabled(void)
++{
++    static LONG enabled = -1;
++
++    if (enabled < 0)
++    {
++        char env[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_RICHED_AUTOCOLOR", env, sizeof(env) );
++        enabled = !(len && len < sizeof(env) && env[0] == '0');
++    }
++    return enabled;
++}
++
++static int luma1000( COLORREF c )
++{
++    /* sRGB relative luminance x1000, gamma approximated as 2 (as user32's DrawTextExW check) */
++    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
++    return (2126 * r * r + 7152 * g * g + 722 * b * b) / (255 * 255 * 10);
++}
++
++static COLORREF readable_auto_color( ME_Context *c, ME_Style *style, COLORREF text )
++{
++    COLORREF back;
++    int lt, lb, hi, lo;
++
++    if (!readable_auto_color_enabled()) return text;
++    if ((style->fmt.dwMask & CFM_BACKCOLOR) && !(style->fmt.dwEffects & CFE_AUTOBACKCOLOR))
++        back = style->fmt.crBackColor;
++    else if (editor_opaque( c->editor ))
++        back = ITextHost_TxGetSysColor( c->editor->texthost, COLOR_WINDOW );
++    else
++        return text;
++
++    lt = luma1000( text ); lb = luma1000( back );
++    hi = max( lt, lb ); lo = min( lt, lb );
++    if ((hi + 50) * 10 >= (lo + 50) * 20) return text;   /* contrast ratio 2:1 or better */
++    /* black or white, whichever contrasts more with the background */
++    return (lb + 50) * (lb + 50) >= 50 * 1050 ? RGB(0,0,0) : RGB(255,255,255);
++}
++
+ static COLORREF get_text_color( ME_Context *c, ME_Style *style, BOOL highlight )
+ {
+     COLORREF color;
+@@ -212,7 +266,8 @@
+     else if ((style->fmt.dwMask & CFM_LINK) && (style->fmt.dwEffects & CFE_LINK))
+         color = RGB(0,0,255);
+     else if ((style->fmt.dwMask & CFM_COLOR) && (style->fmt.dwEffects & CFE_AUTOCOLOR))
+-        color = ITextHost_TxGetSysColor( c->editor->texthost, COLOR_WINDOWTEXT );
++        color = readable_auto_color( c, style,
++                                     ITextHost_TxGetSysColor( c->editor->texthost, COLOR_WINDOWTEXT ) );
+     else
+         color = style->fmt.crTextColor;
+ 

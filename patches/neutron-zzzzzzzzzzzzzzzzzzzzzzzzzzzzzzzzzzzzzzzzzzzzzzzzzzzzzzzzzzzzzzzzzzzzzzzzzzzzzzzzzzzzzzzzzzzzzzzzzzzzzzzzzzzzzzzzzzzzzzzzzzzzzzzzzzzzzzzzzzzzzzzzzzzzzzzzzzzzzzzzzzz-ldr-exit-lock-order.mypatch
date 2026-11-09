@@ -1,0 +1,185 @@
+# ntdll: a thread exit does not take the PEB lock
+#
+# CapCut (lab, runtime 11.10-185lc, 1 start in 9; 0 in 6 on 185, same ntdll): the app hangs at startup before any
+# window. The hang report shows an ABBA: thread A holds peb_lock and waits for loader_section; thread B holds
+# loader_section and waits for peb_lock; CrBrowserMain and five more threads queue on peb_lock, ~45 on loader_section.
+#
+# Mechanism (SOLID by code + the report's frames). Thread B is exiting: RtlExitUserThread -> LdrShutdownThread, which
+# takes loader_section for the DLL_THREAD_DETACH calls and then, still holding it, calls RtlAcquirePebLock to free the
+# thread's TLS and FLS data (ntdll+0x16f63 = that call). Thread A is in GetModuleHandleW -> LdrGetDllHandleEx ->
+# RtlEnterCriticalSection(loader_section) (ntdll+0x155e3) while a caller further down holds the PEB lock (below the hang
+# report's 14-frame scan, not identified; no Wine ntdll or kernelbase function holds the PEB lock across GetModuleHandle,
+# so most likely the app's own code).
+#
+# Windows (probe lockorder-probe.exe, Windows 11 build 26200): GetModuleHandleW waits while another thread holds the
+# loader lock (T2); the controls wait as expected (T1 LoadLibrary vs the loader lock, T3 PEB lock vs the PEB lock); a
+# thread EXITS while another thread holds the PEB lock (T4 completed); "PEB lock held + a thread exiting +
+# GetModuleHandleW" completes (T5). So on Windows a thread exit does not need the PEB lock at all. Wine 185: T4 waits,
+# T5 deadlocks every run.
+#
+# What the PEB lock guarded in LdrShutdownThread, and what guards it now:
+# - The TLS pointer array (ThreadLocalStoragePointer): alloc_tls_slot() and ProcessTlsInformation change every thread's
+#   array with the loader lock held, and LdrShutdownThread frees it with the loader lock held. Unchanged, no PEB lock.
+# - FLS data: RtlProcessFlsData phase 1 unlinks the thread's data under fls_section (before the loader lock, as before);
+#   phase 2 only frees memory no other thread can reach. No lock needed.
+# - The TLS expansion slot array: TlsFree -> virtual_clear_tls_index() walks every thread under virtual_mutex and writes
+#   0 into each thread's array. The exiting thread now unpublishes its array (interlocked TEB pointer -> NULL), waits out
+#   any walk in progress (new unix call tls_cell_barrier: virtual_mutex taken and released), then frees it. Walks that
+#   start later see NULL.
+# LdrShutdownThread releases the loader lock right after the TLS pointer array and takes no PEB lock.
+#
+# Not covered. The PEB-lock holder in CapCut is not identified. Process exit (RtlExitUserProcess) still takes the PEB
+# lock inside the loader lock, as before (it terminates the process right after).
+#
+# Lab evidence:
+# - probe/lockorder-probe.exe on 11.10-185ck, 2 runs per arm: default T1/T2/T3 WAITED, T4/T5 completed 2/2 (= Windows);
+#   NEUTRON_LDR_EXIT_NESTED=1 T4 WAITED, T5 DEADLOCK 2/2 (= 185).
+# - harness/tls-exit-stress (16 threads at a time that own TLS expansion slots exit for 10 s while another thread loops
+#   TlsAlloc/TlsSetValue/TlsFree on expansion indexes), 64-bit and 32-bit, both arms: PASS 4/4, HeapValidate OK, no crash
+#   (default 64-bit: 45952 exits against 2852451 TlsFree walks; 32-bit 42144 / 2407017). Single samples; the stress loop
+#   is pathological and ran ~30% fewer iterations on the default arm (barrier call per exiting thread that owns expansion
+#   slots) -- not a measured cost for apps. The detector was not run against a known-bad (unsynchronized) arm.
+# - Wine conformance tests, cross-built from this tree, 11.10-185 vs 11.10-185ck: ntdll thread (1 failure), rtl, env;
+#   kernel32 thread, fiber (6), loader, module (3): the same failures on both. kernel32 loader showed 2 extra "ntdll.dll:
+#   wrong section" failures on 185ck until the prefix's system32\ntdll.dll was replaced by the swapped build (the test
+#   compares the loaded image with that file: lab swap artifact); then a subset of 185's failures. The loader test's own
+#   page fault (test exe, 0x140016a26) happens on both.
+# - CapCut: 5 starts on 11.10-185ck with this patch (plus the dcomp patch): window 5/5 in 6-7 s, no hang report, no
+#   loader-lock wait. Earlier variant of this patch (PEB lock taken after the loader lock was released): 20 starts, none.
+# - Regression of the earlier variant on 11.10-185ckl: Photoshop 2026, Premiere 2026, Lightroom cloud, Topaz Photo n=1
+#   each, no crashes.
+#
+# Kill switch NEUTRON_LDR_EXIT_NESTED=1 (the PEB lock inside the loader lock, as before).
+# Touches: dlls/ntdll/loader.c, dlls/ntdll/unixlib.h, dlls/ntdll/unix/loader.c, dlls/ntdll/unix/unix_private.h,
+# dlls/ntdll/unix/virtual.c.
+--- a/dlls/ntdll/loader.c	2026-11-08 10:04:04.687237635 -0500
++++ b/dlls/ntdll/loader.c	2026-11-08 10:04:04.688237680 -0500
+@@ -4116,11 +4116,32 @@
+     UINT i;
+     void **pointers;
+ 
++    static int nested = -1;
++    void **slots;
++
+     TRACE("()\n");
+ 
+     /* don't do any detach calls if process is exiting */
+     if (process_detaching) return;
+ 
++    /* NEUTRON 2026-11-08: a thread exit does not take the PEB lock (Windows: a thread exits while another thread holds
++     * the PEB lock). Wine took it here, inside the loader lock, to free the thread's TLS and FLS data, and that
++     * deadlocked against any thread that holds the PEB lock and then needs the loader lock (GetModuleHandle,
++     * LoadLibrary): CapCut hung at startup with one thread in each. Each piece now has the lock that actually
++     * guards it: the TLS pointer array the loader lock (alloc_tls_slot() and ProcessTlsInformation change every
++     * thread's array under it), FLS data fls_section (RtlProcessFlsData takes it), and the TLS expansion slots
++     * virtual_mutex: virtual_clear_tls_index() (TlsFree) writes into every thread's slot array under it, so the array
++     * is unpublished first and freed after any walk in progress has finished. Kill switch NEUTRON_LDR_EXIT_NESTED=1:
++     * the PEB lock inside the loader lock, as before. Read before either lock is taken. */
++    if (nested < 0)
++    {
++        WCHAR buf[4];
++        UNICODE_STRING name = RTL_CONSTANT_STRING( L"NEUTRON_LDR_EXIT_NESTED" ), value;
++        value.Buffer = buf;
++        value.MaximumLength = sizeof(buf);
++        nested = (!RtlQueryEnvironmentVariable_U( NULL, &name, &value ) && value.Length && buf[0] == '1');
++    }
++
+     RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 1 );
+ 
+     RtlEnterCriticalSection( &loader_section );
+@@ -4145,20 +4166,24 @@
+         if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_THREAD_DETACH );
+     }
+ 
+-    RtlAcquirePebLock();
++    if (nested) RtlAcquirePebLock();
+     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
+     {
+         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
+         for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
+         RtlFreeHeap( GetProcessHeap(), 0, pointers );
+     }
++    if (!nested) RtlLeaveCriticalSection( &loader_section );
+     RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 2 );
+     NtCurrentTeb()->FlsSlots = NULL;
+-    RtlFreeHeap( GetProcessHeap(), 0, NtCurrentTeb()->TlsExpansionSlots );
+-    NtCurrentTeb()->TlsExpansionSlots = NULL;
+-    RtlReleasePebLock();
+-
+-    RtlLeaveCriticalSection( &loader_section );
++    slots = InterlockedExchangePointer( (void **)&NtCurrentTeb()->TlsExpansionSlots, NULL );
++    if (slots && !nested) WINE_UNIX_CALL( unix_tls_cell_barrier, NULL );
++    RtlFreeHeap( GetProcessHeap(), 0, slots );
++    if (nested)
++    {
++        RtlReleasePebLock();
++        RtlLeaveCriticalSection( &loader_section );
++    }
+     /* don't call DbgUiGetThreadDebugObject as some apps hook it and terminate if called */
+     if (NtCurrentTeb()->DbgSsReserved[1]) NtClose( NtCurrentTeb()->DbgSsReserved[1] );
+     RtlFreeThreadActivationContextStack();
+--- a/dlls/ntdll/unixlib.h	2026-11-08 10:04:04.690237771 -0500
++++ b/dlls/ntdll/unixlib.h	2026-11-08 10:04:04.690237771 -0500
+@@ -76,6 +76,7 @@
+     unix_wine_server_handle_to_fd,
+     unix_wine_spawnvp,
+     unix_system_time_precise,
++    unix_tls_cell_barrier,
+ };
+ 
+ extern unixlib_handle_t __wine_unixlib_handle;
+--- a/dlls/ntdll/unix/loader.c	2026-11-08 10:04:04.692237861 -0500
++++ b/dlls/ntdll/unix/loader.c	2026-11-08 10:04:04.693237907 -0500
+@@ -1036,6 +1036,7 @@
+     unixcall_wine_server_handle_to_fd,
+     unixcall_wine_spawnvp,
+     system_time_precise,
++    virtual_tls_cell_barrier,
+ };
+ 
+ 
+@@ -1054,6 +1055,7 @@
+     wow64_wine_server_handle_to_fd,
+     wow64_wine_spawnvp,
+     system_time_precise,
++    virtual_tls_cell_barrier,
+ };
+ 
+ #endif  /* _WIN64 */
+--- a/dlls/ntdll/unix/unix_private.h	2026-11-08 10:04:04.695237997 -0500
++++ b/dlls/ntdll/unix/unix_private.h	2026-11-08 10:04:04.696238043 -0500
+@@ -314,6 +314,7 @@
+ struct thread_data *virtual_alloc_thread_data(void);
+ extern void virtual_free_thread_data( struct thread_data *data );
+ extern NTSTATUS virtual_clear_tls_index( ULONG index );
++extern NTSTATUS virtual_tls_cell_barrier( void *args );
+ extern NTSTATUS virtual_set_tls_info( PROCESS_TLS_INFORMATION *info, ULONG size );
+ extern NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                             SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page );
+--- a/dlls/ntdll/unix/virtual.c	2026-11-08 10:04:04.698238134 -0500
++++ b/dlls/ntdll/unix/virtual.c	2026-11-08 10:04:04.698238134 -0500
+@@ -4475,6 +4475,24 @@
+ 
+ 
+ /***********************************************************************
++ *           virtual_tls_cell_barrier
++ *
++ * NEUTRON 2026-11-08: waits out a virtual_clear_tls_index() walk in progress. The walk holds virtual_mutex for its
++ * whole length and writes into every thread's TLS expansion slot array; an exiting thread that has unpublished its
++ * array (TEB pointer set to NULL) calls this before freeing it, so no walk can still write into the freed block.
++ * Walks that start later see NULL. This replaces the PEB lock that LdrShutdownThread used to take for the same purpose.
++ */
++NTSTATUS virtual_tls_cell_barrier( void *args )
++{
++    sigset_t sigset;
++
++    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    return STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
+  *           virtual_alloc_thread_stack
+  */
+ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,

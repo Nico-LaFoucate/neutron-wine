@@ -1,0 +1,62 @@
+winewayland.drv: log the owned-window subsurface decision once per window and owner
+
+What was seen: a user's Photoshop 2026 log (issue 48) repeats
+"neutron-ownedsub: hwnd=... -> SUBSURFACE of owner=..." for the same window on every
+WindowPosChanged -- dozens of identical lines for one window while it is moved, shown or restyled,
+burying the rest of the log.
+
+Mechanism: WAYLAND_WindowPosChanged re-evaluates the owned-subsurface rule on every call and printed
+the ERR line each time the rule matched, although the outcome (subsurface of the same owner) had not
+changed.
+
+Change: struct wayland_win_data keeps the owner last logged (ownedsub_logged, zero from calloc). The
+ERR line prints when a window first becomes a subsurface of an owner, and again only if the owner
+changes; repeats go to TRACE (WINEDEBUG=+waylanddrv). The decision itself (toplevel = gwowner) is
+untouched, so behavior is the same; only the log differs. This matches the other neutron-*
+diagnostics in this driver that print one line per new state (neutron-attach, maxshort).
+
+Windows behavior: not applicable (diagnostic only).
+
+Not covered: the other per-call neutron-* ERR lines in the same log (neutron-gate, neutron-reg,
+dcomp-hook, vkd3d-presentlog) are separate modules and unchanged.
+
+Lab evidence: see the cjk48 notes (Photoshop 2026, script-confirmation dialog, 185 vs 185cj, n=2
+each: line counts per window).
+
+Kill switch: none needed (no behavior change); WINEDEBUG=+waylanddrv shows every evaluation.
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -691,6 +691,7 @@
+     /* NEUTRON: the window surface was flushed while this window had no role; see
+      * wayland_window_surface_note_roleless() */
+     BOOL roleless_contents;
++    HWND ownedsub_logged; /* NEUTRON ownedsub: the owner last logged for this window (one line per new owner) */
+ };
+ 
+ struct wayland_win_data *wayland_win_data_get(HWND hwnd);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1454,10 +1454,18 @@
+                   !neutron_owned_subsurface_modal()) &&
+                 (!(st & WS_CAPTION) || neutron_owned_subsurface_captioned()))
+             {
+-                ERR( "neutron-ownedsub: hwnd=%p (style=%08x ex=%08x) -> SUBSURFACE of owner=%p "
+-                     "so its position is ours to set, not the compositor's\n",
+-                     hwnd, (unsigned)NtUserGetWindowLongW( hwnd, GWL_STYLE ),
+-                     (unsigned)NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), gwowner );
++                /* One line per window and owner: this runs on every WindowPosChanged, and a window
++                 * that is moved or restyled while it stays a subsurface of the same owner printed it
++                 * again each time (hundreds of identical lines in a user's log for one palette). */
++                if (data->ownedsub_logged != gwowner)
++                {
++                    data->ownedsub_logged = gwowner;
++                    ERR( "neutron-ownedsub: hwnd=%p (style=%08x ex=%08x) -> SUBSURFACE of owner=%p "
++                         "so its position is ours to set, not the compositor's\n",
++                         hwnd, (unsigned)NtUserGetWindowLongW( hwnd, GWL_STYLE ),
++                         (unsigned)NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), gwowner );
++                }
++                else TRACE( "neutron-ownedsub: hwnd=%p still a subsurface of owner=%p\n", hwnd, gwowner );
+                 toplevel = gwowner;
+             }
+         }

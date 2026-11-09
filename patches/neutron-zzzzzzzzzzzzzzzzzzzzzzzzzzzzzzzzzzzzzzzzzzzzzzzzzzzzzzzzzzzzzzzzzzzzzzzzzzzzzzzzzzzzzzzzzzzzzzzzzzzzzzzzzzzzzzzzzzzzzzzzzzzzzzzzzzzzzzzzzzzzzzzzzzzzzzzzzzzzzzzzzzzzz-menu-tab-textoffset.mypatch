@@ -1,0 +1,63 @@
+Neutron: measure a popup menu's shortcut column from where its labels are drawn.
+
+Bridge 2026's Label menu drew "Decrease Rating" and "Increase Rating" across their shortcuts ("Ctrl+,", "Ctrl+."). When
+any item of a popup has both text and a bitmap (Bridge's label colors), draw_menu_item starts every label at the menu's
+text offset (the widest bitmap), so the labels line up after the bitmaps. calc_menu_item_size measured each label from
+its own bitmap instead (none for the rating items), so the tab column, the widest measured label end, fell inside the
+widest label by about the bitmap width. The column is now measured from the drawn label start, with the same
+one-average-character gap as before; the menu widens to match. Menus without text-and-bitmap items, menus with
+MNS_CHECKORBMP and owner-drawn items are unchanged.
+Lab (runtime 11.10-185bf, Bridge 16.0.8, same win32u, n=2 per arm): shortcut column clear of every label 2/2 (M-F1,
+M-F2); overlap 2/2 with NEUTRON_MENU_TAB_TEXTOFFSET=0 (M-K1, M-K2). A Segoe UI 9 pt menu font (Windows 10/11's default
+instead of the prefix's Tahoma 8 pt) did not change the overlap (B-Z).
+Kill switch NEUTRON_MENU_TAB_TEXTOFFSET=0.
+--- a/dlls/win32u/menu.c
++++ b/dlls/win32u/menu.c
+@@ -3124,6 +3124,13 @@
+ }
+ 
+ /* Calculate the size of a popup menu */
++static BOOL neutron_menu_tab_textoffset(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_MENU_TAB_TEXTOFFSET" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
+ static void calc_popup_menu_size( struct menu *menu, UINT max_height )
+ {
+     BOOL textandbmp = FALSE, multi_col = FALSE;
+@@ -3172,6 +3179,33 @@
+             if (item->text && item->hbmpItem) textandbmp = TRUE;
+         }
+ 
++        /* NEUTRON menu-tab-offset: when an item has both text and a bitmap, draw_menu_item starts EVERY label at
++         * the menu's text offset (the widest bitmap), but calc_menu_item_size measured each label from its own
++         * bitmap (none for most items), so the tab column could start inside a long label of an item without a
++         * bitmap: Bridge's Label menu drew "Decrease Rating" across "Ctrl+,". Measure the tab column from where the
++         * label is drawn, keeping the same one-character gap. Kill switch NEUTRON_MENU_TAB_TEXTOFFSET=0. */
++        if (textandbmp && menu->textOffset && !(menu->dwStyle & MNS_CHECKORBMP) && neutron_menu_tab_textoffset())
++        {
++            struct menu_item *it;
++            UINT k;
++
++            max_tab = 0;
++            for (k = start, it = &menu->items[start]; k < i; k++, it++)
++            {
++                int delta;
++
++                if (!IS_STRING_ITEM( it->fType ) || !it->xTab) continue;
++                delta = (int)menu->textOffset - (it->hbmpItem ? it->bmpsize.cx + 2 : 0);
++                if (delta > 0)
++                {
++                    it->xTab += delta;
++                    it->rect.right += delta;
++                    menu->items_rect.right = max( menu->items_rect.right, it->rect.right );
++                }
++                max_tab = max( max_tab, it->xTab );
++            }
++        }
++
+         /* Finish the column (set all items to the largest width found) */
+         menu->items_rect.right = max( menu->items_rect.right, max_tab + max_tab_width );
+         for (item = &menu->items[start]; start < i; start++, item++)

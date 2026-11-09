@@ -1,0 +1,351 @@
+winewayland, dcomp: show a window's child windows above its own swap chain; apply a window's constant layered alpha
+
+Adobe Lightroom 9.6 (the cloud app, lab runtime 11.10-185): it launches signed in and its menus and toolbar draw, but
+everything below the toolbar is one flat gray (28,28,28), 3/3. Its modal cards ("Get started", "Organize and edit
+your photos locally") sit on an opaque black backdrop that hides the whole window.
+
+Mechanism 1 (gray content area). Lightroom does not use DirectComposition (no DComp device is created). It presents one
+D3D11 swap chain per content container (the content root, the grid container, the grid; each presented about once, at
+startup and on resize, with the clear color only) and draws every panel, the grid, the empty-library prompt and both
+toolbars as CHILD windows of those containers (WS_CLIPCHILDREN; GDI and ID2D1DCRenderTarget), some of them
+WS_EX_LAYERED with LWA_ALPHA 255. Wine draws those children into the top-level's window surface; DXVK's Vulkan client
+surface of the container is a subsurface above that surface and hid all of them (probe: the committed window surface
+holds the left panel, 0x2d2d2d, where the screen shows 28 gray). Patch 150 (direct HWND chains) is not involved: its
+kill switch changed nothing. A second gap kept even NEUTRON_DCOMP_SUPPRESS_CLIENT=1 from showing the UI until a resize:
+the win32 z-order mirror (neutron_restack_apply, on by default with NEUTRON_OWNED_ZORDER) ignored place_below for the
+surfaces its walk finds and lifted them straight back above the window surface.
+
+Windows. A window's child windows are composed above the window's own swap chain; a WS_CLIPCHILDREN window's presents
+never cover its children, and DWM keeps layered children above it. Upstream winex11 models this by rendering a window
+with children offscreen and copying each present through the window's DC (needs_offscreen_rendering: "window has
+children, needs compositing").
+
+Fix 1. winewayland: a client surface whose window is registered with the dcomp bridge (__wine_dcomp_blit) and has
+WS_CLIPCHILDREN and a visible, non-transparent child over its client area is placed below the window surface, and the
+window is marked __wine_dcomp_below; the z-order mirror now honors place_below. dcomp: a chain made for its own window
+(patch 150's direct case) is copied through the window's DC while that mark is set (the DC clips the children; checked
+about every 100 ms, and the frame already on screen is copied at the switch, since Lightroom may not present again).
+Windows without such children keep patch 150's direct path unchanged.
+
+Mechanism 2 (black backdrop). The backdrop is a top-level WS_EX_LAYERED window with SetLayeredWindowAttributes
+LWA_ALPHA 191. win32u creates its surface without the layered flag (only UpdateLayeredWindow sets it), so winewayland
+used an XRGB buffer and never applied window_surface->alpha_bits: solid black (every pixel 0,0,0). Windows blends the
+whole window at that alpha. Fix 2: a non-layered surface with an LWA_ALPHA constant below 255 gets an ARGB buffer with
+the constant applied premultiplied (wl_shm ARGB8888 is premultiplied). Layered and blur-behind surfaces keep their paths.
+
+Not covered: sibling windows overlapping a swap-chain window inside the same top-level (they stay under its client
+surface); raw Vulkan/OpenGL windows with children (only DXGI chains registered with the bridge are copied); windows
+without WS_CLIPCHILDREN; the copy costs a readback per present while children cover a chain (Lightroom presents
+rarely). Seen once, not judged: one capture taken mid-switch from Edit to Export showed the old Edit panel half
+replaced; 4 s later the Export view was whole. Separate item, not touched: the export folder picker's Open with an
+empty name did nothing; typing the folder path worked.
+
+Lab (11.10-185lc = 185 + x86_64 winewayland.so, x86_64 and i386 dcomp.dll from this patch; fresh reflinks of the
+signed-in Lightroom prefix AcLr-1; desk at 175 %, 168 dpi):
+  185 (adobe-ac-lr L1-L3, LrDc-1/2/3/6)   main view one color (28,28,28) 7/7; backdrop solid black
+  185lc LrDc-7/8/9                        library view at startup 3/3 (left panel, "Add some photos", toolbars;
+                                          53 colors); backdrop translucent 2/2 (UI behind at 25 %: 28 -> 7, 45 -> 11)
+  185lc workflow LrDc-8/9 (n=2)           Local mode, Pictures\lrtest grid thumbnail, photo opened, Edit: Exposure +
+                                          Shadows (photo mean 101.7 -> 232.0 both runs), Crop corner + Enter (Edit menu:
+                                          "Undo Crop Rectangle"), Export (Shift+E) -> chepino-2.jpg 2048x1444 (source
+                                          4886x3236: aspect 1.418 vs 1.51 = cropped), 2/2
+  185lc + both kill switches LrDc-10/11   main view one color 2/2, backdrop black 2/2 (== 185)
+  Regression on 185lc, n=1 each, the new rule never fired (0 neutron-children-copy lines): Photoshop 2026 Home, new
+  document, text, restore/maximize (0 px Home, 0.05 % after resize vs 185rc); Premiere 2026 project, seek, Export
+  Frame, text, restore/maximize (0 px vs 185rc but Home 1,915 px); Topaz Photo sign-in drawn (caption strip 0 px vs
+  fonts2); CapCut settings menu + main window 2/3 == 185 numbers, 1/3 hung at startup in an ntdll loader-lock
+  deadlock (peb_lock vs loader_section) before any present; ntdll is unchanged, INFERRED unrelated, base rate open.
+Kill switches: NEUTRON_DCOMP_CHILDREN_COPY=0 (children over a chain; read by winewayland), NEUTRON_WINDOW_ALPHA=0
+(constant layered alpha).
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -135,8 +135,21 @@
+     ID3D11Texture2D *staging; /* NEUTRON perf: cached staging texture, recreated only on size change */
+     UINT   staging_w, staging_h;
+     LONG   last_client_w, last_client_h; /* NEUTRON: pause blits while the target is mid-resize */
++    BOOL   hwnd_direct; /* NEUTRON: a chain made for this very window (patch 150): copied only while children
++                         * sit over it (neutron_children_over_chain) */
+ };
+ 
++/* NEUTRON children-over-chain (2026-11-07): winewayland marks a window __wine_dcomp_below while visible child
++ * windows sit over its swap chain. On Windows those children are composed above the chain; here they are GDI
++ * content of the top-level's window surface, so winewayland puts the chain's client surface below that surface
++ * and the chain reaches the screen only through this bridge's copy into the window's DC, which clips the
++ * children (WS_CLIPCHILDREN). Lightroom 9.6's panels, grid and prompts are such children. Kill switch
++ * NEUTRON_DCOMP_CHILDREN_COPY=0 (read by winewayland, which then never sets the mark). */
++static BOOL neutron_chain_below(HWND hwnd)
++{
++    return GetPropW(hwnd, L"__wine_dcomp_below") != NULL;
++}
++
+ /* NEUTRON: cross-process CEP panel present path.
+  * The panel host window is owned by the Adobe app process, but dcomp/the swapchain live in the CEF
+  * (CEPHtmlEngine) process. Wine's window_surface is per-process, so a cross-process GetDC+StretchDIBits
+@@ -1114,8 +1127,11 @@
+         struct presentation *p;
+         int nlive = 0;
+         static ULONGLONG regt;
++        static unsigned int tick;
+         ULONGLONG now;
+ 
++        tick++;
++
+         EnterCriticalSection(&presentations_cs);
+         LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
+         {
+@@ -1141,6 +1157,24 @@
+                  * stayed black. Blit whenever the size is non-zero and changed by only
+                  * a small amount since last tick (jitter / slow drag); still pause on a
+                  * genuine large resize step (maximize/restore = hundreds of px). */
++                /* NEUTRON children-over-chain: follow winewayland's mark (~100 ms). On the switch to the copy, copy
++                 * the frame already on screen: the app may not present again (Lightroom presents its containers
++                 * only when they are resized). */
++                if (p->hwnd_direct && !(tick % 6))
++                {
++                    BOOL below = neutron_chain_below(p->hwnd);
++
++                    if (below == p->no_blit)
++                    {
++                        static unsigned int nlog;
++
++                        p->no_blit = !below;
++                        if (below) InterlockedExchange(&p->pending_blit, TRUE);
++                        if (nlog++ < 64)
++                            ERR("neutron-children-copy: hwnd=%p swapchain=%p %s\n", p->hwnd, p->swapchain,
++                                below ? "children over it: copied through the window's DC" : "no children over it: direct");
++                    }
++                }
+                 if (p->no_blit)
+                 {
+                     /* NEUTRON round-35 NATIVE mode: window presents its own Vulkan
+@@ -1294,7 +1328,7 @@
+     IDXGISwapChain *swapchain = NULL;
+     struct presentation *p;
+     HWND host, target;
+-    BOOL target_cross_proc = FALSE, hwnd_direct;
++    BOOL target_cross_proc = FALSE, hwnd_direct, hwnd_copied;
+ 
+     if (!hwnd || !content)
+         return;
+@@ -1467,6 +1501,9 @@
+ 
+     /* NEUTRON 2026-11-05: a same-process swap chain made for this very window is on screen already. */
+     hwnd_direct = !target_cross_proc && target == hwnd && neutron_hwnd_chain_direct(swapchain, hwnd);
++    /* NEUTRON children-over-chain: such a chain is still copied while children sit over it */
++    if (hwnd_direct && neutron_dcomp_native()) hwnd_direct = FALSE;
++    hwnd_copied = hwnd_direct && neutron_chain_below(hwnd);
+ 
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
+@@ -1477,7 +1514,8 @@
+         {
+             p->present_hwnd = target;
+             p->cross_proc = target_cross_proc;
+-            p->no_blit = (neutron_dcomp_native() && !target_cross_proc) || hwnd_direct; /* round-35 native */
++            p->no_blit = (neutron_dcomp_native() && !target_cross_proc) || (hwnd_direct && !hwnd_copied); /* round-35 native */
++            p->hwnd_direct = hwnd_direct;
+             /* NEUTRON M4: this function is the per-Present hook -> mark a blit pending so
+              * the 16ms blit thread only reads back windows that actually presented. */
+             InterlockedExchange(&p->pending_blit, TRUE);
+@@ -1509,7 +1547,8 @@
+         p->hwnd = hwnd;
+         p->present_hwnd = target;
+         p->cross_proc = target_cross_proc;
+-        p->no_blit = (neutron_dcomp_native() && !target_cross_proc) || hwnd_direct; /* round-35 native */
++        p->no_blit = (neutron_dcomp_native() && !target_cross_proc) || (hwnd_direct && !hwnd_copied); /* round-35 native */
++        p->hwnd_direct = hwnd_direct;
+         p->swapchain = swapchain; /* take QI ref */
+         p->content_id = content; /* NEUTRON M4: fast-path identity */
+         p->pending_blit = TRUE; /* NEUTRON M4: fresh present -> blit once */
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -3975,6 +3975,14 @@
+     return n;
+ }
+ 
++/* NEUTRON children-over-chain: kill switch NEUTRON_DCOMP_CHILDREN_COPY=0 (see neutron_children_over_chain) */
++static BOOL neutron_children_copy_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_DCOMP_CHILDREN_COPY", TRUE);
++    return on;
++}
++
+ static void neutron_restack_apply(HWND toplevel, const struct neutron_zlist *zl)
+ {
+     struct wayland_win_data *tdata = wayland_win_data_get_nolock(toplevel);
+@@ -4017,6 +4025,10 @@
+         applied[n] = zl->hwnd[i];
+         /* suppress rule (round-17-proven minimal set): CEF/CEP host containers... */
+         below[n] = zl->cef_host[i] || cs->clipped_out;
++        /* NEUTRON children-over-chain: honor the update's place_below here too, as the loop over the surfaces
++         * phase A missed already does; otherwise this mirror (on by default with NEUTRON_OWNED_ZORDER) lifted
++         * such a surface straight back above the window surface it was just put under. */
++        if (cs->place_below && neutron_children_copy_on()) below[n] = TRUE;
+         /* NEUTRON round-36 TEMPORAL rule ("latest painter wins"): if this chain
+          * is IDLE and newer GDI damage (CEP shared-mem blits, GDI-hybrid paints)
+          * intersects its rect, its stale/black frame must not cover that GDI
+@@ -4208,6 +4220,37 @@
+     return v;
+ }
+ 
++/* NEUTRON children-over-chain (2026-11-07): whether visible child windows of `hwnd` sit over its client area.
++ * On Windows a window's child windows are composed above the window's own swap chain: a WS_CLIPCHILDREN window's
++ * presents never cover its children. Lightroom 9.6 presents one D3D11 swap chain per content container and draws
++ * every panel, the grid and the empty-library prompt as child windows inside it (GDI and ID2D1DCRenderTarget),
++ * which Wine draws into the top-level's window surface. The client surface (DXVK's Vulkan present) is a subsurface
++ * above that window surface, so it hid all of them: the whole area below the toolbar showed the chain's clear
++ * color. Upstream winex11 renders such a window offscreen and copies each present through the window's DC
++ * (needs_offscreen_rendering: "window has children, needs compositing"); for DXGI swap chains the dcomp bridge is
++ * that copy. Only WS_CLIPCHILDREN windows qualify: without it a copy through the DC would paint over the children.
++ * Called before win_data_mutex is taken (user-lock calls). */
++static BOOL neutron_children_over_chain(HWND hwnd)
++{
++    UINT dpi = NtUserGetDpiForWindow(hwnd);
++    HWND child;
++    RECT client, rc;
++
++    if (!neutron_children_copy_on()) return FALSE;
++    if (!(NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_CLIPCHILDREN)) return FALSE;
++    if (!(child = NtUserGetWindowRelative(hwnd, GW_CHILD))) return FALSE;
++    if (!NtUserGetClientRect(hwnd, &client, dpi) || IsRectEmpty(&client)) return FALSE;
++    for (; child; child = NtUserGetWindowRelative(child, GW_HWNDNEXT))
++    {
++        if (!(NtUserGetWindowLongW(child, GWL_STYLE) & WS_VISIBLE)) continue;
++        if (NtUserGetWindowLongW(child, GWL_EXSTYLE) & WS_EX_TRANSPARENT) continue; /* the server does not clip these */
++        if (!NtUserGetWindowRect(child, &rc, dpi)) continue;
++        NtUserMapWindowPoints(0, hwnd, (POINT *)&rc, 2, dpi);
++        if (intersect_rect(&rc, &rc, &client)) return TRUE;
++    }
++    return FALSE;
++}
++
+ static void wayland_client_surface_update(struct client_surface *client)
+ {
+     struct wayland_client_surface *surface = impl_from_client_surface(client);
+@@ -4346,7 +4389,29 @@
+             surface->place_below = !!NtUserGetProp(hwnd, dcomp_present_prop);
+         }
+         else
+-            surface->place_below = (suppress && (marked || sticky));
++        {
++            /* NEUTRON children-over-chain: a bridge-registered swap chain (marked: the dcomp bridge can copy its
++             * frames) whose window has visible children over it goes below the window surface, and the bridge
++             * copies its frames into that surface through the window's DC, around the children (see
++             * neutron_children_over_chain). __wine_dcomp_below tells the bridge, which otherwise leaves such a
++             * chain to this client surface (patch 150). Kill switch NEUTRON_DCOMP_CHILDREN_COPY=0. */
++            static const WCHAR dcomp_below_prop[] =
++                {'_','_','w','i','n','e','_','d','c','o','m','p','_','b','e','l','o','w',0};
++            BOOL below = (marked || sticky) && visible && neutron_children_over_chain(hwnd);
++            BOOL was_below = !!NtUserGetProp(hwnd, dcomp_below_prop);
++
++            if (below != was_below)
++            {
++                static unsigned int nlog;
++
++                if (below) NtUserSetProp(hwnd, dcomp_below_prop, (HANDLE)(ULONG_PTR)1);
++                else NtUserRemoveProp(hwnd, dcomp_below_prop);
++                if (nlog++ < 64)
++                    ERR("neutron-children-copy: hwnd=%p children over its swap chain %d -> client surface %s\n",
++                        hwnd, below, below ? "below, the bridge copies it" : "above");
++            }
++            surface->place_below = (suppress && (marked || sticky)) || below;
++        }
+     }
+ 
+     /* NEUTRON round-34 lock-order fix: win_data_mutex is taken ONLY here, AFTER
+--- a/dlls/winewayland.drv/window_surface.c
++++ b/dlls/winewayland.drv/window_surface.c
+@@ -281,9 +281,17 @@
+  * they are produced by GDI painting (TextOut/fills/blits write alpha=0) mixed into the layered
+  * surface. Making them opaque keeps GDI-drawn popup content (LrC mask dropdown text) readable
+  * while genuine ULW transparency (all-zero pixels, AA edges with alpha>0) is preserved. */
++/* NEUTRON window-alpha: a window's SetLayeredWindowAttributes LWA_ALPHA constant, applied as premultiplied ARGB
++ * (wl_shm ARGB8888 is premultiplied). */
++static inline UINT32 neutron_premul_const(UINT32 v, UINT a)
++{
++    return (a << 24) | ((((v >> 16) & 0xff) * a / 255) << 16) | ((((v >> 8) & 0xff) * a / 255) << 8) |
++           ((v & 0xff) * a / 255);
++}
++
+ static void copy_pixel_region(const char *src_pixels, RECT *src_rect,
+                               char *dst_pixels, RECT *dst_rect,
+-                              HRGN region, UINT alpha_bits, BOOL sanitize)
++                              HRGN region, UINT alpha_bits, BOOL sanitize, int const_alpha)
+ {
+     BOOL force_opaque = alpha_bits != 0;
+     static const int bpp = WINEWAYLAND_BYTES_PER_PIXEL;
+@@ -317,6 +325,18 @@
+         width = rc.right - rc.left;
+         height = rc.bottom - rc.top;
+ 
++        if (const_alpha >= 0)
++        {
++            for (y = 0; y < height; y++)
++            {
++                for (x = 0; x < width; ++x)
++                    ((UINT32 *)dst)[x] = neutron_premul_const(((const UINT32 *)src)[x], const_alpha);
++                src += src_stride;
++                dst += dst_stride;
++            }
++            continue;
++        }
++
+         /* Fast path for full width rectangles. */
+         if (width * bpp == src_stride && src_stride == dst_stride)
+         {
+@@ -381,11 +401,11 @@
+  */
+ static void wayland_shm_buffer_copy_data(struct wayland_shm_buffer *buffer,
+                                          const char *bits, RECT *rect,
+-                                         HRGN region, UINT alpha_bits, BOOL sanitize)
++                                         HRGN region, UINT alpha_bits, BOOL sanitize, int const_alpha)
+ {
+     RECT buffer_rect = {0, 0, buffer->width, buffer->height};
+     TRACE("buffer=%p bits=%p rect=%s\n", buffer, bits, wine_dbgstr_rect(rect));
+-    copy_pixel_region(bits, rect, buffer->map_data, &buffer_rect, region, alpha_bits, sanitize);
++    copy_pixel_region(bits, rect, buffer->map_data, &buffer_rect, region, alpha_bits, sanitize, const_alpha);
+ }
+ 
+ /* NEUTRON PM-TRAILS FIX: wayland_shm_buffer_copy (buffer->buffer copy from the
+@@ -531,6 +551,7 @@
+     HRGN surface_damage_region = NULL;
+     HRGN copy_from_window_region;
+     uint32_t buffer_format;
++    int const_alpha; /* NEUTRON window-alpha: LWA_ALPHA constant of a non-layered surface, or -1 */
+ 
+     /* NEUTRON shape-hittest: win32u reports a shape change once, at the flush that made it; a flush that
+      * bails below must not lose it. */
+@@ -678,7 +699,21 @@
+         }
+     }
+ 
+-    buffer_format = (shape_bits || wws->layered || window_surface->dwm_alpha) ?
++    /* NEUTRON window-alpha (2026-11-07): SetLayeredWindowAttributes(LWA_ALPHA) on a window whose surface win32u
++     * made without the layered flag (that flag comes only with UpdateLayeredWindow) left the constant alpha in
++     * window_surface->alpha_bits unused: the buffer was XRGB and the window fully opaque. On Windows the whole
++     * window is blended at that alpha. Lightroom 9.6 dims the app behind its modal cards with a top-level
++     * window at LWA_ALPHA 191; it showed solid black over the whole window. Apply it here, premultiplied.
++     * Layered surfaces keep their own path below. Kill switch NEUTRON_WINDOW_ALPHA=0. */
++    {
++        static int on = -1;
++        if (on < 0) on = neutron_gate("NEUTRON_WINDOW_ALPHA", TRUE);
++        const_alpha = -1;
++        if (on && !wws->layered && !window_surface->dwm_alpha && window_surface->alpha_bits != (UINT)-1 &&
++            (window_surface->alpha_bits >> 24) < 0xff)
++            const_alpha = window_surface->alpha_bits >> 24;
++    }
++    buffer_format = (shape_bits || wws->layered || window_surface->dwm_alpha || const_alpha >= 0) ?
+                     WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888;
+     if (wws->wayland_buffer_queue->format != buffer_format)
+     {
+@@ -868,7 +903,7 @@
+             _pR = ((const UINT32*)color_bits)[(size_t)_py*_cbW + _px] & 0xffffff;
+ 
+         wayland_shm_buffer_copy_data(shm_buffer, color_bits, &surface_rect, copy_from_window_region,
+-                                     alpha_bits, sanitize);
++                                     alpha_bits, sanitize, const_alpha);
+ 
+         /* NT-PROBE: victim pixel in the COMMITTED shm buffer (== what the compositor
+          * shows) + running black-vs-content tally = the VALID committed-level judge. */

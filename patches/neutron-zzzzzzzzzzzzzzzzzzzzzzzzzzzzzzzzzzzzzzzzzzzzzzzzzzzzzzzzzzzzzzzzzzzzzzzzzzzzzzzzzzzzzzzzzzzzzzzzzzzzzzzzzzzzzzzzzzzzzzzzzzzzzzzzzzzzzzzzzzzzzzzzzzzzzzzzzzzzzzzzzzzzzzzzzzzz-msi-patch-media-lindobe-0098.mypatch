@@ -1,0 +1,147 @@
+From: AdobeWine
+Subject: [PATCH] msi: Look up the files and patches a patch brings on the media the patch added.
+
+Adopted from LinDobe (le-birnes/LinDobe, LGPL-2.1+), patch 0098, with these changes: none to the code; rebased onto Neutron's msi-rollback.mypatch + 0096 (offsets only, no fuzz).
+
+A file's or patch's cabinet was found as the first Media row with LastSequence >= its Sequence. Acrobat's update
+(AcrobatDCx64Upd2600222031.msp) numbers its own files and deltas 8000-17351 on its #PCW_CAB_ACR media, which Wine
+adds as disk 32000; its transform also raises the target's Languages.cab (disk 6) to LastSequence 12159, and
+Wine does not renumber the patch because its media already ends above 10000. Everything numbered 8000-12159 was
+looked up in Languages.cab: those deltas were never extracted and PatchFiles skipped them without an error, and the
+files the patch adds (msidbFileAttributesPatchAdded) were never installed. Acrobat started with an updated Annots
+plug-in and the original Acrobat.dll and crashed (the plug-in registers a notification the old Acrobat.dll does
+not have); with the deltas applied, Acrobat.dll needed thorvg-1.dll, which was missing ("Acrobat failed to load its
+Core DLL"). Patch rows and PatchAdded files now look for the media a patch added (DiskId >= 32000) first, and the
+"already loaded" shortcut is not taken across the two kinds of media.
+Test: debug dump of Media at InstallFiles: disks 1-5 as in AcroPro.msi, 6 (Languages.cab) 12159, 32000
+(#PCW_CAB_ACR) 17351; all 6353 base files at or below 6406, all 5806 files above it PatchAdded. Before: 247 of
+the 3526 deltas applied, Acrobat.dll and 273 more left at the 2021 base, thorvg-1.dll missing, 3460 files. After:
+Acrobat.dll as Windows' mspatcha makes it, thorvg-1.dll present, 7778 files, 1.8 GB, and Acrobat opens to its
+home screen (signed in) with Protected Mode off.
+
+Lab (acrobat-adopt, 2026-11-08, runtime 11.10-185ad = 185 + riched20-textpara-getters + unsecapp-wmi-sink-host
++ this set): Acrobat Pro installed the user's way (`neutron programs install` of the Acrobat setup.exe = AcroPro.msi +
+AcrobatDCx64Upd2600222031.msp) into a fresh copy of a signed-in Adobe prefix: "Setup Completed", installed 26.002.22031,
+7778 files, 1.8 GB, thorvg-1.dll present (n=1). Before this set every install ended 1603 at PatchFiles (AcMsp-1..9).
+Installed result matches the description's figures exactly (7778 files, 1.8 GB, thorvg-1.dll present).
+Kill switch: none.
+Not A/B-tested separately in this lab.
+---
+--- a/dlls/msi/action.c
++++ b/dlls/msi/action.c
+@@ -1015,8 +1015,16 @@
+ 
+ static UINT load_file_disk_id( MSIPACKAGE *package, MSIFILE *file )
+ {
+-    MSIRECORD *row = MSI_QueryGetRecord( package->db, L"SELECT `DiskId` FROM `Media` WHERE `LastSequence` >= %d",
+-                                         file->Sequence );
++    MSIRECORD *row = NULL;
++
++    /* a file a patch added comes from the media the patch added, as in msi_load_patch_media_info */
++    if (file->Attributes & msidbFileAttributesPatchAdded)
++        row = MSI_QueryGetRecord( package->db, L"SELECT `DiskId` FROM `Media` WHERE `LastSequence` >= %d "
++                                  L"AND `DiskId` >= %d ORDER BY `DiskId`", file->Sequence,
++                                  MSI_INITIAL_MEDIA_TRANSFORM_DISKID );
++    if (!row)
++        row = MSI_QueryGetRecord( package->db, L"SELECT `DiskId` FROM `Media` WHERE `LastSequence` >= %d",
++                                  file->Sequence );
+     if (!row)
+     {
+         WARN("query failed\n");
+@@ -1139,8 +1147,13 @@
+ 
+ static UINT load_patch_disk_id( MSIPACKAGE *package, MSIFILEPATCH *patch )
+ {
+-    MSIRECORD *rec = MSI_QueryGetRecord( package->db, L"SELECT `DiskId` FROM `Media` WHERE `LastSequence` >= %u",
+-                                         patch->Sequence );
++    /* the media a patch added first, as in msi_load_patch_media_info */
++    MSIRECORD *rec = MSI_QueryGetRecord( package->db, L"SELECT `DiskId` FROM `Media` WHERE `LastSequence` >= %u "
++                                         L"AND `DiskId` >= %u ORDER BY `DiskId`", patch->Sequence,
++                                         MSI_INITIAL_MEDIA_TRANSFORM_DISKID );
++    if (!rec)
++        rec = MSI_QueryGetRecord( package->db, L"SELECT `DiskId` FROM `Media` WHERE `LastSequence` >= %u ORDER BY `DiskId`",
++                                  patch->Sequence );
+     if (!rec)
+     {
+         WARN("query failed\n");
+--- a/dlls/msi/files.c
++++ b/dlls/msi/files.c
+@@ -807,7 +807,10 @@
+ 
+         file_update_ui( package, file, L"InstallFiles" );
+ 
+-        rc = msi_load_media_info( package, file->Sequence, mi );
++        if (file->Attributes & msidbFileAttributesPatchAdded)
++            rc = msi_load_patch_media_info( package, file->Sequence, mi );
++        else
++            rc = msi_load_media_info( package, file->Sequence, mi );
+         if (rc != ERROR_SUCCESS)
+         {
+             ERR("Unable to load media info for %s (%u)\n", debugstr_w(file->File), rc);
+@@ -1040,7 +1043,7 @@
+         MSIFILE *file = patch->File;
+         MSICOMPONENT *comp = file->Component;
+ 
+-        rc = msi_load_media_info( package, patch->Sequence, mi );
++        rc = msi_load_patch_media_info( package, patch->Sequence, mi );
+         if (rc != ERROR_SUCCESS)
+         {
+             ERR("Unable to load media info for %s (%u)\n", debugstr_w(file->File), rc);
+--- a/dlls/msi/media.c
++++ b/dlls/msi/media.c
+@@ -674,16 +674,24 @@
+     return ret;
+ }
+ 
+-UINT msi_load_media_info(MSIPACKAGE *package, UINT Sequence, MSIMEDIAINFO *mi)
++static UINT load_media_info(MSIPACKAGE *package, UINT Sequence, MSIMEDIAINFO *mi, BOOL patch_media)
+ {
+-    MSIRECORD *row;
++    MSIRECORD *row = NULL;
+     WCHAR *source_dir, *source, *base_url = NULL;
+     DWORD options;
+ 
+-    if (Sequence <= mi->last_sequence) /* already loaded */
++    /* already loaded, from the same kind of media */
++    if (Sequence <= mi->last_sequence && patch_media == (mi->disk_id >= MSI_INITIAL_MEDIA_TRANSFORM_DISKID))
+         return ERROR_SUCCESS;
+ 
+-    row = MSI_QueryGetRecord(package->db, L"SELECT * FROM `Media` WHERE `LastSequence` >= %d ORDER BY `DiskId`", Sequence);
++    /* a patch's transform may raise a target Media row's LastSequence over the range of the patch's own files
++     * (Acrobat's update gives Languages.cab 12159, its own files are 8000-17351), so files and patches that
++     * come from a patch are looked up on the media the patch added first */
++    if (patch_media)
++        row = MSI_QueryGetRecord(package->db, L"SELECT * FROM `Media` WHERE `LastSequence` >= %d AND `DiskId` >= %d "
++                                 L"ORDER BY `DiskId`", Sequence, MSI_INITIAL_MEDIA_TRANSFORM_DISKID);
++    if (!row)
++        row = MSI_QueryGetRecord(package->db, L"SELECT * FROM `Media` WHERE `LastSequence` >= %d ORDER BY `DiskId`", Sequence);
+     if (!row)
+     {
+         TRACE("Unable to query row\n");
+@@ -738,6 +746,16 @@
+     return ERROR_SUCCESS;
+ }
+ 
++UINT msi_load_media_info(MSIPACKAGE *package, UINT Sequence, MSIMEDIAINFO *mi)
++{
++    return load_media_info(package, Sequence, mi, FALSE);
++}
++
++UINT msi_load_patch_media_info(MSIPACKAGE *package, UINT Sequence, MSIMEDIAINFO *mi)
++{
++    return load_media_info(package, Sequence, mi, TRUE);
++}
++
+ /* FIXME: search URL sources as well */
+ static UINT find_published_source(MSIPACKAGE *package, MSIMEDIAINFO *mi)
+ {
+--- a/dlls/msi/msipriv.h
++++ b/dlls/msi/msipriv.h
+@@ -1154,6 +1154,7 @@
+ 
+ extern UINT ready_media(MSIPACKAGE *package, BOOL compressed, MSIMEDIAINFO *mi);
+ extern UINT msi_load_media_info(MSIPACKAGE *package, UINT Sequence, MSIMEDIAINFO *mi);
++extern UINT msi_load_patch_media_info(MSIPACKAGE *package, UINT Sequence, MSIMEDIAINFO *mi);
+ extern void msi_free_media_info(MSIMEDIAINFO *mi);
+ extern BOOL msi_cabextract(MSIPACKAGE* package, MSIMEDIAINFO *mi, LPVOID data);
+ extern UINT msi_add_cabinet_stream(MSIPACKAGE *, UINT, IStorage *, const WCHAR *);

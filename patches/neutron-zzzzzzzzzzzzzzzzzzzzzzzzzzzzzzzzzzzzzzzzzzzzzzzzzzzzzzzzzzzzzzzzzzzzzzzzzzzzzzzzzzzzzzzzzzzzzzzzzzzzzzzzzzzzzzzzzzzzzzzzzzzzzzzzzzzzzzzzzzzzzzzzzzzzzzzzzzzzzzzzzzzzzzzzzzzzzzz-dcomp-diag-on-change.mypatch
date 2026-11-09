@@ -1,0 +1,90 @@
+dcomp: print the bridge's gate and registration diagnostics when they change, not every 2 seconds
+
+What was seen: a user's bug report (GitHub Neutron#49) carried 150 log lines that were nothing but
+"neutron-gate: 2s window calls=... (gate ...)" and "neutron-reg: N live registrations", one pair every
+2 seconds for the whole session, burying the lines that mattered.
+
+Mechanism: dcomp's bridge thread (presentations_proc) keeps two lab diagnostics from the M4 work: the
+present gate's 2 s statistics (blit_swapchain_to_hwnd) and the live registration count. Both printed at ERR
+level on every 2 s window, whether or not anything had changed.
+
+Change: the same 2 s cadence and the same line format, but a line is printed for the first window and then
+only when what it reports changes: the gate line when its state flips between ENGAGED and not-skipping,
+the registration line when the live count changes. Lab harnesses that grep these lines still see every
+state (none counts them per time: checked our test harnesses and the lab
+tools; one counts "neutron-gate" but never reports that count). A stalled bridge thread is
+still reported by neutron-blit-slow (capcut-locks), which this does not touch.
+
+Windows behavior: not applicable (diagnostic only; no behavior change).
+
+Not covered: the other periodic neutron-* lines in the same report (dcomp-hook PresentBase is once per
+swap chain since dxvk-dxgi 0004; the winewayland ownedsub repeats are cjk48's patch).
+
+Lab evidence (lab runtime 11.10-186rc, CapCut start + 120 s on a nested desk, capcut-locks' start1.sh, WINEDEBUG=+timestamp):
+  11.10-185:   neutron-gate 116 / neutron-reg 116 lines in ~123 s (56 per minute each), 3 of 4 runs; 61 / 56 in the
+               run where the bridge thread stalled.
+  11.10-186rc: neutron-gate 2 / neutron-reg 3 lines (the first line in each of CapCut's two bridge processes, plus one
+               registration count change), 2 of 2 runs.
+  11.10-186rc + NEUTRON_DCOMP_DIAG_PERIODIC=1: 116 / 116 lines and "neutron-gateresolved: NEUTRON_DCOMP_DIAG_PERIODIC = 1"
+               in both processes (1 run).
+
+Kill switch: NEUTRON_DCOMP_DIAG_PERIODIC=1 prints both lines every 2 s again (as 11.10-185).
+
+--- a/dlls/dcomp/device.c	2026-11-09 09:39:05.831722812 -0500
++++ b/dlls/dcomp/device.c	2026-11-09 09:39:53.124100012 -0500
+@@ -296,6 +296,23 @@
+  * tick again (the old coupling). */
+ static CRITICAL_SECTION blit_cs;
+ 
++/* NEUTRON (Neutron#49): the bridge's two periodic diagnostics ("neutron-gate: 2s window ..." and "neutron-reg: N live
++ * registrations") are printed for the first 2 s window and then only when what they report changes (the gate's state
++ * flips between ENGAGED and not-skipping, the live registration count changes); a user's log carried 150 lines of
++ * nothing else. Same 2 s cadence, same line format, so harnesses that grep them still see every state.
++ * NEUTRON_DCOMP_DIAG_PERIODIC=1 prints them every 2 s again. */
++static int neutron_dcomp_diag_periodic(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[8];
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DIAG_PERIODIC", b, sizeof(b)) && b[0] == '1') ? 1 : 0;
++        if (v) ERR("neutron-gateresolved: NEUTRON_DCOMP_DIAG_PERIODIC = 1\n");
++    }
++    return v;
++}
++
+ static int neutron_blit_unlocked(void)
+ {
+     static int v = -1;
+@@ -746,9 +763,13 @@
+             if (g_t == 0) g_t = now;
+             if (now - g_t >= 2000)
+             {
++                static int g_last = -1;   /* gate state last printed: -1 none yet, 0 not-skipping, 1 ENGAGED */
++                int state = g_skips > 0;
+                 g_t = now;
+-                ERR("neutron-gate: 2s window calls=%ld blits=%ld skips=%ld (gate %s)\n",
+-                    c, g_blits, g_skips, g_skips > 0 ? "ENGAGED" : "not-skipping");
++                if (state != g_last || neutron_dcomp_diag_periodic())
++                    ERR("neutron-gate: 2s window calls=%ld blits=%ld skips=%ld (gate %s)\n",
++                        c, g_blits, g_skips, state ? "ENGAGED" : "not-skipping");
++                g_last = state;
+                 InterlockedExchange(&g_calls, 0); InterlockedExchange(&g_blits, 0); InterlockedExchange(&g_skips, 0);
+             }
+         }
+@@ -1328,7 +1349,14 @@
+          * plateau at the true live-window count (~15-25), never climb into the thousands. */
+         now = GetTickCount64();
+         if (regt == 0) regt = now;
+-        if (now - regt >= 2000) { regt = now; ERR("neutron-reg: %d live registrations\n", nlive); }
++        if (now - regt >= 2000)
++        {
++            static int reg_last = -1;   /* count last printed, -1 none yet */
++            regt = now;
++            if (nlive != reg_last || neutron_dcomp_diag_periodic())
++                ERR("neutron-reg: %d live registrations\n", nlive);
++            reg_last = nlive;
++        }
+         /* NEUTRON round-34 ztree diag: dump the real win32 z-order every ~5s */
+         if (neutron_ztree_diag())
+         {

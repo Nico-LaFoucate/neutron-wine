@@ -1,0 +1,1402 @@
+# neutron-winewayland-drag-out -- drag files, text and links out of a Windows application onto Linux applications
+#
+# Touches: dlls/ole32/ole2.c, dlls/winewayland.drv/{wayland_data_device.c,wayland_pointer.c,waylanddrv.h,window.c,wayland.c}.
+# Applies on the 185 tree after every earlier winewayland drag-and-drop patch (zzzzzzzj, zzzzzzzk,
+# ...h dnd-with-data-control).
+#
+# WHAT WAS SEEN (lab, 11-07, Adobe Bridge 2026 on 11.10-185): dragging a JPG from Bridge's content panel onto the Linux
+# desktop or a file manager does nothing (2/2). Dropping from the file manager INTO Bridge works. The same for every
+# Windows application: Premiere's project panel, Explorer-style views, text dragged out of an editor.
+#
+# MECHANISM (source): Windows applications drag with OLE DoDragDrop(IDataObject, IDropSource, effects). ole32's loop finds
+# the target with WindowFromPoint, which knows only Wine's windows, and nothing told the compositor that a drag was running:
+# winewayland implemented the receiving side of wl_data_device only (it never called wl_data_device.start_drag). winex11
+# has no drag source either (its XDND code only receives), so this is not specific to Wayland. winewayland also bound
+# wl_data_device_manager at version 2, which has no drag actions and no drop/finish events for a source.
+#
+# WINDOWS: DoDragDrop runs one modal loop for every target, in or out of the process: the target under the cursor (real
+# z-order) gets DragEnter/DragOver/Drop with the source's IDataObject and calls GetData when it needs the data; DoDragDrop
+# returns DRAGDROP_S_DROP with the effect the target answered, DRAGDROP_S_CANCEL on Escape, DROP with no effect over a window
+# that is no target.
+#
+# FIX (kill switch NEUTRON_DRAG_OUT=0: the driver refuses, wl_data_device_manager stays at version 2 = 11.10-185):
+#  - ole32: at the start of DoDragDrop the tracker asks the user driver (WM_WINE_DRAG_SOURCE = WM_WINE_LAST_DRIVER_MSG on its
+#    tracker window, by SendMessageTimeout, the path that reaches the driver; a driver without it answers 0 and nothing
+#    changes) to run the drag on the desktop, with the kinds the data object has (QueryGetData): files (CF_HDROP, or
+#    FileGroupDescriptorW + FileContents), text (CF_UNICODETEXT/CF_TEXT), a link (UniformResourceLocatorW/A).
+#  - winewayland: a wl_data_source (version 3) started with wl_data_device.start_drag from the press that holds the pointer's
+#    implicit grab, offering text/uri-list (files: file:// URIs of the real unix paths; a link), text/plain;charset=utf-8 and
+#    text/plain; DROPEFFECT copy/link -> copy, move -> move. Data is rendered by ole32 on the DoDragDrop thread only when a
+#    target asks for a type (wl_data_source.send wakes the tracker, which calls GetData and hands the bytes back); virtual
+#    files are written to %TEMP%\WineDrag-xxxxxxxx then.
+#  - Wine windows keep the old path: a last, private offered type names the tracker window and a cookie (window property). A
+#    Wine window of the same wineserver under the pointer, in any process, recognizes it, marks itself on the tracker (window
+#    property WineDragTarget), accepts only that type and turns the drag's motion and drop into the hardware mouse move and
+#    button release they are on Windows; they reach the source's OLE loop through its capture window, which does
+#    WindowFromPoint and calls the target's IDropTarget with the application's own IDataObject, across processes too. The
+#    compositor decides which surface is under the pointer, so a Linux window above a Wine window gets the drop.
+#  - over a Linux client ole32 has no Wine target and reports the client's action as the effect. dnd_drop_performed sends the
+#    button release the compositor consumed; DoDragDrop then waits (dispatching messages, at most 15 s) for dnd_finished or
+#    cancelled and returns DRAGDROP_S_DROP with the finished action's effect (copy/move), or no effect when cancelled.
+#    Escape that reaches the application cancels as before and destroys the source; a cancel by the compositor releases the
+#    button and ends the drag with no effect.
+#
+# NOT COVERED / IMPERFECT VS WINDOWS:
+#  - no drag image: the compositor shows its own drag cursor; IDropSource::GiveFeedback cursors and IDragSourceHelper images
+#    are not shown while the compositor runs the drag, and over a Wine window the compositor cursor shows "copy" even where
+#    the Wine target refuses (the drop itself is decided by the target, as on Windows).
+#  - Escape the compositor keeps: DoDragDrop returns DRAGDROP_S_DROP with no effect instead of DRAGDROP_S_CANCEL.
+#  - move to a Linux file manager: the manager moves the file itself; DoDragDrop returns DROPEFFECT_MOVE (Windows' shell
+#    reports an optimized move differently; not measured).
+#  - a drag started after the button is already up, or from a touch/pen press the compositor holds as a tablet grab, stays
+#    on Wine's windows (as before).
+#  - virtual files stay in %TEMP%\WineDrag-* (the Linux client may read them after the drop).
+#  - only CF_HDROP, FileGroupDescriptorW (not the ANSI FileGroupDescriptor), text and links reach Linux clients; private
+#    formats only reach Wine windows.
+#
+#  - Dolphin's own drop menu (Move Here / Copy Here) opens after the Wayland drop is finished, so DoDragDrop reports the
+#    negotiated action (copy) before the user picks; the file operation itself is Dolphin's.
+#
+# LAB EVIDENCE (lab runtime 11.10-185dg = 11.10-185 + this patch's ole32 and winewayland, nested KWin, fakeptr drags):
+#  - test program (OLE source + target): file -> Linux (QML DropArea) delivered file:// URI, DoDragDrop DROP effect copy
+#    4/4 (t5, t8, u1, t20 second drag); text with non-ASCII 2/2 exact (t10; t9 = drag started after the button was up,
+#    driver declined, old path); virtual file (FileGroupDescriptorW/FileContents) 3/3 (written to %TEMP%, drive_c path);
+#    drop on its own Wine target through the compositor drag 2/2 (t13 file, t14 text). Kill switch, same build: file ->
+#    Linux nothing delivered, DROP effect 0, 2/2 (t15, t16); own-window drop unchanged 1/1 (t17).
+#  - Escape during a drag over the Linux client 1/1: DRAGDROP_S_CANCEL, the client got no drop, the source and the held
+#    button were released, the next drag in the same process delivered normally.
+#  - Adobe Bridge 2026 (lab copies of BrIc-base): JPG -> Dolphin (Linux, inside the same sandbox) delivered 8/8 drags;
+#    Copy Here 2/2 (byte-identical copy, source kept), Move Here 1/1 (file moved); 4 more menu clicks did nothing in Dolphin
+#    after a completed transfer (not established; transfer side finished every time). Kill switch, same build: no drag
+#    reaches Dolphin 1/1. Bridge -> Photoshop 2026 (another Wine process) through the compositor drag: Photoshop placed the
+#    JPG into the open document 1/1 (cross-process OLE drop on the Wine path).
+#  - drag IN (Dolphin -> Bridge) with the version-3 binding: 2/2 delivered (effect copy); kill switch arm 1/1 the same.
+--- a/dlls/ole32/ole2.c
++++ b/dlls/ole32/ole2.c
+@@ -40,6 +40,7 @@
+ #include "winreg.h"
+ #include "ole2.h"
+ #include "ole2ver.h"
++#include "shlobj.h"
+ 
+ #include "compobj_private.h"
+ #include "olestd.h"
+@@ -72,6 +73,14 @@
+   IDropTarget* curDragTarget;
+   POINTL     curMousePos;       /* current position of the mouse in screen coordinates */
+   DWORD      dwKeyState;        /* current state of the shift and ctrl keys and the mouse buttons */
++
++  /* NEUTRON drag-out: the drag also runs on the host desktop (see host_drag_start) */
++  HWND       hwndTracker;
++  BOOL       hostDrag;
++  DWORD      hostKinds;         /* HOST_KIND_* the data object has */
++  DWORD      hostRendered;      /* HOST_KIND_* handed to the driver */
++  DWORD      hostState;         /* HOST_STATE_* */
++  DWORD      hostAction;        /* the host's dnd action */
+ } TrackerWindowInfo;
+ 
+ typedef struct tagOleMenuDescriptor  /* OleMenuDescriptor */
+@@ -730,6 +739,398 @@
+   return S_OK;
+ }
+ 
++/******************************************************************************
++ * NEUTRON drag-out: a drag the user driver runs on the host desktop.
++ *
++ * WindowFromPoint knows only Wine's windows, so a drag could never leave them: dropping a file from a Windows
++ * application on a Linux file manager did nothing. At the start of every DoDragDrop the tracker asks the user
++ * driver (WM_WINE_DRAG_SOURCE on the tracker window; a driver without it answers 0 and nothing changes) to run the
++ * drag on the desktop too. The driver turns the pointer over any Wine window back into hardware mouse input to this
++ * loop, so Wine targets are found and called as before; over a host application the driver reports its state
++ * (HOST_STATE_*), and the host asks for data, which is rendered here, on the DoDragDrop thread, only when asked.
++ * Driver side: dlls/winewayland.drv/wayland_data_device.c. Keep these definitions in sync with it.
++ */
++#define WM_WINE_DRAG_SOURCE 0x80001fff  /* WM_WINE_LAST_DRIVER_MSG */
++
++enum { HOST_DRAG_START = 1, HOST_DRAG_POLL, HOST_DRAG_DATA, HOST_DRAG_END };
++enum { HOST_STATE_NONE, HOST_STATE_STARTED, HOST_STATE_WINE, HOST_STATE_FOREIGN, HOST_STATE_DROPPED,
++       HOST_STATE_FINISHED, HOST_STATE_CANCELLED };
++#define HOST_KIND_FILES 1
++#define HOST_KIND_TEXT  2
++#define HOST_KIND_URL   4
++#define HOST_ACTION_COPY 1
++#define HOST_ACTION_MOVE 2
++#ifndef FD_ATTRIBUTES
++#define FD_ATTRIBUTES 0x0004  /* FILEDESCRIPTOR dwFlags, Windows SDK shlobj_core.h */
++#define FD_FILESIZE   0x0040
++#endif
++
++struct host_drag_params
++{
++    UINT32 size;
++    UINT32 effects;
++    UINT32 kinds;
++    UINT32 state;
++    UINT32 action;
++    UINT32 bytes;
++    UINT64 data;
++};
++
++static DWORD_PTR host_drag_call( TrackerWindowInfo *info, UINT op, struct host_drag_params *params )
++{
++    DWORD_PTR res = 0;
++
++    /* SendMessageTimeout, not SendMessage: only that path hands an internal message to the driver on this thread */
++    if (!SendMessageTimeoutW( info->hwndTracker, WM_WINE_DRAG_SOURCE, op, (LPARAM)params, SMTO_NORMAL, 5000, &res ))
++        return 0;
++    return res;
++}
++
++static BOOL host_drag_has( IDataObject *obj, CLIPFORMAT cf )
++{
++    FORMATETC fmt = { cf, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
++    return cf && IDataObject_QueryGetData( obj, &fmt ) == S_OK;
++}
++
++static HRESULT host_drag_get( IDataObject *obj, CLIPFORMAT cf, LONG index, DWORD tymed, STGMEDIUM *medium )
++{
++    FORMATETC fmt = { cf, NULL, DVASPECT_CONTENT, index, tymed };
++    HRESULT hr = IDataObject_GetData( obj, &fmt, medium );
++
++    if (SUCCEEDED(hr) && !(medium->tymed & tymed))
++    {
++        ReleaseStgMedium( medium );
++        hr = DV_E_TYMED;
++    }
++    return hr;
++}
++
++static DWORD host_drag_kinds( IDataObject *obj )
++{
++    DWORD kinds = 0;
++
++    if (host_drag_has( obj, CF_HDROP ) || host_drag_has( obj, RegisterClipboardFormatW( CFSTR_FILEDESCRIPTORW )))
++        kinds |= HOST_KIND_FILES;
++    if (host_drag_has( obj, CF_UNICODETEXT ) || host_drag_has( obj, CF_TEXT ))
++        kinds |= HOST_KIND_TEXT;
++    if (host_drag_has( obj, RegisterClipboardFormatW( CFSTR_INETURLW )) ||
++        host_drag_has( obj, RegisterClipboardFormatA( CFSTR_INETURLA )))
++        kinds |= HOST_KIND_URL;
++    return kinds;
++}
++
++/* Text from a UTF-16 or an ANSI format, null-terminated. */
++static WCHAR *host_drag_text( IDataObject *obj, CLIPFORMAT cfW, CLIPFORMAT cfA, SIZE_T *bytes )
++{
++    STGMEDIUM medium;
++    WCHAR *ret = NULL;
++    SIZE_T len = 0, max;
++
++    if (SUCCEEDED(host_drag_get( obj, cfW, -1, TYMED_HGLOBAL, &medium )))
++    {
++        const WCHAR *text = GlobalLock( medium.hGlobal );
++        max = GlobalSize( medium.hGlobal ) / sizeof(WCHAR);
++        if (text)
++        {
++            while (len < max && text[len]) len++;
++            if ((ret = malloc( (len + 1) * sizeof(WCHAR) )))
++            {
++                memcpy( ret, text, len * sizeof(WCHAR) );
++                ret[len] = 0;
++            }
++            GlobalUnlock( medium.hGlobal );
++        }
++        ReleaseStgMedium( &medium );
++    }
++    else if (cfA && SUCCEEDED(host_drag_get( obj, cfA, -1, TYMED_HGLOBAL, &medium )))
++    {
++        const char *text = GlobalLock( medium.hGlobal );
++        max = GlobalSize( medium.hGlobal );
++        if (text)
++        {
++            int wlen;
++            while (len < max && text[len]) len++;
++            wlen = MultiByteToWideChar( CP_ACP, 0, text, len, NULL, 0 );
++            if ((ret = malloc( (wlen + 1) * sizeof(WCHAR) )))
++            {
++                MultiByteToWideChar( CP_ACP, 0, text, len, ret, wlen );
++                ret[wlen] = 0;
++                len = wlen;
++            }
++            GlobalUnlock( medium.hGlobal );
++        }
++        ReleaseStgMedium( &medium );
++    }
++    *bytes = ret ? (len + 1) * sizeof(WCHAR) : 0;
++    return ret;
++}
++
++/* Append a path to a double-null-terminated list. */
++static WCHAR *host_drag_add_path( WCHAR *list, SIZE_T *len, const WCHAR *path )
++{
++    SIZE_T n = wcslen( path ) + 1;
++    WCHAR *bigger = realloc( list, (*len + n + 1) * sizeof(WCHAR) );
++
++    if (!bigger) return list;
++    memcpy( bigger + *len, path, n * sizeof(WCHAR) );
++    *len += n;
++    bigger[*len] = 0;
++    return bigger;
++}
++
++/* FileGroupDescriptorW + FileContents ("virtual" files: mail attachments, archive members): the host only takes
++ * paths, so write them into a new folder under %TEMP% and hand over its top-level entries. */
++static WCHAR *host_drag_virtual_files( IDataObject *obj, SIZE_T *len )
++{
++    CLIPFORMAT cf_contents = RegisterClipboardFormatW( CFSTR_FILECONTENTSW );
++    WCHAR dir[MAX_PATH], path[MAX_PATH * 2], *list = NULL, *p;
++    FILEGROUPDESCRIPTORW *group;
++    STGMEDIUM medium, contents;
++    UINT i, dirlen;
++
++    if (FAILED(host_drag_get( obj, RegisterClipboardFormatW( CFSTR_FILEDESCRIPTORW ), -1, TYMED_HGLOBAL, &medium )))
++        return NULL;
++    if (!(group = GlobalLock( medium.hGlobal )) ||
++        GlobalSize( medium.hGlobal ) < FIELD_OFFSET(FILEGROUPDESCRIPTORW, fgd[group->cItems]))
++        goto done;
++
++    dirlen = GetTempPathW( MAX_PATH - 24, dir );
++    if (!dirlen || dirlen >= MAX_PATH - 24) goto done;
++    swprintf( dir + dirlen, MAX_PATH - dirlen, L"WineDrag-%08lx\\", GetTickCount() ^ (GetCurrentProcessId() << 20) );
++    if (!CreateDirectoryW( dir, NULL )) goto done;
++    dirlen = wcslen( dir );
++
++    for (i = 0; i < group->cItems; i++)
++    {
++        const FILEDESCRIPTORW *fd = &group->fgd[i];
++        BOOL top = !wcschr( fd->cFileName, '\\' ) && !wcschr( fd->cFileName, '/' );
++        HANDLE file;
++        HRESULT hr;
++
++        /* names are relative to the drop folder; never let one climb out of it */
++        if (!fd->cFileName[0] || fd->cFileName[0] == '\\' || fd->cFileName[0] == '/' ||
++            wcschr( fd->cFileName, ':' ) || wcsstr( fd->cFileName, L".." ))
++            continue;
++        if (dirlen + wcslen( fd->cFileName ) >= ARRAY_SIZE(path)) continue;
++        wcscpy( path, dir );
++        wcscat( path, fd->cFileName );
++        for (p = path + dirlen; *p; p++)
++        {
++            if (*p != '\\' && *p != '/') continue;
++            *p = 0;
++            CreateDirectoryW( path, NULL );
++            *p = '\\';
++        }
++        if ((fd->dwFlags & FD_ATTRIBUTES) && (fd->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
++        {
++            CreateDirectoryW( path, NULL );
++            if (top) list = host_drag_add_path( list, len, path );
++            continue;
++        }
++
++        hr = host_drag_get( obj, cf_contents, i, TYMED_HGLOBAL | TYMED_ISTREAM, &contents );
++        if (FAILED(hr))
++        {
++            WARN( "no contents for %s: %#lx\n", debugstr_w(fd->cFileName), hr );
++            continue;
++        }
++        file = CreateFileW( path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL );
++        if (file != INVALID_HANDLE_VALUE)
++        {
++            DWORD written;
++
++            if (contents.tymed == TYMED_HGLOBAL)
++            {
++                SIZE_T size = GlobalSize( contents.hGlobal );
++                void *bits = GlobalLock( contents.hGlobal );
++
++                if ((fd->dwFlags & FD_FILESIZE) && !fd->nFileSizeHigh && fd->nFileSizeLow < size)
++                    size = fd->nFileSizeLow;
++                if (bits) WriteFile( file, bits, size, &written, NULL );
++                GlobalUnlock( contents.hGlobal );
++            }
++            else
++            {
++                char buffer[65536];
++                ULONG got;
++
++                while (SUCCEEDED(IStream_Read( contents.pstm, buffer, sizeof(buffer), &got )) && got)
++                    WriteFile( file, buffer, got, &written, NULL );
++            }
++            CloseHandle( file );
++            if (top) list = host_drag_add_path( list, len, path );
++        }
++        ReleaseStgMedium( &contents );
++    }
++
++done:
++    GlobalUnlock( medium.hGlobal );
++    ReleaseStgMedium( &medium );
++    return list;
++}
++
++/* Files as a double-null-terminated list of DOS paths. */
++static WCHAR *host_drag_files( IDataObject *obj, SIZE_T *bytes )
++{
++    STGMEDIUM medium;
++    WCHAR *list = NULL;
++    SIZE_T len = 0;
++
++    if (SUCCEEDED(host_drag_get( obj, CF_HDROP, -1, TYMED_HGLOBAL, &medium )))
++    {
++        const DROPFILES *files = GlobalLock( medium.hGlobal );
++        SIZE_T size = GlobalSize( medium.hGlobal );
++
++        if (files && size > sizeof(*files) && files->pFiles < size)
++        {
++            if (files->fWide)
++            {
++                const WCHAR *p = (const WCHAR *)((const char *)files + files->pFiles);
++                SIZE_T max = (size - files->pFiles) / sizeof(WCHAR), n;
++
++                while (len < max && p[len])
++                {
++                    for (n = len; n < max && p[n]; n++) ;
++                    if (n == max) break;
++                    list = host_drag_add_path( list, &len, p + len ) ;
++                    if (len != n + 1) break;
++                }
++            }
++            else
++            {
++                const char *p = (const char *)files + files->pFiles;
++                SIZE_T max = size - files->pFiles, pos = 0, n;
++                WCHAR path[MAX_PATH];
++
++                while (pos < max && p[pos])
++                {
++                    for (n = pos; n < max && p[n]; n++) ;
++                    if (n == max) break;
++                    if (MultiByteToWideChar( CP_ACP, 0, p + pos, -1, path, MAX_PATH ))
++                        list = host_drag_add_path( list, &len, path );
++                    pos = n + 1;
++                }
++            }
++        }
++        GlobalUnlock( medium.hGlobal );
++        ReleaseStgMedium( &medium );
++    }
++    if (!list) list = host_drag_virtual_files( obj, &len );
++    *bytes = list ? (len + 1) * sizeof(WCHAR) : 0;
++    return list;
++}
++
++/* Render the kinds the host asked for, once each. */
++static void host_drag_render( TrackerWindowInfo *info, DWORD kinds )
++{
++    static const DWORD all[] = { HOST_KIND_FILES, HOST_KIND_TEXT, HOST_KIND_URL };
++    struct host_drag_params params = { sizeof(params) };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(all); i++)
++    {
++        SIZE_T bytes = 0;
++        WCHAR *data = NULL;
++
++        if (!(kinds & all[i] & info->hostKinds) || (info->hostRendered & all[i])) continue;
++        info->hostRendered |= all[i];
++        if (all[i] == HOST_KIND_FILES) data = host_drag_files( info->dataObject, &bytes );
++        else if (all[i] == HOST_KIND_TEXT)
++            data = host_drag_text( info->dataObject, CF_UNICODETEXT, CF_TEXT, &bytes );
++        else
++            data = host_drag_text( info->dataObject, RegisterClipboardFormatW( CFSTR_INETURLW ),
++                                   RegisterClipboardFormatA( CFSTR_INETURLA ), &bytes );
++        TRACE( "kind %#lx: %Iu bytes\n", all[i], bytes );
++        params.kinds = all[i];
++        params.data = (UINT_PTR)data;
++        params.bytes = bytes;
++        host_drag_call( info, HOST_DRAG_DATA, &params );
++        free( data );
++    }
++}
++
++static void host_drag_poll( TrackerWindowInfo *info )
++{
++    struct host_drag_params params = { sizeof(params) };
++
++    if (!info->hostDrag || !host_drag_call( info, HOST_DRAG_POLL, &params )) return;
++    info->hostState = params.state;
++    info->hostAction = params.action;
++    if (params.kinds) host_drag_render( info, params.kinds );
++}
++
++/* The pointer is over a host application, not over a Wine window. */
++static BOOL host_drag_external( const TrackerWindowInfo *info )
++{
++    return info->hostDrag && info->hostState >= HOST_STATE_FOREIGN;
++}
++
++/* The effect of the host target's action: what it accepts while hovering, what it did when finished. */
++static DWORD host_drag_effect( const TrackerWindowInfo *info )
++{
++    DWORD effect = DROPEFFECT_NONE;
++
++    if (info->hostState == HOST_STATE_CANCELLED) return DROPEFFECT_NONE;
++    if (info->hostAction & HOST_ACTION_MOVE) effect = DROPEFFECT_MOVE;
++    else if (info->hostAction & HOST_ACTION_COPY)
++        effect = (info->dwOKEffect & DROPEFFECT_COPY) ? DROPEFFECT_COPY : DROPEFFECT_LINK;
++    return effect & info->dwOKEffect;
++}
++
++static void host_drag_start( TrackerWindowInfo *info )
++{
++    struct host_drag_params params = { sizeof(params) };
++
++    if (!(info->hostKinds = host_drag_kinds( info->dataObject ))) return;
++    params.effects = info->dwOKEffect;
++    params.kinds = info->hostKinds;
++    info->hostDrag = host_drag_call( info, HOST_DRAG_START, &params ) == 1;
++    info->hostState = info->hostDrag ? HOST_STATE_STARTED : HOST_STATE_NONE;
++    TRACE( "kinds %#lx, effects %#lx: host drag %d\n", info->hostKinds, info->dwOKEffect, info->hostDrag );
++    /* Hand over now what is already in the data object (paths, text, a link): Linux clients ask for it while the
++     * pointer hovers them and give up after about a second, and this thread is the application's UI thread, which
++     * may be busy in its own drop target or feedback right then. Virtual files are only written when asked for. */
++    if (info->hostDrag)
++        host_drag_render( info, (info->hostKinds & ~HOST_KIND_FILES) |
++                                (host_drag_has( info->dataObject, CF_HDROP ) ? HOST_KIND_FILES : 0) );
++}
++
++/* Dropped on a host application: it asks for the data and then finishes with an action, or the drag is cancelled.
++ * DoDragDrop on Windows also returns only after the target's Drop. Bounded, so a target that never finishes cannot
++ * hang the application. Messages are dispatched meanwhile, keyboard input stays queued. */
++static DWORD host_drag_wait( TrackerWindowInfo *info )
++{
++    DWORD start = GetTickCount();
++    MSG msg;
++
++    while (info->hostState == HOST_STATE_DROPPED && GetTickCount() - start < 15000)
++    {
++        MsgWaitForMultipleObjects( 0, NULL, FALSE, 50, QS_ALLINPUT );
++        while (PeekMessageW( &msg, 0, 0, WM_KEYFIRST - 1, PM_REMOVE ) ||
++               PeekMessageW( &msg, 0, WM_KEYLAST + 1, ~0u, PM_REMOVE ))
++        {
++            if (msg.message == WM_QUIT)
++            {
++                PostQuitMessage( msg.wParam );
++                return host_drag_effect( info );
++            }
++            DispatchMessageW( &msg );
++        }
++        host_drag_poll( info );
++    }
++    TRACE( "state %lu action %#lx\n", info->hostState, info->hostAction );
++    return info->hostState == HOST_STATE_FINISHED ? host_drag_effect( info ) : DROPEFFECT_NONE;
++}
++
++static void host_drag_end( TrackerWindowInfo *info )
++{
++    if (!info->hostDrag) return;
++    host_drag_poll( info );
++    /* the host still takes the drop: render what it may ask for before the data object goes away */
++    if (info->hostState == HOST_STATE_DROPPED) host_drag_render( info, info->hostKinds );
++    host_drag_call( info, HOST_DRAG_END, NULL );
++}
++
+ /***********************************************************************
+  * DoDragDrop [OLE32.@]
+  */
+@@ -749,6 +1150,8 @@
+   if (!pDataObject || !pDropSource || !pdwEffect)
+       return E_INVALIDARG;
+ 
++  memset( &trackerInfo, 0, sizeof(trackerInfo) );
++
+   /*
+    * Setup the drag n drop tracking window.
+    */
+@@ -775,6 +1178,10 @@
+      */
+     SetCapture(hwndTrackWindow);
+ 
++    /* NEUTRON drag-out */
++    trackerInfo.hwndTracker = hwndTrackWindow;
++    host_drag_start(&trackerInfo);
++
+     msg.message = 0;
+ 
+     /* save cursor */
+@@ -818,6 +1225,8 @@
+       }
+     }
+ 
++    host_drag_end(&trackerInfo);
++
+     /* re-post the quit message to outer message loop */
+     if (msg.message == WM_QUIT)
+         PostQuitMessage(msg.wParam);
+@@ -2234,6 +2643,9 @@
+         IDropTarget_Release( info->curDragTarget );
+         info->curDragTarget = NULL;
+     }
++    /* NEUTRON drag-out: dropped on a host application; its answer is the effect */
++    else if (info->returnValue == DRAGDROP_S_DROP && host_drag_external( info ))
++        *info->pdwEffect = host_drag_wait( info );
+     else
+         *info->pdwEffect = DROPEFFECT_NONE;
+ }
+@@ -2245,7 +2657,7 @@
+     HCURSOR cur;
+ 
+     if (info->curDragTarget == NULL)
+-        *info->pdwEffect = DROPEFFECT_NONE;
++        *info->pdwEffect = host_drag_external( info ) ? host_drag_effect( info ) : DROPEFFECT_NONE;
+ 
+     hr = IDropSource_GiveFeedback( info->dropSource, *info->pdwEffect );
+ 
+@@ -2294,7 +2706,9 @@
+    */
+   pt.x = trackerInfo->curMousePos.x;
+   pt.y = trackerInfo->curMousePos.y;
+-  hwndNewTarget = WindowFromPoint(pt);
++  /* NEUTRON drag-out: over a host application there is no Wine target */
++  host_drag_poll(trackerInfo);
++  hwndNewTarget = host_drag_external(trackerInfo) ? 0 : WindowFromPoint(pt);
+ 
+   trackerInfo->returnValue = IDropSource_QueryContinueDrag(trackerInfo->dropSource,
+                                                            trackerInfo->escPressed,
+--- a/dlls/winewayland.drv/wayland.c
++++ b/dlls/winewayland.drv/wayland.c
+@@ -265,7 +265,10 @@
+     else if (strcmp(interface, "wl_data_device_manager") == 0)
+     {
+         process_wayland.wl_data_device_manager =
+-            wl_registry_bind(registry, id, &wl_data_device_manager_interface, 2);
++            /* NEUTRON drag-out: version 3 has the drag actions and the drop/finish events a drag source needs
++             * (wl_data_source.dnd_drop_performed / dnd_finished / action); the drop side already handles 3. */
++            wl_registry_bind(registry, id, &wl_data_device_manager_interface,
++                             wayland_drag_out_enabled() ? min(version, 3) : 2);
+         /* NEUTRON: the globals can arrive in either order, so create the data device here too if
+          * the seat already exists. Needed for drag-and-drop, which requires every app process to
+          * have its own wl_data_device (see the seat branch above). */
+--- a/dlls/winewayland.drv/wayland_data_device.c
++++ b/dlls/winewayland.drv/wayland_data_device.c
+@@ -1148,6 +1148,597 @@
+ };
+ 
+ /**********************************************************************
++ *          NEUTRON drag-out: OLE DoDragDrop as a wl_data_device drag source
++ *
++ * Dragging a file, text or a link OUT of a Windows application onto a Linux application (file manager, editor,
++ * browser) did nothing: this driver received drops (data_device_* below) but never started a drag. Windows
++ * applications drag with OLE DoDragDrop(IDataObject, IDropSource, effects); ole32's loop finds the target with
++ * WindowFromPoint, which knows only Wine's windows, and nothing told the compositor a drag was running.
++ * (winex11 has no drag source either: its XDND code is the receiving side only.)
++ *
++ * Now ole32 asks the driver at the start of every DoDragDrop (WM_WINE_DRAG_SOURCE, sent to its tracker window),
++ * and the drag runs on the compositor, as a Wayland toolkit's does, from the press that holds the pointer's
++ * implicit grab:
++ *  - a wl_data_source offers what the IDataObject has: files (CF_HDROP, or FileGroupDescriptorW + FileContents,
++ *    which ole32 writes to a temporary folder) as text/uri-list; text as text/plain;charset=utf-8 and text/plain;
++ *    a link (UniformResourceLocatorW) as text/uri-list and text. The allowed DROPEFFECTs become copy/move actions.
++ *    ole32 renders data on the DoDragDrop thread only when a target asks for it (wl_data_source.send), as a
++ *    Windows target calls GetData when it needs it.
++ *  - one more, private type (offered last: toolkits that accept "the first type" must pick a real one) names the
++ *    tracker window and a cookie (a window property). A Wine window of the same wineserver under the pointer (this
++ *    process or another) recognizes it, marks itself on the tracker (window property WineDragTarget, read by the
++ *    source synchronously, also at the drop), accepts only that type and turns the drag's motion and drop into the
++ *    hardware mouse move and button release they are on Windows. They reach the source's OLE loop through its
++ *    capture window, which does what it always did: WindowFromPoint, then the target's IDropTarget with the
++ *    application's own IDataObject, across processes too. Drags inside and between Wine windows keep every private
++ *    format.
++ *  - no Wine window under the pointer: ole32 has no Wine target, the host target's action is the effect.
++ *    dnd_drop_performed / dnd_finished(action) / cancelled end the drag: the button release the compositor consumed
++ *    is sent, and DoDragDrop returns DRAGDROP_S_DROP with the effect of the action the target finished with, or no
++ *    effect when the compositor cancelled.
++ * Kill switch NEUTRON_DRAG_OUT=0: ole32 then runs every drag on Wine's windows only, as before.
++ */
++
++#define WINE_DRAG_TAG_PREFIX "application/x-wine-ole-drag;"
++
++static const WCHAR drag_cookie_propW[] =
++    {'W','i','n','e','D','r','a','g','S','o','u','r','c','e','C','o','o','k','i','e',0};
++static const WCHAR drag_target_propW[] =
++    {'W','i','n','e','D','r','a','g','T','a','r','g','e','t',0};
++
++/* Keep in sync with dlls/ole32/ole2.c. */
++enum { DRAG_SOURCE_START = 1, DRAG_SOURCE_POLL, DRAG_SOURCE_DATA, DRAG_SOURCE_END };
++enum { DRAG_STATE_NONE, DRAG_STATE_STARTED, DRAG_STATE_WINE, DRAG_STATE_FOREIGN, DRAG_STATE_DROPPED,
++       DRAG_STATE_FINISHED, DRAG_STATE_CANCELLED };
++#define DRAG_KIND_FILES 1
++#define DRAG_KIND_TEXT  2
++#define DRAG_KIND_URL   4
++#define DRAG_KIND_ALL   7
++
++struct wine_drag_source_params
++{
++    UINT32 size;      /* sizeof(struct wine_drag_source_params) */
++    UINT32 effects;   /* START: the DROPEFFECT_* the source allows */
++    UINT32 kinds;     /* START: DRAG_KIND_* offered; POLL: kinds a target asked for, not rendered yet; DATA: the kind */
++    UINT32 state;     /* POLL: DRAG_STATE_* */
++    UINT32 action;    /* POLL: the compositor's dnd action (WL_DATA_DEVICE_MANAGER_DND_ACTION_*) */
++    UINT32 bytes;     /* DATA: size of data */
++    UINT64 data;      /* DATA: files: double-null-terminated DOS paths; text, url: UTF-16 */
++};
++
++static const struct { const char *mime; UINT32 kind; } drag_mimes[] =
++{
++    { "text/uri-list", DRAG_KIND_FILES },
++    { "text/uri-list", DRAG_KIND_URL },
++    { "text/plain;charset=utf-8", DRAG_KIND_TEXT },
++    { "text/plain", DRAG_KIND_TEXT },
++    { "text/plain;charset=utf-8", DRAG_KIND_URL },
++    { "text/plain", DRAG_KIND_URL },
++};
++
++#define DRAG_MAX_PENDING 16
++
++static struct
++{
++    struct wl_data_source *source;   /* NULL when there is no drag */
++    HWND tracker;                    /* ole32's tracker window; 0 once DoDragDrop is done */
++    HWND origin;                     /* the window the drag started on */
++    UINT32 kinds, state, action, requested;
++    BOOL confirmed;                  /* the compositor runs the drag (it sent a source event) */
++    char tag[96];
++    char *data[3];                   /* rendered, UTF-8 (files: a text/uri-list), by drag_kind_index */
++    size_t size[3];
++    BOOL rendered[3];
++    struct { int fd; UINT32 kind; BOOL uri_list; } pending[DRAG_MAX_PENDING];
++    int npending;
++} drag_src;
++static pthread_mutex_t drag_src_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++static BOOL neutron_drag_out_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_DRAG_OUT", TRUE);
++    return on;
++}
++
++BOOL wayland_drag_out_enabled(void)
++{
++    return neutron_drag_out_on();
++}
++
++static int drag_kind_index(UINT32 kind)
++{
++    return kind == DRAG_KIND_FILES ? 0 : kind == DRAG_KIND_TEXT ? 1 : 2;
++}
++
++/* The kind a requested mime type is served from: the first entry of drag_mimes the drag offers. */
++static UINT32 drag_kind_for_mime(const char *mime, UINT32 kinds)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(drag_mimes); i++)
++        if ((kinds & drag_mimes[i].kind) && !strcmp(mime, drag_mimes[i].mime)) return drag_mimes[i].kind;
++    return 0;
++}
++
++/* Write one transfer and close it, bounded like read_all: a reader that stalls must not hang this thread. */
++static void drag_write(int fd, UINT32 kind, BOOL uri_list, const char *buf, size_t size)
++{
++    char *copy = NULL;
++    size_t done = 0;
++    int waited = 0;
++
++    /* a link as text/uri-list is one line */
++    if (kind == DRAG_KIND_URL && uri_list && size && (copy = malloc(size + 2)))
++    {
++        memcpy(copy, buf, size);
++        copy[size++] = '\r';
++        copy[size++] = '\n';
++        buf = copy;
++    }
++    while (done < size && waited < NEUTRON_DND_READ_TIMEOUT_MS)
++    {
++        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
++        ssize_t ret;
++        int pr = poll(&pfd, 1, 50);
++
++        if (pr == 0) { waited += 50; continue; }
++        if (pr < 0) { if (errno == EINTR) continue; break; }
++        ret = write(fd, buf + done, size - done);
++        if (ret > 0) done += ret;
++        else if (ret < 0 && errno != EINTR && errno != EAGAIN) break;
++    }
++    if (done < size) ERR("neutron-dragout: wrote %zu of %zu bytes\n", done, size);
++    free(copy);
++    close(fd);
++}
++
++/* With drag_src_mutex held. */
++static void drag_source_free_locked(void)
++{
++    int i;
++
++    if (drag_src.source) wl_data_source_destroy(drag_src.source);
++    for (i = 0; i < drag_src.npending; i++) close(drag_src.pending[i].fd);
++    for (i = 0; i < 3; i++) free(drag_src.data[i]);
++    memset(&drag_src, 0, sizeof(drag_src));
++    wl_display_flush(process_wayland.wl_display);
++}
++
++/* With drag_src_mutex held: have the OLE loop look at the drag now rather than at its next 50 ms tick. */
++static void drag_source_wake_locked(void)
++{
++    if (drag_src.tracker) NtUserPostMessage(drag_src.tracker, WM_TIMER, 1, 0);
++}
++
++/* A Wine window of this wineserver is under the pointer (dnd_wine_drag_enter marked it on the tracker). */
++static BOOL drag_source_over_wine(HWND tracker)
++{
++    return tracker && NtUserGetProp(tracker, drag_target_propW);
++}
++
++/* With drag_src_mutex held: where the pointer is, while the drag is still running. */
++static void drag_source_update_locked(void)
++{
++    if (drag_src.state != DRAG_STATE_STARTED && drag_src.state != DRAG_STATE_WINE &&
++        drag_src.state != DRAG_STATE_FOREIGN)
++        return;
++    if (drag_source_over_wine(drag_src.tracker)) drag_src.state = DRAG_STATE_WINE;
++    else if (drag_src.confirmed) drag_src.state = DRAG_STATE_FOREIGN;
++}
++
++static void drag_source_target(void *data, struct wl_data_source *source, const char *mime_type)
++{
++    pthread_mutex_lock(&drag_src_mutex);
++    if (source == drag_src.source)
++    {
++        drag_src.confirmed = TRUE;
++        drag_source_update_locked();
++        TRACE("target %s -> state %u\n", debugstr_a(mime_type), drag_src.state);
++        drag_source_wake_locked();
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++}
++
++static void drag_source_send(void *data, struct wl_data_source *source, const char *mime_type, int32_t fd)
++{
++    const char *what = "not offered";
++    char *copy = NULL;
++    size_t size = 0;
++    BOOL uri_list = FALSE, now = FALSE;
++    UINT32 kind = 0;
++    int idx;
++
++    pthread_mutex_lock(&drag_src_mutex);
++    if (source == drag_src.source && mime_type && (kind = drag_kind_for_mime(mime_type, drag_src.kinds)))
++    {
++        idx = drag_kind_index(kind);
++        uri_list = !strcmp(mime_type, "text/uri-list");
++        if (drag_src.rendered[idx])
++        {
++            if ((size = drag_src.size[idx]) && (copy = malloc(size))) memcpy(copy, drag_src.data[idx], size);
++            else size = 0;
++            now = TRUE;
++            what = "rendered";
++        }
++        else if (drag_src.tracker && drag_src.npending < DRAG_MAX_PENDING)
++        {
++            drag_src.pending[drag_src.npending].fd = fd;
++            drag_src.pending[drag_src.npending].kind = kind;
++            drag_src.pending[drag_src.npending].uri_list = uri_list;
++            drag_src.npending++;
++            drag_src.requested |= kind;
++            drag_source_wake_locked();
++            fd = -1;
++            what = "asking the application";
++        }
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++
++    ERR("neutron-dragout: a target asked for %s: %s\n", debugstr_a(mime_type), what);
++    if (now) drag_write(fd, kind, uri_list, copy, size);
++    else if (fd != -1) close(fd);
++    free(copy);
++}
++
++static void drag_source_cancelled(void *data, struct wl_data_source *source)
++{
++    HWND origin = 0;
++
++    pthread_mutex_lock(&drag_src_mutex);
++    if (source == drag_src.source)
++    {
++        ERR("neutron-dragout: the compositor cancelled the drag (state %u)\n", drag_src.state);
++        drag_src.state = DRAG_STATE_CANCELLED;
++        origin = drag_src.origin;
++        if (!drag_src.tracker) drag_source_free_locked();
++        else drag_source_wake_locked();
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++    if (origin) wayland_pointer_release_drag_buttons(origin, "drag cancelled");
++}
++
++static void drag_source_dnd_drop_performed(void *data, struct wl_data_source *source)
++{
++    HWND origin = 0;
++
++    pthread_mutex_lock(&drag_src_mutex);
++    /* A drop on a Wine window is ended by that window's process (data_device_drop). */
++    if (source == drag_src.source && !drag_source_over_wine(drag_src.tracker))
++    {
++        ERR("neutron-dragout: dropped on a Linux client (action %#x)\n", drag_src.action);
++        drag_src.state = DRAG_STATE_DROPPED;
++        origin = drag_src.origin;
++        drag_source_wake_locked();
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++    if (origin) wayland_pointer_release_drag_buttons(origin, "drop on a Linux client");
++}
++
++static void drag_source_dnd_finished(void *data, struct wl_data_source *source)
++{
++    pthread_mutex_lock(&drag_src_mutex);
++    if (source == drag_src.source)
++    {
++        ERR("neutron-dragout: the target finished (state %u, action %#x)\n", drag_src.state, drag_src.action);
++        if (drag_src.state == DRAG_STATE_DROPPED) drag_src.state = DRAG_STATE_FINISHED;
++        if (!drag_src.tracker) drag_source_free_locked();
++        else drag_source_wake_locked();
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++}
++
++static void drag_source_action(void *data, struct wl_data_source *source, uint32_t dnd_action)
++{
++    pthread_mutex_lock(&drag_src_mutex);
++    if (source == drag_src.source)
++    {
++        drag_src.action = dnd_action;
++        drag_src.confirmed = TRUE;
++        drag_source_wake_locked();
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++}
++
++static const struct wl_data_source_listener drag_source_listener =
++{
++    drag_source_target,
++    drag_source_send,
++    drag_source_cancelled,
++    drag_source_dnd_drop_performed,
++    drag_source_dnd_finished,
++    drag_source_action,
++};
++
++/* DOS paths -> text/uri-list (as winex11's export_hdrop does for the clipboard, escaping only what RFC 3986 needs). */
++static char *drag_uri_list(const WCHAR *paths, size_t count, size_t *ret_size)
++{
++    static const char hex[] = "0123456789ABCDEF";
++    size_t pos = 0, cap = 256, i = 0;
++    char *out = malloc(cap), *bigger;
++
++    while (out && i < count && paths[i])
++    {
++        const WCHAR *path = paths + i;
++        char *unix_name = NULL, *real;
++        const unsigned char *c;
++        size_t need;
++
++        while (i < count && paths[i]) i++;
++        i++;
++        if (ntdll_get_unix_file_name(path, &unix_name, FILE_OPEN))
++        {
++            ERR("neutron-dragout: no unix path for %s\n", debugstr_w(path));
++            continue;
++        }
++        /* C: is the prefix's dosdevices/c: link; hand over the real path, as a Linux application would */
++        if ((real = realpath(unix_name, NULL)))
++        {
++            free(unix_name);
++            unix_name = real;
++        }
++        need = pos + 7 + 3 * strlen(unix_name) + 3;
++        if (need > cap)
++        {
++            cap = max(cap * 2, need);
++            if (!(bigger = realloc(out, cap))) { free(out); out = NULL; free(unix_name); break; }
++            out = bigger;
++        }
++        memcpy(out + pos, "file://", 7);
++        pos += 7;
++        for (c = (const unsigned char *)unix_name; *c; c++)
++        {
++            if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') ||
++                *c == '/' || *c == '-' || *c == '.' || *c == '_' || *c == '~')
++                out[pos++] = *c;
++            else
++            {
++                out[pos++] = '%';
++                out[pos++] = hex[*c >> 4];
++                out[pos++] = hex[*c & 15];
++            }
++        }
++        out[pos++] = '\r';
++        out[pos++] = '\n';
++        free(unix_name);
++    }
++    *ret_size = out ? pos : 0;
++    return out;
++}
++
++static char *drag_utf8(const WCHAR *text, size_t count, size_t *ret_size)
++{
++    DWORD size = 0;
++    size_t len = 0;
++    char *out;
++
++    while (len < count && text[len]) len++;
++    RtlUnicodeToUTF8N(NULL, 0, &size, text, len * sizeof(WCHAR));
++    if (!(out = malloc(size + 1))) return NULL;
++    RtlUnicodeToUTF8N(out, size, &size, text, len * sizeof(WCHAR));
++    *ret_size = size;
++    return out;
++}
++
++static UINT32 drag_actions_from_effects(UINT32 effects)
++{
++    UINT32 actions = 0;
++
++    if (effects & (DROPEFFECT_COPY | DROPEFFECT_LINK)) actions |= WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
++    if (effects & DROPEFFECT_MOVE) actions |= WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
++    return actions;
++}
++
++static LRESULT drag_source_start(HWND tracker, struct wine_drag_source_params *params)
++{
++    struct wayland_data_device *data_device = &process_wayland.data_device;
++    struct wayland_win_data *win_data;
++    struct wl_data_source *source;
++    uint32_t serial, actions;
++    unsigned int i, j, cookie;
++    LARGE_INTEGER now;
++    BOOL started = FALSE;
++    HWND origin;
++
++    if (!neutron_drag_out_on()) return 0;
++    if (!(actions = drag_actions_from_effects(params->effects)) || !(params->kinds & DRAG_KIND_ALL)) return 0;
++    if (!process_wayland.wl_data_device_manager ||
++        wl_data_device_manager_get_version(process_wayland.wl_data_device_manager) <
++            WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
++        return 0;
++    if (!wayland_pointer_drag_origin(&origin, &serial))
++    {
++        ERR("neutron-dragout: no button held on one of our surfaces; the drag stays on Wine's windows\n");
++        return 0;
++    }
++    if (!(source = wl_data_device_manager_create_data_source(process_wayland.wl_data_device_manager)))
++        return 0;
++
++    pthread_mutex_lock(&drag_src_mutex);
++    /* an earlier drop still delivering to a Linux client: the new drag wins */
++    if (drag_src.source) drag_source_free_locked();
++    NtQuerySystemTime(&now);
++    cookie = ((unsigned int)now.QuadPart ^ (unsigned int)(now.QuadPart >> 32) ^ (GetCurrentProcessId() << 16)) | 1;
++    snprintf(drag_src.tag, sizeof(drag_src.tag), WINE_DRAG_TAG_PREFIX "hwnd=%lx;cookie=%x",
++             (unsigned long)HandleToUlong(tracker), cookie);
++    NtUserSetProp(tracker, drag_cookie_propW, UlongToHandle(cookie));
++    NtUserRemoveProp(tracker, drag_target_propW);
++    for (i = 0; i < ARRAY_SIZE(drag_mimes); i++)
++    {
++        if (!(params->kinds & drag_mimes[i].kind)) continue;
++        for (j = 0; j < i; j++)
++            if ((params->kinds & drag_mimes[j].kind) && !strcmp(drag_mimes[j].mime, drag_mimes[i].mime)) break;
++        if (j == i) wl_data_source_offer(source, drag_mimes[i].mime);
++    }
++    wl_data_source_offer(source, drag_src.tag);
++    wl_data_source_set_actions(source, actions);
++    wl_data_source_add_listener(source, &drag_source_listener, NULL);
++    drag_src.source = source;
++    drag_src.tracker = tracker;
++    drag_src.origin = origin;
++    drag_src.kinds = params->kinds & DRAG_KIND_ALL;
++    drag_src.state = DRAG_STATE_STARTED;
++
++    pthread_mutex_lock(&data_device->mutex);
++    if (data_device->wl_data_device && (win_data = wayland_win_data_get(origin)))
++    {
++        if (win_data->wayland_surface && win_data->wayland_surface->wl_surface)
++        {
++            wl_data_device_start_drag(data_device->wl_data_device, source,
++                                      win_data->wayland_surface->wl_surface, NULL, serial);
++            started = TRUE;
++        }
++        wayland_win_data_release(win_data);
++    }
++    pthread_mutex_unlock(&data_device->mutex);
++    if (!started) drag_source_free_locked();
++    pthread_mutex_unlock(&drag_src_mutex);
++    wl_display_flush(process_wayland.wl_display);
++
++    if (!started)
++    {
++        NtUserRemoveProp(tracker, drag_cookie_propW);
++        return 0;
++    }
++    ERR("neutron-dragout: drag started from hwnd %p (serial %u, effects %#x -> actions %#x, kinds %#x)\n",
++        origin, serial, params->effects, actions, params->kinds);
++    return 1;
++}
++
++static LRESULT drag_source_data(HWND tracker, struct wine_drag_source_params *params)
++{
++    const WCHAR *src = (const WCHAR *)(ULONG_PTR)params->data;
++    struct { int fd; UINT32 kind; BOOL uri_list; } out[DRAG_MAX_PENDING];
++    UINT32 kind = params->kinds;
++    size_t size = 0;
++    char *bytes = NULL;
++    int i, n = 0, idx;
++
++    if (kind != DRAG_KIND_FILES && kind != DRAG_KIND_TEXT && kind != DRAG_KIND_URL) return 0;
++    idx = drag_kind_index(kind);
++    if (src && params->bytes >= sizeof(WCHAR))
++    {
++        if (kind == DRAG_KIND_FILES) bytes = drag_uri_list(src, params->bytes / sizeof(WCHAR), &size);
++        else bytes = drag_utf8(src, params->bytes / sizeof(WCHAR), &size);
++    }
++
++    pthread_mutex_lock(&drag_src_mutex);
++    if (drag_src.tracker != tracker || drag_src.rendered[idx])
++    {
++        pthread_mutex_unlock(&drag_src_mutex);
++        free(bytes);
++        return 0;
++    }
++    drag_src.data[idx] = bytes;
++    drag_src.size[idx] = size;
++    drag_src.rendered[idx] = TRUE;
++    drag_src.requested &= ~kind;
++    for (i = 0; i < drag_src.npending; i++)
++    {
++        if (drag_src.pending[i].kind == kind)
++        {
++            out[n].fd = drag_src.pending[i].fd;
++            out[n].kind = kind;
++            out[n++].uri_list = drag_src.pending[i].uri_list;
++            drag_src.pending[i--] = drag_src.pending[--drag_src.npending];
++        }
++    }
++    /* drag_write runs unlocked; a new drag would free these bytes, so write from a copy */
++    bytes = NULL;
++    if (n && size && (bytes = malloc(size))) memcpy(bytes, drag_src.data[idx], size);
++    pthread_mutex_unlock(&drag_src_mutex);
++
++    ERR("neutron-dragout: rendered kind %#x, %zu bytes, for %d waiting transfer(s)\n", kind, size, n);
++    for (i = 0; i < n; i++) drag_write(out[i].fd, out[i].kind, out[i].uri_list, bytes, bytes ? size : 0);
++    free(bytes);
++    return 1;
++}
++
++static LRESULT drag_source_end(HWND tracker)
++{
++    HWND origin = 0;
++    int i;
++
++    pthread_mutex_lock(&drag_src_mutex);
++    if (drag_src.tracker == tracker)
++    {
++        if (drag_src.state != DRAG_STATE_STARTED) origin = drag_src.origin;
++        ERR("neutron-dragout: DoDragDrop is done (state %u)\n", drag_src.state);
++        drag_src.tracker = 0;
++        /* A Linux client still taking the drop keeps the source until it finishes; what it has not asked for
++         * yet was rendered by ole32 before this. */
++        if (drag_src.state != DRAG_STATE_DROPPED) drag_source_free_locked();
++        else
++        {
++            for (i = 0; i < drag_src.npending; i++) close(drag_src.pending[i].fd);
++            drag_src.npending = 0;
++        }
++    }
++    pthread_mutex_unlock(&drag_src_mutex);
++    NtUserRemoveProp(tracker, drag_cookie_propW);
++    NtUserRemoveProp(tracker, drag_target_propW);
++    if (origin) wayland_pointer_release_drag_buttons(origin, "drag ended");
++    return 1;
++}
++
++/**********************************************************************
++ *          wayland_drag_source_message
++ *
++ * WM_WINE_DRAG_SOURCE from ole32's DoDragDrop, on its tracker window's thread.
++ */
++LRESULT wayland_drag_source_message(HWND hwnd, WPARAM op, LPARAM lparam)
++{
++    struct wine_drag_source_params *params = (struct wine_drag_source_params *)lparam;
++
++    if (op == DRAG_SOURCE_END) return drag_source_end(hwnd);
++    if (!params || params->size != sizeof(*params)) return 0;
++    switch (op)
++    {
++    case DRAG_SOURCE_START:
++        return drag_source_start(hwnd, params);
++    case DRAG_SOURCE_POLL:
++        pthread_mutex_lock(&drag_src_mutex);
++        if (drag_src.tracker == hwnd) drag_source_update_locked();
++        params->state = drag_src.tracker == hwnd ? drag_src.state : DRAG_STATE_NONE;
++        params->action = drag_src.action;
++        params->kinds = drag_src.tracker == hwnd ? drag_src.requested : 0;
++        pthread_mutex_unlock(&drag_src_mutex);
++        return 1;
++    case DRAG_SOURCE_DATA:
++        return drag_source_data(hwnd, params);
++    }
++    return 0;
++}
++
++/* The tag of a drag a Wine process of this wineserver runs (see above), or NULL; *tracker is its tracker window. */
++static const char *dnd_wine_drag_tag(struct wayland_data_offer *offer, HWND *tracker)
++{
++    const size_t len = sizeof(WINE_DRAG_TAG_PREFIX) - 1;
++    unsigned long hwnd;
++    unsigned int cookie;
++    char **p;
++
++    wl_array_for_each(p, &offer->types)
++    {
++        if (strncmp(*p, WINE_DRAG_TAG_PREFIX, len)) continue;
++        if (sscanf(*p + len, "hwnd=%lx;cookie=%x", &hwnd, &cookie) != 2 || !cookie) continue;
++        if (HandleToUlong(NtUserGetProp(UlongToHandle(hwnd), drag_cookie_propW)) != cookie) continue;
++        *tracker = UlongToHandle(hwnd);
++        return *p;
++    }
++    return NULL;
++}
++
++/* Mark (hwnd) or unmark (0) the Wine window under a Wine drag on its tracker, and have its OLE loop look now. */
++static void dnd_wine_drag_mark(HWND tracker, HWND hwnd)
++{
++    if (!tracker) return;
++    if (hwnd) NtUserSetProp(tracker, drag_target_propW, hwnd);
++    else NtUserRemoveProp(tracker, drag_target_propW);
++    NtUserPostMessage(tracker, WM_TIMER, 1, 0);
++}
++
++/**********************************************************************
+  *          wl_data_device handling
+  */
+ 
+@@ -1197,6 +1788,8 @@
+     uint32_t enter_serial;
+     int x, y;                    /* surface-local, in wayland (logical) units */
+     const char *mime;            /* owned by offer->types, valid while the offer lives */
++    BOOL wine_drag;              /* NEUTRON drag-out: a drag a Wine process runs (dnd_wine_drag_tag) */
++    HWND tracker;                /* its OLE tracker window */
+ } dnd;
+ 
+ /* Payload handed to the window thread. Only one drag is in flight per process at a time, and the
+@@ -1530,6 +2123,28 @@
+     TRACE("hwnd=%p offer=%p pos=%d,%d\n", hwnd, offer,
+           wl_fixed_to_int(x_w), wl_fixed_to_int(y_w));
+ 
++    /* NEUTRON drag-out: an OLE drag of this wineserver over one of our windows. Its source's OLE loop finds the
++     * target and talks to its IDropTarget itself, with the application's own data; it only needs the pointer, so
++     * give it the hardware mouse move this is. Accept only the private type, so the compositor sends the drop. */
++    dnd.wine_drag = FALSE;
++    if ((dnd.mime = dnd_wine_drag_tag(offer, &dnd.tracker)))
++    {
++        dnd.offer = offer;
++        dnd.hwnd = hwnd;
++        dnd.enter_serial = serial;
++        dnd.wine_drag = TRUE;
++        dnd_wine_drag_mark(dnd.tracker, hwnd);
++        wl_data_offer_accept(wl_data_offer, serial, dnd.mime);
++        if (wl_data_offer_get_version(wl_data_offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
++            wl_data_offer_set_actions(wl_data_offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
++                                      WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
++                                      WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
++        wl_display_flush(process_wayland.wl_display);
++        wayland_pointer_dnd_motion(hwnd, x_w, y_w);
++        TRACE("Wine drag %s over hwnd %p\n", debugstr_a(dnd.mime), hwnd);
++        return;
++    }
++
+     dnd.offer = offer;
+     dnd.hwnd = hwnd;
+     dnd.enter_serial = serial;
+@@ -1585,6 +2200,13 @@
+     dnd.offer = NULL;
+     dnd.mime = NULL;
+     dnd_drag_feedback_wedged = FALSE;
++    /* NEUTRON drag-out: the source's OLE loop learns where the pointer went from the next target's answer */
++    if (dnd.wine_drag)
++    {
++        dnd.wine_drag = FALSE;
++        if (hwnd && NtUserGetProp(dnd.tracker, drag_target_propW) == hwnd) dnd_wine_drag_mark(dnd.tracker, 0);
++        return;
++    }
+     if (!hwnd) return;
+ 
+     /* POSTED, not sent. Nobody uses LEAVE's return value, so a bounded synchronous send buys
+@@ -1609,6 +2231,11 @@
+     DWORD effect;
+ 
+     if (!dnd.hwnd || !dnd.offer) return;
++    if (dnd.wine_drag)
++    {
++        wayland_pointer_dnd_motion(dnd.hwnd, x_w, y_w);
++        return;
++    }
+     dnd.x = wl_fixed_to_int(x_w);
+     dnd.y = wl_fixed_to_int(y_w);
+     dnd_screen_point(dnd.hwnd, x_w, y_w, &dnd_xfer.pt);
+@@ -1631,6 +2258,20 @@
+     dnd.hwnd = NULL;
+     dnd.offer = NULL;
+     dnd.mime = NULL;
++    /* NEUTRON drag-out: a Wine drag dropped on one of our windows. The compositor consumed the button release; it is
++     * what tells the source's OLE loop to drop (IDropSource::QueryContinueDrag), on the window under the pointer. */
++    if (dnd.wine_drag)
++    {
++        dnd.wine_drag = FALSE;
++        if (!offer) return;
++        NtUserSetProp(dnd.tracker, drag_target_propW, hwnd);
++        if (wl_data_offer_get_version(offer->wl_data_offer) >= WL_DATA_OFFER_FINISH_SINCE_VERSION)
++            wl_data_offer_finish(offer->wl_data_offer);
++        wl_display_flush(process_wayland.wl_display);
++        ERR("neutron-dragout: Wine drag dropped on hwnd %p; handing the release to its OLE loop\n", hwnd);
++        wayland_pointer_release_drag_buttons(hwnd, "drop on a Wine window");
++        return;
++    }
+     /* NEUTRON DIAGNOSTIC: the drop path had NO default-channel logging at all, and both early
+      * returns below are silent. On 11.10-55 the user's drop still failed on the first attempt
+      * while the log proved we were accepting (`Answering 0x1`) and that no step timed out -- which
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -746,6 +746,15 @@
+ /* NEUTRON: runs the OLE drop delivery on the target window's thread -- see the
+  * WM_WAYLAND_DND_* comment above. Called only from WAYLAND_WindowMessage(). */
+ LRESULT wayland_dnd_window_message(HWND hwnd, UINT msg);
++/* NEUTRON drag-out: ole32's DoDragDrop asks the driver to run its drag on the desktop with this message, sent to
++ * its own tracker window (wparam = operation, lparam = parameters). The last driver message, so no driver's own
++ * enum reaches it and a driver without drag-out answers 0. Keep in sync with dlls/ole32/ole2.c. */
++#define WM_WINE_DRAG_SOURCE WM_WINE_LAST_DRIVER_MSG
++LRESULT wayland_drag_source_message(HWND hwnd, WPARAM op, LPARAM params);
++BOOL wayland_drag_out_enabled(void);
++void wayland_pointer_dnd_motion(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy);
++BOOL wayland_pointer_drag_origin(HWND *hwnd, uint32_t *serial);
++void wayland_pointer_release_drag_buttons(HWND hwnd, const char *where);
+ 
+ /**********************************************************************
+  *          Helpers
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -181,16 +181,16 @@
+     }
+ }
+ 
+-static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
++/* NEUTRON drag-out: also used for the pointer position of a compositor drag over one of our surfaces
++ * (wayland_pointer_dnd_motion), which has no wl_pointer focus and no cursor of ours to sync. */
++static void pointer_motion_to_hwnd(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy, BOOL cursor_sync)
+ {
+     INPUT input = {0};
+     RECT *window_rect;
+-    HWND hwnd;
+     POINT screen;
+     struct wayland_surface *surface;
+     struct wayland_win_data *data;
+ 
+-    if (!(hwnd = wayland_pointer_get_focused_hwnd())) return;
+     if (!(data = wayland_win_data_get(hwnd))) return;
+     if (!(surface = data->wayland_surface))
+     {
+@@ -226,6 +226,7 @@
+           screen.x, screen.y);
+ 
+     NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    if (!cursor_sync) return;
+ 
+     /* NEUTRON: cross-process cursor sync. When the pointer is over a window owned by ANOTHER process
+      * (a CEF panel host composited into our display subsurface), that process's SetCursor runs in its
+@@ -256,6 +257,22 @@
+     }
+ }
+ 
++static void pointer_handle_motion_internal(wl_fixed_t sx, wl_fixed_t sy)
++{
++    HWND hwnd;
++
++    if ((hwnd = wayland_pointer_get_focused_hwnd())) pointer_motion_to_hwnd(hwnd, sx, sy, TRUE);
++}
++
++/* NEUTRON drag-out: a drag the compositor runs (wl_data_device.start_drag) moves over one of our surfaces. The
++ * compositor reports the position as data_device motion instead of wl_pointer motion; turn it into the same
++ * hardware mouse move, so wineserver's cursor follows and the move reaches the drag source's OLE loop through its
++ * capture window, as the mouse does on Windows. Called on the wayland event thread. */
++void wayland_pointer_dnd_motion(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy)
++{
++    pointer_motion_to_hwnd(hwnd, sx, sy, FALSE);
++}
++
+ static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
+                                   uint32_t time, wl_fixed_t sx, wl_fixed_t sy)
+ {
+@@ -333,6 +350,63 @@
+         NtUserSendHardwareInput(hwnd, 0, &input, 0);
+     }
+ }
++
++/* NEUTRON drag-out: where a drag the application starts now comes from: the window whose surface holds the
++ * pointer's implicit grab and the serial of the press, which wl_data_device.start_drag needs. FALSE when no button
++ * is held on one of our surfaces (the compositor would refuse the drag). */
++BOOL wayland_pointer_drag_origin(HWND *hwnd, uint32_t *serial)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    BOOL ret;
++
++    pthread_mutex_lock(&pointer->mutex);
++    *hwnd = pointer->focused_hwnd;
++    *serial = pointer->button_serial;
++    ret = *hwnd && *serial && pointer->buttons_down;
++    pthread_mutex_unlock(&pointer->mutex);
++    return ret;
++}
++
++/* NEUTRON drag-out: the end of a drag the compositor ran. The compositor consumes the button release that ends
++ * it (it becomes the drop), so no wl_pointer.button reaches us and wineserver would keep the button down. On
++ * Windows the release is a hardware event that goes to the capture window: the drag source's OLE loop, which reads
++ * it as the drop. Send it for every button wineserver still has down (the async state is shared, so a drop
++ * on another Wine process's window is ended once, by whichever process saw it), and drop a late real release
++ * of a button released here (released_early, see pointer_release_pending). */
++void wayland_pointer_release_drag_buttons(HWND hwnd, const char *where)
++{
++    static const struct { INT vk; DWORD flags; DWORD data; uint32_t button; } buttons[] =
++    {
++        { VK_LBUTTON, MOUSEEVENTF_LEFTUP, 0, BTN_LEFT },
++        { VK_RBUTTON, MOUSEEVENTF_RIGHTUP, 0, BTN_RIGHT },
++        { VK_MBUTTON, MOUSEEVENTF_MIDDLEUP, 0, BTN_MIDDLE },
++        { VK_XBUTTON1, MOUSEEVENTF_XUP, XBUTTON1, BTN_SIDE },
++        { VK_XBUTTON2, MOUSEEVENTF_XUP, XBUTTON2, BTN_EXTRA },
++    };
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    INPUT input = {0};
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(buttons); i++)
++    {
++        uint32_t bit = pointer_button_bit(buttons[i].button);
++
++        pthread_mutex_lock(&pointer->mutex);
++        if (pointer->buttons_down & bit)
++        {
++            pointer->buttons_down &= ~bit;
++            pointer->released_early |= bit;
++        }
++        pthread_mutex_unlock(&pointer->mutex);
++        if (!(NtUserGetAsyncKeyState(buttons[i].vk) & 0x8000)) continue;
++
++        ERR("neutron-dragout: %s: sending the release of vk %#x\n", where, buttons[i].vk);
++        input.type = INPUT_MOUSE;
++        input.mi.dwFlags = buttons[i].flags;
++        input.mi.mouseData = buttons[i].data;
++        NtUserSendHardwareInput(hwnd, 0, &input, 0);
++    }
++}
+ 
+ static void pointer_handle_enter(void *data, struct wl_pointer *wl_pointer,
+                                  uint32_t serial, struct wl_surface *wl_surface,
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -2465,6 +2465,9 @@
+     case WM_WAYLAND_DND_LEAVE:
+     case WM_WAYLAND_DND_DROP:
+         return wayland_dnd_window_message(hwnd, msg);
++    /* NEUTRON drag-out: ole32's DoDragDrop, on its tracker window's own thread */
++    case WM_WINE_DRAG_SOURCE:
++        return wayland_drag_source_message(hwnd, wp, lp);
+     default:
+         FIXME("got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp);
+         return 0;

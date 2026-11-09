@@ -1,0 +1,2277 @@
+From: AdobeWine
+Subject: [PATCH] mspatcha: Normalize and transform 32-bit PE files.
+
+Adopted from LinDobe (le-birnes/LinDobe, LGPL-2.1+), patch 0097, with these changes: none to the code; it applies to Wine 11.10 without fuzz; diff regenerated with diff -u against our tree.
+
+Upstream mspatcha could not apply PA19 deltas made for 32-bit executables. It refused every delta with a rift
+table (the per-file "unknown count"). It matched old files by their raw CRC, but the patch creator takes that CRC
+after normalization (rebase to the new image base, new COFF timestamp, unbinding, lock prefixes, checksum). It read
+the header's rebase field as a single VLI where it is a 16-bit image base plus a COFF timestamp, and it skipped
+the resource timestamp. It refused old files larger than the LZX window, and NormalizeFileForPatchSignature was
+a stub. Acrobat DC's update has 1218 deltas with rift tables.
+
+The header is now read in full (second option field with transform bits and optional window size, image base,
+COFF and resource timestamps, rift tables). Old files are normalized before matching. An old file that already is
+the new file, exactly or after normalization, is returned as it is. When a delta has a rift table, the
+normalized old file goes through the rift transform before it is used as the LZX dictionary: relocations or an
+address scan, imports, exports, near jumps and calls, and resource directories are moved to their new RVAs. Only
+the first window of a large old file is the dictionary, and the decoder takes the window size from the caller.
+NormalizeFileForPatchSignature is implemented. The PE work is in the new file pe.c.
+
+Rewritten from a behaviour specification; checked black-box against Windows' mspatcha.dll output. Where the
+specification was unclear or wrong, the Windows DLL's results decided. The specification came from a study of Windows'
+mspatcha.dll that included decompiling it, and the first version of this code was based on that study. A separate
+session of the same AI tool wrote this version without access to the decompile or the first version. That is not a
+clean-room process, and it is not independent proof that no Microsoft code carried over. The file and handle interfaces treat a normalized already-patched file like an exact
+one under APPLY_OPTION_FAIL_IF_EXACT and ignore APPLY_OPTION_FAIL_IF_CLOSE there. A malformed lock-prefix table
+ends normalization (no checksum; NormalizeFileForPatchSignature returns 0). A HIGHADJ relocation that ends a block
+keeps the rebase reading entries up to the end of the file.
+Test: dlls/mspatcha/tests: 2145 tests, 0 failures (x86_64 and i386).
+Test: wine/tests/mspatcha/applypatch.c builtin on Acrobat DC's 3544 deltas (installers/acro-x/all-wine.txt): 3534
+ok, 10 failed (the VC runtime deltas Windows also fails, ERROR_PATCH_WRONG_FILE); all 3534 outputs byte-identical
+to Windows' mspatcha.dll output.
+Test: NormalizeFileForPatchSignature output and return value identical to Windows' for 148 code-bearing PE32 files
+and 33 edited edge-case files under several option sets. The AXE8SharedExpat.dll delta applied to its own new
+file returns it unchanged, as on Windows.
+
+Lab (acrobat-adopt, 2026-11-08, runtime 11.10-185ad = 185 + riched20-textpara-getters + unsecapp-wmi-sink-host
++ this set): Acrobat Pro installed the user's way (`neutron programs install` of the Acrobat setup.exe = AcroPro.msi +
+AcrobatDCx64Upd2600222031.msp) into a fresh copy of a signed-in Adobe prefix: "Setup Completed", installed 26.002.22031,
+7778 files, 1.8 GB, thorvg-1.dll present (n=1). Before this set every install ended 1603 at PatchFiles (AcMsp-1..9).
+PROVENANCE (decision for Nuck before import): the description above states that the specification came from a study
+that decompiled Windows' mspatcha.dll, that the first version was based on it, and that this is not a clean-room
+process. Neutron's own mspatcha patches (mspatcha-pa19-pe-transform, -large-reference, -already-patched; black-box
+only, 3526 of 3544) are the alternative this replaces. Both findings of ours are present here (only the first window of
+an old file larger than the window is the reference; an already-patched old file with APPLY_OPTION_FAIL_IF_EXACT
+returns ERROR_PATCH_NOT_NECESSARY).
+Harness (all 3544 PA19 deltas of AcrobatDCx64Upd2600222031.msp through ApplyPatchToFileW, acrobat-msp's applytest):
+x86_64 3534/10 and i386 3534/10, n=2 each, identical; the 10 = VC++ runtime CC943011/E281B893 copies whose old file in
+this MSI is not the delta's target (ERROR_PATCH_WRONG_FILE, the same 10 that fail with ours). Our three patches
+3526/18; stock 185 2322/1222 (same harness, same prefix). 0 regressions against ours.
+Kill switch: none (the module is replaced as a whole; the A/B arm is stock mspatcha in the same harness).
+---
+--- a/dlls/mspatcha/Makefile.in
++++ b/dlls/mspatcha/Makefile.in
+@@ -9,4 +9,5 @@
+ SOURCES = \
+ 	lzxd_dec.c \
+ 	mspatcha_main.c \
+-	pa19.c
++	pa19.c \
++	pe.c
+--- a/dlls/mspatcha/lzxd_dec.c
++++ b/dlls/mspatcha/lzxd_dec.c
+@@ -52,6 +52,7 @@
+ #define MAX_CHUNK_UNCOMPRESSED_SIZE 0x8000
+ #define E8_TRANSFORM_LIMIT_BITS 30
+ #define E8_TRANSFORM_DEAD_ZONE 10
++#define MIN_WINDOW_SIZE ((size_t)1 << 15)
+ 
+ struct LZXD_dec {
+     /* use byte pointers instead of uint16 for simplicity on uncompressed
+@@ -662,7 +663,7 @@
+ DWORD decode_lzxd_stream(const BYTE *src, const size_t input_size,
+     BYTE *dst, const size_t output_size,
+     const size_t predef_size,
+-    DWORD large_window,
++    const size_t window_size,
+     PPATCH_PROGRESS_CALLBACK progress_fn,
+     PVOID  progress_ctx)
+ {
+@@ -692,29 +693,18 @@
+     dec->reps[1] = 1;
+     dec->reps[2] = 1;
+ 
+-    /* apparently the window size is not recorded and must be deduced from the file sizes */
++    /* the window size decides the number of distance slots */
+     {
+-        unsigned max_window = large_window ? MAX_LARGE_WINDOW : MAX_NORMAL_WINDOW;
+-        size_t window = (size_t)1 << 17;
+-        /* round up the old file size per the lzxd spec - correctness verified by fuzz tests */
+-        size_t total = (predef_size + 0x7FFF) & ~0x7FFF;
+-        unsigned delta;
++        size_t window = min(max(window_size, MIN_WINDOW_SIZE), MAX_LARGE_WINDOW);
++        unsigned bits = 15;
+ 
+-        total += output_size;
+-        dec->dist_slot_count = 34;
+-        while (window < total && window < ((size_t)1 << 19))
+-        {
+-            dec->dist_slot_count += 2;
+-            window <<= 1;
+-        }
+-        delta = 4;
+-        while (window < total && window < max_window)
+-        {
+-            dec->dist_slot_count += delta;
+-            delta <<= 1;
+-            window <<= 1;
+-        }
+-        TRACE("setting window to 0x%X\n", (unsigned)window);
++        while (((size_t)1 << bits) < window)
++            ++bits;
++        if (bits <= 19)
++            dec->dist_slot_count = bits * 2;
++        else
++            dec->dist_slot_count = 38 + 4 * ((1u << (bits - 19)) - 1);
++        TRACE("setting window to 0x%X\n", 1u << bits);
+     }
+ 
+     dec->bit_pos = 0;
+--- a/dlls/mspatcha/lzxd_dec.h
++++ b/dlls/mspatcha/lzxd_dec.h
+@@ -22,6 +22,6 @@
+ DWORD decode_lzxd_stream(const BYTE *src, const size_t input_size,
+     BYTE *dst, const size_t output_size,
+     const size_t predef_size,
+-    DWORD large_window,
++    const size_t window_size,
+     PPATCH_PROGRESS_CALLBACK progress_fn,
+     PVOID  progress_ctx);
+--- a/dlls/mspatcha/mspatcha_main.c
++++ b/dlls/mspatcha/mspatcha_main.c
+@@ -19,14 +19,8 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  *
+  * TODO
+- *  - Special processing of 32-bit executables is not supported, so this
+- *    version cannot patch 32-bit .exe and .dll files. See pa19.c for details.
+- *  - Implement interleaved decoding when PATCH_OPTION_INTERLEAVE_FILES was
+- *    used or the old file exceeds the lzxd window size.
+- *  - APPLY_OPTION_FAIL_IF_CLOSE is ignored. Normalization of 32-bit PE files
+- *    is required for checking this.
+- *  - GetFilePatchSignature* and NormalizeFileForPatchSignature require a
+- *    solution to the above 32-bit exe problem.
++ *  - Implement interleaved decoding when PATCH_OPTION_INTERLEAVE_FILES was used.
++ *  - GetFilePatchSignature* are not implemented.
+  */
+ 
+ #include <stdarg.h>
+@@ -265,8 +259,43 @@
+     ULONG new_coff_base, ULONG new_coff_time, ULONG ignore_range_count, PPATCH_IGNORE_RANGE ignore_range,
+     ULONG retain_range_count, PPATCH_RETAIN_RANGE retain_range)
+ {
+-    FIXME("stub - %p, %lu, %lx, %p, %lu, %lu, %lu, %p, %lu, %p\n", file_buffer, file_size, flags, options, new_coff_base,
++    BYTE *buf = file_buffer;
++    enum pe_normalize_result res;
++    BOOL changed;
++    ULONG i;
++
++    TRACE("%p, %lu, %lx, %p, %lu, %lu, %lu, %p, %lu, %p\n", file_buffer, file_size, flags, options, new_coff_base,
+         new_coff_time, ignore_range_count, ignore_range, retain_range_count, retain_range);
+-    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+-    return 0;
++
++    /* returns 1 if unchanged, 2 if changed, 0 if the image is malformed */
++    if (buf == NULL || file_size == 0)
++        return 1;
++
++    res = pe_normalize(buf, file_size, flags, new_coff_base, new_coff_time);
++    /* nothing more is done to a malformed image */
++    if (res == PE_MALFORMED)
++        return 0;
++    changed = (res == PE_CHANGED);
++
++    /* ranges which do not lie wholly inside the buffer are left alone */
++    for (i = 0; i < ignore_range_count; ++i)
++    {
++        if (ignore_range[i].OffsetInOldFile <= file_size
++            && ignore_range[i].LengthInBytes <= file_size - ignore_range[i].OffsetInOldFile)
++        {
++            memset(buf + ignore_range[i].OffsetInOldFile, 0, ignore_range[i].LengthInBytes);
++            changed = TRUE;
++        }
++    }
++    for (i = 0; i < retain_range_count; ++i)
++    {
++        if (retain_range[i].OffsetInOldFile <= file_size
++            && retain_range[i].LengthInBytes <= file_size - retain_range[i].OffsetInOldFile)
++        {
++            memset(buf + retain_range[i].OffsetInOldFile, 0, retain_range[i].LengthInBytes);
++            changed = TRUE;
++        }
++    }
++
++    return changed ? 2 : 1;
+ }
+--- a/dlls/mspatcha/pa19.c
++++ b/dlls/mspatcha/pa19.c
+@@ -17,19 +17,12 @@
+  * License along with this library; if not, write to the Free Software
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  *
++ * Old files which are 32-bit PE images are normalized before their CRC is
++ * checked, and transformed using the patch's rift table before they are used
++ * as the LZX dictionary. See pe.c.
++ *
+  * TODO
+- * - Normalization of 32-bit PE executable files and reversal of special
+- *   processing of these executables is not implemented.
+- *   Without normalization, old files cannot be validated for patching. The
+- *   function NormalizeFileForPatchSignature() in Windows could be used to work
+- *   out exactly how normalization works.
+- *   Most/all of the special processing seems to be relocation of targets for
+- *   some jump/call instructions to match more of the old file and improve
+- *   compression. Patching of 64-bit exes works because mspatchc.dll does not
+- *   implement special processing of them. In 32-bit patches, the variable
+- *   named here 'unknown_count' seems to indicate presence of data related to
+- *   reversing the processing. The changes that must be reversed occur at some,
+- *   but not all, of the positions listed in the PE .reloc table.
++ * - Interleaved files (PATCH_OPTION_INTERLEAVE_FILES) are not supported.
+  */
+ 
+ #include <stdarg.h>
+@@ -49,6 +42,13 @@
+ #define PA19_FILE_MAGIC 0x39314150
+ #define PATCH_OPTION_EXTRA_FLAGS 0x80000000
+ 
++/* bits of the second option field: the transform bits (see pe.c) and the
++ * presence of a window size field */
++#define PATCH_OPTION_2_WINDOW_SIZE 0x00010000
++#define PATCH_OPTION_2_SUPPORTED_FLAGS (0x0000033f | PATCH_OPTION_2_WINDOW_SIZE)
++
++#define MIN_DERIVED_WINDOW 0x20000
++
+ static UINT32 compute_zero_crc32(UINT32 crc, INT_PTR len)
+ {
+     static const BYTE zero_buffer[1024];
+@@ -68,9 +68,14 @@
+  *  UINT32 options;
+  *  UINT32 options_2; (present if PATCH_OPTION_EXTRA_FLAGS set)
+  *  UINT32 timestamp; (if PATCH_OPTION_NO_TIMESTAMP is SET in options)
+- *  UVLI rebase;      (present if PATCH_OPTION_NO_REBASE is not set; used on 32-bit executables)
+- *  UVLI unpatched_size;
++ *  If PATCH_OPTION_NO_REBASE is not set (new values for normalizing 32-bit executables):
++ *      UINT16 image_base >> 16;
++ *      UINT32 coff_timestamp; (if timestamp is 0, else SVLI (timestamp - coff_timestamp))
++ *  If PATCH_OPTION_NO_RESTIMEFIX is not set:
++ *      UINT32 resource_timestamp; (if coff_timestamp is 0, else SVLI (coff_timestamp - resource_timestamp))
++ *  UVLI patched_size;
+  *  UINT32 crc32_patched;
++ *  BYTE window_bits; (present if options_2 has 0x10000)
+  *  BYTE input_file_count;
+  *
+  *  For each source file:
+@@ -85,8 +90,10 @@
+  *          SVLI (OffsetInOldFile - (prevOffsetInOldFile + prevLengthInBytes));
+  *          SVLI (OffsetInNewFile - OffsetInOldFile);
+  *          UVLI LengthInBytes;
+- *      UVLI unknown_count; (a count of pairs of values related to the reversal of special
+- *                           processing done to improve compression of 32-bit executables)
++ *      UVLI rift_count;  (the rift table for transforming 32-bit executables)
++ *      For each rift:
++ *          UVLI (old_rva - prev_old_rva);
++ *          SVLI (new_rva - prev_new_rva);
+  *      UVLI interleave_count; (present only if PATCH_OPTION_INTERLEAVE_FILES is set in options)
+  *          UVLI interleave_values[interleave_count * 3 - 1];
+  *      UVLI lzxd_input_size;
+@@ -107,16 +114,21 @@
+     BYTE retain_range_count;
+     PATCH_IGNORE_RANGE ignore_table[MAX_RANGES];
+     PATCH_RETAIN_RANGE retain_table[MAX_RANGES];
+-    size_t unknown_count;
++    ULONG rift_count;
++    struct rift_entry *rift_table;
+     size_t stream_size;
+     const BYTE *stream_start;
+-    int next_i;
+     int next_r;
+ };
+ 
+ struct patch_file_header {
+     DWORD flags;
++    DWORD flags_2;
+     DWORD timestamp;
++    DWORD coff_base;
++    DWORD coff_timestamp;
++    DWORD resource_timestamp;
++    size_t window_size;
+     size_t patched_size;
+     DWORD patched_crc32;
+     unsigned input_file_count;
+@@ -144,6 +156,33 @@
+     | PATCH_OPTION_EXTRA_FLAGS)
+ 
+ 
++/* read a byte-aligned little-endian UINT16 from input and set error if eof
++ */
++static inline UINT16 read_raw_uint16(struct patch_file_header *ph)
++{
++    const BYTE *src = ph->src;
++
++    ph->src += 2;
++    if (ph->src > ph->end)
++    {
++        ph->err = ERROR_PATCH_CORRUPT;
++        return 0;
++    }
++    return src[0] | (src[1] << 8);
++}
++
++/* read a byte and set error if eof
++ */
++static inline BYTE read_raw_byte(struct patch_file_header *ph)
++{
++    if (ph->src >= ph->end)
++    {
++        ph->err = ERROR_PATCH_CORRUPT;
++        return 0;
++    }
++    return *ph->src++;
++}
++
+ /* read a byte-aligned little-endian UINT32 from input and set error if eof
+  */
+ static inline UINT32 read_raw_uint32(struct patch_file_header *ph)
+@@ -257,6 +296,60 @@
+     return 0;
+ }
+ 
++/* Read the table of (old RVA, new RVA) pairs used by the PE transform
++ */
++static int read_rift_table(struct patch_file_header *ph, struct input_file_info *fi)
++{
++    ULONG old_rva = 0;
++    ULONG new_rva = 0;
++    UINT64 count;
++    ULONG i;
++
++    count = read_uvli(ph);
++    if (ph->err != ERROR_SUCCESS)
++        return -1;
++
++    /* each entry takes at least two bytes */
++    if (count > (UINT64)(ph->end - ph->src) / 2)
++    {
++        ph->err = ERROR_PATCH_CORRUPT;
++        return -1;
++    }
++    if (count == 0)
++        return 0;
++
++    TRACE("rift table of %u entries\n", (unsigned)count);
++
++    fi->rift_table = malloc(count * sizeof(fi->rift_table[0]));
++    if (fi->rift_table == NULL)
++    {
++        ph->err = ERROR_OUTOFMEMORY;
++        return -1;
++    }
++    fi->rift_count = (ULONG)count;
++
++    for (i = 0; i < fi->rift_count; ++i)
++    {
++        old_rva += (ULONG)read_uvli(ph);
++        new_rva += (ULONG)read_svli(ph);
++        fi->rift_table[i].old_rva = old_rva;
++        fi->rift_table[i].new_rva = new_rva;
++    }
++    return (ph->err == ERROR_SUCCESS) ? 0 : -1;
++}
++
++static void free_header(struct patch_file_header *ph)
++{
++    unsigned i;
++
++    if (ph->file_table == NULL)
++        return;
++    for (i = 0; i < ph->input_file_count; ++i)
++        free(ph->file_table[i].rift_table);
++    free(ph->file_table);
++    ph->file_table = NULL;
++}
++
+ static int read_header(struct patch_file_header *ph, const BYTE *buf, size_t size)
+ {
+     unsigned fileno;
+@@ -282,31 +375,65 @@
+         return -1;
+     }
+ 
++    ph->flags_2 = 0;
++    ph->timestamp = 0;
++    ph->coff_base = 0;
++    ph->coff_timestamp = 0;
++    ph->resource_timestamp = 0;
++    ph->window_size = 0;
++
+     /* additional 32-bit flag field */
+     if (ph->flags & PATCH_OPTION_EXTRA_FLAGS)
+     {
+-        TRACE("skipping extra flag field\n");
+-        (void)read_raw_uint32(ph);
++        ph->flags_2 = read_raw_uint32(ph);
++        if (ph->flags_2 & ~PATCH_OPTION_2_SUPPORTED_FLAGS)
++        {
++            FIXME("unsupported second option flag(s): 0x%08lx\n", ph->flags_2 & ~PATCH_OPTION_2_SUPPORTED_FLAGS);
++            ph->err = ERROR_PATCH_PACKAGE_UNSUPPORTED;
++            return -1;
++        }
+     }
+ 
+     /* the meaning of PATCH_OPTION_NO_TIMESTAMP is inverted for decoding */
+     if(ph->flags & PATCH_OPTION_NO_TIMESTAMP)
+         ph->timestamp = read_raw_uint32(ph);
+ 
+-    /* not sure what this value is for, but its absence seems to mean only that timestamps
+-     * in the decompressed 32-bit exe are not modified */
++    /* the image base and COFF timestamp of the new file, used to normalize old 32-bit executables */
+     if (!(ph->flags & PATCH_OPTION_NO_REBASE))
+     {
+-        TRACE("skipping rebase field\n");
+-        (void)read_uvli(ph);
++        ph->coff_base = (DWORD)read_raw_uint16(ph) << 16;
++        if (ph->timestamp == 0)
++            ph->coff_timestamp = read_raw_uint32(ph);
++        else
++            ph->coff_timestamp = ph->timestamp - (DWORD)read_svli(ph);
++    }
++
++    /* the timestamp written into resource directories by the rift transform */
++    if (!(ph->flags & PATCH_OPTION_NO_RESTIMEFIX))
++    {
++        if (ph->coff_timestamp == 0)
++            ph->resource_timestamp = read_raw_uint32(ph);
++        else
++            ph->resource_timestamp = ph->coff_timestamp - (DWORD)read_svli(ph);
+     }
+ 
+     ph->patched_size = (size_t)read_uvli(ph);
+     TRACE("patched file size will be %u\n", (unsigned)ph->patched_size);
+     ph->patched_crc32 = read_raw_uint32(ph);
+ 
+-    ph->input_file_count = *ph->src;
+-    ++ph->src;
++    if (ph->flags_2 & PATCH_OPTION_2_WINDOW_SIZE)
++    {
++        BYTE bits = read_raw_byte(ph);
++        if (bits > 31)
++        {
++            ph->err = ERROR_PATCH_CORRUPT;
++            return -1;
++        }
++        ph->window_size = (size_t)1 << bits;
++        TRACE("LZX window size 0x%Ix\n", ph->window_size);
++    }
++
++    ph->input_file_count = read_raw_byte(ph);
+     TRACE("patch supports %u old file(s)\n", ph->input_file_count);
+     /* if no old file used, input_file_count is still 1 */
+     if (ph->input_file_count == 0)
+@@ -397,13 +524,9 @@
+             }
+         }
+ 
+-        fi->unknown_count = (size_t)read_uvli(ph);
+-        if (fi->unknown_count)
+-        {
+-            FIXME("special processing of 32-bit executables not implemented.\n");
+-            ph->err = ERROR_PATCH_PACKAGE_UNSUPPORTED;
++        if (read_rift_table(ph, fi))
+             return -1;
+-        }
++
+         fi->stream_size = (size_t)read_uvli(ph);
+     }
+ 
+@@ -445,37 +568,6 @@
+     ft->dwHighDateTime = (DWORD)(ticks >> 32);
+ }
+ 
+-/* Get the next range to ignore in the old file.
+- * fi->next_i must be initialized before use */
+-static ULONG next_ignored_range(const struct input_file_info *fi, size_t index, ULONG old_file_size, ULONG *end)
+-{
+-    ULONG start = old_file_size;
+-    *end = old_file_size;
+-    /* if patching is unnecessary, the ignored ranges are skipped during crc calc */
+-    if (fi->next_i < fi->ignore_range_count && fi->stream_size != 0)
+-    {
+-        start = fi->ignore_table[fi->next_i].OffsetInOldFile;
+-        *end = max(start + fi->ignore_table[fi->next_i].LengthInBytes, index);
+-        start = max(start, index);
+-    }
+-    return start;
+-}
+-
+-/* Get the next range to retain from the old file.
+- * fi->next_r must be initialized before use */
+-static ULONG next_retained_range_old(const struct input_file_info *fi, size_t index, ULONG old_file_size, ULONG *end)
+-{
+-    ULONG start = old_file_size;
+-    *end = old_file_size;
+-    if (fi->next_r < fi->retain_range_count)
+-    {
+-        start = fi->retain_table[fi->next_r].OffsetInOldFile;
+-        *end = max(start + fi->retain_table[fi->next_r].LengthInBytes, index);
+-        start = max(start, index);
+-    }
+-    return start;
+-}
+-
+ /* Get the next range to retain in the new file.
+  * fi->next_r must be initialized before use */
+ static ULONG next_retained_range_new(const struct input_file_info *fi, size_t index, ULONG new_file_size, ULONG *end)
+@@ -491,89 +583,78 @@
+     return start;
+ }
+ 
+-/* Find the next range in the old file which must be assumed zero-filled during crc32 calc
+- */
+-static ULONG next_zeroed_range(struct input_file_info *fi, size_t index, ULONG old_file_size, ULONG *end)
++/* Check if the old file already is the new file, either exactly or after
++ * normalization. The data compared is left in check_buf.
++ * Returns 0 if not, 1 if exact, 2 if normalized */
++static int old_file_is_patched(const struct patch_file_header *ph, const BYTE *old_file_view, ULONG old_file_size,
++    BYTE *check_buf)
+ {
+-    ULONG start = old_file_size;
+-    ULONG end_i;
+-    ULONG start_i;
+-    ULONG end_r;
+-    ULONG start_r;
++    const struct input_file_info *fi = ph->file_table;
++    unsigned i;
+ 
+-    *end = old_file_size;
++    if (old_file_view == NULL || old_file_size != ph->patched_size)
++        return 0;
+ 
+-    start_i = next_ignored_range(fi, index, old_file_size, &end_i);
+-    start_r = next_retained_range_old(fi, index, old_file_size, &end_r);
++    /* retained ranges are left out of the patched file crc32 */
++    memcpy(check_buf, old_file_view, old_file_size);
++    for (i = 0; i < fi->retain_range_count; ++i)
++        memset(check_buf + fi->retain_table[i].OffsetInNewFile, 0, fi->retain_table[i].LengthInBytes);
+ 
+-    if (start_i < start_r)
+-    {
+-        start = start_i;
+-        *end = end_i;
+-        ++fi->next_i;
+-    }
+-    else
+-    {
+-        start = start_r;
+-        *end = end_r;
+-        ++fi->next_r;
+-    }
+-    return start;
++    if (RtlComputeCrc32(0, check_buf, old_file_size) == ph->patched_crc32)
++        return 1;
++
++    if (pe_normalize(check_buf, old_file_size, ph->flags, ph->coff_base, ph->coff_timestamp) != PE_UNCHANGED
++        && RtlComputeCrc32(0, check_buf, old_file_size) == ph->patched_crc32)
++        return 2;
++
++    return 0;
+ }
+ 
+-/* Use the crc32 of the input file to match the file with an entry in the patch file table
+- */
+-struct input_file_info *find_matching_old_file(const struct patch_file_header *ph, const BYTE *old_file_view, ULONG old_file_size)
++/* Use the crc32 of the normalized input file to match the file with an entry in the patch file table.
++ * On success, old_copy holds the normalized old file. */
++static struct input_file_info *find_matching_old_file(const struct patch_file_header *ph,
++    const BYTE *old_file_view, ULONG old_file_size, BYTE *old_copy)
+ {
+     unsigned i;
+ 
+     for (i = 0; i < ph->input_file_count; ++i)
+     {
+-        DWORD crc32 = 0;
+-        ULONG index;
++        struct input_file_info *fi = ph->file_table + i;
+ 
+-        if (ph->file_table[i].input_size != old_file_size)
++        if (fi->input_size != old_file_size)
+             continue;
+ 
+-        ph->file_table[i].next_i = 0;
+-        for (index = 0; index < old_file_size; )
+-        {
+-            ULONG end;
+-            ULONG start = next_zeroed_range(ph->file_table + i, index, old_file_size, &end);
+-            crc32 = RtlComputeCrc32(crc32, old_file_view + index, start - index);
+-            crc32 = compute_zero_crc32(crc32, end - start);
+-            index = end;
+-        }
+-        if (ph->file_table[i].crc32 == crc32)
+-            return ph->file_table + i;
++        if (old_file_size != 0)
++            memcpy(old_copy, old_file_view, old_file_size);
++
++        NormalizeFileForPatchSignature(old_copy, old_file_size, ph->flags, NULL,
++            ph->coff_base, ph->coff_timestamp,
++            fi->ignore_range_count, fi->ignore_table,
++            fi->retain_range_count, fi->retain_table);
++
++        if (RtlComputeCrc32(0, old_copy, old_file_size) == fi->crc32)
++            return fi;
+     }
+     return NULL;
+ }
+ 
+-/* Zero-fill ignored ranges in the old file data for decoder matching
+- */
+-static void zero_fill_ignored_ranges(BYTE *old_file_buf, const struct input_file_info *fi)
+-{
+-    size_t i;
+-    for (i = 0; i < fi->ignore_range_count; ++i)
+-    {
+-        memset(old_file_buf + fi->ignore_table[i].OffsetInOldFile,
+-            0,
+-            fi->ignore_table[i].LengthInBytes);
+-    }
+-}
+-
+-/* Zero-fill retained ranges in the old file data for decoder matching
+- */
+-static void zero_fill_retained_ranges(BYTE *old_file_buf, BYTE *new_file_buf, const struct input_file_info *fi)
+-{
+-    size_t i;
+-    for (i = 0; i < fi->retain_range_count; ++i)
+-    {
+-        memset(old_file_buf + fi->retain_table[i].OffsetInOldFile,
+-            0,
+-            fi->retain_table[i].LengthInBytes);
+-    }
++/* Get the LZX window size: given in the patch, or derived from the file sizes
++ * as the smallest sufficient power of two */
++static size_t get_window_size(const struct patch_file_header *ph, ULONG old_file_size)
++{
++    size_t window = (ph->flags & PATCH_OPTION_USE_LZX_LARGE) ? MAX_LARGE_WINDOW : MAX_NORMAL_WINDOW;
++    /* round up the old file size per the lzxd spec */
++    size_t total = (((size_t)old_file_size + 0x7FFF) & ~(size_t)0x7FFF) + ph->patched_size;
++
++    if (ph->window_size != 0)
++        return ph->window_size;
++
++    if (total <= MIN_DERIVED_WINDOW)
++        return MIN_DERIVED_WINDOW;
++
++    while (total <= window / 2)
++        window /= 2;
++    return window;
+ }
+ 
+ /* Copy the retained ranges to the new file buffer
+@@ -626,9 +707,14 @@
+     DWORD err = ERROR_SUCCESS;
+     struct input_file_info *file_info;
+     struct patch_file_header ph;
++    size_t window_size;
++    size_t dict_size;
+     size_t buf_size;
+     BYTE *new_file_buf = NULL;
+     BYTE *decode_buf = NULL;
++    BYTE *old_copy = NULL;
++    int already_patched;
++    unsigned i;
+ 
+     if (pnew_file_buf == NULL)
+     {
+@@ -658,72 +744,102 @@
+         goto free_patch_header;
+     }
+ 
+-    file_info = find_matching_old_file(&ph, old_file_view, old_file_size);
+-    if (file_info == NULL)
++    /* working copy of the old file for normalization and the transform */
++    old_copy = VirtualAlloc(NULL, max(old_file_size, 1), MEM_COMMIT, PAGE_READWRITE);
++    if (old_copy == NULL)
+     {
+-        err = ERROR_PATCH_WRONG_FILE;
++        err = GetLastError();
+         goto free_patch_header;
+     }
+-    if (file_info->input_size != old_file_size)
++
++    already_patched = old_file_is_patched(&ph, old_file_view, old_file_size, old_copy);
++    if (already_patched)
+     {
+-        err = ERROR_PATCH_CORRUPT;
+-        goto free_patch_header;
++        TRACE("old file is already patched%s\n", already_patched == 2 ? " (normalized)" : "");
++
++        if ((apply_option_flags & APPLY_OPTION_FAIL_IF_CLOSE)
++            || ((apply_option_flags & APPLY_OPTION_FAIL_IF_EXACT) && already_patched == 1))
++        {
++            err = ERROR_PATCH_NOT_NECESSARY;
++            goto free_decode_buf;
++        }
++        if (test_header_only || (apply_option_flags & APPLY_OPTION_TEST_ONLY))
++            goto free_decode_buf;
++
++        /* the result is the checked data with the retained ranges restored */
++        for (i = 0; i < ph.file_table[0].retain_range_count; ++i)
++        {
++            const PATCH_RETAIN_RANGE *rr = ph.file_table[0].retain_table + i;
++            memcpy(old_copy + rr->OffsetInNewFile, old_file_view + rr->OffsetInNewFile, rr->LengthInBytes);
++        }
++        dict_size = 0;
++        decode_buf = old_copy;
++        old_copy = NULL;
++        goto output;
+     }
+-    if (file_info->stream_size == 0 && (apply_option_flags & APPLY_OPTION_FAIL_IF_EXACT))
++
++    file_info = find_matching_old_file(&ph, old_file_view, old_file_size, old_copy);
++    if (file_info == NULL)
+     {
+-        err = ERROR_PATCH_NOT_NECESSARY;
+-        goto free_patch_header;
++        err = ERROR_PATCH_WRONG_FILE;
++        goto free_decode_buf;
+     }
+-    if (file_info->stream_size != 0
+-        && file_info->input_size > ((ph.flags & PATCH_OPTION_USE_LZX_LARGE) ? MAX_LARGE_WINDOW : MAX_NORMAL_WINDOW))
++    if (file_info->stream_size == 0 && (apply_option_flags & APPLY_OPTION_FAIL_IF_EXACT))
+     {
+-        /* interleaved by default but not the same as PATCH_OPTION_INTERLEAVE_FILES */
+-        FIXME("interleaved LZXD decompression is not supported.\n");
+-        err = ERROR_PATCH_PACKAGE_UNSUPPORTED;
+-        goto free_patch_header;
++        err = ERROR_PATCH_NOT_NECESSARY;
++        goto free_decode_buf;
+     }
+ 
+     if (test_header_only)
+-        goto free_patch_header;
++        goto free_decode_buf;
+ 
+     /* missing lzxd stream means it's a header test extract */
+     if (file_info->stream_start + file_info->stream_size > ph.end)
+     {
+         err = ERROR_PATCH_NOT_AVAILABLE;
+-        goto free_patch_header;
++        goto free_decode_buf;
++    }
++
++    if (file_info->stream_size != 0 && file_info->rift_count != 0)
++    {
++        err = pe_transform(old_copy, old_file_size, ph.flags_2, ph.resource_timestamp,
++            file_info->rift_table, file_info->rift_count);
++        if (err != ERROR_SUCCESS)
++            goto free_decode_buf;
+     }
+ 
+-    buf_size = old_file_size + ph.patched_size;
++    /* only the first window of the old file is used as the dictionary */
++    window_size = get_window_size(&ph, old_file_size);
++    dict_size = old_file_size;
++    if (file_info->stream_size != 0)
++        dict_size = min(dict_size, window_size);
++
++    buf_size = dict_size + ph.patched_size;
+     decode_buf = new_file_buf;
+     if (new_file_buf == NULL || new_file_buf_size < buf_size)
+     {
+         /* decode_buf must have room for both files, so allocate a new buffer if
+          * necessary. This will be returned to the caller if new_file_buf == NULL */
+-        decode_buf = VirtualAlloc(NULL, buf_size, MEM_COMMIT, PAGE_READWRITE);
++        decode_buf = VirtualAlloc(NULL, max(buf_size, 1), MEM_COMMIT, PAGE_READWRITE);
+         if (decode_buf == NULL)
+         {
+             err = GetLastError();
+-            goto free_patch_header;
++            goto free_decode_buf;
+         }
+     }
+ 
+-    if (old_file_view != NULL)
+-        memcpy(decode_buf, old_file_view, file_info->input_size);
+-
+-    zero_fill_ignored_ranges(decode_buf, file_info);
+-    zero_fill_retained_ranges(decode_buf, decode_buf + file_info->input_size, file_info);
++    memcpy(decode_buf, old_copy, dict_size);
+ 
+     if (file_info->stream_size != 0)
+     {
+         err = decode_lzxd_stream(file_info->stream_start, file_info->stream_size,
+-            decode_buf, ph.patched_size, file_info->input_size,
+-            ph.flags & PATCH_OPTION_USE_LZX_LARGE,
++            decode_buf, ph.patched_size, dict_size, window_size,
+             progress_fn, progress_ctx);
+     }
+     else if (file_info->input_size == ph.patched_size)
+     {
+         /* files are identical so copy old to new. copying is avoidable but rare */
+-        memcpy(decode_buf + file_info->input_size, decode_buf, ph.patched_size);
++        memcpy(decode_buf + dict_size, decode_buf, ph.patched_size);
+     }
+     else
+     {
+@@ -738,9 +854,9 @@
+         goto free_decode_buf;
+     }
+ 
+-    apply_retained_ranges(old_file_view, decode_buf + file_info->input_size, file_info);
++    apply_retained_ranges(old_file_view, decode_buf + dict_size, file_info);
+ 
+-    if (ph.patched_crc32 != compute_target_crc32(file_info, decode_buf + file_info->input_size, ph.patched_size))
++    if (ph.patched_crc32 != compute_target_crc32(file_info, decode_buf + dict_size, ph.patched_size))
+     {
+         err = ERROR_PATCH_CORRUPT;
+         goto free_decode_buf;
+@@ -749,12 +865,13 @@
+     /* retained ranges must be ignored for this test */
+     if ((apply_option_flags & APPLY_OPTION_FAIL_IF_EXACT)
+         && file_info->input_size == ph.patched_size
+-        && memcmp(decode_buf, decode_buf + file_info->input_size, ph.patched_size) == 0)
++        && memcmp(old_copy, decode_buf + dict_size, ph.patched_size) == 0)
+     {
+         err = ERROR_PATCH_NOT_NECESSARY;
+         goto free_decode_buf;
+     }
+ 
++output:
+     if (!(apply_option_flags & APPLY_OPTION_TEST_ONLY))
+     {
+         if (new_file_buf == NULL)
+@@ -763,7 +880,7 @@
+             new_file_buf = decode_buf;
+             *pnew_file_buf = new_file_buf;
+         }
+-        memmove(new_file_buf, decode_buf + old_file_size, ph.patched_size);
++        memmove(new_file_buf, decode_buf + dict_size, ph.patched_size);
+     }
+ 
+     if (new_file_time != NULL)
+@@ -779,9 +896,11 @@
+ free_decode_buf:
+     if(decode_buf != NULL && decode_buf != new_file_buf)
+         VirtualFree(decode_buf, 0, MEM_RELEASE);
++    if (old_copy != NULL)
++        VirtualFree(old_copy, 0, MEM_RELEASE);
+ 
+ free_patch_header:
+-    free(ph.file_table);
++    free_header(&ph);
+ 
+     return err;
+ }
+@@ -802,6 +921,7 @@
+     FILETIME new_time;
+     BOOL res = FALSE;
+     DWORD err = ERROR_SUCCESS;
++    ULONG flags;
+ 
+     /* truncate the output file if required, or set the handle to invalid */
+     if (test_header_only || (apply_option_flags & APPLY_OPTION_TEST_ONLY))
+@@ -863,11 +983,18 @@
+         }
+     }
+ 
++    /* For the file and handle interfaces, Windows treats an old file that already is the new file
++     * after normalization like an exact one: APPLY_OPTION_FAIL_IF_EXACT fails on both, and
++     * APPLY_OPTION_FAIL_IF_CLOSE on its own has no effect. */
++    flags = apply_option_flags & ~APPLY_OPTION_FAIL_IF_CLOSE;
++    if (apply_option_flags & APPLY_OPTION_FAIL_IF_EXACT)
++        flags |= APPLY_OPTION_FAIL_IF_CLOSE;
++
+     err = apply_patch_to_file_by_buffers(patch_buf, (ULONG)patch_size.QuadPart,
+         old_buf, (ULONG)old_size.QuadPart,
+         &new_buf, 0, &new_size,
+         &new_time,
+-        apply_option_flags, progress_fn, progress_ctx,
++        flags, progress_fn, progress_ctx,
+         test_header_only);
+ 
+     if(err)
+--- a/dlls/mspatcha/pa19.h
++++ b/dlls/mspatcha/pa19.h
+@@ -35,3 +35,22 @@
+     const ULONG apply_option_flags,
+     PATCH_PROGRESS_CALLBACK *progress_fn, void *progress_ctx,
+     const BOOL test_header_only);
++
++/* pe.c */
++
++struct rift_entry {
++    ULONG old_rva;
++    ULONG new_rva;
++};
++
++enum pe_normalize_result {
++    PE_UNCHANGED,
++    PE_CHANGED,
++    PE_MALFORMED,
++};
++
++enum pe_normalize_result pe_normalize(BYTE *buf, ULONG size, ULONG option_flags,
++    ULONG new_image_base, ULONG new_timestamp);
++
++DWORD pe_transform(BYTE *buf, ULONG size, ULONG transform_bits, ULONG resource_time,
++    const struct rift_entry *rifts, ULONG rift_count);
+--- a/dlls/mspatcha/pe.c
++++ b/dlls/mspatcha/pe.c
+@@ -0,0 +1,1368 @@
++/*
++ * PatchAPI processing of 32-bit PE images
++ *
++ * Copyright 2026 AdobeWine
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ *
++ * Two kinds of processing are done on old files which are 32-bit PE images:
++ *
++ * - Normalization undoes the changes that installing an image usually makes
++ *   to it (rebasing, binding, lock prefix removal, checksum), so the old file
++ *   CRC recorded in a patch can be checked against any installed copy.
++ *
++ * - The rift transform moves the addresses in the old image to where they
++ *   are in the new image, following a table of (old RVA, new RVA) pairs
++ *   stored in the patch, so the old image makes a better LZX dictionary.
++ *   The patch creator does the same, so the transform must match exactly.
++ *
++ * All offsets here are into the file as stored on disk, not a mapped image.
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winnt.h"
++#include "wine/debug.h"
++
++#include "patchapi.h"
++
++#include "pa19.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(mspatcha);
++
++/* transform bits in the second patch option field */
++#define TRANSFORM_NO_RELOCS     0x0001
++#define TRANSFORM_NO_IMPORTS    0x0002
++#define TRANSFORM_NO_EXPORTS    0x0004
++#define TRANSFORM_NO_JUMPS      0x0008
++#define TRANSFORM_NO_CALLS      0x0010
++#define TRANSFORM_NO_RESOURCES  0x0020
++#define TRANSFORM_RESOURCES_V2  0x0100
++#define TRANSFORM_RELOCS_V2     0x0200
++
++/* byte map flags */
++#define MAP_DONE        0x01  /* already handled, or not code */
++#define MAP_DIRECTORY   0x02  /* headers and data directories */
++
++/* resource directories nested deeper than this are not followed */
++#define MAX_RESOURCE_DEPTH 32
++
++static inline UINT16 get_word(const BYTE *p)
++{
++    return p[0] | (p[1] << 8);
++}
++
++static inline UINT32 get_dword(const BYTE *p)
++{
++    return p[0] | (p[1] << 8) | (p[2] << 16) | ((UINT32)p[3] << 24);
++}
++
++static inline void put_word(BYTE *p, UINT16 v)
++{
++    p[0] = (BYTE)v;
++    p[1] = (BYTE)(v >> 8);
++}
++
++static inline void put_dword(BYTE *p, UINT32 v)
++{
++    p[0] = (BYTE)v;
++    p[1] = (BYTE)(v >> 8);
++    p[2] = (BYTE)(v >> 16);
++    p[3] = (BYTE)(v >> 24);
++}
++
++struct pe_image
++{
++    BYTE *base;
++    ULONG size;
++    IMAGE_NT_HEADERS32 *nt;
++    IMAGE_SECTION_HEADER *sections;
++    unsigned int section_count;
++    ULONG dir_count;
++};
++
++/* Validate the headers of a PE32 image held in a file buffer */
++static BOOL pe_image_init(struct pe_image *img, BYTE *buf, ULONG size)
++{
++    IMAGE_NT_HEADERS32 *nt;
++    ULONG nt_offset;
++    UINT64 sections_offset;
++    UINT64 dirs_offset;
++
++    if (buf == NULL || size < 0x200)
++        return FALSE;
++    if (get_word(buf) != IMAGE_DOS_SIGNATURE)
++        return FALSE;
++
++    nt_offset = get_dword(buf + FIELD_OFFSET(IMAGE_DOS_HEADER, e_lfanew));
++    if (nt_offset >= size || size - nt_offset < sizeof(IMAGE_NT_HEADERS32))
++        return FALSE;
++
++    nt = (IMAGE_NT_HEADERS32 *)(buf + nt_offset);
++    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
++        return FALSE;
++
++    sections_offset = (UINT64)nt_offset + FIELD_OFFSET(IMAGE_NT_HEADERS32, OptionalHeader)
++        + nt->FileHeader.SizeOfOptionalHeader;
++    if (sections_offset <= nt_offset
++        || sections_offset + (UINT64)nt->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER) > size)
++        return FALSE;
++
++    dirs_offset = (UINT64)nt_offset + FIELD_OFFSET(IMAGE_NT_HEADERS32, OptionalHeader.DataDirectory);
++    if (dirs_offset + (UINT64)nt->OptionalHeader.NumberOfRvaAndSizes * sizeof(IMAGE_DATA_DIRECTORY) > size)
++        return FALSE;
++
++    img->base = buf;
++    img->size = size;
++    img->nt = nt;
++    img->sections = (IMAGE_SECTION_HEADER *)(buf + sections_offset);
++    img->section_count = nt->FileHeader.NumberOfSections;
++    img->dir_count = nt->OptionalHeader.NumberOfRvaAndSizes;
++    return TRUE;
++}
++
++/* Translate an RVA to a file offset. Zero means the RVA has no file data. */
++static ULONG pe_rva_to_offset(const struct pe_image *img, ULONG rva)
++{
++    unsigned int i;
++
++    if (rva < img->nt->OptionalHeader.SizeOfHeaders)
++        return rva;
++
++    for (i = 0; i < img->section_count; ++i)
++    {
++        const IMAGE_SECTION_HEADER *sec = img->sections + i;
++        if (rva >= sec->VirtualAddress && rva - sec->VirtualAddress < sec->SizeOfRawData)
++            return sec->PointerToRawData + (rva - sec->VirtualAddress);
++    }
++    return 0;
++}
++
++static IMAGE_DATA_DIRECTORY *pe_directory(const struct pe_image *img, unsigned int index)
++{
++    if (index >= img->dir_count)
++        return NULL;
++    return img->nt->OptionalHeader.DataDirectory + index;
++}
++
++/* Get the file offset of a data directory whose contents lie wholly in the
++ * file, or zero if there is none */
++static ULONG pe_directory_in_file(const struct pe_image *img, unsigned int index, ULONG *dir_size)
++{
++    IMAGE_DATA_DIRECTORY *dir = pe_directory(img, index);
++    ULONG offset;
++
++    if (dir == NULL || dir->VirtualAddress == 0)
++        return 0;
++    offset = pe_rva_to_offset(img, dir->VirtualAddress);
++    if (offset == 0 || offset >= img->size || (UINT64)offset + dir->Size > img->size)
++        return 0;
++    *dir_size = dir->Size;
++    return offset;
++}
++
++/* Compare a section name with an 8-byte name, folding case and treating NUL
++ * padding as space padding */
++static BOOL section_name_is(const IMAGE_SECTION_HEADER *sec, const char *name)
++{
++    unsigned int i;
++
++    for (i = 0; i < IMAGE_SIZEOF_SHORT_NAME; ++i)
++    {
++        if ((sec->Name[i] | 0x20) != (BYTE)name[i])
++            return FALSE;
++    }
++    return TRUE;
++}
++
++/***********************************************************************************
++ *  Normalization
++ */
++
++static BOOL normalize_rebase(struct pe_image *img, ULONG new_base)
++{
++    BYTE *buf = img->base;
++    ULONG size = img->size;
++    ULONG dir_size = 0;
++    ULONG pos = pe_directory_in_file(img, IMAGE_DIRECTORY_ENTRY_BASERELOC, &dir_size);
++    LONG remaining;
++    UINT32 delta;
++
++    if (pos == 0 || size - pos < sizeof(IMAGE_BASE_RELOCATION))
++        return FALSE;
++
++    delta = new_base - img->nt->OptionalHeader.ImageBase;
++    img->nt->OptionalHeader.ImageBase = new_base;
++
++    remaining = dir_size;
++    while (remaining > 0)
++    {
++        ULONG page = get_dword(buf + pos);
++        ULONG block_size = get_dword(buf + pos + 4);
++        ULONG page_offset;
++        ULONG entry_pos;
++        ULONG count;
++
++        if (block_size > (ULONG)remaining || block_size <= sizeof(IMAGE_BASE_RELOCATION))
++            break;
++
++        page_offset = pe_rva_to_offset(img, page);
++        entry_pos = pos + sizeof(IMAGE_BASE_RELOCATION);
++
++        /* A HIGHADJ entry takes the following entry as its low part and counts
++         * it, even when it is the last entry of the block. The count then wraps
++         * around and Windows goes on reading entries up to the end of the file,
++         * before going on with the next block as usual. */
++        for (count = (block_size - sizeof(IMAGE_BASE_RELOCATION)) / 2; count != 0; --count)
++        {
++            UINT16 entry;
++            UINT64 target;
++            UINT32 value;
++            INT16 low = 0;
++
++            if ((UINT64)entry_pos + 2 > size)
++                break;
++            entry = get_word(buf + entry_pos);
++            entry_pos += 2;
++            target = (UINT64)page_offset + (entry & 0xfff);
++
++            if ((entry >> 12) == IMAGE_REL_BASED_HIGHADJ)
++            {
++                if ((UINT64)entry_pos + 2 <= size)
++                    low = (INT16)get_word(buf + entry_pos);
++                entry_pos += 2;
++                --count;
++            }
++
++            if (target + 2 > size)
++                continue;
++
++            switch (entry >> 12)
++            {
++            case IMAGE_REL_BASED_HIGH:
++                value = ((UINT32)get_word(buf + target) << 16) + delta;
++                put_word(buf + target, (UINT16)(value >> 16));
++                break;
++            case IMAGE_REL_BASED_LOW:
++                put_word(buf + target, (UINT16)(get_word(buf + target) + delta));
++                break;
++            case IMAGE_REL_BASED_HIGHLOW:
++                if (target + 4 <= size)
++                    put_dword(buf + target, get_dword(buf + target) + delta);
++                break;
++            case IMAGE_REL_BASED_HIGHADJ:
++                value = ((UINT32)get_word(buf + target) << 16) + low + 0x8000 + delta;
++                put_word(buf + target, (UINT16)(value >> 16));
++                break;
++            default:
++                break;
++            }
++        }
++
++        pos += block_size;
++        remaining -= block_size;
++        if ((UINT64)pos + sizeof(IMAGE_BASE_RELOCATION) > size)
++            break;
++    }
++
++    /* reported as a change even when the table turned out to be truncated */
++    return TRUE;
++}
++
++static BOOL normalize_binding(struct pe_image *img)
++{
++    BYTE *buf = img->base;
++    ULONG size = img->size;
++    ULONG dir_size = 0;
++    ULONG offset;
++    BOOL changed = FALSE;
++    unsigned int i;
++
++    offset = pe_directory_in_file(img, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT, &dir_size);
++    if (offset != 0)
++    {
++        IMAGE_DATA_DIRECTORY *dir = pe_directory(img, IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT);
++        memset(buf + offset, 0, dir_size);
++        dir->VirtualAddress = 0;
++        dir->Size = 0;
++        changed = TRUE;
++    }
++
++    offset = pe_directory_in_file(img, IMAGE_DIRECTORY_ENTRY_IMPORT, &dir_size);
++    if (offset != 0)
++    {
++        ULONG desc;
++
++        for (desc = offset; (UINT64)desc + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= size;
++             desc += sizeof(IMAGE_IMPORT_DESCRIPTOR))
++        {
++            ULONG original_thunk = get_dword(buf + desc);
++            ULONG first_thunk = get_dword(buf + desc + 16);
++
++            if (original_thunk == 0)
++                break;
++
++            if (get_dword(buf + desc + 4) != 0)
++            {
++                ULONG src = pe_rva_to_offset(img, original_thunk);
++                ULONG dst = pe_rva_to_offset(img, first_thunk);
++
++                /* unbind: restore the import address table from the lookup table */
++                put_dword(buf + desc + 4, 0);
++                changed = TRUE;
++                if (src != 0 && src < size && dst != 0 && dst < size)
++                {
++                    while ((UINT64)src + 4 <= size && (UINT64)dst + 4 <= size)
++                    {
++                        UINT32 thunk = get_dword(buf + src);
++                        if (thunk == 0)
++                            break;
++                        put_dword(buf + dst, thunk);
++                        src += 4;
++                        dst += 4;
++                    }
++                }
++            }
++            if (get_dword(buf + desc + 8) != 0)
++            {
++                put_dword(buf + desc + 8, 0);
++                changed = TRUE;
++            }
++        }
++    }
++
++    /* binding makes the import section writable; make it so in every copy */
++    for (i = 0; i < img->section_count; ++i)
++    {
++        IMAGE_SECTION_HEADER *sec = img->sections + i;
++
++        if (!section_name_is(sec, ".idata  "))
++            continue;
++        if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE))
++        {
++            sec->Characteristics |= IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
++            changed = TRUE;
++        }
++        break;
++    }
++
++    return changed;
++}
++
++/* Restore lock prefixes that may have been replaced with NOPs on single-processor systems */
++static enum pe_normalize_result normalize_lock_prefixes(struct pe_image *img)
++{
++    BYTE *buf = img->base;
++    ULONG size = img->size;
++    ULONG image_base = img->nt->OptionalHeader.ImageBase;
++    ULONG dir_size = 0;
++    ULONG offset;
++    ULONG table_va;
++    ULONG pos;
++    BOOL changed = FALSE;
++
++    offset = pe_directory_in_file(img, IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG, &dir_size);
++    if (offset == 0 || (UINT64)offset + 0x24 > size)
++        return PE_UNCHANGED;
++
++    table_va = get_dword(buf + offset + 0x20);
++    if (table_va == 0)
++        return PE_UNCHANGED;
++    if (table_va < image_base)
++        return PE_MALFORMED;
++
++    pos = pe_rva_to_offset(img, table_va - image_base);
++    if (pos == 0 || pos >= size)
++        return PE_UNCHANGED;
++
++    for (;;)
++    {
++        ULONG va, target;
++
++        if ((UINT64)pos + 4 > size)
++            return PE_MALFORMED;  /* no terminator */
++
++        va = get_dword(buf + pos);
++        if (va == 0)
++            break;
++        if (va < image_base)
++            return PE_MALFORMED;
++
++        target = pe_rva_to_offset(img, va - image_base);
++        if (target != 0 && target < size && buf[target] != 0xf0)
++        {
++            buf[target] = 0xf0;
++            changed = TRUE;
++        }
++        pos += 4;
++    }
++    return changed ? PE_CHANGED : PE_UNCHANGED;
++}
++
++static UINT32 pe_checksum(const BYTE *buf, ULONG size)
++{
++    UINT32 sum = 0;
++    ULONG i;
++
++    for (i = 0; i + 1 < size; i += 2)
++    {
++        sum += get_word(buf + i);
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    if (size & 1)
++    {
++        sum += buf[size - 1];
++        sum = (sum & 0xffff) + (sum >> 16);
++    }
++    sum = (sum & 0xffff) + (sum >> 16);
++    return sum + size;
++}
++
++/* Normalize a 32-bit PE image in place. Images of other kinds are left unchanged.
++ * PE_MALFORMED means normalization stopped part way; callers treat it as a change. */
++enum pe_normalize_result pe_normalize(BYTE *buf, ULONG size, ULONG option_flags,
++    ULONG new_image_base, ULONG new_timestamp)
++{
++    struct pe_image img;
++    BOOL changed = FALSE;
++
++    if (!pe_image_init(&img, buf, size))
++        return PE_UNCHANGED;
++
++    if (!(option_flags & PATCH_OPTION_NO_REBASE))
++    {
++        if (new_timestamp != 0 && new_timestamp != img.nt->FileHeader.TimeDateStamp)
++        {
++            img.nt->FileHeader.TimeDateStamp = new_timestamp;
++            changed = TRUE;
++        }
++        if (new_image_base != 0 && new_image_base != img.nt->OptionalHeader.ImageBase)
++            changed |= normalize_rebase(&img, new_image_base);
++    }
++
++    if (!(option_flags & PATCH_OPTION_NO_BINDFIX))
++        changed |= normalize_binding(&img);
++
++    if (!(option_flags & PATCH_OPTION_NO_LOCKFIX))
++    {
++        enum pe_normalize_result res = normalize_lock_prefixes(&img);
++
++        /* a malformed table ends normalization; the checksum is not updated */
++        if (res == PE_MALFORMED)
++            return PE_MALFORMED;
++        if (res == PE_CHANGED)
++            changed = TRUE;
++    }
++
++    if (!(option_flags & PATCH_OPTION_NO_CHECKSUM))
++    {
++        if (changed)
++        {
++            img.nt->OptionalHeader.CheckSum = 0;
++            img.nt->OptionalHeader.CheckSum = pe_checksum(buf, size);
++        }
++    }
++    else if (img.nt->OptionalHeader.CheckSum != 0)
++    {
++        img.nt->OptionalHeader.CheckSum = 0;
++        changed = TRUE;
++    }
++
++    return changed ? PE_CHANGED : PE_UNCHANGED;
++}
++
++/***********************************************************************************
++ *  Rift transform
++ */
++
++struct transform
++{
++    struct pe_image img;
++    BYTE *map;
++    const struct rift_entry *rifts;
++    ULONG rift_count;
++    ULONG bits;
++    BOOL v2;
++};
++
++/* Move an old RVA to its place in the new image */
++static ULONG rift_map(const struct transform *t, ULONG rva)
++{
++    ULONG lo = 0, hi = t->rift_count;
++
++    /* find the last entry whose old RVA is not above rva */
++    while (lo < hi)
++    {
++        ULONG mid = lo + (hi - lo) / 2;
++        if (t->rifts[mid].old_rva <= rva)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    if (lo == 0)
++        return rva;
++    return rva + (t->rifts[lo - 1].new_rva - t->rifts[lo - 1].old_rva);
++}
++
++static void map_mark(struct transform *t, UINT64 offset, UINT64 length, BYTE flags)
++{
++    UINT64 end = offset + length;
++
++    if (offset >= t->img.size)
++        return;
++    if (end > t->img.size)
++        end = t->img.size;
++    for (; offset < end; ++offset)
++        t->map[offset] |= flags;
++}
++
++static BOOL map_any(const struct transform *t, ULONG offset, ULONG length, BYTE flags)
++{
++    ULONG i;
++    for (i = 0; i < length; ++i)
++    {
++        if (t->map[offset + i] & flags)
++            return TRUE;
++    }
++    return FALSE;
++}
++
++/* Replace an absolute address at a file offset with its new address, if it moves */
++static void remap_address(struct transform *t, ULONG offset)
++{
++    ULONG image_base = t->img.nt->OptionalHeader.ImageBase;
++    UINT32 va = get_dword(t->img.base + offset);
++    UINT32 new_va = rift_map(t, va - image_base) + image_base;
++
++    if (new_va != va)
++        put_dword(t->img.base + offset, new_va);
++}
++
++/* Replace an RVA at a file offset with its new value */
++static void remap_rva(struct transform *t, ULONG offset)
++{
++    UINT32 rva = get_dword(t->img.base + offset);
++    UINT32 new_rva = rift_map(t, rva);
++
++    if (new_rva != rva)
++        put_dword(t->img.base + offset, new_rva);
++}
++
++static void transform_mark_non_code(struct transform *t)
++{
++    IMAGE_OPTIONAL_HEADER32 *opt = &t->img.nt->OptionalHeader;
++    unsigned int i;
++    ULONG count;
++
++    for (i = 0; i < t->img.section_count; ++i)
++    {
++        const IMAGE_SECTION_HEADER *sec = t->img.sections + i;
++        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) && sec->PointerToRawData < t->img.size)
++            map_mark(t, sec->PointerToRawData, sec->SizeOfRawData, MAP_DONE);
++    }
++
++    if (opt->SizeOfHeaders > t->img.size)
++        opt->SizeOfHeaders = t->img.size;
++    map_mark(t, 0, opt->SizeOfHeaders, MAP_DONE | MAP_DIRECTORY);
++
++    count = min(t->img.dir_count, IMAGE_NUMBEROF_DIRECTORY_ENTRIES);
++    for (i = 0; i < count; ++i)
++    {
++        const IMAGE_DATA_DIRECTORY *dir = opt->DataDirectory + i;
++        ULONG offset;
++
++        if (dir->VirtualAddress == 0 || dir->Size == 0)
++            continue;
++        offset = pe_rva_to_offset(&t->img, dir->VirtualAddress);
++        if (offset == 0 && t->v2)
++            continue;
++        map_mark(t, offset, dir->Size, MAP_DONE | MAP_DIRECTORY);
++    }
++}
++
++/* Without a relocation table, treat every value that looks like an address
++ * inside the image as one */
++static void transform_address_scan(struct transform *t, ULONG start, ULONG low, ULONG high, BOOL v2)
++{
++    BYTE *buf = t->img.base;
++    ULONG size = t->img.size;
++    ULONG pos = start;
++
++    if (size < 5)
++        return;
++
++    while (pos < size - 4)
++    {
++        UINT32 value = get_dword(buf + pos);
++        BOOL in_range = v2 ? (value > low && value < high) : (value >= low && value < high);
++
++        if (in_range && !(v2 && map_any(t, pos, 4, MAP_DIRECTORY)))
++        {
++            map_mark(t, pos, 4, MAP_DONE);
++            remap_address(t, pos);
++            pos += 4;
++        }
++        else
++        {
++            ++pos;
++        }
++    }
++}
++
++struct reloc_record
++{
++    ULONG rva;
++    BYTE type;
++    UINT16 extra;
++};
++
++static inline void swap_records(struct reloc_record *a, struct reloc_record *b)
++{
++    struct reloc_record tmp = *a;
++    *a = *b;
++    *b = tmp;
++}
++
++/* Quicksort with the partitioning used by the patch creator. Records with
++ * equal RVAs keep the relative order this produces, which is written back. */
++static void sort_reloc_records(struct reloc_record *rec, LONG lo, LONG hi)
++{
++    while (hi > lo)
++    {
++        LONG mid = lo + (hi - lo) / 2;
++        ULONG pivot = rec[mid].rva;
++        LONG l = lo, r = hi;
++        LONG p;
++
++        for (;;)
++        {
++            if (r < l)
++                break;
++            while (l <= r && rec[l].rva <= pivot)
++                ++l;
++            while (l <= r && pivot <= rec[r].rva)
++                --r;
++            if (l < r)
++            {
++                swap_records(rec + l, rec + r);
++                ++l;
++                --r;
++                if (l <= r)
++                    continue;
++                break;
++            }
++            if (l == r)
++                continue;
++            break;
++        }
++
++        p = mid;
++        if (l < mid)
++        {
++            swap_records(rec + l, rec + mid);
++            p = l;
++        }
++        else if (r > mid)
++        {
++            swap_records(rec + r, rec + mid);
++            p = r;
++        }
++
++        /* the two parts are independent; recurse into the smaller one */
++        if (p - lo < hi - p)
++        {
++            if (p - 1 > lo)
++                sort_reloc_records(rec, lo, p - 1);
++            lo = p + 1;
++        }
++        else
++        {
++            if (hi > p + 1)
++                sort_reloc_records(rec, p + 1, hi);
++            hi = p - 1;
++        }
++    }
++}
++
++static DWORD transform_relocs(struct transform *t)
++{
++    BYTE *buf = t->img.base;
++    ULONG size = t->img.size;
++    ULONG dir_size = 0;
++    ULONG dir_offset = pe_directory_in_file(&t->img, IMAGE_DIRECTORY_ENTRY_BASERELOC, &dir_size);
++    struct reloc_record *records;
++    ULONG record_count = 0;
++    ULONG pos, room, out, index;
++    LONG remaining;
++    unsigned int i;
++
++    if (dir_offset == 0)
++    {
++        IMAGE_FILE_HEADER *fh = &t->img.nt->FileHeader;
++        IMAGE_OPTIONAL_HEADER32 *opt = &t->img.nt->OptionalHeader;
++
++        if (fh->Machine == IMAGE_FILE_MACHINE_I386 && t->img.section_count != 0)
++        {
++            transform_address_scan(t, t->img.sections[0].PointerToRawData,
++                opt->ImageBase + t->img.sections[0].VirtualAddress, opt->ImageBase + opt->SizeOfImage,
++                (t->bits & TRANSFORM_RELOCS_V2) != 0);
++        }
++        return ERROR_SUCCESS;
++    }
++
++    map_mark(t, dir_offset, dir_size, MAP_DONE | MAP_DIRECTORY);
++
++    records = malloc((dir_size / 2 + 1) * sizeof(*records));
++    if (records == NULL)
++        return ERROR_OUTOFMEMORY;
++
++    /* collect the relocations at their new RVAs, moving the addresses they point to */
++    pos = dir_offset;
++    remaining = dir_size;
++    while (remaining > 0)
++    {
++        ULONG page, block_size, page_offset, entry_count;
++
++        if ((UINT64)pos + sizeof(IMAGE_BASE_RELOCATION) > size)
++            goto fail;
++
++        page = get_dword(buf + pos);
++        block_size = get_dword(buf + pos + 4);
++        if (block_size > (ULONG)remaining || block_size < sizeof(IMAGE_BASE_RELOCATION) + 1)
++            break;
++
++        page_offset = pe_rva_to_offset(&t->img, page);
++        entry_count = (block_size - sizeof(IMAGE_BASE_RELOCATION)) / 2;
++
++        for (index = 0; index < entry_count; ++index)
++        {
++            ULONG entry_pos = pos + sizeof(IMAGE_BASE_RELOCATION) + index * 2;
++            struct reloc_record *rec = records + record_count;
++            UINT16 entry;
++            UINT64 target;
++
++            if ((UINT64)entry_pos + 2 > size)
++                goto fail;
++
++            entry = get_word(buf + entry_pos);
++            if ((entry >> 12) == IMAGE_REL_BASED_ABSOLUTE)
++                continue;
++
++            rec->rva = rift_map(t, page + (entry & 0xfff));
++            rec->type = entry >> 12;
++            rec->extra = 0;
++            ++record_count;
++
++            target = (UINT64)page_offset + (entry & 0xfff);
++            switch (rec->type)
++            {
++            case IMAGE_REL_BASED_HIGH:
++            case IMAGE_REL_BASED_LOW:
++                if (target + 2 < size)
++                    map_mark(t, target, 2, MAP_DONE);
++                break;
++            case IMAGE_REL_BASED_HIGHLOW:
++                if (target + 4 <= size)
++                {
++                    map_mark(t, target, 4, MAP_DONE);
++                    remap_address(t, target);
++                }
++                break;
++            case IMAGE_REL_BASED_HIGHADJ:
++                if (target + 2 < size)
++                    map_mark(t, target, 2, MAP_DONE);
++                if (index + 1 < entry_count)
++                {
++                    ++index;
++                    entry_pos += 2;
++                    if ((UINT64)entry_pos + 2 > size)
++                        goto fail;
++                    rec->extra = get_word(buf + entry_pos);
++                }
++                break;
++            default:
++                break;
++            }
++        }
++
++        pos += block_size;
++        remaining -= block_size;
++    }
++
++    if (record_count > 1)
++        sort_reloc_records(records, 0, record_count - 1);
++
++    /* write the table back in place */
++    room = dir_size;
++    for (i = 0; i < t->img.section_count; ++i)
++    {
++        const IMAGE_SECTION_HEADER *sec = t->img.sections + i;
++
++        if (section_name_is(sec, ".reloc  ") && dir_offset >= sec->PointerToRawData
++            && dir_offset - sec->PointerToRawData < sec->SizeOfRawData)
++        {
++            UINT64 end = (UINT64)sec->PointerToRawData + sec->SizeOfRawData;
++            if (end > size)
++                end = size;
++            room = end - dir_offset;
++            break;
++        }
++    }
++    room &= ~1u;
++
++    out = dir_offset;
++    index = 0;
++    while (room > sizeof(IMAGE_BASE_RELOCATION) && index < record_count)
++    {
++        ULONG block = out;
++        ULONG page = records[index].rva & ~0xfffu;
++
++        put_dword(buf + block, page);
++        room -= sizeof(IMAGE_BASE_RELOCATION);
++        out = block + sizeof(IMAGE_BASE_RELOCATION);
++
++        while (room > 0)
++        {
++            if (index >= record_count || (records[index].rva & ~0xfffu) != page)
++            {
++                /* pad blocks to a multiple of four bytes */
++                if (out & 2)
++                {
++                    put_word(buf + out, 0);
++                    out += 2;
++                    room -= 2;
++                }
++                break;
++            }
++            put_word(buf + out, (records[index].type << 12) | (records[index].rva & 0xfff));
++            ++index;
++            out += 2;
++            room -= 2;
++        }
++        put_dword(buf + block + 4, out - block);
++    }
++
++    free(records);
++    return ERROR_SUCCESS;
++
++fail:
++    TRACE("relocation table runs past the end of the file\n");
++    free(records);
++    return ERROR_PATCH_CORRUPT;
++}
++
++static BOOL transform_thunks(struct transform *t, ULONG thunk_rva)
++{
++    BYTE *buf = t->img.base;
++    ULONG size = t->img.size;
++    ULONG start = pe_rva_to_offset(&t->img, thunk_rva);
++    ULONG pos;
++
++    for (pos = start; (UINT64)pos + 4 <= size; pos += 4)
++    {
++        UINT32 thunk = get_dword(buf + pos);
++        ULONG hint_name, name_end;
++
++        if (thunk == 0)
++            break;
++        if (thunk & IMAGE_ORDINAL_FLAG32)
++            continue;
++
++        hint_name = pe_rva_to_offset(&t->img, thunk);
++        if ((UINT64)hint_name + 2 >= size || (UINT64)hint_name + 4 > size)
++            return FALSE;
++
++        for (name_end = hint_name + 2; name_end < size && buf[name_end]; ++name_end)
++            ;
++        if (name_end >= size)
++            return FALSE;
++
++        /* hint, name and terminator */
++        map_mark(t, hint_name, name_end + 1 - hint_name, MAP_DONE | MAP_DIRECTORY);
++        remap_rva(t, pos);
++    }
++
++    if (pos > start)
++        map_mark(t, start, pos - start, MAP_DONE | MAP_DIRECTORY);
++    return TRUE;
++}
++
++static BOOL transform_imports(struct transform *t)
++{
++    BYTE *buf = t->img.base;
++    ULONG dir_size = 0;
++    ULONG offset = pe_directory_in_file(&t->img, IMAGE_DIRECTORY_ENTRY_IMPORT, &dir_size);
++    ULONG desc;
++
++    if (offset == 0)
++        return TRUE;
++
++    map_mark(t, offset, dir_size, MAP_DONE | MAP_DIRECTORY);
++
++    for (desc = offset; (UINT64)desc + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= t->img.size;
++         desc += sizeof(IMAGE_IMPORT_DESCRIPTOR))
++    {
++        ULONG original_thunk = get_dword(buf + desc);
++
++        if (original_thunk == 0)
++            break;
++
++        if (get_dword(buf + desc + 4) == 0)
++        {
++            if (!transform_thunks(t, original_thunk))
++                return FALSE;
++            if (!transform_thunks(t, get_dword(buf + desc + 16)))
++                return FALSE;
++        }
++        remap_rva(t, desc + 12);  /* Name */
++        remap_rva(t, desc);       /* OriginalFirstThunk */
++        remap_rva(t, desc + 16);  /* FirstThunk */
++    }
++    return TRUE;
++}
++
++static void transform_rva_array(struct transform *t, ULONG rva, ULONG count)
++{
++    ULONG offset = pe_rva_to_offset(&t->img, rva);
++    ULONG i;
++
++    if ((UINT64)offset + (UINT64)count * 4 <= t->img.size)
++        map_mark(t, offset, (UINT64)count * 4, MAP_DONE | MAP_DIRECTORY);
++
++    for (i = 0; i < count && (UINT64)offset + 4 * (UINT64)i + 4 <= t->img.size; ++i)
++        remap_rva(t, offset + 4 * i);
++}
++
++static void transform_exports(struct transform *t)
++{
++    BYTE *buf = t->img.base;
++    ULONG dir_size = 0;
++    ULONG offset = pe_directory_in_file(&t->img, IMAGE_DIRECTORY_ENTRY_EXPORT, &dir_size);
++    IMAGE_EXPORT_DIRECTORY *exports;
++    ULONG ordinals;
++
++    if (offset == 0 || (UINT64)offset + sizeof(IMAGE_EXPORT_DIRECTORY) > t->img.size)
++        return;
++
++    map_mark(t, offset, dir_size, MAP_DONE | MAP_DIRECTORY);
++    exports = (IMAGE_EXPORT_DIRECTORY *)(buf + offset);
++
++    transform_rva_array(t, exports->AddressOfFunctions, exports->NumberOfFunctions);
++    transform_rva_array(t, exports->AddressOfNames, exports->NumberOfNames);
++
++    ordinals = pe_rva_to_offset(&t->img, exports->AddressOfNameOrdinals);
++    if ((UINT64)ordinals + (UINT64)exports->NumberOfNames * 2 <= t->img.size)
++        map_mark(t, ordinals, (UINT64)exports->NumberOfNames * 2, MAP_DONE | MAP_DIRECTORY);
++
++    remap_rva(t, offset + FIELD_OFFSET(IMAGE_EXPORT_DIRECTORY, Name));
++    remap_rva(t, offset + FIELD_OFFSET(IMAGE_EXPORT_DIRECTORY, AddressOfFunctions));
++    remap_rva(t, offset + FIELD_OFFSET(IMAGE_EXPORT_DIRECTORY, AddressOfNames));
++    remap_rva(t, offset + FIELD_OFFSET(IMAGE_EXPORT_DIRECTORY, AddressOfNameOrdinals));
++}
++
++/* Check the target of a relative branch at section offset 'at' (the opcode
++ * position) and compute its new displacement. */
++static BOOL branch_new_displacement(struct transform *t, const IMAGE_SECTION_HEADER *sec, ULONG at,
++    INT32 displacement, INT32 *new_displacement)
++{
++    ULONG ip = sec->VirtualAddress + at + 5;
++    ULONG target = ip + displacement;
++    ULONG target_offset;
++
++    if (target >= t->img.nt->OptionalHeader.SizeOfImage)
++        return FALSE;
++    target_offset = pe_rva_to_offset(&t->img, target);
++    if (target_offset >= t->img.size || (t->map[target_offset] & MAP_DONE))
++        return FALSE;
++
++    *new_displacement = rift_map(t, target) - rift_map(t, ip);
++    return TRUE;
++}
++
++/* Get the scan range of an executable section, or FALSE if it has none */
++static BOOL code_section_range(const struct transform *t, const IMAGE_SECTION_HEADER *sec, ULONG *len)
++{
++    if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) || sec->PointerToRawData >= t->img.size)
++        return FALSE;
++    *len = min(sec->Misc.VirtualSize, sec->SizeOfRawData);
++    if ((UINT64)sec->PointerToRawData + *len > t->img.size || *len <= 5)
++        return FALSE;
++    return TRUE;
++}
++
++static void transform_jumps(struct transform *t)
++{
++    BYTE *buf = t->img.base;
++    unsigned int i;
++
++    for (i = 0; i < t->img.section_count; ++i)
++    {
++        const IMAGE_SECTION_HEADER *sec = t->img.sections + i;
++        BYTE *code = buf + sec->PointerToRawData;
++        BYTE *map = t->map + sec->PointerToRawData;
++        ULONG len, at;
++
++        if (!code_section_range(t, sec, &len))
++            continue;
++
++        for (at = 0; at < len - 5; ++at)
++        {
++            INT32 displacement, new_displacement;
++            BOOL near_jcc = FALSE;
++
++            if (code[at] == 0x0f && (code[at + 1] & 0xf0) == 0x80)
++            {
++                /* jcc rel32: continue from the second opcode byte */
++                if (map[at] & MAP_DONE)
++                    continue;
++                ++at;
++                if (at >= len - 5)
++                    continue;
++                near_jcc = TRUE;
++            }
++            else if (code[at] != 0xe9)
++            {
++                continue;
++            }
++
++            if (map_any(t, sec->PointerToRawData + at, 5, MAP_DONE))
++                continue;
++
++            displacement = (INT32)get_dword(code + at + 1);
++            if (displacement >= -128 && displacement <= 127)
++                continue;  /* could have been a short jump; not one we look at */
++
++            if (!branch_new_displacement(t, sec, at, displacement, &new_displacement))
++                continue;
++
++            if (new_displacement >= -128 && new_displacement <= 127)
++            {
++                /* the patch creator rewrites it as a short jump in place */
++                if (near_jcc)
++                {
++                    code[at - 1] = 0x70 | (code[at] & 0x0f);
++                    code[at] = (BYTE)new_displacement;
++                }
++                else
++                {
++                    code[at] = 0xeb;
++                    code[at + 1] = (BYTE)new_displacement;
++                }
++            }
++            else if (new_displacement != displacement)
++            {
++                put_dword(code + at + 1, new_displacement);
++            }
++            at += 4;
++        }
++    }
++}
++
++static void transform_calls(struct transform *t)
++{
++    BYTE *buf = t->img.base;
++    unsigned int i;
++
++    for (i = 0; i < t->img.section_count; ++i)
++    {
++        const IMAGE_SECTION_HEADER *sec = t->img.sections + i;
++        BYTE *code = buf + sec->PointerToRawData;
++        ULONG len, at;
++
++        if (!code_section_range(t, sec, &len))
++            continue;
++
++        for (at = 0; at < len - 5; ++at)
++        {
++            INT32 displacement, new_displacement;
++
++            if (code[at] != 0xe8 || map_any(t, sec->PointerToRawData + at, 5, MAP_DONE))
++                continue;
++
++            displacement = (INT32)get_dword(code + at + 1);
++            if (!branch_new_displacement(t, sec, at, displacement, &new_displacement))
++                continue;
++
++            if (new_displacement != displacement)
++                put_dword(code + at + 1, new_displacement);
++            at += 4;
++        }
++    }
++}
++
++struct resource_walk
++{
++    struct transform *t;
++    ULONG start;        /* file offset of the resource directory */
++    ULONG limit;        /* end of the directory, clipped to the file */
++    ULONG size;         /* directory size */
++    ULONG used;
++    ULONG timestamp;
++    ULONG rva;
++    ULONG mapped_rva;
++    BOOL stop;
++    BOOL error;
++};
++
++/* Remap a directory-relative offset field, keeping its top bit */
++static void resource_remap_offset(struct resource_walk *w, ULONG field)
++{
++    BYTE *p = w->t->img.base + field;
++    UINT32 value = get_dword(p);
++    UINT32 mapped = rift_map(w->t, w->rva + (value & 0x7fffffff)) - w->mapped_rva;
++    UINT32 new_value = (value & 0x80000000) | (mapped & 0x7fffffff);
++
++    if (new_value != value)
++        put_dword(p, new_value);
++}
++
++static void resource_set_timestamp(struct resource_walk *w, ULONG table)
++{
++    BYTE *p = w->t->img.base + table + FIELD_OFFSET(IMAGE_RESOURCE_DIRECTORY, TimeDateStamp);
++
++    if (get_dword(p) != w->timestamp)
++        put_dword(p, w->timestamp);
++}
++
++static void resource_walk_classic(struct resource_walk *w, UINT64 table, unsigned int depth)
++{
++    BYTE *buf = w->t->img.base;
++    unsigned int count, i;
++
++    if (table >= w->limit || table + sizeof(IMAGE_RESOURCE_DIRECTORY) > w->limit
++        || (UINT64)w->used + sizeof(IMAGE_RESOURCE_DIRECTORY) > w->size || depth > MAX_RESOURCE_DEPTH)
++        return;
++
++    resource_set_timestamp(w, table);
++
++    count = get_word(buf + table + FIELD_OFFSET(IMAGE_RESOURCE_DIRECTORY, NumberOfNamedEntries))
++        + get_word(buf + table + FIELD_OFFSET(IMAGE_RESOURCE_DIRECTORY, NumberOfIdEntries));
++
++    for (i = 0; i < count; ++i)
++    {
++        ULONG entry = table + sizeof(IMAGE_RESOURCE_DIRECTORY) + i * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
++        UINT32 name, offset;
++
++        if ((UINT64)entry + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) >= w->limit)
++            break;
++
++        name = get_dword(buf + entry);
++        offset = get_dword(buf + entry + 4);
++
++        if (offset & 0x80000000)
++        {
++            resource_walk_classic(w, (UINT64)w->start + (offset & 0x7fffffff), depth + 1);
++            if (w->stop)
++                return;
++        }
++        else
++        {
++            UINT64 data = (UINT64)w->start + offset;
++
++            if (data > w->start && data + sizeof(IMAGE_RESOURCE_DATA_ENTRY) < w->limit)
++            {
++                w->used += get_dword(buf + data + FIELD_OFFSET(IMAGE_RESOURCE_DATA_ENTRY, Size));
++                if (w->used > w->size)
++                {
++                    w->stop = TRUE;
++                    return;
++                }
++                remap_rva(w->t, data + FIELD_OFFSET(IMAGE_RESOURCE_DATA_ENTRY, OffsetToData));
++            }
++        }
++
++        resource_remap_offset(w, entry + 4);
++        if (name & 0x80000000)
++            resource_remap_offset(w, entry);
++
++        w->used += sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
++        if (w->used > w->size)
++        {
++            w->stop = TRUE;
++            return;
++        }
++    }
++}
++
++static void resource_walk_v2(struct resource_walk *w, UINT64 table, unsigned int depth)
++{
++    BYTE *buf = w->t->img.base;
++    unsigned int count, i;
++
++    if (table < w->start || table > w->limit - sizeof(IMAGE_RESOURCE_DIRECTORY)
++        || (UINT64)w->used + sizeof(IMAGE_RESOURCE_DIRECTORY) > w->size || depth > MAX_RESOURCE_DEPTH)
++    {
++        w->error = TRUE;
++        return;
++    }
++
++    resource_set_timestamp(w, table);
++
++    count = get_word(buf + table + FIELD_OFFSET(IMAGE_RESOURCE_DIRECTORY, NumberOfNamedEntries))
++        + get_word(buf + table + FIELD_OFFSET(IMAGE_RESOURCE_DIRECTORY, NumberOfIdEntries));
++
++    for (i = 0; i < count; ++i)
++    {
++        ULONG entry = table + sizeof(IMAGE_RESOURCE_DIRECTORY) + i * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
++        UINT32 name, offset;
++
++        if ((UINT64)entry + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > w->limit
++            || (UINT64)w->used + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > w->size)
++        {
++            w->error = TRUE;
++            w->stop = TRUE;
++            return;
++        }
++
++        name = get_dword(buf + entry);
++        offset = get_dword(buf + entry + 4);
++
++        if (offset & 0x80000000)
++        {
++            ULONG sub = offset & 0x7fffffff;
++
++            if (w->size < sizeof(IMAGE_RESOURCE_DIRECTORY) || sub > w->size - sizeof(IMAGE_RESOURCE_DIRECTORY))
++            {
++                w->error = TRUE;
++            }
++            else
++            {
++                resource_walk_v2(w, (UINT64)w->start + sub, depth + 1);
++                if (w->stop)
++                    return;
++                if (w->used > w->size)
++                {
++                    w->error = TRUE;
++                    w->stop = TRUE;
++                    return;
++                }
++            }
++        }
++        else
++        {
++            UINT64 data = (UINT64)w->start + offset;
++
++            if (data < w->start || data + sizeof(IMAGE_RESOURCE_DATA_ENTRY) > w->limit)
++                w->error = TRUE;
++            else
++                remap_rva(w->t, data + FIELD_OFFSET(IMAGE_RESOURCE_DATA_ENTRY, OffsetToData));
++        }
++
++        resource_remap_offset(w, entry + 4);
++        if (name & 0x80000000)
++            resource_remap_offset(w, entry);
++
++        w->used += sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
++    }
++}
++
++static void transform_resources(struct transform *t, ULONG resource_time)
++{
++    struct resource_walk w;
++    ULONG dir_size = 0;
++    ULONG offset = pe_directory_in_file(&t->img, IMAGE_DIRECTORY_ENTRY_RESOURCE, &dir_size);
++
++    if (offset == 0 || dir_size < sizeof(IMAGE_RESOURCE_DIRECTORY))
++        return;
++
++    w.t = t;
++    w.start = offset;
++    w.limit = min(t->img.size, offset + dir_size);
++    w.size = dir_size;
++    w.used = 0;
++    w.timestamp = resource_time;
++    w.rva = pe_directory(&t->img, IMAGE_DIRECTORY_ENTRY_RESOURCE)->VirtualAddress;
++    w.mapped_rva = rift_map(t, w.rva);
++    w.stop = FALSE;
++    w.error = FALSE;
++
++    if (t->bits & TRANSFORM_RESOURCES_V2)
++        resource_walk_v2(&w, offset, 0);
++    else
++        resource_walk_classic(&w, offset, 0);
++
++    if (w.error)
++        TRACE("malformed resource directory\n");
++}
++
++/* Apply the rift transform to a normalized 32-bit PE image in place */
++DWORD pe_transform(BYTE *buf, ULONG size, ULONG transform_bits, ULONG resource_time,
++    const struct rift_entry *rifts, ULONG rift_count)
++{
++    struct transform t;
++    DWORD err = ERROR_SUCCESS;
++
++    if (!pe_image_init(&t.img, buf, size))
++        return ERROR_SUCCESS;
++
++    t.map = calloc(size, 1);
++    if (t.map == NULL)
++        return ERROR_OUTOFMEMORY;
++    t.rifts = rifts;
++    t.rift_count = rift_count;
++    t.bits = transform_bits;
++    t.v2 = (transform_bits & (TRANSFORM_RESOURCES_V2 | TRANSFORM_RELOCS_V2)) != 0;
++
++    transform_mark_non_code(&t);
++
++    if (!t.v2)
++    {
++        if (!(t.bits & TRANSFORM_NO_RELOCS))
++            err = transform_relocs(&t);
++        if (!err && !(t.bits & TRANSFORM_NO_IMPORTS) && !transform_imports(&t))
++            err = ERROR_PATCH_CORRUPT;
++        if (!err)
++        {
++            if (!(t.bits & TRANSFORM_NO_EXPORTS))
++                transform_exports(&t);
++            if (t.img.nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386)
++            {
++                if (!(t.bits & TRANSFORM_NO_JUMPS))
++                    transform_jumps(&t);
++                if (!(t.bits & TRANSFORM_NO_CALLS))
++                    transform_calls(&t);
++            }
++            if (!(t.bits & TRANSFORM_NO_RESOURCES))
++                transform_resources(&t, resource_time);
++        }
++    }
++    else
++    {
++        if (!(t.bits & TRANSFORM_NO_IMPORTS) && !transform_imports(&t))
++            err = ERROR_PATCH_CORRUPT;
++        if (!err)
++        {
++            if (!(t.bits & TRANSFORM_NO_EXPORTS))
++                transform_exports(&t);
++            if (!(t.bits & TRANSFORM_NO_RESOURCES))
++                transform_resources(&t, resource_time);
++            if (!(t.bits & TRANSFORM_NO_RELOCS))
++                err = transform_relocs(&t);
++        }
++        if (!err && t.img.nt->FileHeader.Machine == IMAGE_FILE_MACHINE_I386)
++        {
++            if (!(t.bits & TRANSFORM_NO_JUMPS))
++                transform_jumps(&t);
++            if (!(t.bits & TRANSFORM_NO_CALLS))
++                transform_calls(&t);
++        }
++    }
++
++    free(t.map);
++    return err;
++}

@@ -1,0 +1,91 @@
+From: Neutron lab (cjk48b)
+Subject: win32u: GetFontData(hdc, 0, ...) on a collection member covers member offset to end of file
+
+Found on #48 ("UI broken when showing CJK text ..."); it does NOT fix that issue's layer-name boxes and does not
+change Photoshop's font list (see evidence). It is a Windows-parity fix in the same call Photoshop's font engine
+uses to read collection fonts.
+
+Windows (Windows 11 26200, ttcprobe, 11-08): for a font in a .ttc, GetFontData(hdc, 0, ...) starts at the
+member's offset table, its table records keep their FILE-relative offsets, and its size is the file size minus
+the member's offset: MS Gothic (member 0 at 36) 'ttcf' 8990160 / table 0 8990124; MS PGothic (member 2 at 812)
+8989348; MS UI Gothic (member 1 at 416) 8989744; Yu Gothic UI and Cambria Math (member 1 at 380) file - 380.
+Wine already starts table 0 at the member and keeps file-relative records, but reports, and lets callers read
+up to, the whole file size, so size('ttcf') - size(0) is 0 instead of the member's offset and reads near the end
+of table 0 run past the file.
+
+Change: for table 0 of a collection member, the size is file size - member offset, reads are clipped to it, and a
+read starting beyond it fails. 'ttcf', tag reads and non-collection fonts are unchanged; GetFontFileData uses
+'ttcf' and is unaffected.
+
+Not covered: #48's boxes. Photoshop's CoolType reads a collection member's 'CFF ' table with
+GetFontData(hdc, 0, record.offset) and never asks for size(0) (lab trace), so CFF collections (Noto Sans CJK .ttc)
+stay out of its font list with or without this change; Windows' own answer leads to the same misread, so that is
+not a Wine delta. The layer-name rendering is a separate open item.
+
+Lab evidence (runtime 11.10-185ck3 = 185cj + this win32u.so; kill switch on the same build):
+  ttcprobe, Noto Sans CJK JP (member 0 at 52) / KR (member 1 at 320) / WenQuanYi Zen Hei Sharp (member 2 at 608):
+    fix:  size(0) = 19484732 / 19484464 / 16790643 = 'ttcf' - member offset; IDENTICAL; (B) MATCH  -- Windows' pattern
+    kill: size(0) = 'ttcf' size (19484784 / 19484784 / 16791251); IDENTICAL; (B) MATCH
+  Wine gdi32 font.c test (standalone build), fresh default prefix and the lab Adobe prefix: fix and kill print the
+    same lines and the same 98 / 462 failures (normalized diff empty); both stop at the same point in
+    test_nonexistent_font, so later font.c tests are not covered in either arm.
+  Photoshop 2026, 96 dpi, fresh reflink per run, n=2 each: font list 1236, Noto Sans CJK 0, CoolType OS fonts 1113 in
+    all four runs; layer names: Latin fine, CJK boxes in all four (same as before).
+Kill switch: NEUTRON_GDI_TTC_SIZE=0 restores the whole-file size (upstream).
+--- a/dlls/win32u/freetype.c	2026-11-08 21:03:42.569862270 -0500
++++ b/dlls/win32u/freetype.c	2026-11-08 23:29:11.316272339 -0500
+@@ -1704,6 +1704,27 @@
+     free( data );
+ }
+ 
++/* NEUTRON: GetFontData(hdc, 0, ...) on a member of a TrueType/OpenType Collection covers the bytes
++ * from the member's offset table to the end of the file, so its size is the file size minus the
++ * member's offset.  Measured on Windows 11 (ttcprobe, 11-08): MS Gothic member 0 at 36 -> 8990160 'ttcf'
++ * vs 8990124 table 0; MS PGothic member 2 at 812 -> 8989348; Yu Gothic UI member 1 at 380 -> 13908012;
++ * the table records keep their file-relative offsets.  Wine served the data from the member's offset
++ * but reported (and allowed reading up to) the whole file size, so size('ttcf') - size(0) -- the
++ * member's position -- came out 0, and reads near the end ran past the file.
++ * Kill switch: NEUTRON_GDI_TTC_SIZE=0 restores the whole-file size (upstream). */
++static BOOL neutron_ttc_size_on(void)
++{
++    static int on = -1;
++
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_GDI_TTC_SIZE" );
++        on = e ? (e[0] != '0') : 1;
++        if (e) ERR( "neutron-gateresolved: NEUTRON_GDI_TTC_SIZE = %d (environment)\n", on );
++    }
++    return on;
++}
++
+ /*************************************************************
+  * freetype_get_font_data
+  */
+@@ -1728,7 +1749,26 @@
+         if (table == MS_TTCF_TAG)
+             table = 0;
+         else if (table == 0)
++        {
++            if (neutron_ttc_size_on())
++            {
++                FT_ULong file_size = 0, avail;
++
++                if (pFT_Load_Sfnt_Table( ft_face, 0, 0, NULL, &file_size ) || file_size <= font->ttc_item_offset)
++                    return GDI_ERROR;
++                avail = file_size - font->ttc_item_offset;
++                if (!buf || !cbData) return avail;
++                if (offset >= avail) return GDI_ERROR;
++                len = min( cbData, avail - offset );
++                if (pFT_Load_Sfnt_Table( ft_face, 0, offset + font->ttc_item_offset, buf, &len ))
++                {
++                    TRACE("Can't read collection member data at %u\n", offset);
++                    return GDI_ERROR;
++                }
++                return len;
++            }
+             offset += font->ttc_item_offset;
++        }
+     }
+ 
+     /* make sure value of len is the value freetype says it needs */

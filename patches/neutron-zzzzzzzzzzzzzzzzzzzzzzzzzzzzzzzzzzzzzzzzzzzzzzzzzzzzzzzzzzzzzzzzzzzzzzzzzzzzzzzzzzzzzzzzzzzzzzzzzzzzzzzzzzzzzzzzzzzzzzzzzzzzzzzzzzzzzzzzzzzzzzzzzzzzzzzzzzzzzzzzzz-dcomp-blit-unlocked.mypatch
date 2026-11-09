@@ -1,0 +1,319 @@
+# dcomp: never hold the presentation list lock across a blit
+#
+# CapCut (lab, runtime 11.10-185): about 1 start in 6 the window shows and paints, then the app stalls. The hang report
+# names dcomp's presentations_cs: CapCut's Qt Quick render thread (in Present, d3d11 -> dxgi -> dcomp_register_external ->
+# register_presentation) and a second Qt thread wait on it, "blocked by" dcomp's blit thread (presentations_proc).
+# Same rate on 185 and 185lc (1/6 each, capcut-rate).
+#
+# Mechanism. Every Enter/Leave of presentations_cs in device.c is balanced on every path (no early return, no SEH region
+# spans the lock), so no lock count leaks. The coupling is structural: the blit worker held presentations_cs for its whole
+# tick, across blit_swapchain_to_hwnd (GetBuffer, CopyResource, Map(READ) = a GPU wait, GetDC/StretchDIBits/ReleaseDC
+# into windows of other threads), and the per-Present hook takes the same lock on the app's render thread for every
+# frame. In both bad runs the blit thread logged its first blit after >= 2 s without one ("gate: calls=1") at the moment
+# the render threads' 5 s waits timed out, several times per run, with frames getting through in between: the blit thread
+# stalled for seconds inside the tick, and every render thread of the process waited inside Present for it. The hang
+# report runs after the stall ended, so it shows the owner already back in Sleep(16). What stalls the blit call itself is
+# not identified here. Lab run CkB-8 narrows it: both processes' blit threads (CapCut and its GPU process) paused
+# together, the time was outside the D3D readback and GDI (in the per-window user32 calls), and a per-process pause
+# watchdog stayed quiet -- a shared blocker (wineserver or the display/compositor path), INFERRED. This patch removes
+# the render threads' dependency on it.
+#
+# Windows. DWM composes asynchronously: an application's Present never waits on a lock that the compositor holds while it
+# reads back or draws another frame.
+#
+# Fix. presentations_cs guards the list only. The blit worker takes a new blit_cs, copies the list under presentations_cs,
+# releases it and blits the copy under blit_cs alone. blit_cs is also taken, first, by the only writers of a
+# presentation's blit state, register_presentation's slow path (new window or new swap chain) and
+# unregister_presentations_for_hwnd, so no presentation changes or is freed under a blit. Lock order blit_cs ->
+# presentations_cs everywhere. The per-Present fast path is unchanged (it only sets pending_blit, interlocked) and can no
+# longer wait on a blit. Diagnostics: "neutron-blit-slow" (a tick >= 1 s, split into D3D readback / after it / GDI),
+# "neutron-present-wait" (a Present waited >= 250 ms for the list lock; measured only when TryEnter fails, no cost
+# otherwise). Lab-only, off by default: NEUTRON_DCOMP_FREEZE_WATCH=1 (process-pause watchdog),
+# NEUTRON_DCOMP_TEST_BLIT_STALL_MS (test-only: every 60th blit sleeps that long).
+#
+# Not covered. A first Present of a new window or swap chain (slow path) still waits for a running blit tick to finish.
+# A blit stalled in Map holds the device's ID3D10Multithread lock (the bridge turns protection on), so the app's own
+# immediate-context calls on that device still wait for it; that path is unchanged. The cause of the multi-second blit
+# call is not fixed here.
+#
+# Lab evidence (runtime 11.10-185ck = 185 + this dcomp + the ntdll patch; desk ck; WINEDEBUG=+timestamp):
+# - CapCut, 20 starts, arms alternating on the same build (B = default, A = NEUTRON_DCOMP_BLIT_UNLOCKED=0), fresh reflink
+#   of the lab prefix each, 120 s each: window B 10/10, A 8/10 (A-1, A-3: the process exited at ~1 s with code 0 before
+#   winewayland's init -- the failure capcut-rate saw once on 185lc; not dcomp). Render-thread waits: 0/20 (no critsec
+#   timeout, no hang report, no neutron-present-wait).
+# - The blit stall itself happened once (CkB-8, default arm): 17 slow ticks of 1.2 to 14.0 s, in BOTH processes' blit
+#   threads (CapCut and its GPU process) at the same instants, mostly outside the D3D readback and GDI (d3d 0, after-d3d 0:
+#   the per-window user32 calls), while each process's pause watchdog stayed quiet. No Present waited >= 250 ms and no
+#   thread timed out on the lock. Base (185, capcut-rate): the same both-process blit stall in 2 of 12 starts, and each time
+#   CapCut's render threads hung on presentations_cs ("blocked by" the blit thread). KWin's window list (rig, 120 s) came
+#   back empty in every run with that stall (Ccr-185-2, Ccr-185lc-3, CkB-8).
+# - Harness dcomp-present-stall.exe (two windows, two render threads presenting as fast as they can; the bridge copies
+#   them with NEUTRON_DCOMP_HWND_CHAIN_COPY=1; NEUTRON_DCOMP_TEST_BLIT_STALL_MS=2000): default PASS 3/3 (longest Present
+#   7.2-7.5 ms, ~2880 presents per thread in 12 s); kill switch FAIL 3/3 (longest Present 2013-2014 ms, 5 presents
+#   >= 250 ms per thread, 600 presents). One more kill-switch run crashed at start inside DXVK's presenter creation
+#   ("Failed to query surface formats: VK_INCOMPLETE", before any blit), seen once in 7 runs, not judged.
+# - Regression n=1 each on 11.10-185ckl (185lc + this patch's 185lc variant + the ntdll patch), desk ck: Photoshop 2026
+#   (scripted home/doc/type/maximize, 0 crashes), Premiere 2026 (opens Waterfalls.prproj, Export Frame, maximize; 0
+#   crashes), Lightroom cloud (window in 6 s, library panels drawn, "Get started" card on a translucent backdrop = 185lc's
+#   fix intact, 0 crashes), Topaz Photo (window, caption strip identical to fonts2's reference; maximized strip 760 of
+#   32000 px differ, not compared with a 185lc run of the same script).
+#
+# Kill switch NEUTRON_DCOMP_BLIT_UNLOCKED=0 (hold presentations_cs for the whole tick again).
+# Touches: dlls/dcomp/device.c. Variant of dcomp-blit-unlocked.mypatch that applies AFTER
+# lrcc-dcomp/children-over-chain.mypatch (same change, one hunk rebased onto its tick counter).
+--- a/dlls/dcomp/device.c	2026-11-07 15:11:31.058147201 -0500
++++ b/dlls/dcomp/device.c	2026-11-07 15:11:31.061147311 -0500
+@@ -282,6 +282,59 @@
+ static INIT_ONCE presentations_once = INIT_ONCE_STATIC_INIT;
+ static HANDLE presentations_thread;
+ 
++/* NEUTRON 2026-11-07 (CapCut stall): presentations_cs guards the LIST only and is never held across
++ * blit work. The per-Present hook (register_presentation's fast path, run on the app's render thread
++ * for every frame) takes presentations_cs, and the blit worker used to hold it for the whole tick:
++ * GetBuffer, CopyResource, Map(READ) (a wait for the GPU) and GetDC/StretchDIBits/ReleaseDC into
++ * windows of other threads. Whenever one of those calls took seconds, every render thread of the
++ * process waited on it inside Present (CapCut: the Qt Quick render threads, "blocked by" the blit
++ * thread). blit_cs now serializes the blit worker against the only writers of a presentation's
++ * blit state -- register_presentation's slow path (new window / new swap chain) and
++ * unregister_presentations_for_hwnd -- so a presentation cannot change or be freed under a blit.
++ * Lock order: blit_cs before presentations_cs, everywhere. The fast path writes only pending_blit
++ * (interlocked). Kill switch NEUTRON_DCOMP_BLIT_UNLOCKED=0: hold presentations_cs for the whole
++ * tick again (the old coupling). */
++static CRITICAL_SECTION blit_cs;
++
++static int neutron_blit_unlocked(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[8];
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_BLIT_UNLOCKED", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_BLIT_UNLOCKED = %d\n", v);
++    }
++    return v;
++}
++
++static LONGLONG neutron_qpc_ms(void)
++{
++    LARGE_INTEGER c, f;
++    QueryPerformanceCounter(&c);
++    QueryPerformanceFrequency(&f);
++    return c.QuadPart * 1000 / f.QuadPart;
++}
++
++/* Where the blit worker spent the current tick (blit thread only; printed for a slow tick). */
++static LONGLONG blit_ms_d3d, blit_ms_gdi, blit_ms_px;
++
++/* Lab diagnostic (NEUTRON_DCOMP_FREEZE_WATCH=1, off by default): a thread that sleeps 50 ms at a time
++ * and reports when it overslept by more than a second -- a process-wide freeze (scheduler, file system,
++ * paging) rather than a dcomp wait. */
++static DWORD WINAPI freeze_watch_proc(void *arg)
++{
++    LONGLONG prev = neutron_qpc_ms(), now;
++    for (;;)
++    {
++        Sleep(50);
++        now = neutron_qpc_ms();
++        if (now - prev > 1000) ERR("neutron-freeze: watchdog slept %lld ms (asked 50)\n", now - prev);
++        prev = now;
++    }
++    return 0;
++}
++
+ /* NEUTRON gpu-churn fix (Premiere Edit<->Export stall):
+  * The final IDXGISwapChain_Release of a RETIRED swapchain must never run
+  * synchronously on the app's Present thread, and never under presentations_cs.
+@@ -648,6 +701,7 @@
+     LONG n;
+     BOOL diag;
+     BOOL mt_entered = FALSE, have_pixels = FALSE;
++    LONGLONG d3d_t0 = 0, px_t0 = 0, gdi_t0;
+     /* direct_used, NOT (direct_sh != NULL): the direct branch is also skipped for a frame
+      * larger than the shared buffer, and that frame must still be published by the packed
+      * path below. Keying the skip on direct_sh alone silently dropped those frames. */
+@@ -729,6 +783,7 @@
+                 UINT index = 0;
+                 if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchain, &scd)))
+                     index = neutron_presented_buffer(&scd);
++                d3d_t0 = neutron_qpc_ms();
+                 hr = IDXGISwapChain_GetBuffer(swapchain, index, &IID_ID3D11Texture2D, (void **)&backbuffer);
+             }
+             if (FAILED(hr))
+@@ -876,6 +931,21 @@
+     {
+         ID3D10Multithread_Leave(mt);
+     }
++    if (d3d_t0) blit_ms_d3d += neutron_qpc_ms() - d3d_t0;
++    px_t0 = neutron_qpc_ms();
++    /* TEST-ONLY stall injection (NEUTRON_DCOMP_TEST_BLIT_STALL_MS=<ms>): every 60th blit that read a frame
++     * sleeps that long here, standing in for a GDI or publish call that blocks. Proves the per-Present path
++     * no longer waits on the blit worker (harness dcomp-present-stall). Inert unless the variable is set. */
++    {
++        static int stall = -1;
++        static LONG nstall;
++        if (stall < 0)
++        {
++            char b[16];
++            stall = GetEnvironmentVariableA("NEUTRON_DCOMP_TEST_BLIT_STALL_MS", b, sizeof(b)) ? atoi(b) : 0;
++        }
++        if (stall > 0 && have_pixels && !(InterlockedIncrement(&nstall) % 60)) Sleep(stall);
++    }
+     if (mt) ID3D10Multithread_Release(mt);
+ 
+     /* NEUTRON DIAG: once per hwnd, did the readback produce pixels? Distinguishes
+@@ -1079,6 +1149,7 @@
+         bmi.bmiHeader.biBitCount = 32;
+         bmi.bmiHeader.biCompression = BI_RGB;
+ 
++        gdi_t0 = neutron_qpc_ms();
+         if (!uniform_black && (hdc = GetDC(hwnd)))
+         {
+             GetClientRect(hwnd, &rc);
+@@ -1087,6 +1158,7 @@
+                           0, 0, desc.Width, desc.Height,
+                           packed, &bmi, DIB_RGB_COLORS, SRCCOPY) != 0;
+             ReleaseDC(hwnd, hdc);
++            blit_ms_gdi += neutron_qpc_ms() - gdi_t0;
+         }
+         {
+             static int d2dui = -1;
+@@ -1106,6 +1178,7 @@
+         }
+     }
+     free(packed);
++    if (px_t0) blit_ms_px += neutron_qpc_ms() - px_t0;
+ 
+ done:
+     /* NEUTRON M1a: `staging` is a borrow of the cached p->staging — do NOT release it here.
+@@ -1122,6 +1195,9 @@
+ 
+ static DWORD WINAPI presentations_proc(void *arg)
+ {
++    struct presentation **snap = NULL;
++    unsigned int snap_size = 0;
++
+     for (;;)
+     {
+         struct presentation *p;
+@@ -1129,13 +1205,28 @@
+         static ULONGLONG regt;
+         static unsigned int tick;
+         ULONGLONG now;
++        unsigned int i, n = 0;
++        BOOL unlocked = neutron_blit_unlocked();
++        LONGLONG tick0;
+ 
+         tick++;
+ 
++        EnterCriticalSection(&blit_cs);
+         EnterCriticalSection(&presentations_cs);
++        tick0 = neutron_qpc_ms();
++        blit_ms_d3d = blit_ms_gdi = blit_ms_px = 0;
++        LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry) nlive++;
++        if (nlive > snap_size)
++        {
++            struct presentation **grown = realloc(snap, nlive * 2 * sizeof(*snap));
++            if (grown) { snap = grown; snap_size = nlive * 2; }
++        }
+         LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++            if (n < snap_size) snap[n++] = p;
++        if (unlocked) LeaveCriticalSection(&presentations_cs);
++        for (i = 0; i < n; i++)
+         {
+-            nlive++;
++            p = snap[i];
+             if (p->swapchain && p->present_hwnd && IsWindow(p->present_hwnd))
+             {
+                 /* NEUTRON R3 (resize glitch): pause blits while the target is mid-resize.
+@@ -1224,7 +1315,15 @@
+                 }
+             }
+         }
+-        LeaveCriticalSection(&presentations_cs);
++        if (!unlocked) LeaveCriticalSection(&presentations_cs);
++        LeaveCriticalSection(&blit_cs);
++        {
++            LONGLONG took = neutron_qpc_ms() - tick0;
++            if (took >= 1000)
++                ERR("neutron-blit-slow: tick took %lld ms for %u presentations (d3d %lld, after-d3d %lld of which gdi %lld ms), "
++                    "presentations_cs %s\n", took, n, blit_ms_d3d, blit_ms_px, blit_ms_gdi,
++                    unlocked ? "not held" : "HELD");
++        }
+         /* NEUTRON M4: confirm the registration list stays BOUNDED (dedup working). Should
+          * plateau at the true live-window count (~15-25), never climb into the thousands. */
+         now = GetTickCount64();
+@@ -1318,8 +1417,13 @@
+ 
+ static BOOL CALLBACK presentations_init(INIT_ONCE *once, void *param, void **ctx)
+ {
++    char b[8];
++
+     InitializeCriticalSection(&presentations_cs);
++    InitializeCriticalSection(&blit_cs);
+     presentations_thread = CreateThread(NULL, 0, presentations_proc, NULL, 0, NULL);
++    if (GetEnvironmentVariableA("NEUTRON_DCOMP_FREEZE_WATCH", b, sizeof(b)) && b[0] == '1')
++        CloseHandle(CreateThread(NULL, 0, freeze_watch_proc, NULL, 0, NULL));
+     return TRUE;
+ }
+ 
+@@ -1341,7 +1445,13 @@
+      * fastfail/coredump = not a crash, a livelock). If (hwnd, content) is ALREADY
+      * registered, just mark a blit pending and return -- no QI, no ancestor walk, no log. */
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+-    EnterCriticalSection(&presentations_cs);
++    if (!TryEnterCriticalSection(&presentations_cs))
++    {
++        LONGLONG t0 = neutron_qpc_ms(), waited;
++        EnterCriticalSection(&presentations_cs);
++        if ((waited = neutron_qpc_ms() - t0) >= 250)
++            ERR("neutron-present-wait: Present on hwnd %p waited %lld ms for presentations_cs\n", hwnd, waited);
++    }
+     LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
+     {
+         if (p->hwnd == hwnd)
+@@ -1507,6 +1617,7 @@
+ 
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
++    EnterCriticalSection(&blit_cs);
+     EnterCriticalSection(&presentations_cs);
+     LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
+     {
+@@ -1533,11 +1644,13 @@
+                 /* NEUTRON perf gate: force a fresh present-count comparison on the new swapchain. */
+                 p->have_present_count = FALSE;
+                 LeaveCriticalSection(&presentations_cs);
++                LeaveCriticalSection(&blit_cs);
+                 release_swapchain_async(old_swapchain, old_staging);
+                 return;
+             }
+             else IDXGISwapChain_Release(swapchain);
+             LeaveCriticalSection(&presentations_cs);
++            LeaveCriticalSection(&blit_cs);
+             return;
+         }
+     }
+@@ -1558,6 +1671,7 @@
+     }
+     else IDXGISwapChain_Release(swapchain);
+     LeaveCriticalSection(&presentations_cs);
++    LeaveCriticalSection(&blit_cs);
+ }
+ 
+ static void unregister_presentations_for_hwnd(HWND hwnd)
+@@ -1567,6 +1681,7 @@
+ 
+     InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
+ 
++    EnterCriticalSection(&blit_cs);
+     EnterCriticalSection(&presentations_cs);
+     LIST_FOR_EACH_ENTRY_SAFE(p, next, &presentations, struct presentation, entry)
+     {
+@@ -1581,6 +1696,7 @@
+         }
+     }
+     LeaveCriticalSection(&presentations_cs);
++    LeaveCriticalSection(&blit_cs);
+ 
+     /* NEUTRON gpu-churn fix: do the final swapchain releases outside the lock and
+      * off this thread — same DXVK teardown wedge as in register_presentation. */

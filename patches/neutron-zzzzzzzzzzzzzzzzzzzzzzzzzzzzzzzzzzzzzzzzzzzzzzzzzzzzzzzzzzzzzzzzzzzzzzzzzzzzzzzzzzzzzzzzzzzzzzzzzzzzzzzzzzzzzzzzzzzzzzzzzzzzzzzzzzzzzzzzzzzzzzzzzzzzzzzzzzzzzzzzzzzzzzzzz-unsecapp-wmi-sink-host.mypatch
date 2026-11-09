@@ -1,0 +1,690 @@
+From: Neutron lab (team agent unsecapp) 2026-11-07
+Subject: [PATCH] programs/unsecapp: Add the Unsecured Apartment local server (WMI async sink host).
+
+What was seen (lab, Adobe Acrobat Pro 21.001.20135): from the second Acrobat launch on, Adobe's AGMService.exe (Adobe
+Genuine Monitor Service, a 32-bit auto-start service installed with Acrobat) dies with a Wine "Program Error" dialog
+on every launch (n=4 earlier rounds, n=2 here before the fix): page fault reading 0x0 at agmservice+0x56315.
+
+Mechanism (+ole/+wbemprox/+seh trace and disassembly): the service thread does what Microsoft's sample "Receiving
+event notifications through WMI" does: CoInitializeEx(MTA), WbemLocator -> ConnectServer("ROOT\CIMV2"),
+CoSetProxyBlanket, then CoCreateInstance(CLSID_UnsecuredApartment {49bd2028-...}, CLSCTX_LOCAL_SERVER,
+IID_IUnsecuredApartment). Wine has no such class (no unsecapp.exe, no registration): combase logs "class not
+registered" and returns REGDB_E_CLASSNOTREG (0x80040154, measured by the new test on the unpatched build). The
+service does not check the result and calls CreateObjectStub through the NULL pointer. Next on its path:
+QueryInterface(stub, IID_IWbemObjectSink), then IWbemServices::ExecNotificationQueryAsync("WQL",
+"Select * From Win32_ProcessStartTrace Where processName=..." (a list of Adobe app executables),
+WBEM_FLAG_SEND_STATUS, NULL, stub sink).
+
+Windows behavior: unsecapp.exe (System32\wbem) is the COM local server for CLSID_UnsecuredApartment. Its
+IUnsecuredApartment::CreateObjectStub / IWbemUnsecuredApartment::CreateSinkStub wrap a client's IWbemObjectSink
+in a forwarder living in the unsecapp process; WMI calls Indicate/SetStatus on the forwarder, which passes them on
+to the client's sink. The WMI interfaces it uses are marshalable across processes.
+
+Fix:
+- programs/unsecapp: the local server. MTA, REGCLS_MULTIPLEUSE; the apartment object exposes IUnsecuredApartment and
+  IWbemUnsecuredApartment; both methods return a forwarder that implements IWbemObjectSink and forwards Indicate and
+  SetStatus to the client's sink. The process exits when its last object is released. Like Wine's other background
+  servers it marks itself a Wine system process, so it never keeps a prefix's session alive on its own (it exits
+  with the session).
+- wbemprox: proxy/stub code for the non-local interfaces of wbemcli.idl (IWbemObjectSink, IUnsecuredApartment,
+  IWbemUnsecuredApartment, IWbemServices, IWbemCallResult, IEnumWbemClassObject, ...), registered by wbemprox's
+  DllRegisterServer with PSFactoryBuffer {7c857801-...} (= IID_IWbemObjectSink). Windows hosts these proxies in its
+  own WMI DLLs; which DLL is not modeled here.
+- wine.inf: unsecapp.exe in system32\wbem (both arches), HKCR\CLSID\{49BD2028-...} AppID + LocalServer32 =
+  %11%\wbem\unsecapp.exe, HKCR\AppID\{49BD2028-...} and HKCR\AppID\unsecapp.exe. A 32-bit client finds the 64-bit
+  registration through combase's opposite-view lookup and starts the 64-bit server, as on 64-bit Windows.
+- wbemprox tests: test_UnsecuredApartment (local server activation, CreateObjectStub + QI IWbemObjectSink,
+  CreateSinkStub, SetStatus forwarded to the client's sink).
+
+Not covered:
+- No WMI event provider: Win32_ProcessStartTrace events are never delivered. Wine's ExecNotificationQueryAsync
+  (unchanged) runs the query once as a data query and reports SetStatus(WBEM_STATUS_COMPLETE, S_OK) at once; AGMService
+  logs "Process Creation Monitoring enabled..." and then idles.
+- IWbemClassObject is a [local] interface (Windows marshals it by value with custom marshaling): Indicate() with
+  objects through a forwarder fails to marshal under Wine. AGMService's path never calls Indicate.
+- Wine has no DCOM ping rundown: a client that dies without releasing leaves its forwarder alive until the session
+  ends (Windows releases it after the ping timeout).
+- wineboot starts auto-start services before it applies wine.inf: on the first start after updating a prefix to a
+  runtime with this patch (the wineboot -u boot), AGMService can run before the registration exists and crash once
+  (seen 3 of 3 such boots); every later start is clean.
+- widl also writes CLSID default-name keys for wbemcli.idl's other coclasses (WbemClassObject, WbemStatusCodeText,
+  WbemRefresher; no server, so creating them still fails as before).
+
+Lab evidence (runtime 11.10-185 + 185ao's riched20 + this patch = 11.10-185us; prefixes = reflinks of the lab's base
+Acrobat install; nested KWin desk at 168 dpi):
+  Acrobat launches, switch on: 4 of 4 clean (2 + 2 on two prefixes; 2 on the final build): no Program Error, AGMService
+  running, unsecapp.exe running, AGMService's own log (adobegc.log) says "Process Creation Monitoring enabled...",
+  Acrobat window up, Ctrl+Q quits Acrobat.
+  Kill switch NEUTRON_UNSECAPP=0 (prefix registry environment, same build): 2 of 2 launches show the Program Error
+  again, no unsecapp, no "Monitoring enabled" line.
+  Session end: boot + exit of the only user process -> 0 processes 45 s later; unsecapp traced "session ending".
+  Service stop (net stop AGMService): service stops; the forwarder stays (AGMService never cancels; see above).
+  Wine's wbemprox tests (x64, 2 runs per arm): query 1647 tests 0 failures both arms; services 71 tests 1 failure
+  (the new test: 0x80040154) unpatched, 81 tests 0 failures patched.
+  Other Adobe apps: AGMService is not installed in the lab Creative Cloud prefixes (PgD-pr2/ps2/lrc2: no
+  AdobeGCClient folder, no AGM service). Several CC binaries contain the CLSID bytes (dunamis-ingest.dll, IMSLib.dll,
+  Registration.dll, ...), but none of 1928 lab CC launch logs shows an UnsecuredApartment activation.
+
+Kill switch: NEUTRON_UNSECAPP=0 (read by unsecapp.exe from its environment, inherited from the client). Windows
+services get a fresh environment block, so for a service client set it in the prefix's registry environment
+(HKCU\Environment).
+---
+--- a/configure.ac
++++ b/configure.ac
+@@ -3664,6 +3664,7 @@
+ WINE_CONFIG_MAKEFILE(programs/timeout/tests)
+ WINE_CONFIG_MAKEFILE(programs/uninstaller)
+ WINE_CONFIG_MAKEFILE(programs/unlodctr)
++WINE_CONFIG_MAKEFILE(programs/unsecapp)
+ WINE_CONFIG_MAKEFILE(programs/view)
+ WINE_CONFIG_MAKEFILE(programs/wevtutil)
+ WINE_CONFIG_MAKEFILE(programs/where)
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -237,6 +237,8 @@
+ HKCR,.rtf,,2,"rtffile"
+ HKCR,.wri,,2,"wrifile"
+ HKCR,*\shellex\ContextMenuHandlers,,16
++HKCR,AppID\{49BD2028-1523-11D1-AD79-00C04FD8FDFF},,16
++HKCR,AppID\unsecapp.exe,"AppID",2,"{49BD2028-1523-11D1-AD79-00C04FD8FDFF}"
+ HKCR,AppID\{B8C54A54-355E-11D3-83EB-00A0C92A2F2D},,2,"Windows Media Player"
+ HKCR,Applications\wmplayer.exe,,2,"Windows Media Player"
+ HKCR,CERfile,,2,"Security Certificate"
+@@ -244,6 +246,8 @@
+ HKCR,chm.file,,2,"Compiled HTML Help File"
+ HKCR,chm.file\DefaultIcon,,2,"%10%\hh.exe,0"
+ HKCR,chm.file\shell\open\command,,2,"""%10%\hh.exe"" ""%1"""
++HKCR,CLSID\{49BD2028-1523-11D1-AD79-00C04FD8FDFF},"AppID",2,"{49BD2028-1523-11D1-AD79-00C04FD8FDFF}"
++HKCR,CLSID\{49BD2028-1523-11D1-AD79-00C04FD8FDFF}\LocalServer32,,2,"%11%\wbem\unsecapp.exe"
+ HKCR,cplfile,,2,"Control Panel Item"
+ HKCR,cplfile\shell\cplopen,,2,"Open with Control Panel"
+ HKCR,cplfile\shell\cplopen\command,,2,"rundll32.exe shell32.dll,Control_RunDLL ""%1"",%*"
+@@ -1001,6 +1005,7 @@
+ 11,wbem,mofcomp.exe
+ 11,wbem,wbemdisp.dll
+ 11,wbem,wbemprox.dll
++11,wbem,unsecapp.exe
+ 11,wbem,wmic.exe
+ 11,wbem,wmiutils.dll
+ 11,WindowsPowerShell\v1.0,powershell.exe
+@@ -1100,6 +1105,7 @@
+ 11,wbem,mofcomp.exe
+ 11,wbem,wbemdisp.dll
+ 11,wbem,wbemprox.dll
++11,wbem,unsecapp.exe
+ 11,wbem,wmic.exe
+ 11,wbem,wmiutils.dll
+ 11,WindowsPowerShell\v1.0,powershell.exe
+--- a/dlls/wbemprox/Makefile.in
++++ b/dlls/wbemprox/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = wbemprox.dll
+-IMPORTS   = winspool version iphlpapi setupapi oleaut32 ole32 advapi32 user32 gdi32 ws2_32
++IMPORTS   = uuid winspool version iphlpapi setupapi oleaut32 ole32 rpcrt4 advapi32 user32 gdi32 ws2_32
+ 
+ SOURCES = \
+ 	builtin.c \
+@@ -16,4 +16,7 @@
+ 	table.c \
+ 	wbemlocator.c \
+ 	wbemprox.idl \
++	wbemprox_wbemcli.idl \
+ 	wql.y
++
++dlldata_EXTRADEFS = -DENTRY_PREFIX=wbemprox_ -DWINE_REGISTER_DLL
+--- a/dlls/wbemprox/main.c
++++ b/dlls/wbemprox/main.c
+@@ -125,6 +125,8 @@
+     return TRUE;
+ }
+ 
++extern HRESULT WINAPI wbemprox_DllGetClassObject( REFCLSID, REFIID, void ** );
++
+ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *ppv )
+ {
+     IClassFactory *cf = NULL;
+@@ -140,6 +142,6 @@
+     {
+        cf = &wbem_context_cf.IClassFactory_iface;
+     }
+-    if (!cf) return CLASS_E_CLASSNOTAVAILABLE;
++    if (!cf) return wbemprox_DllGetClassObject( rclsid, iid, ppv );
+     return IClassFactory_QueryInterface( cf, iid, ppv );
+ }
+--- a/dlls/wbemprox/tests/services.c
++++ b/dlls/wbemprox/tests/services.c
+@@ -285,6 +285,124 @@
+     IWbemLocator_Release( locator );
+ }
+ 
++struct test_sink
++{
++    IWbemObjectSink IWbemObjectSink_iface;
++    LONG refs;
++    LONG status_calls;
++    HRESULT status_hr;
++};
++
++static inline struct test_sink *impl_from_IWbemObjectSink( IWbemObjectSink *iface )
++{
++    return CONTAINING_RECORD( iface, struct test_sink, IWbemObjectSink_iface );
++}
++
++static HRESULT WINAPI test_sink_QueryInterface( IWbemObjectSink *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IWbemObjectSink ))
++    {
++        *obj = iface;
++        IWbemObjectSink_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI test_sink_AddRef( IWbemObjectSink *iface )
++{
++    return InterlockedIncrement( &impl_from_IWbemObjectSink( iface )->refs );
++}
++
++static ULONG WINAPI test_sink_Release( IWbemObjectSink *iface )
++{
++    return InterlockedDecrement( &impl_from_IWbemObjectSink( iface )->refs );
++}
++
++static HRESULT WINAPI test_sink_Indicate( IWbemObjectSink *iface, LONG count, IWbemClassObject **objects )
++{
++    return S_OK;
++}
++
++static HRESULT WINAPI test_sink_SetStatus( IWbemObjectSink *iface, LONG flags, HRESULT hr, BSTR param,
++                                           IWbemClassObject *object )
++{
++    struct test_sink *sink = impl_from_IWbemObjectSink( iface );
++    sink->status_hr = hr;
++    InterlockedIncrement( &sink->status_calls );
++    return S_OK;
++}
++
++static const IWbemObjectSinkVtbl test_sink_vtbl =
++{
++    test_sink_QueryInterface,
++    test_sink_AddRef,
++    test_sink_Release,
++    test_sink_Indicate,
++    test_sink_SetStatus,
++};
++
++static void wait_status_calls( struct test_sink *sink, LONG count )
++{
++    DWORD start = GetTickCount();
++    MSG msg;
++
++    while (sink->status_calls < count && GetTickCount() - start < 5000)
++    {
++        while (PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
++        Sleep( 10 );
++    }
++}
++
++static void test_UnsecuredApartment(void)
++{
++    struct test_sink sink = { { &test_sink_vtbl }, 1 };
++    IWbemUnsecuredApartment *wbem_apartment;
++    IUnsecuredApartment *apartment;
++    IWbemObjectSink *stub;
++    IUnknown *unk;
++    HRESULT hr;
++
++    hr = CoCreateInstance( &CLSID_UnsecuredApartment, NULL, CLSCTX_LOCAL_SERVER, &IID_IUnsecuredApartment,
++                           (void **)&apartment );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    if (hr != S_OK) return;
++
++    hr = IUnsecuredApartment_CreateObjectStub( apartment, (IUnknown *)&sink.IWbemObjectSink_iface, &unk );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    hr = IUnknown_QueryInterface( unk, &IID_IWbemObjectSink, (void **)&stub );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    IUnknown_Release( unk );
++
++    hr = IWbemObjectSink_SetStatus( stub, WBEM_STATUS_COMPLETE, WBEM_E_FAILED, NULL, NULL );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    wait_status_calls( &sink, 1 );
++    ok( sink.status_calls == 1, "got %ld calls\n", sink.status_calls );
++    ok( sink.status_hr == WBEM_E_FAILED, "got %#lx\n", sink.status_hr );
++    IWbemObjectSink_Release( stub );
++
++    hr = IUnsecuredApartment_QueryInterface( apartment, &IID_IWbemUnsecuredApartment, (void **)&wbem_apartment );
++    ok( hr == S_OK, "got %#lx\n", hr );
++    if (hr == S_OK)
++    {
++        hr = IWbemUnsecuredApartment_CreateSinkStub( wbem_apartment, &sink.IWbemObjectSink_iface,
++                                                     WBEM_FLAG_UNSECAPP_DEFAULT_CHECK_ACCESS, NULL, &stub );
++        ok( hr == S_OK, "got %#lx\n", hr );
++        if (hr == S_OK)
++        {
++            hr = IWbemObjectSink_SetStatus( stub, WBEM_STATUS_COMPLETE, S_OK, NULL, NULL );
++            ok( hr == S_OK, "got %#lx\n", hr );
++            wait_status_calls( &sink, 2 );
++            ok( sink.status_calls == 2, "got %ld calls\n", sink.status_calls );
++            ok( sink.status_hr == S_OK, "got %#lx\n", sink.status_hr );
++            IWbemObjectSink_Release( stub );
++        }
++        IWbemUnsecuredApartment_Release( wbem_apartment );
++    }
++    IUnsecuredApartment_Release( apartment );
++}
++
+ START_TEST(services)
+ {
+     CoInitialize( NULL );
+@@ -292,5 +410,6 @@
+     test_IWbemLocator();
+     test_IWbemContext();
+     test_namespaces();
++    test_UnsecuredApartment();
+     CoUninitialize();
+ }
+--- /dev/null
++++ b/dlls/wbemprox/wbemprox_wbemcli.idl
+@@ -0,0 +1,28 @@
++/*
++ * Proxy/stub code for the WMI interfaces that cross process boundaries
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#pragma makedep proxy
++#pragma makedep register
++
++#include "wbemcli.idl"
++
++[
++    threading(both),
++    uuid(7c857801-7381-11cf-884d-00aa004b2e24)  /* IWbemObjectSink */
++]
++coclass PSFactoryBuffer { interface IPSFactoryBuffer; }
+--- /dev/null
++++ b/programs/unsecapp/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = unsecapp.exe
++IMPORTS   = uuid ole32 ntdll
++
++EXTRADLLFLAGS = -mwindows -municode
++
++SOURCES = \
++	main.c
+--- /dev/null
++++ b/programs/unsecapp/main.c
+@@ -0,0 +1,359 @@
++/*
++ * Unsecured Apartment (unsecapp.exe), the WMI out-of-process sink host
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * Clients that receive asynchronous WMI results create CLSID_UnsecuredApartment as a local
++ * server and wrap their IWbemObjectSink with IUnsecuredApartment::CreateObjectStub or
++ * IWbemUnsecuredApartment::CreateSinkStub.  The returned forwarder lives in this process;
++ * WMI calls Indicate/SetStatus on it and it passes each call on to the client's sink.
++ *
++ * Like Wine's other background servers, the process marks itself as a Wine system process, so it
++ * never keeps a prefix's session alive on its own: it exits when its last object is released or
++ * when the session ends, whichever comes first.
++ *
++ * Kill switch: NEUTRON_UNSECAPP=0 in the client's environment makes the server exit without
++ * registering its class object (the activation then fails as it did before this server existed).
++ * Windows services get a fresh environment block, so for a service client (Adobe's AGMService)
++ * the variable has to be in the prefix's registry environment (HKCU\Environment).
++ */
++
++#define COBJMACROS
++#include <stdarg.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "objbase.h"
++#include "initguid.h"
++#include "wbemcli.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(unsecapp);
++
++static HANDLE exit_event;
++
++static void server_addref(void)
++{
++    CoAddRefServerProcess();
++}
++
++static void server_release(void)
++{
++    if (!CoReleaseServerProcess()) SetEvent( exit_event );
++}
++
++/* the forwarder handed back to the client */
++struct sink_stub
++{
++    IWbemObjectSink IWbemObjectSink_iface;
++    LONG refs;
++    IWbemObjectSink *sink;
++};
++
++static inline struct sink_stub *impl_from_IWbemObjectSink( IWbemObjectSink *iface )
++{
++    return CONTAINING_RECORD( iface, struct sink_stub, IWbemObjectSink_iface );
++}
++
++static HRESULT WINAPI sink_stub_QueryInterface( IWbemObjectSink *iface, REFIID riid, void **obj )
++{
++    struct sink_stub *stub = impl_from_IWbemObjectSink( iface );
++
++    TRACE( "%p, %s, %p\n", stub, debugstr_guid(riid), obj );
++
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IWbemObjectSink ))
++    {
++        *obj = iface;
++        IWbemObjectSink_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI sink_stub_AddRef( IWbemObjectSink *iface )
++{
++    struct sink_stub *stub = impl_from_IWbemObjectSink( iface );
++    ULONG refs = InterlockedIncrement( &stub->refs );
++    TRACE( "%p, refs %lu\n", stub, refs );
++    return refs;
++}
++
++static ULONG WINAPI sink_stub_Release( IWbemObjectSink *iface )
++{
++    struct sink_stub *stub = impl_from_IWbemObjectSink( iface );
++    ULONG refs = InterlockedDecrement( &stub->refs );
++
++    TRACE( "%p, refs %lu\n", stub, refs );
++    if (!refs)
++    {
++        IWbemObjectSink_Release( stub->sink );
++        free( stub );
++        server_release();
++    }
++    return refs;
++}
++
++static HRESULT WINAPI sink_stub_Indicate( IWbemObjectSink *iface, LONG count, IWbemClassObject **objects )
++{
++    struct sink_stub *stub = impl_from_IWbemObjectSink( iface );
++
++    TRACE( "%p, %ld, %p\n", stub, count, objects );
++    return IWbemObjectSink_Indicate( stub->sink, count, objects );
++}
++
++static HRESULT WINAPI sink_stub_SetStatus( IWbemObjectSink *iface, LONG flags, HRESULT hr, BSTR param,
++                                           IWbemClassObject *object )
++{
++    struct sink_stub *stub = impl_from_IWbemObjectSink( iface );
++
++    TRACE( "%p, %#lx, %#lx, %s, %p\n", stub, flags, hr, debugstr_w(param), object );
++    return IWbemObjectSink_SetStatus( stub->sink, flags, hr, param, object );
++}
++
++static const IWbemObjectSinkVtbl sink_stub_vtbl =
++{
++    sink_stub_QueryInterface,
++    sink_stub_AddRef,
++    sink_stub_Release,
++    sink_stub_Indicate,
++    sink_stub_SetStatus,
++};
++
++static HRESULT create_sink_stub( IUnknown *object, IWbemObjectSink **ret )
++{
++    struct sink_stub *stub;
++    IWbemObjectSink *sink;
++    HRESULT hr;
++
++    if (FAILED(hr = IUnknown_QueryInterface( object, &IID_IWbemObjectSink, (void **)&sink ))) return hr;
++    if (!(stub = calloc( 1, sizeof(*stub) )))
++    {
++        IWbemObjectSink_Release( sink );
++        return E_OUTOFMEMORY;
++    }
++    stub->IWbemObjectSink_iface.lpVtbl = &sink_stub_vtbl;
++    stub->refs = 1;
++    stub->sink = sink;
++    server_addref();
++
++    TRACE( "forwarder %p for sink %p\n", stub, sink );
++    *ret = &stub->IWbemObjectSink_iface;
++    return S_OK;
++}
++
++/* the UnsecuredApartment object */
++struct apartment
++{
++    IWbemUnsecuredApartment IWbemUnsecuredApartment_iface;
++    LONG refs;
++};
++
++static inline struct apartment *impl_from_IWbemUnsecuredApartment( IWbemUnsecuredApartment *iface )
++{
++    return CONTAINING_RECORD( iface, struct apartment, IWbemUnsecuredApartment_iface );
++}
++
++static HRESULT WINAPI apartment_QueryInterface( IWbemUnsecuredApartment *iface, REFIID riid, void **obj )
++{
++    struct apartment *apartment = impl_from_IWbemUnsecuredApartment( iface );
++
++    TRACE( "%p, %s, %p\n", apartment, debugstr_guid(riid), obj );
++
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IUnsecuredApartment ) ||
++        IsEqualGUID( riid, &IID_IWbemUnsecuredApartment ))
++    {
++        *obj = iface;
++        IWbemUnsecuredApartment_AddRef( iface );
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI apartment_AddRef( IWbemUnsecuredApartment *iface )
++{
++    struct apartment *apartment = impl_from_IWbemUnsecuredApartment( iface );
++    return InterlockedIncrement( &apartment->refs );
++}
++
++static ULONG WINAPI apartment_Release( IWbemUnsecuredApartment *iface )
++{
++    struct apartment *apartment = impl_from_IWbemUnsecuredApartment( iface );
++    ULONG refs = InterlockedDecrement( &apartment->refs );
++
++    if (!refs)
++    {
++        TRACE( "destroying %p\n", apartment );
++        free( apartment );
++        server_release();
++    }
++    return refs;
++}
++
++static HRESULT WINAPI apartment_CreateObjectStub( IWbemUnsecuredApartment *iface, IUnknown *object,
++                                                  IUnknown **stub )
++{
++    TRACE( "%p, %p, %p\n", iface, object, stub );
++
++    if (!stub) return E_POINTER;
++    *stub = NULL;
++    if (!object) return E_INVALIDARG;
++    return create_sink_stub( object, (IWbemObjectSink **)stub );
++}
++
++static HRESULT WINAPI apartment_CreateSinkStub( IWbemUnsecuredApartment *iface, IWbemObjectSink *sink,
++                                                DWORD flags, const WCHAR *reserved, IWbemObjectSink **stub )
++{
++    TRACE( "%p, %p, %#lx, %s, %p\n", iface, sink, flags, debugstr_w(reserved), stub );
++
++    if (!stub) return E_POINTER;
++    *stub = NULL;
++    if (!sink || flags > WBEM_FLAG_UNSECAPP_DONT_CHECK_ACCESS) return WBEM_E_INVALID_PARAMETER;
++    return create_sink_stub( (IUnknown *)sink, stub );
++}
++
++static const IWbemUnsecuredApartmentVtbl apartment_vtbl =
++{
++    apartment_QueryInterface,
++    apartment_AddRef,
++    apartment_Release,
++    apartment_CreateObjectStub,
++    apartment_CreateSinkStub,
++};
++
++static HRESULT WINAPI factory_QueryInterface( IClassFactory *iface, REFIID riid, void **obj )
++{
++    if (IsEqualGUID( riid, &IID_IUnknown ) || IsEqualGUID( riid, &IID_IClassFactory ))
++    {
++        *obj = iface;
++        return S_OK;
++    }
++    *obj = NULL;
++    return E_NOINTERFACE;
++}
++
++static ULONG WINAPI factory_AddRef( IClassFactory *iface )
++{
++    return 2;
++}
++
++static ULONG WINAPI factory_Release( IClassFactory *iface )
++{
++    return 1;
++}
++
++static HRESULT WINAPI factory_CreateInstance( IClassFactory *iface, IUnknown *outer, REFIID riid, void **obj )
++{
++    struct apartment *apartment;
++    HRESULT hr;
++
++    TRACE( "%p, %s, %p\n", outer, debugstr_guid(riid), obj );
++
++    *obj = NULL;
++    if (outer) return CLASS_E_NOAGGREGATION;
++    if (!(apartment = calloc( 1, sizeof(*apartment) ))) return E_OUTOFMEMORY;
++    apartment->IWbemUnsecuredApartment_iface.lpVtbl = &apartment_vtbl;
++    apartment->refs = 1;
++    server_addref();
++
++    hr = IWbemUnsecuredApartment_QueryInterface( &apartment->IWbemUnsecuredApartment_iface, riid, obj );
++    IWbemUnsecuredApartment_Release( &apartment->IWbemUnsecuredApartment_iface );
++    return hr;
++}
++
++static HRESULT WINAPI factory_LockServer( IClassFactory *iface, BOOL lock )
++{
++    TRACE( "%d\n", lock );
++
++    if (lock) server_addref();
++    else server_release();
++    return S_OK;
++}
++
++static const IClassFactoryVtbl factory_vtbl =
++{
++    factory_QueryInterface,
++    factory_AddRef,
++    factory_Release,
++    factory_CreateInstance,
++    factory_LockServer,
++};
++
++static IClassFactory factory = { &factory_vtbl };
++
++static BOOL server_enabled(void)
++{
++    WCHAR value[8];
++    DWORD len = GetEnvironmentVariableW( L"NEUTRON_UNSECAPP", value, ARRAY_SIZE(value) );
++    BOOL enabled = !(len && len < ARRAY_SIZE(value) && value[0] == '0' && !value[1]);
++
++    ERR( "neutron-unsecapp: gate NEUTRON_UNSECAPP resolved to %d\n", enabled );
++    return enabled;
++}
++
++int __cdecl wmain( int argc, WCHAR *argv[] )
++{
++    BOOL embedding = FALSE;
++    HANDLE handles[2];
++    DWORD cookie;
++    HRESULT hr;
++    int i;
++
++    for (i = 1; i < argc; i++)
++        if (!wcsicmp( argv[i], L"-Embedding" ) || !wcsicmp( argv[i], L"/Embedding" )) embedding = TRUE;
++
++    if (!embedding)
++    {
++        TRACE( "not started by COM, nothing to do\n" );
++        return 0;
++    }
++    if (!server_enabled()) return 0;
++
++    if (!(exit_event = CreateEventW( NULL, TRUE, FALSE, NULL ))) return 1;
++    if (FAILED(hr = CoInitializeEx( NULL, COINIT_MULTITHREADED )))
++    {
++        ERR( "CoInitializeEx failed, hr %#lx\n", hr );
++        return 1;
++    }
++    hr = CoRegisterClassObject( &CLSID_UnsecuredApartment, (IUnknown *)&factory, CLSCTX_LOCAL_SERVER,
++                                REGCLS_MULTIPLEUSE, &cookie );
++    if (FAILED(hr))
++    {
++        ERR( "CoRegisterClassObject failed, hr %#lx\n", hr );
++        CoUninitialize();
++        return 1;
++    }
++
++    handles[0] = exit_event;
++    handles[1] = NULL;
++    NtSetInformationProcess( GetCurrentProcess(), ProcessWineMakeProcessSystem, &handles[1], sizeof(HANDLE *) );
++
++    TRACE( "serving\n" );
++    if (handles[1]) i = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
++    else i = WaitForSingleObject( exit_event, INFINITE );
++    TRACE( "%s, exiting\n", i == WAIT_OBJECT_0 ? "last object released" : "session ending" );
++
++    CoRevokeClassObject( cookie );
++    CoUninitialize();
++    CloseHandle( exit_event );
++    return 0;
++}

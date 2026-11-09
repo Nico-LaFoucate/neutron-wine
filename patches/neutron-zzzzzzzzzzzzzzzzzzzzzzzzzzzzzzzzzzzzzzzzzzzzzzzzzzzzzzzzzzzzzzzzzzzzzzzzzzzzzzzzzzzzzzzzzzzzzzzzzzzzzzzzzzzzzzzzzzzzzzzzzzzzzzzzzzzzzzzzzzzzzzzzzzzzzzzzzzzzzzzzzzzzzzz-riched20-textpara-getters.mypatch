@@ -1,0 +1,344 @@
+From: Neutron lab (team agent acrobat-open) 2026-11-07
+Subject: [PATCH] riched20: Implement the ITextPara property getters.
+
+What was seen (lab, Adobe Acrobat Pro 21.001.20135): opening any PDF, or clicking the Tools tab, kills Acrobat.exe
+(n=2 each before the fix). The main thread overflows its 1 MB stack right after Msftedit.dll/riched20.dll load.
+
+Mechanism: Acrobat creates a RICHEDIT50W control, gets its ITextDocument (EM_GETOLEINTERFACE) and converts the
+contents to its own rich text by bisecting ranges until each range's formatting reads as uniform: on each level it
+gets ITextFont and ITextPara for the range and calls ITextPara::GetAlignment, then splits the range in two
+(GetDuplicate, SetEnd/SetStart at the midpoint) and recurses into both halves. Every ITextPara method in Wine was a
+stub returning E_NOTIMPL without writing *value, so the paragraph format never reads as uniform. On the control's
+empty text the midpoint of [0,0] is 0, so the recursion never ends: a lab call-chain dump at the overflow showed
+8020 frames, about 7970 of them one Acrobat function calling itself, 21190 GetAlignment calls in the trace.
+
+Fix: the ITextPara getters read the paragraph format of the range, like ITextFont's getters do for character
+format: GetAlignment, GetFirstLineIndent, GetLeftIndent, GetRightIndent, GetSpaceBefore, GetSpaceAfter,
+GetKeepTogether, GetKeepWithNext, GetPageBreakBefore, GetNoLineNumber, GetWidowControl, GetHyphenation. A property
+whose value differs between the range's paragraphs reads tomUndefined. The paragraph walk is the one
+EM_GETPARAFORMAT uses (split out of editor_get_selection_para_fmt as para_range_get_fmt, unchanged), including
+its rule that a range ending at the start of a paragraph does not include that paragraph.
+
+Windows behavior: ITextPara (TOM, RichEdit 3.0 and later, Msftedit 4.1+) returns the range's paragraph
+properties with S_OK and tomUndefined for a property that is not the same over the range. Units: indents and
+spacing in points (PARAFORMAT twips / 20); the left indent is that of the lines after the first and the first-line
+indent is relative to it (TOM's definition, PARAFORMAT's dxStartIndent/dxOffset); PFA_* alignment maps to
+tomAlign* (PFA_LEFT 1 -> tomAlignLeft 0, PFA_CENTER 3 -> tomAlignCenter 1, PFA_RIGHT 2 -> tomAlignRight 2,
+PFA_JUSTIFY..PFA_SNAP_GRID -> tomAlignJustify..tomAlignSnapGrid).
+
+Not covered: the ITextPara setters, GetStyle, GetLineSpacing/GetLineSpacingRule, the list getters, the tab
+methods, IsEqual/GetDuplicate stay stubs (no Windows reference measured for their units; Acrobat does not call
+them on this path). Unrelated stub still logged on this path: EM_SETTYPOGRAPHYOPTIONS.
+
+Lab evidence (runtime 11.10-185 + this patch, prefix = reflink of the base Acrobat install, nested KWin desk at
+168 dpi):
+  open ms-patch.pdf (29 pages) at launch:  opens, 3 of 3 launches (0 stack overflows in the logs)
+  Tools tab:                               opens, 2 of 2
+  smoke (run 1): scroll, zoom 74.5 -> 125 %, Find, select + copy + paste, sticky-note comment + Post, Export to
+  Word (.docx written and readable), quit with the save prompt -> all work; print: no printer in the prefix.
+  NEUTRON_RICHED_TEXTPARA=0, same build and prefix: open ms-patch.pdf -> main-thread stack overflow (as before).
+  Wine's riched20 tests (x64, 3 runs per arm, 185 vs 185 + patch): richole 181516 tests, 0 failures with the patch
+  apart from clipboard-busy runs seen in both arms; editor and txtsrv: no failure class new with the patch (the
+  differing lines are clipboard-paste and pointer-position failures that vary run to run in both arms).
+
+Kill switch: NEUTRON_RICHED_TEXTPARA=0 (the getters return E_NOTIMPL as before).
+
+--- a/dlls/riched20/editor.h	2026-11-07 15:00:14.475082029 -0500
++++ b/dlls/riched20/editor.h	2026-11-07 15:00:14.518739037 -0500
+@@ -206,6 +206,7 @@
+ /* para.c */
+ void editor_get_selection_paras(ME_TextEditor *editor, ME_Paragraph **para, ME_Paragraph **para_end );
+ void editor_get_selection_para_fmt( ME_TextEditor *editor, PARAFORMAT2 *fmt );
++void para_range_get_fmt( ME_Paragraph *para, ME_Paragraph *para_end, PARAFORMAT2 *fmt );
+ void editor_mark_rewrap_all( ME_TextEditor *editor );
+ void editor_set_default_para_fmt(ME_TextEditor *editor, PARAFORMAT2 *pFmt);
+ BOOL editor_set_selection_para_fmt( ME_TextEditor *editor, const PARAFORMAT2 *fmt );
+--- a/dlls/riched20/para.c	2026-11-07 15:00:14.473081946 -0500
++++ b/dlls/riched20/para.c	2026-11-07 15:00:14.517033471 -0500
+@@ -911,7 +911,13 @@
+   }
+ 
+   editor_get_selection_paras( editor, &para, &para_end );
++  para_range_get_fmt( para, para_end, fmt );
++}
+ 
++/* The format shared by the paragraphs para .. para_end: a field whose value
++ * differs between them has its mask bit cleared. */
++void para_range_get_fmt( ME_Paragraph *para, ME_Paragraph *para_end, PARAFORMAT2 *fmt )
++{
+   para_copy_fmt( para, fmt );
+ 
+   /* Invalidate values that change across the selected paragraphs. */
+--- a/dlls/riched20/richole.c	2026-11-07 15:00:14.471081863 -0500
++++ b/dlls/riched20/richole.c	2026-11-07 15:00:39.052199083 -0500
+@@ -3635,6 +3635,102 @@
+     return NULL;
+ }
+ 
++/* ITextPara getters report the paragraph format of the range, as Windows does:
++ * a property that differs between the range's paragraphs reads tomUndefined.
++ * NEUTRON_RICHED_TEXTPARA=0 restores the old E_NOTIMPL stubs. */
++static BOOL textpara_getters_enabled(void)
++{
++    static LONG enabled = -1;
++
++    if (enabled < 0)
++    {
++        char env[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_RICHED_TEXTPARA", env, sizeof(env) );
++        enabled = !(len && len < sizeof(env) && env[0] == '0');
++    }
++    return enabled;
++}
++
++static HRESULT textpara_get_fmt( ITextParaImpl *This, PARAFORMAT2 *fmt )
++{
++    struct text_services *services = para_get_reole( This );
++    ME_Paragraph *para, *para_end;
++    ME_Cursor from, to;
++    LONG start, end;
++
++    if (!services)
++        return CO_E_RELEASED;
++
++    ITextRange_GetStart( This->range, &start );
++    ITextRange_GetEnd( This->range, &end );
++    cursor_from_char_ofs( services->editor, start, &from );
++    cursor_from_char_ofs( services->editor, end, &to );
++
++    para = from.para;
++    para_end = to.para;
++    /* as EM_GETPARAFORMAT: a range that ends at the start of a paragraph
++     * does not include that paragraph */
++    if (para != para_end && !to.run->nCharOfs && !to.nOffset)
++        para_end = para_prev( para_end );
++
++    memset( fmt, 0, sizeof(*fmt) );
++    fmt->cbSize = sizeof(*fmt);
++    para_range_get_fmt( para, para_end, fmt );
++    return S_OK;
++}
++
++static HRESULT textpara_get_long( ITextParaImpl *This, DWORD mask, LONG *value, LONG (*conv)(const PARAFORMAT2 *) )
++{
++    PARAFORMAT2 fmt;
++    HRESULT hr;
++
++    if (!value)
++        return E_INVALIDARG;
++    if ((hr = textpara_get_fmt( This, &fmt )) != S_OK)
++        return hr;
++    *value = (fmt.dwMask & mask) == mask ? conv( &fmt ) : tomUndefined;
++    return S_OK;
++}
++
++static HRESULT textpara_get_float( ITextParaImpl *This, DWORD mask, FLOAT *value, FLOAT (*conv)(const PARAFORMAT2 *) )
++{
++    PARAFORMAT2 fmt;
++    HRESULT hr;
++
++    if (!value)
++        return E_INVALIDARG;
++    if ((hr = textpara_get_fmt( This, &fmt )) != S_OK)
++        return hr;
++    *value = (fmt.dwMask & mask) == mask ? conv( &fmt ) : tomUndefined;
++    return S_OK;
++}
++
++static LONG textpara_alignment( const PARAFORMAT2 *fmt )
++{
++    switch (fmt->wAlignment)
++    {
++    case PFA_LEFT:   return tomAlignLeft;
++    case PFA_CENTER: return tomAlignCenter;
++    case PFA_RIGHT:  return tomAlignRight;
++    /* PFA_JUSTIFY .. PFA_SNAP_GRID map to tomAlignJustify .. tomAlignSnapGrid */
++    default:         return fmt->wAlignment >= PFA_JUSTIFY ? fmt->wAlignment - 1 : tomAlignLeft;
++    }
++}
++
++/* twips -> points; TOM's left indent is that of the lines after the first,
++ * its first-line indent is relative to the left indent */
++static FLOAT textpara_first_line_indent( const PARAFORMAT2 *fmt ) { return -fmt->dxOffset / 20.0f; }
++static FLOAT textpara_left_indent( const PARAFORMAT2 *fmt ) { return (fmt->dxStartIndent + fmt->dxOffset) / 20.0f; }
++static FLOAT textpara_right_indent( const PARAFORMAT2 *fmt ) { return fmt->dxRightIndent / 20.0f; }
++static FLOAT textpara_space_before( const PARAFORMAT2 *fmt ) { return fmt->dySpaceBefore / 20.0f; }
++static FLOAT textpara_space_after( const PARAFORMAT2 *fmt ) { return fmt->dySpaceAfter / 20.0f; }
++static LONG textpara_keep_together( const PARAFORMAT2 *fmt ) { return fmt->wEffects & PFE_KEEP ? tomTrue : tomFalse; }
++static LONG textpara_keep_with_next( const PARAFORMAT2 *fmt ) { return fmt->wEffects & PFE_KEEPNEXT ? tomTrue : tomFalse; }
++static LONG textpara_page_break_before( const PARAFORMAT2 *fmt ) { return fmt->wEffects & PFE_PAGEBREAKBEFORE ? tomTrue : tomFalse; }
++static LONG textpara_no_line_number( const PARAFORMAT2 *fmt ) { return fmt->wEffects & PFE_NOLINENUMBER ? tomTrue : tomFalse; }
++static LONG textpara_widow_control( const PARAFORMAT2 *fmt ) { return fmt->wEffects & PFE_NOWIDOWCONTROL ? tomFalse : tomTrue; }
++static LONG textpara_hyphenation( const PARAFORMAT2 *fmt ) { return fmt->wEffects & PFE_DONOTHYPHEN ? tomFalse : tomTrue; }
++
+ static HRESULT WINAPI TextPara_GetTypeInfoCount(ITextPara *iface, UINT *pctinfo)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
+@@ -3778,6 +3874,13 @@
+ static HRESULT WINAPI TextPara_GetAlignment(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_ALIGNMENT, value, textpara_alignment );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -3800,6 +3903,13 @@
+ static HRESULT WINAPI TextPara_GetHyphenation(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_DONOTHYPHEN, value, textpara_hyphenation );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -3822,6 +3932,13 @@
+ static HRESULT WINAPI TextPara_GetFirstLineIndent(ITextPara *iface, FLOAT *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_float( This, PFM_OFFSET, value, textpara_first_line_indent );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -3833,6 +3950,13 @@
+ static HRESULT WINAPI TextPara_GetKeepTogether(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_KEEP, value, textpara_keep_together );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -3855,6 +3979,13 @@
+ static HRESULT WINAPI TextPara_GetKeepWithNext(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_KEEPNEXT, value, textpara_keep_with_next );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -3877,6 +4008,13 @@
+ static HRESULT WINAPI TextPara_GetLeftIndent(ITextPara *iface, FLOAT *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_float( This, PFM_STARTINDENT | PFM_OFFSET, value, textpara_left_indent );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -4020,6 +4158,13 @@
+ static HRESULT WINAPI TextPara_GetNoLineNumber(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_NOLINENUMBER, value, textpara_no_line_number );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -4042,6 +4187,13 @@
+ static HRESULT WINAPI TextPara_GetPageBreakBefore(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_PAGEBREAKBEFORE, value, textpara_page_break_before );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -4064,6 +4216,13 @@
+ static HRESULT WINAPI TextPara_GetRightIndent(ITextPara *iface, FLOAT *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_float( This, PFM_RIGHTINDENT, value, textpara_right_indent );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -4108,6 +4267,13 @@
+ static HRESULT WINAPI TextPara_GetSpaceAfter(ITextPara *iface, FLOAT *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_float( This, PFM_SPACEAFTER, value, textpara_space_after );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -4130,6 +4296,13 @@
+ static HRESULT WINAPI TextPara_GetSpaceBefore(ITextPara *iface, FLOAT *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_float( This, PFM_SPACEBEFORE, value, textpara_space_before );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))
+@@ -4152,6 +4325,13 @@
+ static HRESULT WINAPI TextPara_GetWidowControl(ITextPara *iface, LONG *value)
+ {
+     ITextParaImpl *This = impl_from_ITextPara(iface);
++
++    if (textpara_getters_enabled())
++    {
++        TRACE("(%p)->(%p)\n", This, value);
++        return textpara_get_long( This, PFM_NOWIDOWCONTROL, value, textpara_widow_control );
++    }
++
+     FIXME("(%p)->(%p)\n", This, value);
+ 
+     if (!para_get_reole(This))

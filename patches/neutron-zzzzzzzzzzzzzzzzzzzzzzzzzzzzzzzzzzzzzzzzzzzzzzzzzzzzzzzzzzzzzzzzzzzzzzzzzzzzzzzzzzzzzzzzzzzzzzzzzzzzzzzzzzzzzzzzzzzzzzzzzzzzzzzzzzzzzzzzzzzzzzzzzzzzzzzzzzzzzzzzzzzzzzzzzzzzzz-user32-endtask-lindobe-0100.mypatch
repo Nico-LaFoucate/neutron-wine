@@ -1,0 +1,67 @@
+From: AdobeWine
+Subject: [PATCH] user32: Implement EndTask.
+
+Adopted from LinDobe (le-birnes/LinDobe, LGPL-2.1+), patch 0100, with these changes: code unchanged; the win.c hunk placed by hand after TileChildWindows (our win.c has more code after it, so the
+original hunk only applied with fuzz 2), the user32.spec line as in the original.
+
+AdobeCollabSync calls it and Wine's stub aborted the process ("unimplemented function user32.dll.EndTask").
+EndTask sends WM_CLOSE; with force it ends the process when the window stays.
+Test: wine/tests/endtask: bad window, window closes, no force leaves it, force ends the process.
+
+Lab (acrobat-adopt, 2026-11-08, runtime 11.10-185ad = 185 + riched20-textpara-getters + unsecapp-wmi-sink-host
++ this set): Acrobat Pro installed the user's way (`neutron programs install` of the Acrobat setup.exe = AcroPro.msi +
+AcrobatDCx64Upd2600222031.msp) into a fresh copy of a signed-in Adobe prefix: "Setup Completed", installed 26.002.22031,
+7778 files, 1.8 GB, thorvg-1.dll present (n=1). Before this set every install ended 1603 at PatchFiles (AcMsp-1..9).
+Lab: Acrobat 26.002 relaunch aborted with "unimplemented function user32.dll.EndTask" on 185 + the set without this
+(log acrobat-pgi-ad1-20261108-210658.log); with it, no EndTask abort in 4 later launches.
+Kill switch: none.
+---
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -463,7 +463,7 @@
+ @ stdcall EndDialog(long long)
+ @ stdcall EndMenu() NtUserEndMenu
+ @ stdcall EndPaint(long ptr) NtUserEndPaint
+-@ stub EndTask
++@ stdcall EndTask(long long long)
+ # @ stub EnterReaderModeHelper
+ @ stdcall EnumChildWindows(long ptr long)
+ @ stdcall EnumClipboardFormats(long) NtUserEnumClipboardFormats
+--- a/dlls/user32/win.c
++++ b/dlls/user32/win.c
+@@ -2253,6 +2253,35 @@
+ }
+ 
+ /**********************************************************************
++ *              EndTask (USER32.@)
++ *
++ * Asks a window to close; with force, ends its process when the window stays.
++ */
++BOOL WINAPI EndTask( HWND hwnd, BOOL shutdown, BOOL force )
++{
++    DWORD_PTR result;
++    DWORD pid = 0;
++    HANDLE process;
++    BOOL ret;
++
++    TRACE( "%p %d %d\n", hwnd, shutdown, force );
++
++    if (!GetWindowThreadProcessId( hwnd, &pid ))
++    {
++        SetLastError( ERROR_INVALID_WINDOW_HANDLE );
++        return FALSE;
++    }
++    SendMessageTimeoutW( hwnd, WM_CLOSE, 0, 0, SMTO_ABORTIFHUNG, 5000, &result );
++    if (!IsWindow( hwnd )) return TRUE;
++    if (!force) return FALSE;
++
++    if (!(process = OpenProcess( PROCESS_TERMINATE, FALSE, pid ))) return FALSE;
++    ret = TerminateProcess( process, 0 );
++    CloseHandle( process );
++    return ret;
++}
++
++/**********************************************************************
+  * NEUTRON RECT BACKTRACE DIAG (NEUTRON_RECT_BT=<right edge>)
+  *
+  * Animate's playback invalidation is 13 pixels short on its right edge, and the

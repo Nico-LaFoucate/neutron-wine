@@ -1,0 +1,140 @@
+# Bridge 2026 sat at 66-106% of a CPU core while idle once Camera Raw had been opened from it (Ctrl+R), and stayed there
+# after Done: the blit-to-window poller of 0001-neutron.patch copies every back buffer of a presented swap chain to host
+# memory, converts it and StretchDIBits it to the window every 33 ms for as long as the swap chain lives, whether or not
+# anything was presented. Camera Raw keeps its three D3D12 swap chains (2719x1601, 2719x263, 1092x546) after Done.
+# DXGI shows the last presented buffer and does no work until the next Present. The poller now scans once after each
+# present (still 33 ms after it, as before) and then blocks on an auto-reset event that the present callback signals
+# after its own blit, and that swap chain cleanup signals so the poller sees the stop. Presenting apps are unchanged:
+# while presents keep coming the poller scans at the same cadence. Also: only swap chains that have a poller take one of
+# the 64 stop-list slots (swap chains that never presented used to fill it, after which no poller was told to stop).
+# Not covered: the per-present blit itself (a GPU->host copy + GDI blit of every presented frame) still throttles
+# playback, so profiles that set NEUTRON_DISABLE_BTW=1 (Photoshop, Lightroom, After Effects, Premiere 2026) keep it:
+# with it forced on, After Effects' DirectX-display preview moved 20/44 px in 2 s against 299 px with it off, and
+# Premiere 2026 playback presented 11.6 frames/s (2/2) with two threads near 50% each.
+# Lab (runtime 11.10-185bf, Bridge 16.0.8 + Camera Raw 18.7, same d3d12core, n=2 per arm): Camera Raw open and idle
+# 20.9/27.3% (Bridge's own start-up work, 4.7% after 40 s) vs 105.2/106.3% with the kill switch; after Done 1.8-3.4%
+# (4 samples) vs 66.3-92.4%; Camera Raw preview pixels identical in all four runs. After Effects 2026 with blit-to-window
+# on (DirectX display): idle 6.5-15.4% with every poller waiting; Premiere 2026 with it on: Home 4.4/7.8%.
+# Kill switch NEUTRON_VKD3D_BTW_IDLE_WAIT=0. Applies after 0001-neutron.patch, 0002 and 0003.
+--- a/libs/vkd3d/blit_to_window.h
++++ b/libs/vkd3d/blit_to_window.h
+@@ -94,15 +94,31 @@
+ static void btw_cap_lock(void)   { if (btw_cap_cs_ready && btw_enter_cs) btw_enter_cs(&btw_cap_cs); }
+ static void btw_cap_unlock(void) { if (btw_cap_cs_ready && btw_leave_cs) btw_leave_cs(&btw_cap_cs); }
+ 
++/* NEUTRON: between presents the poller blocks on chain->btw_wake instead of copying and repainting
++   the back buffers every 33 ms (an idle swapchain cost 17-70% of a core per window). Kill switch
++   NEUTRON_VKD3D_BTW_IDLE_WAIT=0 restores the fixed 33 ms poll. Read once. */
++static int btw_idle_wait(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_VKD3D_BTW_IDLE_WAIT"); v = (e && *e == '0') ? 0 : 1; }
++    return v;
++}
++
+ /* Mark a chain's poller to stop (called from swapchain cleanup, under lock). */
+-void btw_mark_stopped(void *chain)
++void btw_mark_stopped(void *chain_)
+ {
++    struct dxgi_vk_swap_chain *chain = chain_;
+     int i;
++    /* NEUTRON: only a chain that has a poller needs an entry; the never-presented ones used to fill
++       the 64 slots, after which no poller was told to stop. */
++    if (!chain->btw_thread_started) return;
+     btw_cap_lock_init();
+     btw_cap_lock();
+     for (i = 0; i < btw_stopped_count; i++)
+         if (btw_stopped[i] == chain) { btw_cap_unlock(); return; }
+     if (btw_stopped_count < 64) btw_stopped[btw_stopped_count++] = chain;
++    /* NEUTRON: a poller waiting for the next present must wake up to see the stop. */
++    if (chain->btw_wake) SetEvent(chain->btw_wake);
+     btw_cap_unlock();
+ }
+ static int btw_is_stopped(void *chain)
+@@ -412,6 +428,10 @@
+     struct dxgi_vk_swap_chain *chain = arg;
+     HMODULE k = GetModuleHandleA("kernel32.dll");
+     PFN_BTW_Sleep pSleep = k ? (PFN_BTW_Sleep)GetProcAddress(k, "Sleep") : NULL;
++    /* NEUTRON: copied while the chain is alive; this thread owns the handle and closes it on exit. */
++    HANDLE wake = chain->btw_wake;
++    LONG seen_gen = -1;
++    int idle_logged = 0;
+     ERR("blit-to-window: blit thread running chain=%p\n", chain);
+     {
+     unsigned int btw_iter = 0;     /* for throttled logging */
+@@ -422,6 +442,24 @@
+         /* teardown safety: stop if this swapchain is being destroyed, or if its
+            queue has already been released/NULL'd. */
+         if (btw_is_stopped(chain)) break;
++        if (wake)
++        {
++            /* NEUTRON: DXGI shows the last presented buffer and does no work until the next
++               Present. Scan once after each present (33 ms after it, as before), then block
++               until the present callback or swapchain cleanup signals. */
++            LONG gen;
++            btw_cap_lock();
++            if (btw_is_stopped_locked(chain)) { btw_cap_unlock(); break; }
++            gen = chain->btw_present_gen;
++            btw_cap_unlock();
++            if (gen == seen_gen)
++            {
++                if (!idle_logged) { idle_logged = 1; ERR("blit-to-window: chain=%p idle, waiting for the next present\n", chain); }
++                WaitForSingleObject(wake, INFINITE);
++                continue;
++            }
++            seen_gen = gen;
++        }
+         if (!chain->queue || !chain->queue->device) break;
+         if (!chain->user_hwnd) continue;
+         ++btw_iter;
+@@ -461,6 +499,7 @@
+         (void)painted;
+     }
+     }
++    if (wake) CloseHandle(wake);
+     return 0;
+ }
+ 
+@@ -474,11 +513,20 @@
+     /* NEUTRON: per-chain idempotent start (replaces the buggy never-cleared cap-16 global
+        array; safe to call from the present thread on every present). */
+     if (InterlockedExchange(&chain->btw_thread_started, 1)) return;
++    /* NEUTRON: auto-reset event the present callback signals; NULL = fixed 33 ms poll. */
++    chain->btw_wake = btw_idle_wait() ? CreateEventA(NULL, FALSE, FALSE, NULL) : NULL;
+     k = GetModuleHandleA("kernel32.dll");
+     pCreateThread = k ? (PFN_BTW_CreateThread)GetProcAddress(k, "CreateThread") : NULL;
+     if (pCreateThread)
+-    { h = pCreateThread(NULL, 0, (void *)btw_thread_proc, chain, 0, NULL); ERR("blit-to-window: started blit thread chain=%p hwnd=%p handle=%p\n", chain, chain->user_hwnd, h); }
++    { h = pCreateThread(NULL, 0, (void *)btw_thread_proc, chain, 0, NULL); ERR("blit-to-window: started blit thread chain=%p hwnd=%p handle=%p wait=%d\n", chain, chain->user_hwnd, h, chain->btw_wake != NULL); }
+     else ERR("blit-to-window: CreateThread unresolved\n");
++    if (!pCreateThread || !h)
++    {
++        btw_cap_lock();
++        if (chain->btw_wake) CloseHandle(chain->btw_wake);
++        chain->btw_wake = NULL;
++        btw_cap_unlock();
++    }
+ }
+ 
+ /* ---- IDENT probe ---------------------------------------------------------
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -218,6 +218,8 @@
+     VkSurfaceKHR vk_surface;
+     HWND user_hwnd;
+     LONG btw_thread_started; /* NEUTRON: lazy btw-blit-thread start on first present (churn fix) */
++    HANDLE btw_wake;         /* NEUTRON: signalled after each present; the poller waits on it when idle */
++    LONG btw_present_gen;    /* NEUTRON: presents blitted so far, read by the poller under btw_cap_lock */
+ 
+     struct low_latency_state requested_low_latency_state;
+     bool low_latency_update_requested;
+@@ -3442,6 +3444,9 @@
+         btw_cap_lock_init();
+         btw_cap_lock();
+         blit_user_backbuffer_to_window(chain);
++        /* NEUTRON: a new frame exists; let the poller scan once more. */
++        chain->btw_present_gen++;
++        if (chain->btw_wake) SetEvent(chain->btw_wake);
+         btw_cap_unlock();
+     }
+ 
