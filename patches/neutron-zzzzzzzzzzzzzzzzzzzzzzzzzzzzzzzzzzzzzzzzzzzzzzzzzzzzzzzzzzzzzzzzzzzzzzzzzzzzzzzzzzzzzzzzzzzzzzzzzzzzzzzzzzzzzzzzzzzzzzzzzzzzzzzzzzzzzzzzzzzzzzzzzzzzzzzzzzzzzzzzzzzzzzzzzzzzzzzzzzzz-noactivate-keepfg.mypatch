@@ -1,0 +1,171 @@
+From: Neutron lab (fg187) 
+Subject: [PATCH] win32u: a WS_EX_NOACTIVATE top-level activated implicitly never takes the foreground from another thread
+
+What he saw (Illustrator 2026, runtime 186): "ctrl q did not work after clicking on those panels. It only worked after I
+clicked somewhere else" / "There was nothing "in front" I used a mouse and there was no dialog. It was a simple new and
+blank document."
+
+Mechanism (his log illustrator-adobe2026-20261110-125005.log, WINEDEBUG=+key,+win, SOLID): Illustrator's AGM graphics
+thread owns a never-shown top-level "AGM Invisible Window" (ex 08000000 WS_EX_NOACTIVATE, style 06000000) and resizes it
+with SetWindowPos(NOMOVE|NOZORDER|NOREDRAW) -- no SWP_NOACTIVATE -- whenever the canvas changes; once, at creation, it
+also calls SetFocus on it. set_window_pos() always ended in set_foreground_window() without SWP_NOACTIVATE, and
+NtUserSetFocus() goes through set_foreground_window() when the calling thread has nothing active. Every foreground move
+by that thread in his log (6, the failing one right after his click on a panel made the main window foreground) sits
+inside such a SetWindowPos. The hidden window became the foreground window, his Ctrl+Q went to the AGM thread's queue,
+which ignores keys, and only a click on the canvas (main window foreground again) made the next Ctrl+Q work.
+
+Windows (fgsteal.exe reference probe, his PC, Win11 26200, 11-10): the same SetWindowPos on a hidden or visible
+WS_EX_NOACTIVATE window, and SetFocus on it, activate the window FOR ITS OWN THREAD only -- it gets WM_ACTIVATEAPP 1,
+WM_NCACTIVATE 0, WM_ACTIVATE, WM_SETFOCUS and its thread's active = focus = it -- while the foreground window, its
+activation and the keyboard stay with the main window (no deactivation messages there). An explicit
+SetForegroundWindow from the same process still moves the foreground (measured, arm d) and is not touched.
+
+Fix: neutron_noactivate_keepfg() (input.c) -- for a non-child top-level with WS_EX_NOACTIVATE, owned by the calling
+thread, while the foreground window belongs to another thread, set_window_pos's implicit activation and SetFocus's
+no-active-window activation call set_active_window() for this thread instead of set_foreground_window(). WM_NCACTIVATE
+goes out as 0 there because the window is not the foreground window, as on Windows. When the caller holds the
+foreground, or nothing is foreground, the upstream path runs unchanged.
+Also: set_active_window() returned its `ret` uninitialized when the window was already active (gcc's
+-Wmaybe-uninitialized at that line); with background activation that case is now common (SetForegroundWindow on a
+window its thread already has active returned garbage in the lab, e.g. -1356560, 7 -- also seen once on 186). It now
+returns TRUE there: nothing to do is success.
+
+Not covered (Wine still differs from his Windows run, left for later):
+- a window WITHOUT the flag (probe arm b): Windows' foreground lock keeps a later implicit SetWindowPos activation in
+  the background once the user has given input elsewhere; Wine still moves the foreground there.
+- a second process (arm e): Windows refuses its SetForegroundWindow after the user's input in the first process
+  (returns 0); Wine allows it for a child of the foreground process (server/queue.c is_current_process_foreground).
+
+Lab evidence (runtime 11.10-186fg = 186 + this win32u.so only; desk f7a, scratch prefix, fgsteal.exe):
+- 186fg 2/2: arms a/c/d/f print his Windows lines (a: after 1st SetWindowPos fg=M, M active/focus=M, T2 active/focus=W,
+  W gets WM_ACTIVATEAPP 1 / WM_NCACTIVATE 0 / WM_ACTIVATE / WM_SETFOCUS, F13 -> M; c the same visible; d F13 -> T2;
+  f F13 -> M); 5 neutron-noactivate-keepfg lines per run.
+- kill switch NEUTRON_NOACTIVATE_SWP_KEEPFG=0 on the same build 2/2 = 186 (3/3): every arm F13 -> T2.
+- Wine user32 conformance tests win/msg/input (standalone build from this tree): see NOTES (186 vs 186fg).
+
+Kill switch: NEUTRON_NOACTIVATE_SWP_KEEPFG=0. Diagnostic: NEUTRON_WL_DIAG=1 prints one neutron-noactivate-keepfg line
+per background activation, after it happened.
+---
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -2018,6 +2018,8 @@
+     if (previous == hwnd)
+     {
+         if (prev) *prev = hwnd;
++        ret = TRUE;  /* NEUTRON noactivate-keepfg: nothing to do is success; ret was returned uninitialized here, so
++                      * SetForegroundWindow() on a window already active for its (background) thread returned garbage */
+         goto done;
+     }
+ 
+@@ -2270,6 +2272,64 @@
+     return on;
+ }
+ 
++/* NEUTRON noactivate-keepfg (2026-11-10): the implicit activation of a WS_EX_NOACTIVATE top-level never moves the
++ * foreground away from another thread.
++ *
++ * Illustrator 2026: "ctrl q did not work after clicking on those panels. It only worked after I clicked somewhere
++ * else". Illustrator's AGM graphics thread owns a never-shown top-level "AGM Invisible Window" (ex 08000000
++ * WS_EX_NOACTIVATE, style 06000000) and resizes it with SetWindowPos(NOMOVE|NOZORDER|NOREDRAW), without
++ * SWP_NOACTIVATE, whenever the canvas changes; it also calls SetFocus on it once. set_window_pos() and
++ * NtUserSetFocus() (when the calling thread has nothing active) reached set_foreground_window(), so the hidden
++ * window became the foreground window and every key went to the AGM thread's queue, which ignores them
++ * (illustrator-adobe2026-20261110-125005.log: 0ab4 set_foreground_window 0x20b86 right after its SetWindowPos,
++ * previous = the main window 0x1006c the user had just clicked).
++ *
++ * Windows (fgsteal probe, Win11 26200, his PC, 11-10): the same SetWindowPos -- hidden or visible window -- and
++ * SetFocus activate the window FOR ITS OWN THREAD only (WM_ACTIVATEAPP 1, WM_NCACTIVATE 0, WM_ACTIVATE,
++ * WM_SETFOCUS; GetGUIThreadInfo active = focus = it), the foreground window, its activation and the keyboard stay
++ * where they were. An explicit SetForegroundWindow from the same process still moves the foreground (also
++ * measured) and is not touched here.
++ *
++ * Only these two implicit paths, only for a non-child top-level with WS_EX_NOACTIVATE owned by the calling thread,
++ * and only while the foreground window belongs to another thread: the window is activated in the background with
++ * set_active_window() (WM_NCACTIVATE goes out as 0 because it is not the foreground window). When the caller
++ * already holds the foreground, or nothing is foreground, the upstream path runs unchanged.
++ * Not covered: Windows' foreground lock for a window WITHOUT the flag (a later implicit activation after user
++ * input elsewhere stays in the background there too; Wine still moves the foreground), and a second process's
++ * SetForegroundWindow after the user's input (refused on Windows, allowed here for a child of the foreground
++ * process).
++ *
++ * Kill switch NEUTRON_NOACTIVATE_SWP_KEEPFG=0 restores the upstream behaviour; NEUTRON_WL_DIAG=1 prints one
++ * neutron-noactivate-keepfg line per background activation, after it happened. */
++BOOL neutron_noactivate_keepfg( HWND top, const char *caller, BOOL *ok )
++{
++    static int on = -1;
++    DWORD tid = GetCurrentThreadId(), fg_tid;
++    HWND fg;
++
++    if (!top || (get_window_long( top, GWL_STYLE ) & (WS_POPUP | WS_CHILD)) == WS_CHILD) return FALSE;
++    if (!(get_window_long( top, GWL_EXSTYLE ) & WS_EX_NOACTIVATE)) return FALSE;
++    if (get_window_thread( top, NULL ) != tid) return FALSE;
++    if (!(fg = NtUserGetForegroundWindow()) || fg == top) return FALSE;
++    if ((fg_tid = get_window_thread( fg, NULL )) == tid || !fg_tid) return FALSE;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_NOACTIVATE_SWP_KEEPFG" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_NOACTIVATE_SWP_KEEPFG = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    if (!on) return FALSE;
++
++    *ok = TRUE;
++    if (get_active_window() == top) return TRUE;   /* already active for this thread: nothing changes */
++    *ok = set_active_window( top, NULL, FALSE, TRUE, 0 );
++    if (neutron_wl_diag())
++        ERR( "neutron-noactivate-keepfg: %s(%p) exstyle %08x -> activated for its thread %04x only (ret %d, active now %p), foreground stays %p (thread %04x)\n",
++             caller, top, (unsigned int)get_window_long( top, GWL_EXSTYLE ), (unsigned int)tid, *ok,
++             get_active_window(), NtUserGetForegroundWindow(), (unsigned int)fg_tid );
++    return TRUE;
++}
++
+ /**********************************************************************
+  *           NtUserSetActiveWindow    (win32u.@)
+  */
+@@ -2495,7 +2555,17 @@
+         if (call_hooks( WH_CBT, HCBT_SETFOCUS, (WPARAM)hwnd, (LPARAM)previous, 0 )) return 0;
+ 
+         /* activate hwndTop if needed. */
+-        if (!(active = get_active_window()) && !set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
++        if (!(active = get_active_window()))
++        {
++            BOOL ok;
++
++            /* NEUTRON noactivate-keepfg: a WS_EX_NOACTIVATE top-level is activated for this thread only */
++            if (neutron_noactivate_keepfg( hwndTop, "SetFocus", &ok ))
++            {
++                if (!ok) return 0;
++            }
++            else if (!set_foreground_window( hwndTop, FALSE, FALSE )) return 0;
++        }
+         if (hwndTop != active)
+         {
+             if (neutron_noactivate_refuse( hwndTop, active ))
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -5314,7 +5314,14 @@
+         if ((style & (WS_CHILD | WS_POPUP)) == WS_CHILD)
+             send_message( winpos->hwnd, WM_CHILDACTIVATE, 0, 0 );
+         else if (!(style & WS_MINIMIZE))
+-            set_foreground_window( winpos->hwnd, FALSE, FALSE );
++        {
++            BOOL ok;
++
++            /* NEUTRON noactivate-keepfg (input.c): a WS_EX_NOACTIVATE top-level is activated for its own
++             * thread only, the foreground stays with the other thread that holds it */
++            if (!neutron_noactivate_keepfg( winpos->hwnd, "SetWindowPos", &ok ))
++                set_foreground_window( winpos->hwnd, FALSE, FALSE );
++        }
+     }
+ 
+     if(!(orig_flags & SWP_DEFERERASE))
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -107,6 +107,7 @@
+ extern HWND get_active_window(void);
+ extern HWND get_capture(void);
+ extern BOOL neutron_noactivate_click( HWND top );
++extern BOOL neutron_noactivate_keepfg( HWND top, const char *caller, BOOL *ok );
+ extern HWND get_focus(void);
+ extern DWORD get_input_state(void);
+ extern DWORD get_last_input_time(void);
