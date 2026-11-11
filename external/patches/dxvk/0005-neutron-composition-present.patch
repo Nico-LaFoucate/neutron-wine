@@ -1,0 +1,135 @@
+From: Neutron
+Subject: [PATCH] d3d11: present composition swap chains without Vulkan WSI
+
+The Mister Horse Product Manager (JUCE 8.0.10) drew its first frame and then froze, started from
+Premiere or After Effects or on its own. JUCE 8 draws into a CreateSwapChainForComposition swap chain
+and waits on the frame latency waitable object before every Present. DXGI backs a composition swap
+chain with its own hidden DXVKDUMMYWNDCLASS window; the presenter makes a Vulkan swapchain on it, and
+under winewayland that window is never mapped. The presenter only raises the frame latency signal
+once vkWaitForPresentKHR reports the frame shown, which for an unmapped window does not happen, so
+after the first frame the app never presents again. The log has
+exactly one "dcomp-hook PresentBase m_window=0" for the whole session.
+
+A composition swap chain has nothing to present to: Wine's DirectComposition bridge reads its back
+buffer for the window the app committed it to. Such chains (surface factory window of class
+DXVKDUMMYWNDCLASS) now present like the GDI path, without touching the WSI: the flushed back buffer
+stays where it is (no rotation, so the bridge reads the frame just presented and partial redraws
+accumulate), and the frame is signalled at once. The bridge's fallback window (dcomp_set_pending_hwnd)
+is kept pointing at the chain's own dummy window, as the Vulkan path did when it made its surface.
+Kill switch NEUTRON_COMPOSITION_PRESENT=0.
+
+--- a/src/d3d11/d3d11_swapchain.cpp
++++ b/src/d3d11/d3d11_swapchain.cpp
+@@ -12,6 +12,24 @@
+ 
+ namespace dxvk {
+ 
++  // neutron: dcomp.dll's fallback window for composition presents (see
++  // DxgiSurfaceFactory::CreateSurface, which calls the same export).
++  static void NeutronSetDcompPendingHwnd(HWND hwnd) {
++    static void (*s_set)(HWND) = nullptr;
++    static bool s_resolved = false;
++
++    if (!s_resolved) {
++      HMODULE h = ::GetModuleHandleA("dcomp.dll");
++      if (!h) h = ::LoadLibraryA("dcomp.dll");
++      if (h) s_set = reinterpret_cast<void(*)(HWND)>(::GetProcAddress(h, "dcomp_set_pending_hwnd"));
++      s_resolved = true;
++    }
++
++    if (s_set && hwnd)
++      s_set(hwnd);
++  }
++
++
+   static uint16_t MapGammaControlPoint(float x) {
+     if (x < 0.0f) x = 0.0f;
+     if (x > 1.0f) x = 1.0f;
+@@ -79,6 +97,25 @@ namespace dxvk {
+       m_gdiPresent = env::getEnvVar("NEUTRON_GDI_PRESENT") == "1";
+     }
+ 
++    // neutron: a composition swap chain has no window of its own. DXGI gives
++    // its surface factory a hidden dummy window, and presenting a Vulkan
++    // swapchain into that window never completes under winewayland: the window
++    // is never mapped, so vkWaitForPresentKHR never returns and the frame
++    // latency event is never signalled again after the first frame. Apps that
++    // pace on that event (JUCE 8 waits for it before every Present) draw one
++    // frame and stop. Present such chains without Vulkan WSI instead.
++    if (!m_gdiPresent && env::getEnvVar("NEUTRON_COMPOSITION_PRESENT") != "0") {
++      HWND hwnd = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
++      WCHAR cls[32] = { };
++
++      if (hwnd && ::GetClassNameW(hwnd, cls, 32) && !lstrcmpW(cls, L"DXVKDUMMYWNDCLASS")) {
++        m_compositionPresent = true;
++        NeutronSetDcompPendingHwnd(hwnd);
++        Logger::warn(str::format("neutron-composition-present: ", m_desc.Width, "x", m_desc.Height,
++          " fmt=", m_desc.Format, " effect=", m_desc.SwapEffect, " bufCount=", m_desc.BufferCount));
++      }
++    }
++
+     if (m_gdiPresent) {
+       HWND hwnd = static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow();
+       Logger::warn(str::format("neutron-gdi-present: hwnd=", (void*)hwnd,
+@@ -306,7 +343,7 @@ namespace dxvk {
+       if (hr != S_OK)
+         return hr;
+ 
+-      if (m_gdiPresent)
++      if (m_gdiPresent || m_compositionPresent)
+         return S_OK; /* neutron N2: GDI path is never occluded-blocked */
+       VkResult status = m_presenter->checkSwapChainStatus();
+       return status == VK_SUCCESS ? S_OK : DXGI_STATUS_OCCLUDED;
+@@ -444,6 +481,25 @@ namespace dxvk {
+   static std::atomic<uint64_t> g_gdiSkips    = { 0u }; // round-41: fully-covered skip
+   static std::atomic<uint64_t> g_gdiBandPx   = { 0u }; // round-41: pixels actually read back
+ 
++  HRESULT D3D11SwapChain::PresentImageComposition() {
++    // The rendering was flushed by PresentImage. There is no WSI image to
++    // acquire or present: the DirectComposition bridge reads the back buffer
++    // (GetBuffer(0)) for the window the app committed this chain to. Keep that
++    // buffer stable, as the GDI path does, so the bridge always reads the frame
++    // that was just presented and partial redraws accumulate in it.
++    //
++    // The Vulkan path told the bridge about the dummy window when it created
++    // its surface (dcomp_set_pending_hwnd); this path never creates one, so
++    // keep the bridge's fallback window pointing at this chain's own dummy
++    // window instead of whatever window last created a surface.
++    NeutronSetDcompPendingHwnd(static_cast<DxgiSurfaceFactory*>(m_surfaceFactory.ptr())->GetWindow());
++
++    m_frameId += 1;
++    m_frameLatencySignal->signal(m_frameId);
++    return S_OK;
++  }
++
++
+   HRESULT D3D11SwapChain::PresentImageGdi() {
+     // neutron round-38 N2-HYBRID synchronous GDI present:
+     //   backbuffer -> staging (CopyResource) -> Map (waits for the GPU copy;
+@@ -782,6 +838,9 @@ namespace dxvk {
+     if (m_gdiPresent)
+       return PresentImageGdi();
+ 
++    if (m_compositionPresent)
++      return PresentImageComposition();
++
+     m_presenter->setSyncInterval(SyncInterval);
+ 
+     // Presentation semaphores and WSI swap chain image
+--- a/src/d3d11/d3d11_swapchain.h
++++ b/src/d3d11/d3d11_swapchain.h
+@@ -133,6 +133,14 @@ namespace dxvk {
+ 
+     HRESULT PresentImageGdi();
+ 
++    // neutron: composition swap chains (CreateSwapChainForComposition, which
++    // DXGI backs with its own hidden DXVKDUMMYWNDCLASS window) have nothing to
++    // present to; Wine's DirectComposition bridge shows their back buffer in the
++    // app's window. Kill switch: NEUTRON_COMPOSITION_PRESENT=0.
++    bool m_compositionPresent = false;
++
++    HRESULT PresentImageComposition();
++
+     DXGI_SWAP_CHAIN_DESC1     m_desc;
+ 
+     Rc<DxvkDevice>            m_device;
