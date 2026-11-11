@@ -1,0 +1,538 @@
+comctl32_v6, user32: the press that drops a combo list never picks an item; closing without a pick restores the selection, as on Windows
+(neutron combo-handover, revision 4 -- replaces cbx186's combo-handover.mypatch and cbx187's revisions 2 and 3; kill switches
+NEUTRON_COMBO_HANDOVER=0 (press / hand-over / coordinates) and NEUTRON_COMBO_ESCAPE_RESTORE=0 (Escape, CB_SHOWDROPDOWN); stacks on
+popup-input-anchor)
+
+What he saw (runtime 11.10-186, Photoshop 2026, KDE Plasma Wayland, 175%): Edit > Color Settings > RGB working space: "it lists
+them but it's broken as fuck. It closes instantly after you click it and it changes the color space. You have to hold the click
+to keep it up. That's pretty bad". His call (C233): revise the combo fix to Windows' rule.
+
+Mechanism (SOLID, lab message logs). The press on the combo drops the list and the combo keeps the capture; once the pointer
+is in the list (at once when the list drops over it, as the 150+ profile RGB list does, or after a drag into a list below or
+above), the combo hands tracking over: it sends the list a WM_LBUTTONDOWN. Wine's list took that as a click on the item under
+the cursor, and the button-up selected that item and rolled up. The combo also forwarded its own client coordinates in that
+WM_LBUTTONDOWN instead of the list's, so a list that drops ABOVE the combo closed unpicked as soon as a press-drag entered it.
+Separately, closing the list without a pick -- Escape, or the program's CB_SHOWDROPDOWN(FALSE), which is what Photoshop sends
+on Escape -- kept the item the hover had moved the selection to (CBRollUp(FALSE) does not restore it); Photoshop applied it.
+
+Windows (black-box, his PC, Windows 11, comctl32 6.16, combo animation on; SendInput probes):
+- combolist-probe v1/v2 (round 12/13): the hand-over happens (combo MOVE with capture=combo, list DOWN at the true point with the
+  button still down, list takes the capture); the release leaves the list open, selection unchanged.
+- combolist-probe3 (round 14), list over the pressed point: click, 1 px / 3 px jiggle, 200 px drag onto another item, drag and
+  back: all STILL OPEN, selection unchanged, SELCHANGE x0. Only a following click (or hover then click) picks.
+- combolist-probe4 (round 15): the same in EVERY case -- below-drag and above-drag (8-item list, press on the combo, drag onto
+  item 4, release) STILL OPEN unchanged "comboDOWN DROPDOWN listDOWN listUP", over-drag and over-hold too. While that press is
+  down only the caret follows the pointer: mid "sel 0 lbsel 0 caret 4" (below/above), caret 38 / 28 = the item under the pointer
+  (over); with the button up, hovering moves selection and caret together ("sel 4 lbsel 4 caret 4"). Escape after such a hover:
+  CLOSED, selection unchanged (back to item 0), SELCHANGE x0, "comboUP CLOSEUP" (below and over).
+- combolist-probe5 (round 16): CB_SHOWDROPDOWN(FALSE) sent by the program after a hover (below: sel 4; over: sel 38) and without
+  a hover: CLOSED, selection unchanged (item 0), SELCHANGE x0, "ENDCANCEL CLOSEUP"; Escape the same. (Wine already sends
+  CBN_SELENDCANCEL before CBN_CLOSEUP on both paths.)
+Revision 1 keyed on "pointer not moved"; revision 2 on "list covers the press point"; round 15 shows the rule is every press that
+drops the list.
+
+Implemented: (1) CBF_OPENPRESS is set when a press on the combo drops the list (COMBO_LButtonDown, after CBDropDown). Until that
+press is released, the list takes the hand-over DOWN as capture-only, moves only its caret to the item under the pointer (on the
+DOWN and on each move inside the list), and on the release -- wherever it ends -- stays open with the selection unchanged and the
+capture on the list, exactly as after a release on the combo itself (COMBO_LButtonUp). The flag ends at that release (list UP or
+combo UP) or any roll-up; hover tracking and the next click work as before. The hand-over DOWN carries list coordinates.
+(2) Escape on a dropped list (the combo's WM_KEYDOWN) and CB_SHOWDROPDOWN(FALSE) set the list back to the selection it had when
+it dropped (droppedIndex, LB_SETCURSEL, no notification) before CBRollUp(FALSE). A pick (click on an item, Enter) is untouched:
+CBN_SELENDOK, item kept. A CB_SHOWDROPDOWN(FALSE) that the program sends from inside the roll-up's own CBN_SELENDOK /
+CBN_SELENDCANCEL notification (Photoshop does after a pick) does not restore (CBF_INROLLUP): without that guard the restore
+undid Photoshop's pick (lab, first 186pf build, 2/2 runs: item click left sRGB).
+
+Not covered / INFERRED: (1) Other roll-ups without a pick (focus loss, a click outside the list, F4/Alt+Up) are unchanged
+(Windows not measured; a click outside already restored in Wine). (2) While that first press is down and the pointer leaves the
+list, Wine does not autoscroll it (Windows not measured). (3) A capture lost while that press is down leaves the flag set until
+the next release in the list (one extra click). (4) Bottom clamp of a list taller than the work area: not changed (revision 1).
+(5) The classic comctl32 (v5) has no combo box in this tree (user32's is used): user32's copy carries the same change.
+
+Lab evidence (runtime 11.10-186pg = 186pp + this patch's comctl32_v6 + user32; desk c7a 175%, prefix at 168 dpi; "kill" = both
+switches 0 on the same build):
+- (probe4, probe3, v1/v2, real-pointer and Photoshop rows below were measured on revision 3's build 186pe, which differs only
+  by the CB_SHOWDROPDOWN restore; probe4 and probe3 rechecked on 186pf: = Windows 1/1 each.)
+- combolist-probe4: all 7 lines = Windows' (open/closed, selection, SELCHANGE count, message list, mid sel/lbsel = item 0 and
+  caret = item under the pointer during the press; esc arms restore item 0) 2/2; kill 2/2: below/over drag and over-hold CLOSED
+  + CHANGED, above-drag closes unpicked, both esc arms keep the hovered item. (In the full run the over-hold caret reads 60, the
+  item under the nested desk's jumped SendInput cursor; the arm alone: caret 47 = item under the release, 3/3.)
+- combolist-probe5: all 4 lines = Windows' 2/2 on 186pf, 1/1 on 186pg; pick arm ENDOK + item kept 2/2 on both (over-sdd mid 60 vs Windows' 38 is geometry); kill 2/2: Escape and
+  CB_SHOWDROPDOWN keep the hovered item. OK path (lab-only arm: click, hover item 4, click it): ENDOK CLOSEUP SELCHANGE, item 4
+  kept 2/2, kill 2/2 the same.
+- combolist-probe3: all 7 RESULT lines = Windows' 2/2; kill 2/2 all CLOSED + CHANGED (item numbers differ from Windows' by geometry).
+- combolist-probe v1, v2 hold 60, v2 hold 500: STILL OPEN unchanged 2/2 each (= Windows); kill CLOSED + CHANGED 1/1 each.
+- Real desk pointer (fakeptr, combolist-probe2 wait), v6: click OPEN 2/2, drag 120 px + release OPEN unchanged 2/2, a second
+  click picks the item under it 1/1; kill: click CLOSED 47, drag CLOSED 61. user32 combo: click OPEN 1/1, drag OPEN 1/1; kill
+  drag CLOSED 61 1/1.
+- Photoshop 2026 Color Settings (lab copy, real pointer; second run with WINEDEBUG=+combo): RGB one click -> list open, profile
+  unchanged 2/2; press-drag 150 px and release -> open, unchanged 2/2; a click on an item then picks it and closes 2/2; Color
+  Management Policies RGB (3-item list that drops below) press-drag-release onto "Convert to Working RGB" -> stays open 2/2
+  (as Windows' below-drag), then Escape closes it with the policy unchanged 1/1 (screenshot checked). Kill: RGB click closes at once and changes the
+  profile (Canon Cinema CLog3) 1/1, drag closes and picks 1/1; Policies drag-release picks "Convert to Working RGB" 1/1 (stock
+  path, run on revision 2's build). Escape after hovering the RGB list (Photoshop closes with CB_SHOWDROPDOWN(FALSE), +combo trace): profile changed on
+  revision 3 2/2. This revision: Escape after hovering keeps "sRGB IEC61966-2.1" / "North America General Purpose 2" on 186pf
+  1/1 clean run (the other run's Escape step was unreadable: the window-list helper misread and the harness reopened the
+  dialog) and on 186pg 1/1; one click open, drag-release open, Policies drag-release open with the policy unchanged after
+  Escape: 186pf 2/2, 186pg 1/1; an item click picks on 186pg 1/1 (Fujifilm 3521XD) -- it did NOT on 186pf (field stayed sRGB,
+  2/2), which is what the CBF_INROLLUP guard fixes. Kill on 186pf 2/2: RGB click closes and applies Canon Cinema CLog3, drag
+  closes and applies Fujifilm 3521XD.
+- Wine conformance tests (cross-built, comctl32 combo+listbox, user32 combo+listbox) identical on this build, the kill switches
+  and 186pp on the same desk: 916/6485/488/3420 tests, 0 failures; 186pf = 186pp on a later desk: 916/6493/488/3420, 0 failures.
+--- a/dlls/comctl32/comctl32.h
++++ b/dlls/comctl32/comctl32.h
+@@ -152,6 +152,8 @@
+     CBF_NOLBSELECT   = 0x2000, /* do not change current selection */
+     CBF_BEENFOCUSED  = 0x4000, /* has it ever had focus           */
+     CBF_EUI          = 0x8000,
++    CBF_INROLLUP     = 0x20000, /* Neutron: inside CBRollUp's CBN_SELENDOK/CANCEL notification */
++    CBF_OPENPRESS    = 0x10000, /* Neutron: the press that dropped the list is still down; its release picks nothing */
+ };
+ 
+ typedef struct
+@@ -174,6 +176,8 @@
+ } HEADCOMBO, *LPHEADCOMBO;
+ 
+ extern BOOL COMBO_FlipListbox(HEADCOMBO *lphc, BOOL ok, BOOL bRedrawButton);
++extern BOOL COMBO_HandoverParity(void);
++extern BOOL COMBO_EscapeParity(void);
+ 
+ typedef struct
+ {
+--- a/dlls/comctl32_v6/combo.c
++++ b/dlls/comctl32_v6/combo.c
+@@ -1019,7 +1019,10 @@
+    TRACE("[%p]: sel ok? [%i] dropped? [%i]\n",
+ 	 lphc->self, ok, (INT)(lphc->wState & CBF_DROPPED));
+ 
++   lphc->wState &= ~CBF_OPENPRESS;
++   lphc->wState |= CBF_INROLLUP;
+    CB_NOTIFY( lphc, (ok) ? CBN_SELENDOK : CBN_SELENDCANCEL );
++   if (IsWindow( hWnd )) lphc->wState &= ~CBF_INROLLUP;
+ 
+    if( IsWindow( hWnd ) && CB_GETTYPE(lphc) != CBS_SIMPLE )
+    {
+@@ -1517,6 +1520,55 @@
+ }
+ 
+ /***********************************************************************
++ *           COMBO_HandoverParity  (Neutron)
++ *
++ * The press on a combo box that drops its list never picks an item on Windows,
++ * wherever the list drops (below, above, or over the pressed point) and
++ * wherever the press is released: the combo hands tracking over to the list
++ * once the pointer is in it (it sends it the button-down at the true point, in
++ * list coordinates), the list takes the capture and only its caret follows the
++ * pointer while the button stays down (the selection stays), and the release
++ * leaves the list open with the selection unchanged and the capture on the
++ * list; the next click picks.  Wine's list took the hand-over as a click on the
++ * item under the pointer and the release selected it and rolled up (with the
++ * combo's coordinates, so a list above the combo closed unpicked).
++ * NEUTRON_COMBO_HANDOVER=0 restores Wine's old behavior.
++ */
++BOOL COMBO_HandoverParity(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_COMBO_HANDOVER", buf, sizeof(buf) );
++        on = !(len && len < sizeof(buf) && buf[0] == '0');
++        if (!on) ERR( "neutron-combo-handover: NEUTRON_COMBO_HANDOVER = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/***********************************************************************
++ *           COMBO_EscapeParity  (Neutron)
++ *
++ * Escape on a dropped list closes it and restores the selection the list had
++ * when it dropped, with no CBN_SELCHANGE, as on Windows (hovering moves the
++ * list's selection; Wine kept the hovered item).  NEUTRON_COMBO_ESCAPE_RESTORE=0
++ * restores Wine's old behavior.
++ */
++BOOL COMBO_EscapeParity(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_COMBO_ESCAPE_RESTORE", buf, sizeof(buf) );
++        on = !(len && len < sizeof(buf) && buf[0] == '0');
++        if (!on) ERR( "neutron-combo-escape: NEUTRON_COMBO_ESCAPE_RESTORE = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/***********************************************************************
+  *           COMBO_LButtonDown
+  */
+ static void COMBO_LButtonDown( LPHEADCOMBO lphc, LPARAM lParam )
+@@ -1552,8 +1604,12 @@
+ 	   /* drop down the listbox and start tracking */
+ 
+            lphc->wState |= CBF_CAPTURE;
++           lphc->wState &= ~CBF_OPENPRESS;
+            SetCapture( hWnd );
+            CBDropDown( lphc );
++           /* the press that dropped the list picks nothing, wherever it is released */
++           if (COMBO_HandoverParity() && (lphc->wState & CBF_DROPPED))
++               lphc->wState |= CBF_OPENPRESS;
+        }
+        if( bButton ) CBRepaintButton( lphc );
+    }
+@@ -1566,6 +1622,7 @@
+  */
+ static void COMBO_LButtonUp( LPHEADCOMBO lphc )
+ {
++   lphc->wState &= ~CBF_OPENPRESS;
+    if( lphc->wState & CBF_CAPTURE )
+    {
+        lphc->wState &= ~CBF_CAPTURE;
+@@ -1626,8 +1683,9 @@
+        ReleaseCapture();
+        if( CB_GETTYPE(lphc) == CBS_DROPDOWN ) CBUpdateLBox( lphc, TRUE );
+ 
+-       /* hand over pointer tracking */
+-       SendMessageW(lphc->hWndLBox, WM_LBUTTONDOWN, wParam, lParam);
++       /* hand over pointer tracking; Windows sends the point in the list's coordinates */
++       SendMessageW(lphc->hWndLBox, WM_LBUTTONDOWN, wParam,
++                    COMBO_HandoverParity() ? MAKELPARAM(pt.x, pt.y) : lParam);
+    }
+ }
+ 
+@@ -1843,6 +1901,9 @@
+         if ((wParam == VK_RETURN || wParam == VK_ESCAPE) &&
+                 (lphc->wState & CBF_DROPPED))
+         {
++            /* Escape: back to the selection the list had when it dropped (no notification) */
++            if (wParam == VK_ESCAPE && COMBO_EscapeParity())
++                SendMessageW( lphc->hWndLBox, LB_SETCURSEL, lphc->droppedIndex, 0 );
+             CBRollUp( lphc, wParam == VK_RETURN, FALSE );
+             return TRUE;
+         }
+@@ -2033,7 +2094,12 @@
+                     CBDropDown( lphc );
+             }
+             else if (lphc->wState & CBF_DROPPED)
++            {
++                /* closing without a pick: back to the selection the list had when it dropped (Windows) */
++                if (COMBO_EscapeParity() && !(lphc->wState & CBF_INROLLUP))
++                    SendMessageW( lphc->hWndLBox, LB_SETCURSEL, lphc->droppedIndex, 0 );
+                 CBRollUp( lphc, FALSE, TRUE );
++            }
+         }
+         return  TRUE;
+ 
+--- a/dlls/comctl32_v6/listbox.c
++++ b/dlls/comctl32_v6/listbox.c
+@@ -2178,6 +2178,32 @@
+ }
+ 
+ 
++/***********************************************************************
++ *           LISTBOX_ComboDropPress  (Neutron, see COMBO_HandoverParity)
++ *
++ * TRUE from the moment a press on the combo dropped this list until the
++ * release of that press: the press that opened the list picks nothing.
++ */
++static BOOL LISTBOX_ComboDropPress( LB_DESCR *descr )
++{
++    return descr->lphc && (descr->lphc->wState & CBF_OPENPRESS);
++}
++
++/* during that press only the caret follows the pointer, the selection stays (Windows) */
++static void LISTBOX_ComboDropPressTrack( LB_DESCR *descr, INT x, INT y )
++{
++    RECT rect;
++    POINT pt;
++    INT index;
++
++    pt.x = x;
++    pt.y = y;
++    GetClientRect( descr->self, &rect );
++    if (!PtInRect( &rect, pt )) return;
++    index = LISTBOX_GetItemFromPoint( descr, x, y );
++    if (index != -1) LISTBOX_SetCaretIndex( descr, index, FALSE );
++}
++
+ /*************************************************************************
+  * LISTBOX_HandleLButtonDownCombo [Internal]
+  *
+@@ -2213,6 +2239,15 @@
+         if (msg == WM_LBUTTONDOWN)
+         {
+            descr->lphc->droppedIndex = descr->nb_items ? descr->selected_item : -1;
++           if (LISTBOX_ComboDropPress( descr ))
++           {
++               /* the combo's hand-over of the press that dropped the list: the list
++                * takes the capture, the caret follows, this press picks nothing */
++               descr->captured = TRUE;
++               SetCapture( descr->self );
++               LISTBOX_ComboDropPressTrack( descr, x, y );
++               return 0;
++           }
+            return LISTBOX_HandleLButtonDown( descr, keys, x, y);
+         }
+         else if (descr->style & LBS_NOTIFY)
+@@ -3026,6 +3061,13 @@
+             mousePos.x = (INT16)LOWORD(lParam);
+             mousePos.y = (INT16)HIWORD(lParam);
+ 
++            /* the press that dropped the list is still down: only the caret follows */
++            if (LISTBOX_ComboDropPress( descr ))
++            {
++                LISTBOX_ComboDropPressTrack( descr, mousePos.x, mousePos.y );
++                return 0;
++            }
++
+             /*
+              * If we are in a dropdown combobox, we simulate that
+              * the mouse is captured to show the tracking of the item.
+@@ -3044,6 +3086,16 @@
+         }
+         return 0;
+     case WM_LBUTTONUP:
++        if (lphc && lParam != (LPARAM)-1 && LISTBOX_ComboDropPress( descr ))
++        {
++            /* the release of the press that dropped the list, wherever it ends: the
++             * list stays open with the selection unchanged and keeps the capture (as
++             * after a release on the combo itself, see COMBO_LButtonUp) */
++            lphc->wState &= ~CBF_OPENPRESS;
++            descr->captured = FALSE;
++            if (GetCapture() != descr->self) SetCapture( descr->self );
++            return 0;
++        }
+ 	if (lphc)
+ 	{
+             POINT mousePos;
+--- a/dlls/user32/combo.c
++++ b/dlls/user32/combo.c
+@@ -1009,7 +1009,10 @@
+    TRACE("[%p]: sel ok? [%i] dropped? [%i]\n",
+ 	 lphc->self, ok, (INT)(lphc->wState & CBF_DROPPED));
+ 
++   lphc->wState &= ~CBF_OPENPRESS;
++   lphc->wState |= CBF_INROLLUP;
+    CB_NOTIFY( lphc, (ok) ? CBN_SELENDOK : CBN_SELENDCANCEL );
++   if (IsWindow( hWnd )) lphc->wState &= ~CBF_INROLLUP;
+ 
+    if( IsWindow( hWnd ) && CB_GETTYPE(lphc) != CBS_SIMPLE )
+    {
+@@ -1558,6 +1561,55 @@
+ }
+ 
+ /***********************************************************************
++ *           COMBO_HandoverParity  (Neutron)
++ *
++ * The press on a combo box that drops its list never picks an item on Windows,
++ * wherever the list drops (below, above, or over the pressed point) and
++ * wherever the press is released: the combo hands tracking over to the list
++ * once the pointer is in it (it sends it the button-down at the true point, in
++ * list coordinates), the list takes the capture and only its caret follows the
++ * pointer while the button stays down (the selection stays), and the release
++ * leaves the list open with the selection unchanged and the capture on the
++ * list; the next click picks.  Wine's list took the hand-over as a click on the
++ * item under the pointer and the release selected it and rolled up (with the
++ * combo's coordinates, so a list above the combo closed unpicked).
++ * NEUTRON_COMBO_HANDOVER=0 restores Wine's old behavior.
++ */
++BOOL COMBO_HandoverParity(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_COMBO_HANDOVER", buf, sizeof(buf) );
++        on = !(len && len < sizeof(buf) && buf[0] == '0');
++        if (!on) ERR( "neutron-combo-handover: NEUTRON_COMBO_HANDOVER = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/***********************************************************************
++ *           COMBO_EscapeParity  (Neutron)
++ *
++ * Escape on a dropped list closes it and restores the selection the list had
++ * when it dropped, with no CBN_SELCHANGE, as on Windows (hovering moves the
++ * list's selection; Wine kept the hovered item).  NEUTRON_COMBO_ESCAPE_RESTORE=0
++ * restores Wine's old behavior.
++ */
++BOOL COMBO_EscapeParity(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char buf[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_COMBO_ESCAPE_RESTORE", buf, sizeof(buf) );
++        on = !(len && len < sizeof(buf) && buf[0] == '0');
++        if (!on) ERR( "neutron-combo-escape: NEUTRON_COMBO_ESCAPE_RESTORE = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/***********************************************************************
+  *           COMBO_LButtonDown
+  */
+ static void COMBO_LButtonDown( LPHEADCOMBO lphc, LPARAM lParam )
+@@ -1593,8 +1645,12 @@
+ 	   /* drop down the listbox and start tracking */
+ 
+            lphc->wState |= CBF_CAPTURE;
++           lphc->wState &= ~CBF_OPENPRESS;
+            NtUserSetCapture( hWnd );
+            CBDropDown( lphc );
++           /* the press that dropped the list picks nothing, wherever it is released */
++           if (COMBO_HandoverParity() && (lphc->wState & CBF_DROPPED))
++               lphc->wState |= CBF_OPENPRESS;
+        }
+        if( bButton ) CBRepaintButton( lphc );
+    }
+@@ -1607,6 +1663,7 @@
+  */
+ static void COMBO_LButtonUp( LPHEADCOMBO lphc )
+ {
++   lphc->wState &= ~CBF_OPENPRESS;
+    if( lphc->wState & CBF_CAPTURE )
+    {
+        lphc->wState &= ~CBF_CAPTURE;
+@@ -1667,8 +1724,9 @@
+        NtUserReleaseCapture();
+        if( CB_GETTYPE(lphc) == CBS_DROPDOWN ) CBUpdateLBox( lphc, TRUE );
+ 
+-       /* hand over pointer tracking */
+-       SendMessageW(lphc->hWndLBox, WM_LBUTTONDOWN, wParam, lParam);
++       /* hand over pointer tracking; Windows sends the point in the list's coordinates */
++       SendMessageW(lphc->hWndLBox, WM_LBUTTONDOWN, wParam,
++                    COMBO_HandoverParity() ? MAKELPARAM(pt.x, pt.y) : lParam);
+    }
+ }
+ 
+@@ -1854,6 +1912,9 @@
+ 		if ((wParam == VK_RETURN || wParam == VK_ESCAPE) &&
+ 		     (lphc->wState & CBF_DROPPED))
+ 		{
++		   /* Escape: back to the selection the list had when it dropped (no notification) */
++		   if (wParam == VK_ESCAPE && COMBO_EscapeParity())
++		       SendMessageW( lphc->hWndLBox, LB_SETCURSEL, lphc->droppedIndex, 0 );
+ 		   CBRollUp( lphc, wParam == VK_RETURN, FALSE );
+ 		   return TRUE;
+ 		}
+@@ -2030,9 +2091,13 @@
+ 			if( !(lphc->wState & CBF_DROPPED) )
+ 			    CBDropDown( lphc );
+ 		    }
+-		    else
+-			if( lphc->wState & CBF_DROPPED )
+-		            CBRollUp( lphc, FALSE, TRUE );
++		    else if( lphc->wState & CBF_DROPPED )
++		    {
++			/* closing without a pick: back to the selection the list had when it dropped (Windows) */
++			if (COMBO_EscapeParity() && !(lphc->wState & CBF_INROLLUP))
++			    SendMessageW( lphc->hWndLBox, LB_SETCURSEL, lphc->droppedIndex, 0 );
++			CBRollUp( lphc, FALSE, TRUE );
++		    }
+ 		}
+ 		return  TRUE;
+ 	case CB_GETCOUNT:
+--- a/dlls/user32/controls.h
++++ b/dlls/user32/controls.h
+@@ -113,6 +113,8 @@
+ #define CBF_NOLBSELECT          0x2000  /* do not change current selection */
+ #define CBF_BEENFOCUSED         0x4000  /* has it ever had focus           */
+ #define CBF_EUI                 0x8000
++#define CBF_INROLLUP            0x20000 /* Neutron: inside CBRollUp's CBN_SELENDOK/CANCEL notification */
++#define CBF_OPENPRESS           0x10000 /* Neutron: the press that dropped the list is still down; its release picks nothing */
+ 
+ /* combo state struct */
+ typedef struct
+@@ -134,6 +136,8 @@
+ } HEADCOMBO,*LPHEADCOMBO;
+ 
+ extern BOOL COMBO_FlipListbox( LPHEADCOMBO, BOOL, BOOL );
++extern BOOL COMBO_HandoverParity(void);
++extern BOOL COMBO_EscapeParity(void);
+ 
+ /* Dialog info structure (note: shared with user.exe) */
+ typedef struct tagDIALOGINFO
+--- a/dlls/user32/listbox.c
++++ b/dlls/user32/listbox.c
+@@ -2207,6 +2207,32 @@
+ }
+ 
+ 
++/***********************************************************************
++ *           LISTBOX_ComboDropPress  (Neutron, see COMBO_HandoverParity)
++ *
++ * TRUE from the moment a press on the combo dropped this list until the
++ * release of that press: the press that opened the list picks nothing.
++ */
++static BOOL LISTBOX_ComboDropPress( LB_DESCR *descr )
++{
++    return descr->lphc && (descr->lphc->wState & CBF_OPENPRESS);
++}
++
++/* during that press only the caret follows the pointer, the selection stays (Windows) */
++static void LISTBOX_ComboDropPressTrack( LB_DESCR *descr, INT x, INT y )
++{
++    RECT rect;
++    POINT pt;
++    INT index;
++
++    pt.x = x;
++    pt.y = y;
++    GetClientRect( descr->self, &rect );
++    if (!PtInRect( &rect, pt )) return;
++    index = LISTBOX_GetItemFromPoint( descr, x, y );
++    if (index != -1) LISTBOX_SetCaretIndex( descr, index, FALSE );
++}
++
+ /*************************************************************************
+  * LISTBOX_HandleLButtonDownCombo [Internal]
+  *
+@@ -2242,6 +2268,15 @@
+         if (msg == WM_LBUTTONDOWN)
+         {
+            descr->lphc->droppedIndex = descr->nb_items ? descr->selected_item : -1;
++           if (LISTBOX_ComboDropPress( descr ))
++           {
++               /* the combo's hand-over of the press that dropped the list: the list
++                * takes the capture, the caret follows, this press picks nothing */
++               descr->captured = TRUE;
++               NtUserSetCapture( descr->self );
++               LISTBOX_ComboDropPressTrack( descr, x, y );
++               return 0;
++           }
+            return LISTBOX_HandleLButtonDown( descr, keys, x, y);
+         }
+         else if (descr->style & LBS_NOTIFY)
+@@ -3162,6 +3197,13 @@
+             mousePos.x = (INT16)LOWORD(lParam);
+             mousePos.y = (INT16)HIWORD(lParam);
+ 
++            /* the press that dropped the list is still down: only the caret follows */
++            if (LISTBOX_ComboDropPress( descr ))
++            {
++                LISTBOX_ComboDropPressTrack( descr, mousePos.x, mousePos.y );
++                return 0;
++            }
++
+             /*
+              * If we are in a dropdown combobox, we simulate that
+              * the mouse is captured to show the tracking of the item.
+@@ -3180,6 +3222,16 @@
+         }
+         return 0;
+     case WM_LBUTTONUP:
++        if (lphc && lParam != (LPARAM)-1 && LISTBOX_ComboDropPress( descr ))
++        {
++            /* the release of the press that dropped the list, wherever it ends: the
++             * list stays open with the selection unchanged and keeps the capture (as
++             * after a release on the combo itself, see COMBO_LButtonUp) */
++            lphc->wState &= ~CBF_OPENPRESS;
++            descr->captured = FALSE;
++            if (GetCapture() != descr->self) NtUserSetCapture( descr->self );
++            return 0;
++        }
+ 	if (lphc)
+ 	{
+             POINT mousePos;

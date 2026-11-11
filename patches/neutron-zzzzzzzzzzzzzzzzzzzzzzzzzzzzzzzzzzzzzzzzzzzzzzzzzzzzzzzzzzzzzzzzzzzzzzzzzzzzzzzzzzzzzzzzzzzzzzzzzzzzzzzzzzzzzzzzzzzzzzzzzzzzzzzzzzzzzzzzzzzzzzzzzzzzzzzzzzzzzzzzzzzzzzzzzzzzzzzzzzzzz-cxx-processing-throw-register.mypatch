@@ -1,0 +1,166 @@
+From: Neutron lab (nlp50b) <noreply@neutron.invalid>
+Subject: [PATCH] msvcrt: end "processing a throw" in __CxxRegisterExceptionObject, as Windows does (Neutron#50)
+
+WHAT HE SAW (GitHub Neutron#50, reporter's words): "The main dialog of the Negative Lab Pro plug-in
+(NLP 3.1.1) never appears in Lightroom Classic under Neutron."
+
+MECHANISM
+Lightroom Classic builds an LrView control's font from a STRING ("Arial", NLP's "<system/bold"
+with no closing ">", ...) by trying AgTableArchiving.unarchiveNameAndStringToTable under a
+substrate.dll StTempLuaState guard. That guard's destructor restores the Lua stack only when
+std::uncaught_exceptions() == 0 (it skips cleanup while an exception unwinds). Under Neutron the
+count was -1 on every thread that had ever caught a C++ exception, so on a NORMAL return the
+guard left one value on the Lua stack; the caller then popped that value instead of the font and
+called view:inheritedViewAttribute("emphasis_font") on the font string ->
+string.inheritedViewAttribute == nil -> "attempt to call a nil value". NLP's view build dies at
+its "i" label (font="<system/bold") and the dialog never shows. Only the exact "<system...>"
+tokens and {name=, size=} tables avoid the guard, which is why LrC's own dialogs work.
+
+Why -1: Neutron prefixes run Wine's vcruntime140_1 (__CxxFrameHandler4) on top of Microsoft's
+vcruntime140 (CLI MS_OVERRIDES). Wine's call_catch_block4 calls __CxxRegisterExceptionObject (here
+Microsoft's) and then decrements the per-thread processing-throw count itself. Microsoft's
+__CxxRegisterExceptionObject ALREADY decrements it (when above 0), so each catch decremented twice.
+
+WINDOWS BEHAVIOR (measured, not guessed): a lab build that logged the count around each call, on
+LrC's main thread with Microsoft's vcruntime140.dll 14.44.35211: the first catch logged
+"register pt 1 -> 0" inside __CxxRegisterExceptionObject; with the count at 0 it stays 0. With
+Microsoft's own vcruntime140_1.dll (14.38) in place of Wine's, every font string builds (16/16).
+
+FIX
+__CxxRegisterExceptionObject now decrements processing_throw when it is above 0 (as Microsoft's
+does); call_catch_block (x86_64/ARM FH3, except.c) and call_catch_block4 (FH4, handler4.c) no
+longer decrement after calling it. Wine-only pairs stay balanced (find_catch_block[4] incremented
+first, so the count is >= 1 when Register runs); the Wine-FH4 + Microsoft-vcruntime140 pair
+Neutron ships is now balanced too. i386 (except_i386.c) never calls Register on its catch path and
+is unchanged there; a direct caller of Register on i386 now gets Windows' decrement.
+
+NOT COVERED
+- Only the decrement inside __CxxRegisterExceptionObject is mirrored; its other Windows details
+  (e.g. behavior for a NULL ExceptionRecord) are unchanged.
+- The "Loading Negative Lab Pro..." progress box stays open behind NLP's main dialog until the
+  dialog closes; not compared with Windows.
+- Lab-tested on x86_64 only (LrC is 64-bit); the i386 modules were not run.
+
+LAB EVIDENCE (LrC 15.6, lab prefix copies of Lr46b-182, 168 dpi, nested KWin desk)
+Lab runtime 11.10-186nl = 11.10-186 + this patch (vcruntime140_1, ucrtbase, msvcrt x86_64), same build both arms:
+- gate on (default), 3 sessions: a plain-text probe plug-in building 16 font strings ("Arial",
+  "Tahoma", "Segoe UI", NLP's "<system/bold", archived forms, "") -> 16/16 dialogs built, 3/3
+  sessions; NLP 3.1.1 main dialog "NEGATIVE LAB PRO v3.1.1 [trial mode]" appears, 2/2 sessions.
+- NEUTRON_CXX_THROW_COUNT=0, 2 sessions: 3/16 (only the exact "<system...>" tokens), NLP main
+  dialog never appears, 2/2 (= unpatched 186, 5/5 earlier plus 4 probe sessions here).
+- Regression: Develop renders the raw, Exposure slider drag + undo, Preferences dialog; no new
+  seh errors, aborts or "unexpected handler result" in any log.
+- Measurement build (not shipped): Microsoft's Register took the count 1 -> 0, Wine then -1.
+
+KILL SWITCH: NEUTRON_CXX_THROW_COUNT=0 restores the old placement exactly (one-shot ERR line
+"neutron-cxx: gate NEUTRON_CXX_THROW_COUNT resolved to N" per module that evaluates it).
+---
+--- a/dlls/msvcrt/except.c
++++ b/dlls/msvcrt/except.c
+@@ -46,6 +46,36 @@
+ WINE_DECLARE_DEBUG_CHANNEL(unwind);
+ #endif
+ 
++/* ==== Neutron: the "processing a throw" count is ended by __CxxRegisterExceptionObject =========
++ * Windows' vcruntime140 decrements the per-thread processing-throw count (what
++ * std::uncaught_exceptions() returns) inside __CxxRegisterExceptionObject, when it is above 0:
++ * entering a catch block ends "processing a throw".  Measured on Microsoft's own vcruntime140.dll
++ * 14.44: the first catch on a thread takes the count 1 -> 0 inside that call, a count of 0 stays 0.
++ * Wine did the decrement in its catch-block callers (call_catch_block, call_catch_block4) instead.
++ * Wine's own pairs balance either way, but Neutron's prefixes run Wine's vcruntime140_1
++ * (__CxxFrameHandler4) on top of Microsoft's vcruntime140: Microsoft's Register decremented and
++ * then Wine's caller decremented again, so after the first caught C++ exception every thread
++ * reported std::uncaught_exceptions() == -1 ("an exception is in flight") for good.  Code that
++ * skips cleanup during unwinding then skipped it on normal returns: Lightroom Classic's
++ * StTempLuaState stops restoring the Lua stack, which breaks every LrView font given by name
++ * ("attempt to call a nil value"; Negative Lab Pro's main dialog never appears, Neutron#50).
++ * Now Register does the decrement as on Windows and the callers no longer do.
++ * KILL SWITCH: NEUTRON_CXX_THROW_COUNT=0 restores the old placement exactly. */
++static BOOL neutron_cxx_register_ends_throw(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        WCHAR buf[8];
++        DWORD len = GetEnvironmentVariableW( L"NEUTRON_CXX_THROW_COUNT", buf, ARRAY_SIZE(buf) );
++        enabled = (len && len < ARRAY_SIZE(buf) && buf[0] == '0') ? 0 : 1;
++        /* One-shot at ERR so a capture can tell "gate off" from "patch absent". */
++        ERR( "neutron-cxx: gate NEUTRON_CXX_THROW_COUNT resolved to %d\n", enabled );
++    }
++    return enabled == 1;
++}
++
+ #if _MSVCR_VER>=70 && _MSVCR_VER<=71
+ static MSVCRT_security_error_handler security_error_handler;
+ #endif
+@@ -227,7 +257,8 @@
+     ctx.rethrow = FALSE;
+     ctx.prev_rec = prev_rec;
+     __CxxRegisterExceptionObject(&ep, &ctx.frame_info);
+-    msvcrt_get_thread_data()->processing_throw--;
++    if (!neutron_cxx_register_ends_throw())
++        msvcrt_get_thread_data()->processing_throw--;
+     __TRY
+     {
+         __TRY
+@@ -991,6 +1022,9 @@
+     data->exc_record = ep->ExceptionRecord;
+     data->ctx_record = ep->ContextRecord;
+     _CreateFrameInfo(&frame_info->frame_info, (void*)ep->ExceptionRecord->ExceptionInformation[1]);
++    /* Windows ends "processing a throw" here (see neutron_cxx_register_ends_throw). */
++    if (neutron_cxx_register_ends_throw() && data->processing_throw > 0)
++        data->processing_throw--;
+     return TRUE;
+ }
+ 
+--- a/dlls/msvcrt/handler4.c
++++ b/dlls/msvcrt/handler4.c
+@@ -32,6 +32,37 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(seh);
+ 
++/* ==== Neutron: the "processing a throw" count is ended by __CxxRegisterExceptionObject =========
++ * Windows' vcruntime140 decrements the per-thread processing-throw count (what
++ * std::uncaught_exceptions() returns) inside __CxxRegisterExceptionObject, when it is above 0:
++ * entering a catch block ends "processing a throw".  Measured on Microsoft's own vcruntime140.dll
++ * 14.44: the first catch on a thread takes the count 1 -> 0 inside that call, a count of 0 stays 0.
++ * Wine did the decrement in its catch-block callers (call_catch_block, call_catch_block4) instead.
++ * Wine's own pairs balance either way, but Neutron's prefixes run Wine's vcruntime140_1
++ * (__CxxFrameHandler4) on top of Microsoft's vcruntime140: Microsoft's Register decremented and
++ * then Wine's caller decremented again, so after the first caught C++ exception every thread
++ * reported std::uncaught_exceptions() == -1 ("an exception is in flight") for good.  Code that
++ * skips cleanup during unwinding then skipped it on normal returns: Lightroom Classic's
++ * StTempLuaState stops restoring the Lua stack, which breaks every LrView font given by name
++ * ("attempt to call a nil value"; Negative Lab Pro's main dialog never appears, Neutron#50).
++ * Now Register does the decrement as on Windows and the callers no longer do (same gate as
++ * in except.c, which is built into other modules).
++ * KILL SWITCH: NEUTRON_CXX_THROW_COUNT=0 restores the old placement exactly. */
++static BOOL neutron_cxx_register_ends_throw(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        WCHAR buf[8];
++        DWORD len = GetEnvironmentVariableW( L"NEUTRON_CXX_THROW_COUNT", buf, ARRAY_SIZE(buf) );
++        enabled = (len && len < ARRAY_SIZE(buf) && buf[0] == '0') ? 0 : 1;
++        /* One-shot at ERR so a capture can tell "gate off" from "patch absent". */
++        ERR( "neutron-cxx: gate NEUTRON_CXX_THROW_COUNT resolved to %d\n", enabled );
++    }
++    return enabled == 1;
++}
++
+ static DWORD fls_index;
+ 
+ typedef struct
+@@ -412,7 +443,8 @@
+     ctx.search_state = rec->ExceptionInformation[2];
+     ctx.unwind_state = rec->ExceptionInformation[3];
+     ctx.prev_rec = prev_rec;
+-    (*__processing_throw())--;
++    if (!neutron_cxx_register_ends_throw())
++        (*__processing_throw())--;
+     __TRY
+     {
+         __TRY

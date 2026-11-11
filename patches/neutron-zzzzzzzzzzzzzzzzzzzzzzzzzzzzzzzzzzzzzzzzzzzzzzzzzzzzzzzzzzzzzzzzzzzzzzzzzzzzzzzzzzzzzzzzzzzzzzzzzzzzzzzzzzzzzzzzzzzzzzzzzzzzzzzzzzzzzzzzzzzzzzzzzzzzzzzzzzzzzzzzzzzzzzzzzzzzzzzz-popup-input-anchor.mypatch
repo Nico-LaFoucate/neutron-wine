@@ -1,0 +1,257 @@
+winewayland: anchor an unowned popup to the toplevel its thread's input is in, and adopt the compositor's slide for it
+(neutron popup-input-anchor; kill switch NEUTRON_POPUP_INPUT_ANCHOR=0)
+
+What he saw (runtime 11.10-186, Photoshop 2026, KDE Plasma 6.8 Wayland, 175%, two screens): Edit > Color Settings > RGB
+working space: "it lists them but it's broken as fuck. It closes instantly after you click it and it changes the color space.
+You have to hold the click to keep it up." Edit > Convert to Profile > Profile: "the mouse target is way off. It highlights
+options way above the cursor". The 4-item Intent list in the same dialog: "yes, those are fine".
+
+Mechanism (SOLID, lab trace + window rects). The list is a ComboLBox with NO Win32 owner. win32u hands the driver owner_hint =
+root of the window under the list's top-left corner. CBDropDown puts a list that fits neither below nor above the combo at the
+top of the work area (as on Windows), i.e. above the dialog, so the window under its corner is Photoshop's MAIN window and the
+list became an xdg_popup of the main window at Win32-absolute offsets. The main window is where Win32 thinks; the dialog is not
+(KWin placed Color Settings at y 349.6 logical, Win32 has it at 216: Wayland never tells a client where a toplevel is). The
+combo, the pointer (surface-local to the dialog + the dialog's Win32 origin) and the list's hit-testing are in the dialog's
+frame, the list's pixels in the main window's: every point is off by 133 px -- the highlighted row sits 133.2 px above the
+cursor and the release picks it. A short list's corner is inside the dialog, so it was anchored to the dialog and was right.
+Present on 171 already (same list, same offset): not new in 185.
+
+Windows: positions are absolute and every window is where its app put it, so any frame gives the same answer. Here only the
+frame the app computed the rect in is right. An unowned popup is placed from the window the user is working in (a combo list
+from its combo, which holds the capture; an autocomplete list from its focused edit) -- Win32 records that as the thread's
+capture / focus / active window (GUITHREADINFO). Such a popup is now anchored to that window's root. When every toplevel is
+where Win32 thinks, this is a different frame with the same answer. Part 2: the app sized the list to fit the work area in the
+dialog's frame; in the real one it runs off the bottom, and the positioner's slide brings it back -- so the Win32 window is
+moved to where the compositor put it (as GetWindowRect reports an adjusted window on Windows), as a delta from where the
+positioner asked, applied to the raw rect; a 1-unit difference is rounding at a fractional scale and is ignored; bounded (3).
+Windows with a Win32 owner (menus, tooltips, owned dialogs) and tray popups are untouched.
+
+Not covered: (1) a QUICK click still closes the list and selects the item now under the cursor (fix 2/2, kill switch 3/3):
+a separate mechanism, wineserver's synthetic WM_MOUSEMOVE (set_window_pos -> update_cursor_pos, for ANY visible window whose
+rect changes, even far from the cursor) arrives right after the list shows and changes its frame; the combo (holding the
+capture) sees the cursor inside the list and hands tracking to it, so the button-up selects. Whether Windows does the same is
+UNKNOWN at the time; the Windows probe rounds that followed are covered by the combo-handover patch. (2) A residual of ~1-2 logical px (integer
+surface coordinates at 175%): at a row edge the neighbor row can be the one picked. (3) Keyboard-opened lists (alt+Down) use
+the focus window -- covered by the same rule, checked only by the regression arm's capture.
+
+Lab evidence (Photoshop 2026, fresh reflink of PgD-ps2 at 168 dpi, desk p6a 175%/200%, press-and-hold 6 s on the RGB combo,
+highlighted row measured against the cursor): 186 and 171: -133.2 px (n=2 + n=1); 11.10-186pp (this patch): the row at the
+cursor (f1, f2: row 432..448 logical, cursor 449); same build + NEUTRON_POPUP_INPUT_ANCHOR=0: -133.2 px (k1, k3). Trace
+(NEUTRON_POPUP_TRACE=1): fix = owner is the dialog, KWin slid it to y 54.3, Win32 rect moved 56 -> -138 raw; kill = owner is
+the main window. Short Intent list: open and in place on all arms.
+Regression (11.10-186pp vs the same build + NEUTRON_POPUP_INPUT_ANCHOR=0, n=1 each, integ186's scripted arms): Photoshop
+(File/Edit menus, document, Camera Raw, Color Settings, Convert to Profile, preferences, type, maximize), Illustrator, Premiere
+(3 menu passes) and Lightroom Classic (soft-proof Profile list, masking, export): menus open with identical pixel counts,
+popup role/owner decisions identical apart from the combo lists, owned subsurfaces identical (PS 3, LrC 1); frame differences =
+timing noise (Premiere playhead, PS type bar) and LrC's left-panel scroll-bar column (known startup race, not this patch).
+Wine-native combos (probe, comctl32 v6 and user32): the long list is anchored to its dialog and the hit item is the one under
+the cursor (item 47) vs item 35 with the kill switch. Not run: right-click menus.
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -470,6 +470,11 @@
+      * a slid panel jumped 491x125 device px (289x74 logical) with 4 ms between samples. */
+     int32_t popup_slide_x, popup_slide_y;
+     BOOL popup_slide_pending;
++    /* NEUTRON popup-input-anchor (window.c neutron_popup_input_anchor): this popup has no Win32 owner and is
++     * anchored to the toplevel its thread's input is in; popup_expect_x/y = where the last positioner asked
++     * for it (owner window-geometry relative, surface units), so a configure elsewhere is the compositor's slide. */
++    BOOL input_anchor;
++    int32_t popup_expect_x, popup_expect_y;
+     /* NEUTRON tray-popup-layer: WAYLAND_SURFACE_ROLE_LAYER, at margins (output-local logical) from the top-left of
+      * layer_output (see wayland_surface_make_layer) */
+     struct zwlr_layer_surface_v1 *layer_surface;
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -906,6 +906,9 @@
+                 ERR("Failed to create positioner!\n");
+                 return;
+             }
++            /* NEUTRON popup-input-anchor: where this positioner puts the popup if nothing is constrained */
++            surface->popup_expect_x = owner->geometry.left + config.x;
++            surface->popup_expect_y = owner->geometry.top + config.y;
+             xdg_popup_reposition(surface->xdg_popup, xdg_positioner, 0);
+             xdg_positioner_destroy(xdg_positioner);
+             wl_surface_commit(surface->wl_surface);
+@@ -933,6 +936,9 @@
+                                        &config.width, &config.height);
+ 
+     if (!(xdg_positioner = popup_create_positioner(owner, &config))) goto err;
++    /* NEUTRON popup-input-anchor: where this positioner puts the popup if nothing is constrained */
++    surface->popup_expect_x = owner->geometry.left + config.x;
++    surface->popup_expect_y = owner->geometry.top + config.y;
+ 
+     surface->xdg_popup = xdg_surface_get_popup(surface->xdg_surface, owner->xdg_surface,
+                                                xdg_positioner);
+--- a/dlls/winewayland.drv/window.c
++++ b/dlls/winewayland.drv/window.c
+@@ -1316,6 +1316,73 @@
+     return (ex & WS_EX_LAYERED) && ((ex & WS_EX_TRANSPARENT) || (st & WS_DISABLED)) &&
+            ((ex & WS_EX_NOACTIVATE) || !(ex & WS_EX_TOPMOST));
+ }
++/* NEUTRON popup-input-anchor (NEUTRON_POPUP_INPUT_ANCHOR=0 disables).
++ *
++ * WHAT HE SAW (Photoshop 2026, 11.10-186, two screens at 175%): the RGB working-space list in Edit > Color Settings
++ * and the Profile list in Edit > Convert to Profile "closes instantly after you click it and it changes the color
++ * space", and while the button is held it "highlights options way above the cursor". The 4-item Intent list in the
++ * same dialog is fine.
++ *
++ * WHY. An unmanaged window becomes an xdg_popup of `owner`, at its Win32 position RELATIVE to that owner's Win32
++ * position. That is exact only if the owner is where Win32 thinks it is -- and on Wayland no toplevel is guaranteed
++ * to be: KWin placed Color Settings 133 logical px lower than the position Photoshop gave it (the compositor
++ * places xdg_toplevels; nothing tells Wine). Within one toplevel this never shows, because the pointer, the
++ * window and its popups all share that toplevel's frame. The combo list (ComboLBox) has NO Win32 owner, so the
++ * owner it got was win32u's owner_hint fallback: the root window under its top-left corner. The tall list is put
++ * at the top of the work area by CBDropDown (exactly what Windows does: it does not fit below the combo), above
++ * the dialog -- so the window under its corner was the MAIN window, the list landed in the main window's frame
++ * while the combo, the pointer (implicit grab on the dialog's surface) and the list's hit-testing were all in the
++ * dialog's: every point off by the dialog's misplacement. A short list's corner is inside the dialog, so it is
++ * anchored to the dialog and was always right.
++ *
++ * On Windows every window is where the app put it, so any frame gives the same answer. Here only one frame is
++ * right: the one the app computed the rect in. An unowned popup's rect is computed from the window the user is
++ * working in -- a combo list from its combo (CBDropDown: GetWindowRect of the combo, with the combo holding the
++ * capture), an autocomplete list from its edit box -- which Win32 records as the thread's capture, focus and
++ * active window (GUITHREADINFO). So such a popup is anchored to the root of that window. When every toplevel is
++ * where Win32 thinks, this chooses a different frame with the same answer; it changes something only when a
++ * toplevel has been placed elsewhere, and then it picks the frame the coordinates came from.
++ *
++ * Not used: windows with a Win32 owner (menus, tooltips, owned dialogs keep their owner), a tray popup (it has
++ * its own layer path), a candidate that is the popup itself or owned by it. Returns TRUE when it chose. */
++static BOOL neutron_popup_input_anchor_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = neutron_gate("NEUTRON_POPUP_INPUT_ANCHOR", TRUE);
++    return on;
++}
++
++static BOOL neutron_popup_input_anchor(HWND hwnd, HWND *owner)
++{
++    GUITHREADINFO info;
++    HWND cand[3], root;
++    DWORD style, exstyle;
++    int i;
++
++    if (!neutron_popup_input_anchor_on()) return FALSE;
++    if (NtUserGetWindowRelative(hwnd, GW_OWNER)) return FALSE;
++    style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
++    exstyle = NtUserGetWindowLongW(hwnd, GWL_EXSTYLE);
++    if (wayland_tray_popup_wanted(hwnd, style, exstyle)) return FALSE;
++    memset(&info, 0, sizeof(info));
++    info.cbSize = sizeof(info);
++    if (!NtUserGetGUIThreadInfo(NtUserGetWindowThread(hwnd, NULL), &info)) return FALSE;
++    cand[0] = info.hwndCapture;
++    cand[1] = info.hwndFocus;
++    cand[2] = info.hwndActive;
++    for (i = 0; i < 3; i++)
++    {
++        if (!cand[i] || !(root = NtUserGetAncestor(cand[i], GA_ROOT)) || root == hwnd) continue;
++        if (!NtUserIsWindowVisible(root) || NtUserGetWindowRelative(root, GW_OWNER) == hwnd) continue;
++        if (root != *owner)
++            TRACE("hwnd=%p anchored to %p (input window %p, %s) instead of owner_hint %p\n", hwnd, root, cand[i],
++                  i == 0 ? "capture" : i == 1 ? "focus" : "active", *owner);
++        *owner = root;
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ void WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                               const struct window_rects *new_rects, struct window_surface *surface)
+ {
+@@ -1329,6 +1396,7 @@
+     struct wayland_client_surface *client;
+     struct wayland_win_data *data, *toplevel_data, *owner_data;
+     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
++    BOOL input_anchor = FALSE;   /* NEUTRON popup-input-anchor */
+ 
+     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
+ 
+@@ -1351,6 +1419,8 @@
+      * may need to query win_data information about other HWNDs and thus
+      * acquire the lock itself internally. */
+     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
++    /* NEUTRON popup-input-anchor: an unowned popup belongs to the frame its thread's input is in, see above */
++    if (!managed && surface) input_anchor = neutron_popup_input_anchor(hwnd, &owner);
+     owner_chain_len = neutron_owner_chain(owner, owner_chain);
+ 
+     if (!(data = wayland_win_data_get(hwnd))) return;
+@@ -1579,6 +1649,9 @@
+     {
+         wayland_win_data_update_wayland_state(data);
+     }
++    /* NEUTRON popup-input-anchor: let the slide handler know this popup's frame is the input window's */
++    if (data->wayland_surface && wayland_surface_is_popup(data->wayland_surface))
++        data->wayland_surface->input_anchor = input_anchor && owner_surface;
+ 
+     /* An owned top-level window that is a subsurface of its owner: restack below if its place
+      * in the owner's stack can have changed (shown, hidden, raised/lowered) or its wl_subsurface
+@@ -1625,6 +1698,60 @@
+  * gives the compositor a fresh chance to slide it; a popup wedged against an edge could ping-pong
+  * forever. Converges in one step in the normal case (we move exactly where it asked), so a small
+  * cap costs nothing and makes an oscillation impossible. */
++/* NEUTRON popup-input-anchor, part 2: a popup anchored by neutron_popup_input_anchor() that the compositor SLID.
++ *
++ * The app sized and placed the popup to fit the work area in its own frame -- the combo list in Color Settings
++ * fills the work area from its top. When that frame (the dialog) really sits lower, the same offset runs off the
++ * bottom of the screen, and the positioner's slide (popup_create_positioner) brings it back up: on screen, but no
++ * longer where Win32 has it, so the pointer and the list disagree by the slide distance again. On Windows a
++ * window is where its rect says; the faithful answer is to move the Win32 window to where it really is, as
++ * GetWindowRect reports an adjusted menu on Windows. Measured as a DELTA from where the positioner asked
++ * (popup_expect_x/y), so the owner's window geometry and content origin cancel out; applied to the RAW rect.
++ *
++ * A difference of one surface unit is the rounding of window px -> surface units at a fractional scale, not a
++ * slide: ignored (wayland_popup_adopt_slide below chased exactly that on Premiere). Bounded like it, too.
++ * Returns FALSE when the popup is not one of ours (the older, gated adoption below then decides). */
++static BOOL neutron_popup_adopt_input_slide(HWND hwnd)
++{
++    struct wayland_win_data *data;
++    struct wayland_surface *surface;
++    int dx, dy;
++    RECT rect;
++    double scale;
++
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++    if (!(surface = data->wayland_surface) || !wayland_surface_is_popup(surface) || !surface->input_anchor ||
++        !surface->popup_slide_pending)
++    {
++        wayland_win_data_release(data);
++        return FALSE;
++    }
++    surface->popup_slide_pending = FALSE;
++    dx = surface->popup_slide_x - surface->popup_expect_x;
++    dy = surface->popup_slide_y - surface->popup_expect_y;
++    if (abs(dx) <= 1) dx = 0;
++    if (abs(dy) <= 1) dy = 0;
++    if ((!dx && !dy) || surface->popup_slide_applied >= 3)
++    {
++        if (dx || dy) WARN("popup %p slid %u times already; not chasing it further\n", hwnd, surface->popup_slide_applied);
++        wayland_win_data_release(data);
++        return TRUE;
++    }
++    surface->popup_slide_applied++;
++    surface->popup_expect_x = surface->popup_slide_x;
++    surface->popup_expect_y = surface->popup_slide_y;
++    scale = surface->window.scale;
++    rect = surface->window.rect;
++    /* ⛔ released before NtUserSetRawWindowPos: it re-enters wayland_win_data_get (round-34 ABBA) */
++    wayland_win_data_release(data);
++
++    TRACE("hwnd=%p slid by (%d,%d) surface units at scale %.4f: moving %s by (%d,%d)\n", hwnd, dx, dy, scale,
++          wine_dbgstr_rect(&rect), (int)round(dx * scale), (int)round(dy * scale));
++    OffsetRect(&rect, (int)round(dx * scale), (int)round(dy * scale));
++    NtUserSetRawWindowPos(hwnd, rect, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER, FALSE);
++    return TRUE;
++}
++
+ static void wayland_popup_adopt_slide(HWND hwnd)
+ {
+     struct wayland_win_data *data;
+@@ -2380,7 +2507,7 @@
+         return 0;
+ 
+     case WM_WAYLAND_POPUP_SLIDE:
+-        wayland_popup_adopt_slide(hwnd);
++        if (!neutron_popup_adopt_input_slide(hwnd)) wayland_popup_adopt_slide(hwnd);
+         return 0;
+     case WM_WAYLAND_OUTPUT_CHANGE:
+         wayland_window_output_change(hwnd, (UINT)wp);

@@ -1,0 +1,76 @@
+comctl32: hide a tracking tooltip when its tool is deleted (TTM_DELTOOL), as Windows does
+
+What he saw (11.10-186, Photoshop 2026, Adobe2026 prefix, 168 dpi): "There is a stale restore dialog that won't go away after
+after resizing, but maximizing and unmaximizing works fine" -- the caption button's "Restore" tooltip stays drawn under the
+button for good.
+
+Mechanism (SOLID: +tooltips trace of Photoshop, and the source): Photoshop shows its caption-button tips as a TRACKING tooltip
+(tooltips_class32, no owner): TTM_ADDTOOLW "Restore", TTM_TRACKPOSITION, TTM_TRACKACTIVATE(TRUE). To take it down it sends
+TTM_GETTOOLCOUNT, TTM_DELTOOLW and only then TTM_TRACKACTIVATE(FALSE). TOOLTIPS_DelToolT called TOOLTIPS_Hide, which only knows
+the non-tracking current tool (nCurrentTool, -1 for a tracking tip) and returned, then reset nTrackTool to -1; the following
+TTM_TRACKACTIVATE(FALSE) reached TOOLTIPS_TrackHide with nTrackTool == -1 and returned too. No SWP_HIDEWINDOW was ever sent:
+the window stayed visible (IsWindowVisible 1) until the next hover reused it. Not a resize issue: in the lab the tip also stays
+when the pointer simply leaves the button. Present on 171, 185rc and 186 (upstream Wine code).
+
+Windows (his run of the ttprobe probe, comctl32 6.16): a shown TTF_TRACK tip is hidden right after TTM_DELTOOL (visible=0,
+tools=0) and stays hidden after TTM_TRACKACTIVATE(FALSE); TTM_TRACKACTIVATE(FALSE) with the tool still there hides it as well.
+
+Fix (dlls/comctl32/tooltips.c, built into comctl32.dll AND comctl32_v6.dll): when the deleted tool is the tracked tool,
+TOOLTIPS_DelToolT hides the tracking tip through TOOLTIPS_TrackHide (TTN_POP to the tool's window, SWP_HIDEWINDOW) and clears
+bTrackActive, before the tool is freed.
+
+Not covered: whether Windows sends TTN_POP on this path was not measured (Wine's existing hide paths send it; Photoshop's tool
+has hwnd NULL, so it goes nowhere). TTM_DELTOOL of a tracked tool whose tip is not shown also sends TTN_POP + a hide of an already
+hidden window (harmless).
+
+Lab evidence (runtime 11.10-186tt = 186 + this patch in comctl32.dll x2 + comctl32_v6.dll x2; scratch prefix; desk r6a):
+- ttprobe: 186 2/2 "after TTM_DELTOOL visible=1, after TRACKACTIVATE(0) visible=1"; 186tt 2/2 Windows' lines (0, 0, control 0);
+  186tt + NEUTRON_TOOLTIP_DELTOOL_HIDE=0 2/2 back to 1, 1.
+- Wine's comctl32 tooltips conformance test (tests/tooltips.c, standalone build): 1480 tests, 7 todo, 1 failure (tooltips.c:424
+  "got wrong text", resource-less standalone build) identically on 186, 186tt and 186tt + kill switch.
+- Photoshop 2026 (fresh PgD-ps2 copies, 168 dpi; hover Restore 3 s, pointer away; hover, click Restore, pointer away, +8 s;
+  white "Restore" box pixels at the tip's place): 186tt 3/3 (one with +tooltips) tip drawn while hovering (1699 px), gone after
+  leaving and after the restore click (0 px), Wine reports it hidden; kill switch 2/2 stuck (1699 px after leaving/restore, Wine
+  visible=1); 186 / 185rc / 171 2/2 each stuck.
+
+Kill switch: NEUTRON_TOOLTIP_DELTOOL_HIDE=0
+--- a/dlls/comctl32/tooltips.c	2026-11-09 22:22:52.894700207 -0500
++++ b/dlls/comctl32/tooltips.c	2026-11-09 22:22:52.896954031 -0500
+@@ -1181,6 +1181,19 @@
+     }
+ }
+ 
++static BOOL neutron_deltool_hide(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        char env[8];
++        DWORD len = GetEnvironmentVariableA( "NEUTRON_TOOLTIP_DELTOOL_HIDE", env, sizeof(env) );
++        on = !(len && len < sizeof(env) && env[0] == '0');
++        TRACE( "NEUTRON_TOOLTIP_DELTOOL_HIDE = %d\n", on );
++    }
++    return on;
++}
++
+ static LRESULT
+ TOOLTIPS_DelToolT (TOOLTIPS_INFO *infoPtr, const TTTOOLINFOW *ti, BOOL isW)
+ {
+@@ -1204,6 +1217,17 @@
+     /* make sure the tooltip has disappeared before deleting it */
+     TOOLTIPS_Hide(infoPtr);
+ 
++    /* NEUTRON: deleting the tool a tracking tooltip is showing hides the tooltip, as on Windows (comctl32 6.16 measured:
++     * a shown TTF_TRACK tip is hidden right after TTM_DELTOOL, before any TTM_TRACKACTIVATE(FALSE)). TOOLTIPS_Hide above
++     * only covers the non-tracking current tool, and the index reset below then made the app's following
++     * TTM_TRACKACTIVATE(FALSE) a no-op: Photoshop 2026's caption-button tip ("Restore") stayed on screen for good.
++     * Kill switch NEUTRON_TOOLTIP_DELTOOL_HIDE=0. */
++    if (nTool == infoPtr->nTrackTool && neutron_deltool_hide())
++    {
++        TOOLTIPS_TrackHide(infoPtr);
++        infoPtr->bTrackActive = FALSE;
++    }
++
+     toolPtr = &infoPtr->tools[nTool];
+     TOOLTIPS_FreeToolText (toolPtr);
+     TOOLTIPS_ResetSubclass (toolPtr);

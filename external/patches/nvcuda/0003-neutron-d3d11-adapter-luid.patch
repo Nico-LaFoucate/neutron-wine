@@ -1,0 +1,234 @@
+From: Neutron lab (fx49) 
+Subject: [PATCH] nvcuda: cuD3D11GetDevice/cuD3D11GetDevices answer by adapter LUID, like Windows
+
+What he saw (Neutron#49): a hybrid laptop (Radeon 760M + RTX 5050) where Premiere's export
+loads the CPU. This patch is a Windows-parity fix found on the way, not the cause of that.
+
+Mechanism: wine_cuD3D11GetDevice was a semi-stub. For ANY DXGI adapter -- the AMD/Intel GPU
+of a hybrid laptop too -- it returned CUDA_SUCCESS and device 0, and stored that adapter's LUID
+as a global override that cuDeviceGetLuid then returned for every device. So asking "which CUDA
+device drives the AMD adapter?" answered "the NVIDIA one" and then made the NVIDIA device report
+the AMD LUID. cuD3D11GetDevices was an unimplemented stub (calling it crashed the caller).
+
+Windows: cuD3D11GetDevice returns the CUDA device whose LUID equals the adapter's, and
+CUDA_ERROR_NO_DEVICE (100) for an adapter no CUDA device drives; cuD3D11GetDevices does the same
+for the adapter of a D3D11 device. Now: each CUDA device's LUID is read from the same registry key
+cuDeviceGetLuid already reads (win32u writes it next to the Vulkan UUID) and compared with the
+adapter's. The LUID override stays, but only for the matched device. If no device's LUID can be
+read at all, the old answer (device 0) is kept for an NVIDIA adapter only.
+
+Not covered: cuD3D10GetDevice, cuD3D9GetDevice and cuD3D11CtxCreate still use device 0 (unchanged).
+Multi-NVIDIA machines are untested (one NVIDIA GPU in the lab).
+
+Lab (runtime 11.10-186fx = 186 + this, Premiere 26.5.2.5, emulated hybrid: lavapipe presented as
+a Radeon 760M + __NV_PRIME_RENDER_OFFLOAD=1; probe = gpuprobe + cuD3D11GetDevices per adapter):
+  fix, n=2: GetDevice(NVIDIA) -> 0 dev 0, LUID 3f7; GetDevice(AMD) -> 100, LUID stays 3f7;
+            GetDevices(NVIDIA device) -> 0, 1 device; GetDevices(AMD device) -> 100, 0 devices.
+  NEUTRON_CUDA_D3D_ANY_ADAPTER=1, n=2, same build: GetDevice(AMD) -> 0 dev 0 and cuDeviceGetLuid(0)
+            becomes the AMD LUID 3f6 (= 11.10-186).
+  Premiere on the fix: CUDA renderer offered and current; 28 exports (13 sequences x2 + MRQ x2)
+            all on the GPU path, same CPU cost as 186 (p0 4.5-6 CPU-s, 6-track 22-30 CPU-s per 30 s).
+
+Kill switch: NEUTRON_CUDA_D3D_ANY_ADAPTER=1 (old cuD3D11GetDevice semi-stub and global LUID override).
+---
+--- a/dlls/nvcuda/nvcuda.c
++++ b/dlls/nvcuda/nvcuda.c
+@@ -4278,29 +4278,39 @@
+     else return CUDA_ERROR_INVALID_VALUE;
+ }
+ 
+-/* Neutron: DXGI adapter LUID captured in cuD3D11GetDevice, echoed by cuDeviceGetLuid. */
++/* Neutron: DXGI adapter LUID captured in cuD3D11GetDevice, echoed by cuDeviceGetLuid -- for the
++ * CUDA device that adapter was matched to only (see neutron_cuda_devices_for_adapter). With the
++ * kill switch NEUTRON_CUDA_D3D_ANY_ADAPTER=1 it is the old global override: ANY adapter, device 0. */
+ static LUID g_neutron_adapter_luid;
+ static int  g_neutron_adapter_luid_valid;
++static CUdevice g_neutron_adapter_luid_dev;
++static int  g_neutron_adapter_luid_anydev;
++
++static CUresult device_luid_from_registry(char *luid, unsigned int *deviceNodeMask, CUdevice dev);
+ 
+ CUresult WINAPI wine_cuDeviceGetLuid(char *luid, unsigned int *deviceNodeMask, CUdevice dev)
+ {
+-    CUresult ret;
+-    CUuuid uuid;
+-    char buffer[1024];
+-    KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
+-    KEY_BASIC_INFORMATION *key = (void *)buffer;
+-    HKEY pci, outerdev, innerdev, prop;
+-    DWORD size, i = 0;
+-
+     TRACE("(%p, %p, %d)\n", luid, deviceNodeMask, dev);
+-    if (g_neutron_adapter_luid_valid)
++    if (g_neutron_adapter_luid_valid && (g_neutron_adapter_luid_anydev || dev == g_neutron_adapter_luid_dev))
+     {
+         memcpy(luid, &g_neutron_adapter_luid, sizeof(LUID));
+         if (deviceNodeMask) *deviceNodeMask = 1;
+-        TRACE("neutron-luid: cuDeviceGetLuid dev=%d -> forced adapter LUID %08x:%08x\n",
++        TRACE("neutron-luid: cuDeviceGetLuid dev=%d -> adapter LUID %08x:%08x\n",
+             dev, (unsigned)g_neutron_adapter_luid.HighPart, (unsigned)g_neutron_adapter_luid.LowPart);
+         return CUDA_SUCCESS;
+     }
++    return device_luid_from_registry(luid, deviceNodeMask, dev);
++}
++
++static CUresult device_luid_from_registry(char *luid, unsigned int *deviceNodeMask, CUdevice dev)
++{
++    CUresult ret;
++    CUuuid uuid;
++    char buffer[1024];
++    KEY_VALUE_PARTIAL_INFORMATION *value = (void *)buffer;
++    KEY_BASIC_INFORMATION *key = (void *)buffer;
++    HKEY pci, outerdev, innerdev, prop;
++    DWORD size, i = 0;
+ 
+     if ((ret = pcuDeviceGetUuid(&uuid, dev)) != CUDA_SUCCESS)
+     {
+@@ -6950,15 +6960,81 @@
+     return CUDA_ERROR_UNKNOWN;
+ }
+ 
++/* Neutron (#49): which CUDA devices drive this DXGI adapter. Windows answers by the adapter's LUID:
++ * the CUDA device whose LUID equals it, and CUDA_ERROR_NO_DEVICE for an adapter no CUDA device
++ * drives (the AMD/Intel GPU of a hybrid laptop). Each device's LUID comes from the same registry
++ * key cuDeviceGetLuid reads (win32u writes it next to the Vulkan UUID). Only when no device's LUID
++ * can be read at all do we fall back to the old answer, device 0, and then for an NVIDIA adapter
++ * only. */
++#define NEUTRON_CUDA_ERROR_NO_DEVICE 100
++static CUresult neutron_cuda_devices_for_adapter(IDXGIAdapter *adapter, unsigned int *count,
++                                                 CUdevice *devices, unsigned int max)
++{
++    DXGI_ADAPTER_DESC desc;
++    int n = 0, i, readable = 0;
++    unsigned int found = 0;
++    CUresult ret;
++
++    *count = 0;
++    if (!adapter || FAILED(IDXGIAdapter_GetDesc(adapter, &desc))) return CUDA_ERROR_INVALID_VALUE;
++    if ((ret = pcuDeviceGetCount(&n))) return ret;
++    for (i = 0; i < n; i++)
++    {
++        LUID luid;
++        unsigned int mask;
++        if (device_luid_from_registry((char *)&luid, &mask, i)) continue;
++        readable++;
++        if (luid.LowPart != desc.AdapterLuid.LowPart || luid.HighPart != desc.AdapterLuid.HighPart) continue;
++        if (found < max && devices) devices[found] = i;
++        found++;
++    }
++    if (!readable && n > 0 && desc.VendorId == 0x10de)
++    {
++        WARN("no CUDA device LUID readable; NVIDIA adapter -> device 0\n");
++        if (max && devices) devices[0] = 0;
++        found = 1;
++    }
++    TRACE("adapter %04x:%04x LUID %08x:%08x -> %u CUDA device(s) of %d\n", desc.VendorId, desc.DeviceId,
++          (unsigned)desc.AdapterLuid.HighPart, (unsigned)desc.AdapterLuid.LowPart, found, n);
++    if (!found) return NEUTRON_CUDA_ERROR_NO_DEVICE;
++    *count = found;
++    if (max && devices)
++    {
++        g_neutron_adapter_luid = desc.AdapterLuid;
++        g_neutron_adapter_luid_dev = devices[0];
++        g_neutron_adapter_luid_anydev = 0;
++        g_neutron_adapter_luid_valid = 1;
++    }
++    return CUDA_SUCCESS;
++}
++
++static int neutron_cuda_d3d_any_adapter(void)
++{
++    const char *e = getenv("NEUTRON_CUDA_D3D_ANY_ADAPTER");
++    return e && *e == '1';
++}
++
+ CUresult WINAPI wine_cuD3D11GetDevice(CUdevice *pCudaDevice, IDXGIAdapter *pAdapter)
+ {
+-    FIXME("(%p, %p) - semi-stub\n", pCudaDevice, pAdapter);
++    unsigned int count;
++    CUresult ret;
++
++    TRACE("(%p, %p)\n", pCudaDevice, pAdapter);
++    if (!neutron_cuda_d3d_any_adapter())
++    {
++        if (!pCudaDevice) return CUDA_ERROR_INVALID_VALUE;
++        ret = neutron_cuda_devices_for_adapter(pAdapter, &count, pCudaDevice, 1);
++        TRACE("-> %d, device %d\n", ret, ret ? -1 : *pCudaDevice);
++        return ret;
++    }
++    FIXME("(%p, %p) - semi-stub (NEUTRON_CUDA_D3D_ANY_ADAPTER=1)\n", pCudaDevice, pAdapter);
+     if (pAdapter)
+     {
+         DXGI_ADAPTER_DESC _nd;
+         if (SUCCEEDED(pAdapter->lpVtbl->GetDesc(pAdapter, &_nd)))
+         {
+             g_neutron_adapter_luid = _nd.AdapterLuid;
++            g_neutron_adapter_luid_anydev = 1;
+             g_neutron_adapter_luid_valid = 1;
+             ERR("neutron-luid: D3D adapter LUID=%08x:%08x\n",
+                 (unsigned)_nd.AdapterLuid.HighPart, (unsigned)_nd.AdapterLuid.LowPart);
+@@ -6969,6 +7045,35 @@
+     return pcuDeviceGet(pCudaDevice, 0);
+ }
+ 
++/* Neutron (#49): was an unimplemented stub (calling it crashed the caller). The D3D11 device's DXGI
++ * adapter, then the same LUID match as cuD3D11GetDevice. One adapter per D3D11 device, so every
++ * CUd3d11DeviceList value (all / current frame / next frame) has the same answer. */
++CUresult WINAPI wine_cuD3D11GetDevices(unsigned int *pCudaDeviceCount, CUdevice *pCudaDevices,
++                                       unsigned int cudaDeviceCount, ID3D11Device *pD3D11Device, int deviceList)
++{
++    IDXGIDevice *dxgi_device;
++    IDXGIAdapter *adapter;
++    unsigned int count = 0;
++    CUresult ret;
++
++    TRACE("(%p, %p, %u, %p, %d)\n", pCudaDeviceCount, pCudaDevices, cudaDeviceCount, pD3D11Device, deviceList);
++    if (!pCudaDeviceCount || !pD3D11Device || deviceList < 1 || deviceList > 3) return CUDA_ERROR_INVALID_VALUE;
++    *pCudaDeviceCount = 0;
++    if (FAILED(ID3D11Device_QueryInterface(pD3D11Device, &IID_IDXGIDevice, (void **)&dxgi_device)))
++        return CUDA_ERROR_INVALID_VALUE;
++    if (FAILED(IDXGIDevice_GetAdapter(dxgi_device, &adapter)))
++    {
++        IDXGIDevice_Release(dxgi_device);
++        return CUDA_ERROR_INVALID_VALUE;
++    }
++    ret = neutron_cuda_devices_for_adapter(adapter, &count, pCudaDevices, pCudaDevices ? cudaDeviceCount : 0);
++    IDXGIAdapter_Release(adapter);
++    IDXGIDevice_Release(dxgi_device);
++    if (!ret) *pCudaDeviceCount = count;
++    TRACE("-> %d, %u device(s)\n", ret, count);
++    return ret;
++}
++
+ /* NEUTRON 2026-08-02: CUDA <-> Direct3D 11 interop.
+  *
+  * Linux's libcuda has NO cuD3D11 / cuGraphicsD3D entry points at all, so this can never be a
+--- a/dlls/nvcuda/nvcuda.spec
++++ b/dlls/nvcuda/nvcuda.spec
+@@ -58,7 +58,7 @@
+ @ stdcall cuD3D11CtxCreate_v2(ptr ptr long ptr) wine_cuD3D11CtxCreate_v2
+ @ stub cuD3D11CtxCreateOnDevice
+ @ stdcall cuD3D11GetDevice(ptr ptr) wine_cuD3D11GetDevice
+-@ stub cuD3D11GetDevices
++@ stdcall cuD3D11GetDevices(ptr ptr long ptr long) wine_cuD3D11GetDevices
+ @ stub cuD3D11GetDirect3DDevice
+ @ stub cuD3D9Begin
+ @ stdcall cuD3D9CtxCreate(ptr ptr long ptr) wine_cuD3D9CtxCreate
+--- a/dlls/nvcuda/function_mappings.c
++++ b/dlls/nvcuda/function_mappings.c
+@@ -369,6 +369,7 @@
+ extern void wine_cuProfilerStart(void);
+ extern void wine_cuProfilerStop(void);
+ extern void wine_cuD3D11GetDevice(void);
++extern void wine_cuD3D11GetDevices(void);
+ extern void wine_cuGraphicsD3D11RegisterResource(void);
+ extern void wine_cuD3D10GetDevice(void);
+ extern void wine_cuGraphicsD3D10RegisterResource(void);
+@@ -1096,6 +1097,7 @@
+     {"cuProfilerStart", 4000, 0, wine_cuProfilerStart},
+     {"cuProfilerStop", 4000, 0, wine_cuProfilerStop},
+     {"cuD3D11GetDevice", 3000, 0, wine_cuD3D11GetDevice},
++    {"cuD3D11GetDevices", 3000, 0, wine_cuD3D11GetDevices},
+     {"cuGraphicsD3D11RegisterResource", 3000, 0, wine_cuGraphicsD3D11RegisterResource},
+     {"cuD3D10GetDevice", 2010, 0, wine_cuD3D10GetDevice},
+     {"cuGraphicsD3D10RegisterResource", 3000, 0, wine_cuGraphicsD3D10RegisterResource},

@@ -215,7 +215,8 @@ must = {
                                                   b"NEUTRON_VKD3D_LIST_KEEPS_ALLOCATOR",    # 0003, 11.10-151
                                                   b"NEUTRON_VKD3D_BTW_IDLE_WAIT"],          # 0004, 11.10-186
     "nvidia-libs/x86_64-unix/nvcuda.dll": [b"NEUTRON_CUDA_PLAYBACK_EXPERIMENT",
-                                           b"NEUTRON_CUDA_D3D_INTEROP"],               # 0002, 11.10-122
+                                           b"NEUTRON_CUDA_D3D_INTEROP",                # 0002, 11.10-122
+                                           b"NEUTRON_CUDA_D3D_ANY_ADAPTER"],           # 0003, 11.10-187
     # SveSop's additions (patches/dxvk-nvapi), absent from plain v0.9.2.
     "nvapi/x86_64-windows/nvapi64.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],
     "nvapi/i386-windows/nvapi.dll": [b"NvAPI_GPU_ClientFanCoolersGetStatus", b"NvAPI_GPU_GetGPCMask"],

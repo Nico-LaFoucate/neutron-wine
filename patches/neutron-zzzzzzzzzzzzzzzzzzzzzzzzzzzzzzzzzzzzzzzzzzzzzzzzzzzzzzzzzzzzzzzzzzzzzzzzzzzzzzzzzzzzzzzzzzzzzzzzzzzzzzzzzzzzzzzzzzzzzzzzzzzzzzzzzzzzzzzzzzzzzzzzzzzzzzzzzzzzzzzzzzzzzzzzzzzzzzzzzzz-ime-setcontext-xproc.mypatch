@@ -1,0 +1,125 @@
+win32u: send WM_IME_SETCONTEXT to a focus window that belongs to another process (Windows parity).
+
+What he saw (Illustrator 2026, runtime 186): "ctrl q did not work after clicking on those panels. It only worked after I
+clicked somewhere else". This patch is a Windows-parity fix found while chasing that report; it does NOT change that
+report's lab repro (see evidence). It ships on parity grounds.
+
+Mechanism: set_focus_window() sends WM_IME_INTERNAL (IME_INTERNAL_ACTIVATE / _DEACTIVATE) to the default IME window of
+the old and the new focus window; imm32 on that window's thread turns it into WM_IME_SETCONTEXT(0/1). The IME window comes
+from get_default_ime_window(), which only knows THIS process's threads (thread_data_list). When the focus moves to or from
+a window of ANOTHER process (attached input, e.g. Adobe's CEPHtmlEngine panel inside an Illustrator panel), the lookup gave
+0 and that window never got WM_IME_SETCONTEXT.
+
+Windows (his PC, probe xmodal: panel B1 > B2 in a second process, child of process A's popup H):
+  A SetFocus(B2):   M WM_KILLFOCUS to=B2, M WM_IME_SETCONTEXT 0, B2 WM_IME_SETCONTEXT 1, B2 WM_SETFOCUS from=M
+  A SetFocus(G):    B2 WM_KILLFOCUS to=G, B2 WM_IME_SETCONTEXT 0, G WM_IME_SETCONTEXT 1, G WM_SETFOCUS from=B2
+  B SetFocus(H):    B1 WM_IME_SETCONTEXT 0, H WM_IME_SETCONTEXT 1, H WM_SETFOCUS from=B1
+Wine 186 lacked "B2 IME 1", "B2 IME 0" and "H IME 1" in those blocks.
+
+Fix: when get_default_ime_window() has no answer for the old/new focus window and that window belongs to another process,
+find that thread's default IME window (top-level class "IME", title "Default IME", same thread id; register_imm_window
+creates exactly that) and send it the same WM_IME_INTERNAL. Same order as before (KILLFOCUS, IME 0, IME 1, SETFOCUS).
+The other process's IME window is not re-owned (neutron_ime_follow stays per-process). Same-process windows: unchanged
+code path (the helper returns 0 at once).
+
+Not covered: ImmGetDefaultIMEWnd() of another process's window still returns NULL (Windows returns that thread's IME
+window); Wine's transient WM_SETFOCUS to the host popup when another thread focuses a child inside it, Windows' extra
+"G KILLFOCUS to=G" on the open path, and Wine's extra NCACTIVATE/ACTIVATE/ACTIVATEAPP at xmodal teardown are separate
+differences, not touched. FindWindowEx walks all "IME" top-levels once per cross-process focus change (one server call).
+
+Lab evidence (lab runtime 11.10-186ic = 186 + this win32u, x86_64 + i386; kill-switch arms on the same build):
+- xmodal: 186ic 2/2 identical, IME_SETCONTEXT lines in Windows' order in all three blocks above; kill 2/2 identical, = 186.
+- Wine conformance (built standalone): imm32 5504 tests 78 failures both arms, same lines; user32 win 87418/67 both arms;
+  msg 110,108 vs 107,108 and input 81,119 vs 168,119 (timer/layout-change noise, no consistent direction).
+- Illustrator CEP-restore repro (Libraries panel focus + Save prompt + Escape, then Ctrl+Q): dead 2/2 on 186ic, 2/2 kill.
+  The CEP page still never regains focus (CDP document.hasFocus false). Not the cause of that repro.
+- His steps (File > New > Create, one click on Properties or Layers, Ctrl+Q): worked 2/2 + 2/2 on both builds.
+- Regression n=1 per arm: typing into a CEP page text input and into Illustrator's native Properties field, Photoshop
+  Ctrl+N + Ctrl+Q, Premiere Ctrl+O + Ctrl+Q, Notepad typing "abc def": same on both arms (n=1 each).
+
+Kill switch: NEUTRON_IME_SETCONTEXT_XPROC=0.
+
+--- a/dlls/win32u/imm.c
++++ b/dlls/win32u/imm.c
+@@ -409,6 +409,43 @@
+     return ret;
+ }
+ 
++/* NEUTRON: the default IME window of a window that belongs to ANOTHER PROCESS.
++ *
++ * get_default_ime_window() only knows this process's threads, so set_focus_window() sent no WM_IME_INTERNAL to the IME
++ * window of another process's focus window, and imm32 never sent that window WM_IME_SETCONTEXT. Windows does: measured on
++ * Windows 11 (probe xmodal, panel B1 > B2 in a second process inside process A's popup H): A's SetFocus(B2) gives
++ * "M WM_KILLFOCUS to=B2, M WM_IME_SETCONTEXT 0, B2 WM_IME_SETCONTEXT 1, B2 WM_SETFOCUS from=M"; A's SetFocus(G) away from B2
++ * gives "B2 WM_KILLFOCUS to=G, B2 WM_IME_SETCONTEXT 0"; B's SetFocus(H) gives "H WM_IME_SETCONTEXT 1, H WM_SETFOCUS".
++ * The default IME window is a top-level "IME" window titled "Default IME" created by the thread (register_imm_window),
++ * so it is found by class, title and thread. Kill switch NEUTRON_IME_SETCONTEXT_XPROC=0. */
++static int neutron_ime_setcontext_xproc(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv( "NEUTRON_IME_SETCONTEXT_XPROC" ); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++HWND neutron_other_process_ime_window( HWND hwnd )
++{
++    static const WCHAR imeW[] = {'I','M','E',0};
++    static const WCHAR default_imeW[] = {'D','e','f','a','u','l','t',' ','I','M','E',0};
++    UNICODE_STRING class_name = RTL_CONSTANT_STRING( imeW );
++    UNICODE_STRING title = RTL_CONSTANT_STRING( default_imeW );
++    DWORD thread_id, pid = 0;
++    HWND ime = 0;
++    int guard = 0;
++
++    if (!hwnd || !neutron_ime_setcontext_xproc()) return 0;
++    if (!(thread_id = get_window_thread( hwnd, &pid ))) return 0;
++    if (pid == GetCurrentProcessId()) return 0;  /* get_default_ime_window() answers for our own threads */
++
++    while (guard++ < 4096 && (ime = NtUserFindWindowEx( 0, ime, &class_name, &title, 0 )))
++        if (get_window_thread( ime, NULL ) == thread_id) break;
++
++    TRACE( "other-process default for %p (tid %04x) is %p\n", hwnd, (UINT)thread_id, ime );
++    return ime;
++}
++
+ void cleanup_imm_thread(void)
+ {
+     struct user_thread_info *thread_info = get_user_thread_info();
+--- a/dlls/win32u/input.c
++++ b/dlls/win32u/input.c
+@@ -1980,6 +1980,8 @@
+         send_message( previous, WM_KILLFOCUS, (WPARAM)hwnd, 0 );
+ 
+         ime_hwnd = get_default_ime_window( previous );
++        /* NEUTRON: another process's focus window gets WM_IME_SETCONTEXT too, as on Windows (imm.c) */
++        if (!ime_hwnd) ime_hwnd = neutron_other_process_ime_window( previous );
+         if (ime_hwnd)
+             send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_DEACTIVATE,
+                           HandleToUlong(previous) );
+@@ -1988,9 +1990,14 @@
+     }
+     if (is_window(hwnd))
+     {
++        HWND xproc_ime;
++
+         ime_hwnd = get_default_ime_window( hwnd );
+-        if (ime_hwnd)
+-            send_message( ime_hwnd, WM_IME_INTERNAL, IME_INTERNAL_ACTIVATE,
++        /* NEUTRON: another process's focus window gets WM_IME_SETCONTEXT too, as on Windows (imm.c); its IME window
++         * stays where its own thread put it (no neutron_ime_follow across processes) */
++        xproc_ime = ime_hwnd ? 0 : neutron_other_process_ime_window( hwnd );
++        if (ime_hwnd || xproc_ime)
++            send_message( ime_hwnd ? ime_hwnd : xproc_ime, WM_IME_INTERNAL, IME_INTERNAL_ACTIVATE,
+                           HandleToUlong(hwnd) );
+         /* NEUTRON: the focus window's thread hands its IME window to the focus window's top level (window.c) */
+         neutron_ime_follow( ime_hwnd, hwnd );
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -93,6 +93,7 @@
+ /* imm.c */
+ extern void cleanup_imm_thread(void);
+ extern HWND get_default_ime_window( HWND hwnd );
++extern HWND neutron_other_process_ime_window( HWND hwnd );
+ extern HIMC get_default_input_context(void);
+ extern HIMC get_window_input_context( HWND hwnd );
+ extern BOOL register_imm_window( HWND hwnd );
