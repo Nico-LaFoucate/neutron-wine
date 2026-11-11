@@ -1,0 +1,155 @@
+server: list the window under the pointer first in WindowFromPoint (Mister Horse dialogs ignored clicks)
+
+The Mister Horse Product Manager (a JUCE 8 app) asks for confirmation in small dialogs ("Do you
+really want to uninstall Starter Pack?"). Their buttons answered Enter but no mouse click.
+
+The Product Manager keeps its main window always on top (SetWindowPos HWND_TOPMOST); its dialogs
+are not. Under Wayland the compositor draws the dialog in front, but it never tells Wine, so in
+Wine's z-order the topmost main window stays above the dialog. The clicks themselves reached the
+dialog (winewayland sends them with the dialog's hwnd), but JUCE checks every mouse event with
+ComponentPeer::contains(), which is WindowFromPoint() == its own window. WindowFromPoint() over
+the dialog answered "main window", so JUCE dropped every click and every hover.
+
+The driver does know which window is in front where the pointer is: each mouse event carries the
+hwnd of the surface the pointer is on, and the server keeps it as desktop->cursor_win
+(update_desktop_cursor_pos). In a desktop-scope get_window_children_from_point, when that window's
+top-level covers the point and the cursor is still on it, it is now listed before the windows
+Wine stacks above it. When it already comes first nothing changes, and lookups inside a window
+(ChildWindowFromPoint, message hit-testing) are not touched.
+
+Measured with WINEDEBUG=+waylanddrv: pointer_handle_button hwnd=<dialog> for every click, the main
+window ex-style 0x40108 (WS_EX_TOPMOST), the dialog 0x40100. Taking the topmost flag off the main
+window by hand (SetWindowPos HWND_NOTOPMOST from another process) made the clicks work; with this
+patch they work without that.
+
+NEUTRON_CURSOR_STACKING=0 turns it off. The first lookups it changes are logged as
+neutron-cursorstack.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/server/window.c b/server/window.c
+--- a/server/window.c
++++ b/server/window.c
+@@ -22,6 +22,8 @@
+ 
+ #include <assert.h>
+ #include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -1153,28 +1155,101 @@
+     return parent;  /* not found any child */
+ }
+ 
+-/* find all children of 'parent' that contain the given point */
+ static int get_window_children_from_point( struct window *parent, int x, int y, unsigned int dpi,
+-                                           struct user_handle_array *array )
++                                           struct user_handle_array *array );
++
++/* add 'ptr' and its children that contain the given point, if 'ptr' contains it */
++static int add_window_from_point( struct window *ptr, int x, int y, unsigned int dpi,
++                                  struct user_handle_array *array )
+ {
+-    struct window *ptr;
++    int x_child = x, y_child = y;
++
++    if (!is_point_in_window( ptr, &x_child, &y_child, dpi )) return 1;  /* skip it */
++
++    /* if point is in client area, and window is not minimized or disabled, check children */
++    if (!(ptr->style & (WS_MINIMIZE|WS_DISABLED)) && point_in_rect( &ptr->client_rect, x_child, y_child ))
++    {
++        if (!get_window_children_from_point( ptr, x_child - ptr->client_rect.left,
++                                             y_child - ptr->client_rect.top, get_window_dpi( ptr ), array ))
++            return 0;
++    }
++
++    /* now add window to the array */
++    return add_handle_to_array( array, ptr->handle );
++}
++
++/* NEUTRON cursor-stacking: under Wayland the compositor, not Wine, decides which top-level window is in front,
++ * and it never tells Wine. Wine's own z-order can then disagree with the screen: the Mister Horse Product
++ * Manager keeps its main window WS_EX_TOPMOST, its confirmation dialogs are not, so Wine keeps the main window
++ * above a dialog the compositor draws in front of it. WindowFromPoint over the dialog answered "main window",
++ * and JUCE (ComponentPeer::contains) drops every mouse event whose point WindowFromPoint does not give back to
++ * the window itself: no click reached the dialog's buttons, only the keyboard (Enter) worked.
++ *
++ * The driver does know which window the pointer is on: it reports the hwnd of the surface the pointer entered
++ * with every mouse event, and that is desktop->cursor_win (update_desktop_cursor_pos). So when a desktop-scope
++ * lookup hits that window at a point it covers, while the cursor is still on it, it is listed first: that is
++ * the window the user sees there. Nothing changes when it is already first among the windows at that point.
++ * Kill switch NEUTRON_CURSOR_STACKING=0. */
++static int neutron_cursor_stacking(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_CURSOR_STACKING" );
++        on = !(e && e[0] == '0');
++        if (!on) fprintf( stderr, "neutron-gateresolved: NEUTRON_CURSOR_STACKING = 0 (environment)\n" );
++    }
++    return on;
++}
++
++static struct window *neutron_cursor_top_window( struct window *parent, int x, int y, unsigned int dpi )
++{
++    static unsigned int logged;
++    struct desktop *desktop = parent->desktop;
++    struct window *win, *ptr;
++    int px = x, py = y, cx, cy;
++
++    if (!desktop || parent != desktop->top_window || !desktop->cursor_win) return NULL;
++    if (!neutron_cursor_stacking()) return NULL;
++    if (!(win = get_user_object( desktop->cursor_win, NTUSER_OBJ_WINDOW ))) return NULL;
++    while (win->parent && win->parent != parent) win = win->parent;  /* its top-level window */
++    if (win->parent != parent) return NULL;
++
++    if (!is_point_in_window( win, &px, &py, dpi )) return NULL;  /* the point is not on it */
++    cx = desktop->shared->cursor.x;
++    cy = desktop->shared->cursor.y;
++    map_point_raw_to_virt( desktop, &cx, &cy );
++    if (!is_point_in_window( win, &cx, &cy, 0 )) return NULL;  /* the cursor has left it */
+ 
+     LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
+     {
+         int x_child = x, y_child = y;
+ 
+-        if (!is_point_in_window( ptr, &x_child, &y_child, dpi )) continue;  /* skip it */
+-
+-        /* if point is in client area, and window is not minimized or disabled, check children */
+-        if (!(ptr->style & (WS_MINIMIZE|WS_DISABLED)) && point_in_rect( &ptr->client_rect, x_child, y_child ))
++        if (ptr == win) return NULL;  /* already first at this point */
++        if (!is_point_in_window( ptr, &x_child, &y_child, dpi )) continue;
++        if (logged < 8)
+         {
+-            if (!get_window_children_from_point( ptr, x_child - ptr->client_rect.left,
+-                                                 y_child - ptr->client_rect.top, get_window_dpi( ptr ), array ))
+-                return 0;
++            logged++;
++            fprintf( stderr, "neutron-cursorstack: point (%d,%d): %08x is under the pointer, listed before %08x "
++                     "which Wine stacks above it\n", x, y, win->handle, ptr->handle );
+         }
++        return win;
++    }
++    return NULL;
++}
++
++/* find all children of 'parent' that contain the given point */
++static int get_window_children_from_point( struct window *parent, int x, int y, unsigned int dpi,
++                                           struct user_handle_array *array )
++{
++    struct window *ptr, *first = neutron_cursor_top_window( parent, x, y, dpi );
+ 
+-        /* now add window to the array */
+-        if (!add_handle_to_array( array, ptr->handle )) return 0;
++    if (first && !add_window_from_point( first, x, y, dpi, array )) return 0;
++
++    LIST_FOR_EACH_ENTRY( ptr, &parent->children, struct window, entry )
++    {
++        if (ptr == first) continue;
++        if (!add_window_from_point( ptr, x, y, dpi, array )) return 0;
+     }
+     return 1;
+ }
