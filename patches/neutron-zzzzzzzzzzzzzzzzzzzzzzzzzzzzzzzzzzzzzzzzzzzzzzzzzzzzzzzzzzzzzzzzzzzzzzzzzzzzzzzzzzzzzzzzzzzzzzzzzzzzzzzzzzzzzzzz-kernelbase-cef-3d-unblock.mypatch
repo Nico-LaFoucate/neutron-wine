@@ -1,0 +1,174 @@
+kernelbase: let Adobe CEP panels use WebGL in their first seconds (Mister Horse previews)
+
+Adobe's CEP panels run in CEPHtmlEngine (Chromium 99). Under Wine its GPU context is lost about
+0.3 s after a panel opens and recovers on its own, but Chromium then blocks WebGL for every domain
+for 10 s. Animation Composer and Premiere Composer check for WebGL2 at about 1.3 s, get "Failed to
+create a WebGL2 context", remember that for the life of the panel and leave every item at
+"Loading preview".
+
+CEP hands the browser process its Chromium switches as a base64 JSON array in a fixed position of
+the command line (adding another argument makes the panel stay grey), and the panel manifests are
+signed, so the switch --disable-domain-blocking-for-3d-apis is added inside that JSON array when
+CEPHtmlEngine.exe starts its browser process. Child processes (--type=...) are left alone.
+Set NEUTRON_CEF_3D_UNBLOCK=0 to turn it off.
+
+--- a/dlls/kernelbase/process.c
++++ b/dlls/kernelbase/process.c
+@@ -589,6 +589,146 @@
+     return 1;
+ }
+ 
++/* NEUTRON cef-3d-unblock: let a CEP panel ask for WebGL in its first ten seconds.
++ *
++ * CEPHtmlEngine (the Chromium inside every Adobe extension panel) loses its GPU context once, about
++ * 0.3 s after a panel opens under Neutron. Chromium answers a context loss of unknown cause by
++ * blocking WebGL for EVERY page for ten seconds (GpuDataManagerImpl, kBlockAllDomainsMs = 10000);
++ * a page that asks inside that window gets "Failed to create a WebGL2 context."
++ *
++ * Mister Horse Animation Composer asks exactly once, about 1.3 s after its panel opens, and keeps the
++ * answer: its preview player decided "no WebGL2" and every item stayed on "Loading preview" for the
++ * whole session. Measured by probing getContext('webgl2') every 200 ms from the panel: available at
++ * 0.19 s, refused from 0.41 s, available again at 10.28 s.
++ *
++ * Chromium's --disable-domain-blocking-for-3d-apis turns that block off (the GPU context recovers on
++ * its own; the block is what kept the page from using it); added to the panel's CSXS/manifest.xml it
++ * fixes the previews. Manifests are signed, though (CEP refuses an edited one outside debug mode),
++ * so the switch is added where CEP passes the manifest's switches on: PlugPlug starts the panel's
++ * browser process as
++ *     CEPHtmlEngine.exe <page> <id> <pid> <host> <version> <extension> ... <base64 JSON array> ...
++ * with a FIXED number of positional arguments, the <CEFCommandLine> parameters being the base64 of
++ * a JSON array of strings (["--enable-nodejs","--allow-file-access",...]). An argument appended to
++ * the command line breaks that count and the panel never starts (it stays grey), so the switch goes
++ * INTO that array. Only the browser process (no --type=) is touched; its GPU and renderer children
++ * get their switches from it. Kill switch NEUTRON_CEF_3D_UNBLOCK=0. */
++static const char neutron_b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++static int neutron_b64_val( WCHAR c )
++{
++    if (c >= 'A' && c <= 'Z') return c - 'A';
++    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++    if (c >= '0' && c <= '9') return c - '0' + 52;
++    if (c == '+') return 62;
++    if (c == '/') return 63;
++    return -1;
++}
++
++/* base64 text [s, s + n) -> bytes; NULL unless it is well-formed base64 */
++static char *neutron_b64_decode( const WCHAR *s, int n, int *out_len )
++{
++    char *out;
++    int i, o = 0;
++
++    if (n < 4 || n % 4) return NULL;
++    for (i = 0; i < n; i++)
++        if (neutron_b64_val( s[i] ) < 0 && !(s[i] == '=' && i >= n - 2)) return NULL;
++    if (s[n - 2] == '=' && s[n - 1] != '=') return NULL;
++    if (!(out = RtlAllocateHeap( GetProcessHeap(), 0, n / 4 * 3 + 1 ))) return NULL;
++    for (i = 0; i < n; i += 4)
++    {
++        int a = neutron_b64_val( s[i] ), b = neutron_b64_val( s[i + 1] );
++        int c = neutron_b64_val( s[i + 2] ), d = neutron_b64_val( s[i + 3] );
++        out[o++] = (a << 2) | (b >> 4);
++        if (c >= 0) out[o++] = ((b & 15) << 4) | (c >> 2);
++        if (c >= 0 && d >= 0) out[o++] = ((c & 3) << 6) | d;
++    }
++    out[o] = 0;
++    *out_len = o;
++    return out;
++}
++
++static BOOL neutron_cef_3d_unblock( const WCHAR *app_name, WCHAR **cmd_line )
++{
++    static const char sw[] = "\"--disable-domain-blocking-for-3d-apis\"";
++    static int on = -1;
++    const WCHAR *base, *p, *start, *end;
++    WCHAR buf[4], *new_cmd;
++    char *json, *json2;
++    int jlen, j2len, i, o, enc_len, prefix, suffix;
++
++    if (!app_name || !*cmd_line) return FALSE;
++    base = wcsrchr( app_name, '\\' );
++    base = base ? base + 1 : app_name;
++    if (wcsicmp( base, L"CEPHtmlEngine.exe" )) return FALSE;
++    if (on < 0)
++    {
++        DWORD n = GetEnvironmentVariableW( L"NEUTRON_CEF_3D_UNBLOCK", buf, ARRAY_SIZE(buf) );
++        on = !(n && n < ARRAY_SIZE(buf) && buf[0] == '0');
++    }
++    if (!on || wcsstr( *cmd_line, L"--type=" )) return FALSE;
++
++    for (p = *cmd_line; *p; p = *end ? end + 1 : end)
++    {
++        while (*p == ' ' || *p == '\t') p++;
++        if (!*p) break;
++        if (*p == '"') { start = p + 1; end = wcschr( start, '"' ); if (!end) break; }
++        else { start = p; for (end = p; *end && *end != ' ' && *end != '\t'; end++); }
++
++        if (!(json = neutron_b64_decode( start, end - start, &jlen ))) continue;
++        if (jlen < 2 || json[0] != '[' || json[jlen - 1] != ']' || (jlen > 2 && json[1] != '"'))
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, json );
++            continue;
++        }
++        if (strstr( json, "disable-domain-blocking-for-3d-apis" ))
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, json );
++            return FALSE;
++        }
++        /* [..."x"] -> [..."x","--disable-domain-blocking-for-3d-apis"] */
++        j2len = jlen + 1 + sizeof(sw) - 1;
++        if (!(json2 = RtlAllocateHeap( GetProcessHeap(), 0, j2len + 1 )))
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, json );
++            return FALSE;
++        }
++        memcpy( json2, json, jlen - 1 );
++        o = jlen - 1;
++        if (jlen > 2) json2[o++] = ',';
++        memcpy( json2 + o, sw, sizeof(sw) - 1 );
++        o += sizeof(sw) - 1;
++        json2[o++] = ']';
++        RtlFreeHeap( GetProcessHeap(), 0, json );
++
++        enc_len = (o + 2) / 3 * 4;
++        prefix = start - *cmd_line;
++        suffix = lstrlenW( end );
++        if (!(new_cmd = RtlAllocateHeap( GetProcessHeap(), 0, (prefix + enc_len + suffix + 1) * sizeof(WCHAR) )))
++        {
++            RtlFreeHeap( GetProcessHeap(), 0, json2 );
++            return FALSE;
++        }
++        memcpy( new_cmd, *cmd_line, prefix * sizeof(WCHAR) );
++        for (i = 0; i < o; i += 3)
++        {
++            unsigned int v = (unsigned char)json2[i] << 16;
++            if (i + 1 < o) v |= (unsigned char)json2[i + 1] << 8;
++            if (i + 2 < o) v |= (unsigned char)json2[i + 2];
++            new_cmd[prefix++] = neutron_b64[(v >> 18) & 63];
++            new_cmd[prefix++] = neutron_b64[(v >> 12) & 63];
++            new_cmd[prefix++] = i + 1 < o ? neutron_b64[(v >> 6) & 63] : '=';
++            new_cmd[prefix++] = i + 2 < o ? neutron_b64[v & 63] : '=';
++        }
++        memcpy( new_cmd + prefix, end, (suffix + 1) * sizeof(WCHAR) );
++        RtlFreeHeap( GetProcessHeap(), 0, json2 );
++        TRACE( "neutron-cef-3d: %s\n", debugstr_w(new_cmd) );
++        *cmd_line = new_cmd;
++        return TRUE;
++    }
++    return FALSE;
++}
++
+ /**********************************************************************
+  *           CreateProcessInternalW   (kernelbase.@)
+  */
+@@ -638,6 +778,10 @@
+             HeapFree( GetProcessHeap(), 0, p );
+     }
+ 
++    p = tidy_cmdline;
++    if (neutron_cef_3d_unblock( app_name, &tidy_cmdline ) && p != cmd_line)
++        HeapFree( GetProcessHeap(), 0, p );
++
+     /* Warn if unsupported features are used */
+ 
+     if (flags & (IDLE_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS |

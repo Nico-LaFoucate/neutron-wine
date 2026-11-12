@@ -1,0 +1,223 @@
+kernelbase: add ReadDirectoryChangesExW (Mister Horse plugins crashed Premiere and After Effects)
+
+Premiere Pro and After Effects crashed on start once the Mister Horse Product Manager was
+installed in the prefix (Animation Composer, Premiere Composer). The backtrace has one line:
+
+    Unhandled exception: unimplemented function KERNEL32.dll.ReadDirectoryChangesExW
+    called in 64-bit code
+    1 mhpc_controlsurface.acsrf (+0xacab0)
+
+ReadDirectoryChangesExW (Windows 10 1709+) is ReadDirectoryChangesW with one extra argument, the
+record format. kernel32 did not export it at all, so the first call aborted. The Mister Horse
+plugins (MHPC_ControlSurface.acsrf, AnimationComposer4.aex, MHPC_AeRenderHelper.aex) all import it:
+they ask for ReadDirectoryNotifyExtendedInformation and, when that call fails, go on with
+ReadDirectoryChangesW (MHPC_ControlSurface.acsrf+0xaca60: ExW with class 2, and on FALSE the same
+call through ReadDirectoryChangesW). The folder they watch only exists once the Product Manager
+is installed, which is why the crash starts then.
+
+This adds the export:
+- ReadDirectoryNotifyInformation: the same call as ReadDirectoryChangesW, same records.
+- ReadDirectoryNotifyExtendedInformation: fails with ERROR_NOT_SUPPORTED. Windows supports it
+  only on some file systems, so callers already need the fallback; Wine has no
+  NtNotifyChangeDirectoryFileEx to build it on.
+- any other class: ERROR_INVALID_PARAMETER (STATUS_INVALID_INFO_CLASS).
+
+READ_DIRECTORY_NOTIFY_INFORMATION_CLASS goes in minwinbase.h, as in the Windows SDK. The test in
+kernel32/tests/change.c checks the plain class against a file creation and marks the extended class
+todo_wine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
+index 87eb83a..c273924 100644
+--- a/dlls/kernel32/kernel32.spec
++++ b/dlls/kernel32/kernel32.spec
+@@ -1232,6 +1232,7 @@
+ @ stdcall -import ReadConsoleOutputCharacterW(long ptr long long ptr)
+ @ stdcall -import ReadConsoleOutputW(long ptr long long ptr)
+ @ stdcall -import ReadConsoleW(long ptr long ptr ptr)
++@ stdcall -import ReadDirectoryChangesExW(long ptr long long long ptr ptr ptr long)
+ @ stdcall -import ReadDirectoryChangesW(long ptr long long long ptr ptr ptr)
+ @ stdcall -import ReadFile(long ptr long ptr ptr)
+ @ stdcall -import ReadFileEx(long ptr long ptr ptr)
+diff --git a/dlls/kernel32/tests/change.c b/dlls/kernel32/tests/change.c
+index f89d3ba..67b0678 100644
+--- a/dlls/kernel32/tests/change.c
++++ b/dlls/kernel32/tests/change.c
+@@ -1085,6 +1085,90 @@ static void test_ffcn_directory_overlap(void)
+     ok(ret, "RemoveDirectoryA error: %ld\n", GetLastError());
+ }
+ 
++static void test_readdirectorychangesex(void)
++{
++    BOOL (WINAPI *pReadDirectoryChangesExW)(HANDLE, void *, DWORD, BOOL, DWORD, DWORD *,
++                                            OVERLAPPED *, LPOVERLAPPED_COMPLETION_ROUTINE,
++                                            READ_DIRECTORY_NOTIFY_INFORMATION_CLASS);
++    static const WCHAR szFile[] = L"file";
++    WCHAR path[MAX_PATH], file[MAX_PATH];
++    FILE_NOTIFY_INFORMATION *fni;
++    DWORD buffer[0x1000], count, r;
++    OVERLAPPED ov;
++    HANDLE hdir, hfile;
++    BOOL ret;
++
++    pReadDirectoryChangesExW = (void *)GetProcAddress( GetModuleHandleA("kernel32.dll"),
++                                                       "ReadDirectoryChangesExW" );
++    if (!pReadDirectoryChangesExW)
++    {
++        win_skip( "ReadDirectoryChangesExW is not available\n" );
++        return;
++    }
++
++    GetTempPathW( MAX_PATH, path );
++    lstrcatW( path, L"rdcex" );
++    lstrcpyW( file, path );
++    lstrcatW( file, L"\\" );
++    lstrcatW( file, szFile );
++    DeleteFileW( file );
++    RemoveDirectoryW( path );
++
++    ret = CreateDirectoryW( path, NULL );
++    ok( ret, "failed to create directory, error %lu\n", GetLastError() );
++
++    hdir = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL );
++    ok( hdir != INVALID_HANDLE_VALUE, "failed to open directory, error %lu\n", GetLastError() );
++
++    memset( &ov, 0, sizeof(ov) );
++    ov.hEvent = CreateEventW( NULL, FALSE, FALSE, NULL );
++
++    /* An unknown information class is rejected. */
++    SetLastError( 0xdeadbeef );
++    ret = pReadDirectoryChangesExW( hdir, buffer, sizeof(buffer), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME,
++                                    NULL, &ov, NULL, 0 );
++    ok( !ret, "ReadDirectoryChangesExW succeeded with information class 0\n" );
++
++    /* ReadDirectoryNotifyInformation returns the same records as ReadDirectoryChangesW. */
++    ret = pReadDirectoryChangesExW( hdir, buffer, sizeof(buffer), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME,
++                                    NULL, &ov, NULL, ReadDirectoryNotifyInformation );
++    ok( ret, "ReadDirectoryChangesExW failed, error %lu\n", GetLastError() );
++
++    hfile = CreateFileW( file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
++    ok( hfile != INVALID_HANDLE_VALUE, "failed to create file, error %lu\n", GetLastError() );
++    CloseHandle( hfile );
++
++    r = WaitForSingleObject( ov.hEvent, 1000 );
++    ok( r == WAIT_OBJECT_0, "event should be ready, got %lu\n", r );
++    ret = GetOverlappedResult( hdir, &ov, &count, FALSE );
++    ok( ret, "GetOverlappedResult failed, error %lu\n", GetLastError() );
++    ok( count >= sizeof(*fni), "got %lu bytes\n", count );
++
++    fni = (FILE_NOTIFY_INFORMATION *)buffer;
++    ok( fni->NextEntryOffset == 0, "there should be no more events in buffer\n" );
++    ok( fni->Action == FILE_ACTION_ADDED, "Action = %lu\n", fni->Action );
++    ok( fni->FileNameLength == lstrlenW(szFile) * sizeof(WCHAR),
++        "FileNameLength = %lu\n", fni->FileNameLength );
++    ok( !memcmp( fni->FileName, szFile, lstrlenW(szFile) * sizeof(WCHAR) ), "FileName = %s\n",
++        wine_dbgstr_wn( fni->FileName, fni->FileNameLength / sizeof(WCHAR) ) );
++
++    /* NTFS supports the extended records; Wine does not yet, and callers fall back. */
++    ret = pReadDirectoryChangesExW( hdir, buffer, sizeof(buffer), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME,
++                                    NULL, &ov, NULL, ReadDirectoryNotifyExtendedInformation );
++    todo_wine ok( ret, "ReadDirectoryChangesExW failed, error %lu\n", GetLastError() );
++    if (ret)
++    {
++        CancelIo( hdir );
++        WaitForSingleObject( ov.hEvent, 1000 );
++    }
++
++    CloseHandle( ov.hEvent );
++    CloseHandle( hdir );
++    DeleteFileW( file );
++    RemoveDirectoryW( path );
++}
++
+ START_TEST(change)
+ {
+     test_ffcnMultipleThreads();
+@@ -1097,5 +1181,6 @@ START_TEST(change)
+     test_readdirectorychanges_null();
+     test_readdirectorychanges_filedir();
+     test_readdirectorychanges_cr();
++    test_readdirectorychangesex();
+     test_ffcn_directory_overlap();
+ }
+diff --git a/dlls/kernelbase/file.c b/dlls/kernelbase/file.c
+index 9b66cec..db0b0e2 100644
+--- a/dlls/kernelbase/file.c
++++ b/dlls/kernelbase/file.c
+@@ -3605,6 +3605,34 @@ BOOL WINAPI DECLSPEC_HOTPATCH ReadDirectoryChangesW( HANDLE handle, LPVOID buffe
+ }
+ 
+ 
++/***********************************************************************
++ *	ReadDirectoryChangesExW   (kernelbase.@)
++ */
++BOOL WINAPI DECLSPEC_HOTPATCH ReadDirectoryChangesExW( HANDLE handle, LPVOID buffer, DWORD len,
++                                                       BOOL subtree, DWORD filter, LPDWORD returned,
++                                                       LPOVERLAPPED overlapped,
++                                                       LPOVERLAPPED_COMPLETION_ROUTINE completion,
++                                                       READ_DIRECTORY_NOTIFY_INFORMATION_CLASS class )
++{
++    TRACE( "%p %p %08lx %d %08lx %p %p %p %d\n",
++           handle, buffer, len, subtree, filter, returned, overlapped, completion, class );
++
++    switch (class)
++    {
++    case ReadDirectoryNotifyInformation:
++        return ReadDirectoryChangesW( handle, buffer, len, subtree, filter, returned,
++                                      overlapped, completion );
++    case ReadDirectoryNotifyExtendedInformation:
++        /* Not every file system supports the extended records on Windows either; callers are
++         * expected to fall back to FILE_NOTIFY_INFORMATION when this fails. */
++        FIXME( "ReadDirectoryNotifyExtendedInformation not supported\n" );
++        return set_ntstatus( STATUS_NOT_SUPPORTED );
++    default:
++        return set_ntstatus( STATUS_INVALID_INFO_CLASS );
++    }
++}
++
++
+ /***********************************************************************
+  *	ReadFile   (kernelbase.@)
+  */
+diff --git a/dlls/kernelbase/kernelbase.spec b/dlls/kernelbase/kernelbase.spec
+index 2c5906a..9eb89e8 100644
+--- a/dlls/kernelbase/kernelbase.spec
++++ b/dlls/kernelbase/kernelbase.spec
+@@ -1291,6 +1291,7 @@
+ @ stdcall ReadConsoleOutputCharacterW(long ptr long long ptr)
+ @ stdcall ReadConsoleOutputW(long ptr long long ptr)
+ @ stdcall ReadConsoleW(long ptr long ptr ptr)
++@ stdcall ReadDirectoryChangesExW(long ptr long long long ptr ptr ptr long)
+ @ stdcall ReadDirectoryChangesW(long ptr long long long ptr ptr ptr)
+ @ stdcall ReadFile(long ptr long ptr ptr)
+ @ stdcall ReadFileEx(long ptr long ptr ptr)
+diff --git a/include/minwinbase.h b/include/minwinbase.h
+index bc2fc12..e8ac02d 100644
+--- a/include/minwinbase.h
++++ b/include/minwinbase.h
+@@ -158,6 +158,11 @@ typedef enum _GET_FILEEX_INFO_LEVELS {
+     GetFileExInfoStandard
+ } GET_FILEEX_INFO_LEVELS;
+ 
++typedef enum _READ_DIRECTORY_NOTIFY_INFORMATION_CLASS {
++    ReadDirectoryNotifyInformation = 1,
++    ReadDirectoryNotifyExtendedInformation
++} READ_DIRECTORY_NOTIFY_INFORMATION_CLASS, *PREAD_DIRECTORY_NOTIFY_INFORMATION_CLASS;
++
+ typedef enum _FILE_INFO_BY_HANDLE_CLASS {
+     FileBasicInfo,
+     FileStandardInfo,
+diff --git a/include/winbase.h b/include/winbase.h
+index db7a63f..38942e9 100644
+--- a/include/winbase.h
++++ b/include/winbase.h
+@@ -2169,6 +2169,7 @@ WINADVAPI  BOOL        WINAPI ReadEventLogA(HANDLE,DWORD,DWORD,LPVOID,DWORD,DWOR
+ WINADVAPI  BOOL        WINAPI ReadEventLogW(HANDLE,DWORD,DWORD,LPVOID,DWORD,DWORD *,DWORD *);
+ #define                       ReadEventLog WINELIB_NAME_AW(ReadEventLog)
+ WINBASEAPI BOOL        WINAPI ReadDirectoryChangesW(HANDLE,LPVOID,DWORD,BOOL,DWORD,LPDWORD,LPOVERLAPPED,LPOVERLAPPED_COMPLETION_ROUTINE);
++WINBASEAPI BOOL        WINAPI ReadDirectoryChangesExW(HANDLE,LPVOID,DWORD,BOOL,DWORD,LPDWORD,LPOVERLAPPED,LPOVERLAPPED_COMPLETION_ROUTINE,READ_DIRECTORY_NOTIFY_INFORMATION_CLASS);
+ WINADVAPI  DWORD       WINAPI ReadEncryptedFileRaw(PFE_EXPORT_FUNC,PVOID,PVOID);
+ WINBASEAPI BOOL        WINAPI ReadFile(HANDLE,LPVOID,DWORD,LPDWORD,LPOVERLAPPED);
+ WINBASEAPI BOOL        WINAPI ReadFileEx(HANDLE,LPVOID,DWORD,LPOVERLAPPED,LPOVERLAPPED_COMPLETION_ROUTINE);

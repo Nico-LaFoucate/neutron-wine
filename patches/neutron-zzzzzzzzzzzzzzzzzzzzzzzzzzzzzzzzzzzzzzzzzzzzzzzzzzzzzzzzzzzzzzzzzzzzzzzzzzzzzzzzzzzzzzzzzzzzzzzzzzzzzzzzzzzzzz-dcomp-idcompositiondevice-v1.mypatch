@@ -1,0 +1,448 @@
+dcomp: JUCE 8 windows (IDCompositionDevice v1 + composition swapchain presents) were an empty grey frame
+
+The Mister Horse Product Manager (the login window of the Animation Composer and Premiere
+Composer plugins) opened as an empty grey window. It is a JUCE 8.0.10 app. JUCE 8 draws every
+window with Direct2D into a CreateSwapChainForComposition swap chain and shows it with
+DirectComposition:
+
+    DCompositionCreateDevice(dxgi_device, __uuidof(IDCompositionDevice), &device)
+    device->CreateTargetForHwnd / CreateVisual / SetRoot / SetContent(swapchain) / Commit
+    swapchain->Present1(...) for every frame
+
+Two things stopped it.
+
+1. The device only answered IDCompositionDevice2 and IDCompositionDesktopDevice, so
+   DCompositionCreateDevice failed, JUCE never built its visual tree, and it retried on every
+   paint. The log line, 7176 times in one After Effects session, from ProductManager.exe:
+
+       neutron-qi: DEVICE refused {c37ea93a-e7aa-450d-b16f-9746cb0407f3} (E_NOINTERFACE)
+
+   c37ea93a-... is IID_IDCompositionDevice. This adds that interface to the same device object.
+   Its methods are the IDCompositionDevice2 ones in another order, with CreateVisual returning
+   IDCompositionVisual (IDCompositionVisual2 extends it, so the same visual serves) and one extra
+   method, CheckDeviceState, which reports a valid device. Everything forwards to the existing
+   implementation. Kill switch: NEUTRON_DCOMP_DEVICE1=0.
+
+2. With the tree built, Commit registered the swap chain against the JUCE window, but the blit
+   thread only reads back a registration whose pending_blit is set, and only the per-Present
+   hook (dcomp_register_external) sets it. A composition swap chain presents with m_window == 0,
+   so the hook registered the frame under pending_hwnd (DXVK's dummy window) instead, and the JUCE
+   window's registration was marked once, at Commit, so it showed the first frames and froze:
+
+       neutron-time: REGISTER hwnd=...40076 [JUCE_...] swapchain ...28F4590   <- Commit
+       gluon-register-fallback: null hwnd -> using pending_hwnd ...20088 for swapchain ...21D1EB0
+
+   The two pointers differ because DXVK gives the app a DxgiSwapChainDispatcher wrapping the
+   real swap chain, and the hook runs on the inner one. The dispatcher forwards private data, so
+   Commit now tags the committed swap chain with its target window (SetPrivateData), and the hook
+   reads the tag back and marks that window's registration. A tagged frame skips the pending_hwnd
+   fallback (it would only read the frame back a second time into the hidden dummy window); an
+   untagged one takes the old path unchanged. Kill switch: NEUTRON_DCOMP_MARK_COMPOSITION=0.
+
+   One more thing kept the frames away inside Premiere and After Effects. Their profiles set
+   NEUTRON_DCOMP_NATIVE=1, which every process they start inherits (the plugins start the
+   Product Manager), and native mode never blits a same-process registration: it expects the
+   swap chain to present its own Vulkan surface into the window. A composition swap chain has no
+   window of its own (GetHwnd gives NULL; DXVK presents it to a hidden dummy window), so at
+   Commit such a registration is now left blittable. Run on its own, the Product Manager drew;
+   started from Premiere or After Effects, it stayed grey until this.
+
+Photoshop also asks for IDCompositionDevice once per thread at startup and was refused; it now
+gets the interface.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -47,6 +47,7 @@
+ struct composition_device
+ {
+     IDCompositionDesktopDevice IDCompositionDesktopDevice_iface;
++    IDCompositionDevice IDCompositionDevice_iface;
+     LONG refcount;
+     IUnknown *rendering_device;
+     struct list targets;
+@@ -1426,12 +1427,57 @@
+ }
+ 
+ /* Walk a visual subtree and register any swapchain content against hwnd. */
++/* NEUTRON: private-data tag naming the dcomp target window a swapchain was committed to.
++ * DXVK hands apps a DxgiSwapChainDispatcher that wraps the real DxgiSwapChain, and the
++ * per-Present hook sees the inner object, so the two pointers never compare equal. Private
++ * data is forwarded by the dispatcher to the inner swapchain, so a tag set here through the
++ * app's pointer is readable in dcomp_register_external through the hook's pointer. */
++DEFINE_GUID(IID_NEUTRON_dcomp_target, 0x6a1e3c2d, 0x8f4b, 0x4e57, 0x9a, 0x0c, 0x1d, 0x2b, 0x7e, 0x5f, 0x43, 0x91);
++
++static BOOL neutron_dcomp_mark_composition(void);
++
++static void tag_composition_target(IUnknown *content, HWND hwnd)
++{
++    IDXGISwapChain1 *swapchain;
++    HWND own = NULL;
++
++    if (!neutron_dcomp_mark_composition())
++        return;
++    if (FAILED(IUnknown_QueryInterface(content, &IID_IDXGISwapChain1, (void **)&swapchain)))
++        return;
++    IDXGISwapChain1_SetPrivateData(swapchain, &IID_NEUTRON_dcomp_target, sizeof(hwnd), &hwnd);
++
++    /* NATIVE mode (NEUTRON_DCOMP_NATIVE=1, set by the Premiere and After Effects profiles and
++     * inherited by every process they start) never blits a same-process registration: it
++     * expects the swapchain to present its own Vulkan surface into the window. A composition
++     * swapchain has no window of its own (GetHwnd gives NULL; DXVK presents it to a hidden dummy
++     * window), so for it the bridge's blit is the only way its frames reach the target. */
++    if (FAILED(IDXGISwapChain1_GetHwnd(swapchain, &own)))
++        own = NULL;
++    if (!own)
++    {
++        struct presentation *p;
++
++        EnterCriticalSection(&presentations_cs);
++        LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++        {
++            if (p->hwnd == hwnd && !p->cross_proc)
++                p->no_blit = FALSE;
++        }
++        LeaveCriticalSection(&presentations_cs);
++    }
++    IDXGISwapChain1_Release(swapchain);
++}
++
+ static void visual_register(struct composition_visual *visual, HWND hwnd)
+ {
+     struct composition_visual *child;
+ 
+     if (visual->content)
++    {
+         register_presentation(hwnd, visual->content);
++        tag_composition_target(visual->content, hwnd);
++    }
+ 
+     LIST_FOR_EACH_ENTRY(child, &visual->children, struct composition_visual, entry)
+         visual_register(child, hwnd);
+@@ -1790,6 +1836,20 @@
+ 
+ static const IDCompositionDesktopDeviceVtbl composition_device_vtbl;
+ 
++/* NEUTRON: kill switch for the IDCompositionDevice (v1) interface below. Default on;
++ * NEUTRON_DCOMP_DEVICE1=0 restores the old E_NOINTERFACE answer. */
++static BOOL neutron_dcomp_device1_enabled(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[8];
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_DEVICE1", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_DEVICE1 = %d\n", v);
++    }
++    return v;
++}
++
+ static HRESULT WINAPI device_QueryInterface(IDCompositionDesktopDevice *iface, REFIID iid, void **out)
+ {
+     struct composition_device *device = impl_device_from_IDCompositionDesktopDevice(iface);
+@@ -1805,6 +1865,13 @@
+         return S_OK;
+     }
+ 
++    if (IsEqualGUID(iid, &IID_IDCompositionDevice) && neutron_dcomp_device1_enabled())
++    {
++        IDCompositionDesktopDevice_AddRef(&device->IDCompositionDesktopDevice_iface);
++        *out = &device->IDCompositionDevice_iface;
++        return S_OK;
++    }
++
+     ERR("neutron-qi: DEVICE refused %s (E_NOINTERFACE) -- e.g. IDCompositionDevice3 Chromium may need\n",
+         debugstr_guid(iid));
+     *out = NULL;
+@@ -2082,6 +2149,217 @@
+     device_CreateSurfaceFromHwnd,
+ };
+ 
++/* ----------------------------------------------------------------------
++ * IDCompositionDevice (the original Windows 8 interface)
++ *
++ * DCompositionCreateDevice() callers that ask for IDCompositionDevice used to get E_NOINTERFACE,
++ * so they never built a visual tree. JUCE 8's Direct2D renderer does exactly that (it presents
++ * through CreateSwapChainForComposition + IDCompositionDevice), and every JUCE 8 window stayed an
++ * empty grey frame. The methods are the IDCompositionDevice2 ones in a different order, plus
++ * CreateTargetForHwnd/CreateSurfaceFromHandle/CreateSurfaceFromHwnd and CheckDeviceState, so this
++ * vtable forwards to the existing implementation.
++ * -------------------------------------------------------------------- */
++
++static struct composition_device *impl_device_from_IDCompositionDevice(IDCompositionDevice *iface)
++{
++    return CONTAINING_RECORD(iface, struct composition_device, IDCompositionDevice_iface);
++}
++
++#define DEVICE1_DESKTOP(iface) (&impl_device_from_IDCompositionDevice(iface)->IDCompositionDesktopDevice_iface)
++
++static HRESULT WINAPI device1_QueryInterface(IDCompositionDevice *iface, REFIID iid, void **out)
++{
++    return device_QueryInterface(DEVICE1_DESKTOP(iface), iid, out);
++}
++
++static ULONG WINAPI device1_AddRef(IDCompositionDevice *iface)
++{
++    return device_AddRef(DEVICE1_DESKTOP(iface));
++}
++
++static ULONG WINAPI device1_Release(IDCompositionDevice *iface)
++{
++    return device_Release(DEVICE1_DESKTOP(iface));
++}
++
++static HRESULT WINAPI device1_Commit(IDCompositionDevice *iface)
++{
++    return device_Commit(DEVICE1_DESKTOP(iface));
++}
++
++static HRESULT WINAPI device1_WaitForCommitCompletion(IDCompositionDevice *iface)
++{
++    return device_WaitForCommitCompletion(DEVICE1_DESKTOP(iface));
++}
++
++static HRESULT WINAPI device1_GetFrameStatistics(IDCompositionDevice *iface,
++        DCOMPOSITION_FRAME_STATISTICS *statistics)
++{
++    return device_GetFrameStatistics(DEVICE1_DESKTOP(iface), statistics);
++}
++
++static HRESULT WINAPI device1_CreateTargetForHwnd(IDCompositionDevice *iface, HWND hwnd,
++        BOOL topmost, IDCompositionTarget **target)
++{
++    return device_CreateTargetForHwnd(DEVICE1_DESKTOP(iface), hwnd, topmost, target);
++}
++
++static HRESULT WINAPI device1_CreateVisual(IDCompositionDevice *iface, IDCompositionVisual **visual)
++{
++    /* IDCompositionVisual2 extends IDCompositionVisual, so the same object serves both. */
++    return device_CreateVisual(DEVICE1_DESKTOP(iface), (IDCompositionVisual2 **)visual);
++}
++
++static HRESULT WINAPI device1_CreateSurface(IDCompositionDevice *iface, UINT width, UINT height,
++        DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionSurface **surface)
++{
++    return device_CreateSurface(DEVICE1_DESKTOP(iface), width, height, pixel_format, alpha_mode, surface);
++}
++
++static HRESULT WINAPI device1_CreateVirtualSurface(IDCompositionDevice *iface, UINT width, UINT height,
++        DXGI_FORMAT pixel_format, DXGI_ALPHA_MODE alpha_mode, IDCompositionVirtualSurface **surface)
++{
++    return device_CreateVirtualSurface(DEVICE1_DESKTOP(iface), width, height, pixel_format, alpha_mode, surface);
++}
++
++static HRESULT WINAPI device1_CreateSurfaceFromHandle(IDCompositionDevice *iface,
++        HANDLE handle, IUnknown **surface)
++{
++    return device_CreateSurfaceFromHandle(DEVICE1_DESKTOP(iface), handle, surface);
++}
++
++static HRESULT WINAPI device1_CreateSurfaceFromHwnd(IDCompositionDevice *iface,
++        HWND hwnd, IUnknown **surface)
++{
++    return device_CreateSurfaceFromHwnd(DEVICE1_DESKTOP(iface), hwnd, surface);
++}
++
++static HRESULT WINAPI device1_CreateTranslateTransform(IDCompositionDevice *iface,
++        IDCompositionTranslateTransform **transform)
++{
++    return device_CreateTranslateTransform(DEVICE1_DESKTOP(iface), transform);
++}
++
++static HRESULT WINAPI device1_CreateScaleTransform(IDCompositionDevice *iface,
++        IDCompositionScaleTransform **transform)
++{
++    return device_CreateScaleTransform(DEVICE1_DESKTOP(iface), transform);
++}
++
++static HRESULT WINAPI device1_CreateRotateTransform(IDCompositionDevice *iface,
++        IDCompositionRotateTransform **transform)
++{
++    return device_CreateRotateTransform(DEVICE1_DESKTOP(iface), transform);
++}
++
++static HRESULT WINAPI device1_CreateSkewTransform(IDCompositionDevice *iface,
++        IDCompositionSkewTransform **transform)
++{
++    return device_CreateSkewTransform(DEVICE1_DESKTOP(iface), transform);
++}
++
++static HRESULT WINAPI device1_CreateMatrixTransform(IDCompositionDevice *iface,
++        IDCompositionMatrixTransform **transform)
++{
++    return device_CreateMatrixTransform(DEVICE1_DESKTOP(iface), transform);
++}
++
++static HRESULT WINAPI device1_CreateTransformGroup(IDCompositionDevice *iface,
++        IDCompositionTransform **transforms, UINT elements, IDCompositionTransform **transform_group)
++{
++    return device_CreateTransformGroup(DEVICE1_DESKTOP(iface), transforms, elements, transform_group);
++}
++
++static HRESULT WINAPI device1_CreateTranslateTransform3D(IDCompositionDevice *iface,
++        IDCompositionTranslateTransform3D **transform_3d)
++{
++    return device_CreateTranslateTransform3D(DEVICE1_DESKTOP(iface), transform_3d);
++}
++
++static HRESULT WINAPI device1_CreateScaleTransform3D(IDCompositionDevice *iface,
++        IDCompositionScaleTransform3D **transform_3d)
++{
++    return device_CreateScaleTransform3D(DEVICE1_DESKTOP(iface), transform_3d);
++}
++
++static HRESULT WINAPI device1_CreateRotateTransform3D(IDCompositionDevice *iface,
++        IDCompositionRotateTransform3D **transform_3d)
++{
++    return device_CreateRotateTransform3D(DEVICE1_DESKTOP(iface), transform_3d);
++}
++
++static HRESULT WINAPI device1_CreateMatrixTransform3D(IDCompositionDevice *iface,
++        IDCompositionMatrixTransform3D **transform_3d)
++{
++    return device_CreateMatrixTransform3D(DEVICE1_DESKTOP(iface), transform_3d);
++}
++
++static HRESULT WINAPI device1_CreateTransform3DGroup(IDCompositionDevice *iface,
++        IDCompositionTransform3D **transforms_3d, UINT elements, IDCompositionTransform3D **transform_3d_group)
++{
++    return device_CreateTransform3DGroup(DEVICE1_DESKTOP(iface), transforms_3d, elements, transform_3d_group);
++}
++
++static HRESULT WINAPI device1_CreateEffectGroup(IDCompositionDevice *iface,
++        IDCompositionEffectGroup **effect_group)
++{
++    return device_CreateEffectGroup(DEVICE1_DESKTOP(iface), effect_group);
++}
++
++static HRESULT WINAPI device1_CreateRectangleClip(IDCompositionDevice *iface,
++        IDCompositionRectangleClip **clip)
++{
++    return device_CreateRectangleClip(DEVICE1_DESKTOP(iface), clip);
++}
++
++static HRESULT WINAPI device1_CreateAnimation(IDCompositionDevice *iface,
++        IDCompositionAnimation **animation)
++{
++    return device_CreateAnimation(DEVICE1_DESKTOP(iface), animation);
++}
++
++static HRESULT WINAPI device1_CheckDeviceState(IDCompositionDevice *iface, BOOL *valid)
++{
++    TRACE("%p, %p.\n", iface, valid);
++
++    if (!valid) return E_INVALIDARG;
++    *valid = TRUE;
++    return S_OK;
++}
++
++#undef DEVICE1_DESKTOP
++
++static const IDCompositionDeviceVtbl composition_device1_vtbl =
++{
++    device1_QueryInterface,
++    device1_AddRef,
++    device1_Release,
++    device1_Commit,
++    device1_WaitForCommitCompletion,
++    device1_GetFrameStatistics,
++    device1_CreateTargetForHwnd,
++    device1_CreateVisual,
++    device1_CreateSurface,
++    device1_CreateVirtualSurface,
++    device1_CreateSurfaceFromHandle,
++    device1_CreateSurfaceFromHwnd,
++    device1_CreateTranslateTransform,
++    device1_CreateScaleTransform,
++    device1_CreateRotateTransform,
++    device1_CreateSkewTransform,
++    device1_CreateMatrixTransform,
++    device1_CreateTransformGroup,
++    device1_CreateTranslateTransform3D,
++    device1_CreateScaleTransform3D,
++    device1_CreateRotateTransform3D,
++    device1_CreateMatrixTransform3D,
++    device1_CreateTransform3DGroup,
++    device1_CreateEffectGroup,
++    device1_CreateRectangleClip,
++    device1_CreateAnimation,
++    device1_CheckDeviceState,
++};
++
+ static HRESULT create_device(IUnknown *rendering_device, REFIID iid, void **out)
+ {
+     struct composition_device *device;
+@@ -2090,6 +2368,7 @@
+     if (!(device = calloc(1, sizeof(*device))))
+         return E_OUTOFMEMORY;
+     device->IDCompositionDesktopDevice_iface.lpVtbl = &composition_device_vtbl;
++    device->IDCompositionDevice_iface.lpVtbl = &composition_device1_vtbl;
+     device->refcount = 1;
+     device->rendering_device = rendering_device;
+     if (rendering_device) IUnknown_AddRef(rendering_device);
+@@ -2125,8 +2404,64 @@
+  * swapchain so the blit thread can present it to its window via GDI. Used for
+  * surfaces that bypass DirectComposition (e.g. Premiere's program monitor),
+  * which otherwise present to an invisible Vulkan child-window surface. */
++/* NEUTRON: kill switch for marking composition-swapchain presents on their dcomp target
++ * (see dcomp_register_external). Default on; NEUTRON_DCOMP_MARK_COMPOSITION=0 turns it off. */
++static BOOL neutron_dcomp_mark_composition(void)
++{
++    static int v = -1;
++    if (v < 0)
++    {
++        char b[8];
++        v = (GetEnvironmentVariableA("NEUTRON_DCOMP_MARK_COMPOSITION", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_MARK_COMPOSITION = %d\n", v);
++    }
++    return v;
++}
++
+ void dcomp_register_external(HWND hwnd, IUnknown *swapchain)
+ {
++    /* NEUTRON: a composition swapchain (m_window == 0) that an app put in a visual tree was
++     * registered against its real target window at Commit (visual_register). The blit thread
++     * only reads back a registration whose pending_blit is set, and only this per-Present hook
++     * sets it -- but the hook registered the frame under pending_hwnd below, so the target's
++     * registration was marked once (at Commit, before anything was drawn) and never again: the
++     * window kept its first, empty frame. JUCE 8 windows (CreateSwapChainForComposition +
++     * IDCompositionDevice) were an empty grey frame because of it. Mark the registration of the
++     * window this swapchain was committed to. Swapchains nobody committed keep the old path. */
++    if (!hwnd && swapchain && neutron_dcomp_mark_composition())
++    {
++        IDXGISwapChain *sc;
++        HWND committed = NULL;
++        UINT size = sizeof(committed);
++
++        /* The hook sees DXVK's inner swapchain, not the dispatcher the app committed, so find
++         * the target through the private-data tag set at Commit (tag_composition_target). */
++        if (SUCCEEDED(IUnknown_QueryInterface(swapchain, &IID_IDXGISwapChain, (void **)&sc)))
++        {
++            if (FAILED(IDXGISwapChain_GetPrivateData(sc, &IID_NEUTRON_dcomp_target, &size, &committed))
++                    || size != sizeof(committed))
++                committed = NULL;
++            IDXGISwapChain_Release(sc);
++        }
++        if (committed)
++        {
++            struct presentation *p;
++
++            InitOnceExecuteOnce(&presentations_once, presentations_init, NULL, NULL);
++            EnterCriticalSection(&presentations_cs);
++            LIST_FOR_EACH_ENTRY(p, &presentations, struct presentation, entry)
++            {
++                if (p->hwnd == committed)
++                    InterlockedExchange(&p->pending_blit, TRUE);
++            }
++            LeaveCriticalSection(&presentations_cs);
++            /* The frame has a real destination; the pending_hwnd fallback below exists for
++             * swapchains nobody committed to a visual, and would only read this frame back a
++             * second time into DXVK's hidden dummy window. */
++            return;
++        }
++    }
++
+     /* gluon-register-fallback: composition swapchains present with m_window == 0.
+      * Fall back to the pending hwnd (set by the surface factory) so the blit
+      * worker presents to the correct window (UXP composition panels / program monitor). */
