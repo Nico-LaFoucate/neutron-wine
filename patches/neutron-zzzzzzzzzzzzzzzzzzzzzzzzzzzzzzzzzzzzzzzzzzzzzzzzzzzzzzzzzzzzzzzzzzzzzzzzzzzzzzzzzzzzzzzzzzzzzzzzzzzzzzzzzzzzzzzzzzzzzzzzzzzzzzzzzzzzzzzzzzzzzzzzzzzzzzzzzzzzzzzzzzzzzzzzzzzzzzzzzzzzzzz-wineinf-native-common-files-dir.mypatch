@@ -1,0 +1,36 @@
+wine.inf: Register the native 64-bit common files directory (CommonW6432Dir).
+
+Adobe's Unified Plugin Installer Agent (UPIA) reads CommonW6432Dir directly from the 64-bit
+HKLM\Software\Microsoft\Windows\CurrentVersion key. Wine registers CommonFilesDir but not this alias, so UPIA
+cannot build its UXP install path and rejects a Premiere UXP plugin with status -1 (seen with Mister Horse's
+Animation Composer for Premiere 2.2.3 through Product Manager 3.7.7). Windows has the value (Microsoft's
+CurrentVersion registry example shows it). Initialize it in the AMD64 and ARM64 sections from the existing
+common-files directory id; an existing customized value is kept (flag 2, FLG_ADDREG_NOCLOBBER).
+
+From le-birnes/LinDobe 0149, written by a LinDobe contributor in LinDobe PR #52 (LGPL-2.1-or-later; DCO sign-off on
+the commit). Applies with patch -F0 on wine-11.10 with neutron-wine's own wine.inf.in hunks (unsecapp, widl winmd);
+they are elsewhere in the file.
+
+MEASURED on the shipped neutron-wine v11.10-187 runtime (Xvfb, fresh prefix, LinDobe's
+tests/misterhorse/native-common-files.c, which compares CommonW6432Dir with CommonFilesDir in the 64-bit view):
+  187 as shipped:                                  FAIL CommonW6432Dir: status 2 (value missing)
+  187 with the two lines added to share/wine/wine.inf: PASS native common-files directory
+The plugin install in Premiere was confirmed by the contributor under LinDobe (Wine 11.20), not under Neutron.
+
+diff --git a/loader/wine.inf.in b/loader/wine.inf.in
+--- a/loader/wine.inf.in
++++ b/loader/wine.inf.in
+@@ -392,11 +392,13 @@
+ HKLM,%CurrentVersionNT%\Winlogon,"Shell",,"explorer.exe"
+ 
+ [CurrentVersionWow64.ntamd64]
++HKLM,%CurrentVersion%,"CommonW6432Dir",2,"%16427%"
+ HKLM,%CurrentVersion%,"ProgramFilesDir (x86)",,"%16426%"
+ HKLM,%CurrentVersion%,"CommonFilesDir (x86)",,"%16428%"
+ HKLM,Software\Microsoft\Wow64\x86,,2,"wow64cpu.dll"
+ 
+ [CurrentVersionWow64.ntarm64]
++HKLM,%CurrentVersion%,"CommonW6432Dir",2,"%16427%"
+ HKLM,%CurrentVersion%,"ProgramFilesDir (x86)",,"%16426%"
+ HKLM,%CurrentVersion%,"CommonFilesDir (x86)",,"%16428%"
+ HKLM,%CurrentVersion%,"ProgramFilesDir (Arm)",,"C:\Program Files (Arm)"
