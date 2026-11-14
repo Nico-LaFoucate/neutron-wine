@@ -1593,6 +1593,19 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
+### patch 183 — `…z×183-wineinf-native-common-files-dir` (Adobe's plugin installer (UPIA) fails with -1 installing a Premiere UXP plugin: CommonW6432Dir missing) — from LinDobe 0149 (le-birnes/LinDobe PR #52), LGPL-2.1+
+wine.inf adds HKLM\Software\Microsoft\Windows\CurrentVersion CommonW6432Dir in the AMD64 and ARM64 sections (from the common-files
+dirid, no-clobber). UPIA reads it to build its UXP plugin path. MEASURED on the shipped 11.10-187 runtime: native-common-files.c
+FAIL (value missing) as shipped, PASS with the two lines in share/wine/wine.inf. Real app (Product Manager installing Animation
+Composer for Premiere 2.2.3, plugin opened under Extensions) checked under LinDobe, not yet under Neutron.
+
+### patch 182 — `…z×182-msvcrt-keep-fetched-locale` (After Effects 2027 crashed at most starts in ucrtbase strtod/sscanf while other threads call setlocale) — from LinDobe 0146 (le-birnes/LinDobe), LGPL-2.1+
+strtod, the scanf family and a few _l functions fetched the thread locale and then called _isspace_l(c, NULL) and friends, whose
+own get_locinfo() frees that locale once another thread has called setlocale: use after free in fpnum_parse_bnum. Nested calls
+now get the fetched locale. MEASURED on the shipped 11.10-187 runtime (localerace.c): shipped 3/3 page fault; control
+ucrtbase/msvcrt (11.10 + the three neutron msvcrt patches) 3/3 page fault; control + this patch 3/3 PASS. After Effects 2027
+5/5 clean starts checked under LinDobe (Wine 11.20), not yet under Neutron.
+
 ### patch 108 — `…z×108-win32u-blend-argb-fast` (Photoshop panel resize: faster alpha blending) — SHIPPED in 11.10-172
 His words (11-02, on 171): *"the resizing could definitely be a lot smoother"*. blend_rects_8888 (AlphaBlend with a per-pixel alpha source) took 29% of Photoshop's main-thread user time during a panel resize: four divisions by 255 per pixel. Fully transparent source pixels now leave the destination alone, fully opaque ones replace it, the rest are blended four at a time with SSE2 (the division as (t + (t >> 8)) >> 8, t one past the dividend, exact for all 8-bit values; channel sums combined with OR as blend_argb() does, so malformed non-premultiplied sources spill the same way). Bit-exact: 16.3 million pixels compared, 0 differ. Overlapping blends inside one bitmap keep the per-pixel loop. Kill switch `NEUTRON_BLEND_FAST=0`.
 Lab: the function's share 29% -> 14%; CPU per size change 23.3/29.4 vs 25.1/30.8 ms without (both pairs, about 5%).
