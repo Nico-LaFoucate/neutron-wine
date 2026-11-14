@@ -1,0 +1,149 @@
+From: Neutron <neutron@localhost>
+Subject: [PATCH] d2d1: Give a float-noise line segment no stroke join (NEUTRON_D2D_STROKE_DEGEN).
+
+What he saw: "aside from this minor artifacct on buttons, Lr CC actually works pretty good so far" -- Lightroom (cloud)
+10.0.202610291525, runtime 11.10-203, 168 dpi: the pill buttons ("Add my own photos", "Start now") each have a small
+square spike at the top-left, where the left round end meets the top edge. On Windows these are clean pills.
+
+Mechanism (lab, SOLID):
+- Lightroom strokes its pills with DrawGeometry on an ID2D1PathGeometry: one OPEN figure, width 1.5-3 px, default stroke
+  style (miter join, limit 10). Its figure (dumped in the lab):
+      AddLine (0,34) -> AddLine (0,8) -> AddLine (0,8.00000095) -> AddBezier ... (7.9999995,0)
+  The left edge runs UP to y = 8, then a 9.5e-7 segment (1 ulp of 8) runs back DOWN to where the computed arc starts.
+- d2d_geometry_add_figure_outline() normalises that segment like any other, so its direction is exactly opposite the
+  edge: both of its ends are 180 degree turns. Since stroke-turn-miter-extension (11-11) a 180 degree turn under a miter
+  join carries the stroke limit * width / 2 past the corner (correct for a real reversal; Wine's tests expect it), which
+  here is a vertical spike above the arc start = the notch he saw. Present in runtime 187 already (187's d2d1 shows it).
+
+Windows behavior: his report (clean pills from the same app code). Microsoft documents no rule for degenerate segments
+(ID2D1StrokeStyle / D2D1_LINE_JOIN docs describe joins between segments only), so the length below which Windows stops
+treating a reversal as a turn is NOT known: probe lrb/probe/spurprobe.exe measures it (see Not covered).
+
+Fix (dlls/d2d1/geometry.c, d2d_geometry_add_figure_outline() only, strokes only):
+- a LINE segment whose two ends coincide to 8 ulps of the larger coordinate (at least 8 * FLT_EPSILON) adds no band and
+  no join at its start; the join at its end is taken from the segment before it, as if its two vertices were one;
+- a CLOSED figure whose last point coincides with its start the same way is treated like the exact-match case
+  (d2d_figure_end's END), so the implicit closing segment is dropped and the closing join uses the real last segment.
+Fill tessellation is untouched. No per-app logic.
+
+Not covered:
+- Reversals longer than float noise (1e-5 and up in the probe) still get the full miter extension. Whether Windows
+  also suppresses those (e.g. below its flattening tolerance) is unmeasured: lrb/probe/spurprobe.exe prints, per reversal
+  length d (0, 1 ulp, 1e-5 ... 0.1, 3), whether the spur box above the corner is lit. Windows expected: d=3 lit (real
+  reversal, known-bad), d=0 / 1 ulp clean (his report). If Windows is clean at larger d, widen the tolerance to match.
+- Degenerate BEZIER segments (all control points within float noise) are not handled; none seen in Lightroom's figures.
+
+Lab evidence (Lightroom (cloud) 10 lab copy Lr-lrb-a, 168 dpi, nested desk; Local/Favorites outlined pills, spur metric =
+lit pixels above the arc start, tools/spur.py; crops lrb/shots/spur-*.png):
+  stock 203:                          spur 11, 10 (n=2)
+  203 + NEUTRON_D2D_AA=0 (191 off):   10, 10       203 + NEUTRON_D2D_TESS_ROBUST=0 (190 off): 10, 10
+  203 with 187's d2d1 (pre-190/191):  10, 10
+  203lb (this patch):                 0, 0         203lb + NEUTRON_D2D_STROKE_DEGEN=0 (same build): 10, 10
+  Cloud view (Cloud pill selected + the full "Add an Album" pill, the same shape as the welcome card's buttons; the card
+  itself does not show in the lab copy because its cloud library holds a photo): fix 0, 0 / kill 9, 9 on the Cloud pill;
+  "Add an Album" left end spiked in kill, clean in fix (lrb/shots/card-cfx2-vs-ckl2.png).
+  Standalone probe (spurprobe.exe, Lightroom's pill in local coordinates): stock and kill switch draw the spur from 1 ulp
+  up; this patch: 0 and 1 ulp clean, 1e-5..3 unchanged; CLOSED pill exact vs 1-ulp closure: 300 = 300 lit in every arm.
+  Wine d2d1 conformance (d2d1_full.exe d2d1 --single, DXVK prefix): stock 203, 203lb, 203lb kill: 17045 tests, the same
+  2 failures each (d2d1.c:15665 Map E_INVALIDARG todo, DXVK-specific, known since 194).
+  Regression (stock 203 vs 203lb): Premiere 2026 Home pixel-identical except a "yesterday"/"3 minutes ago" label;
+  project open: panels, timeline, monitor drawn in both (states differ, no pixel diff possible), err 430/429, Unhandled 0.
+  Illustrator 2026 start: second pair pixel-identical (0 px); err 1161/1160, Unhandled 0. Lightroom Classic 16 Develop:
+  0 differing pixels. vMix Add Input: not run (the only vMix lab prefixes are copies of the sign-in prefix).
+
+Kill switch: NEUTRON_D2D_STROKE_DEGEN=0 restores the old outline for every figure (logs "neutron-stroke-degen: gate ...").
+---
+--- a/dlls/d2d1/geometry.c	2026-11-14 14:42:23.729135796 -0500
++++ b/dlls/d2d1/geometry.c	2026-11-14 14:42:23.730135830 -0500
+@@ -3765,11 +3765,50 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON STROKE DEGENERATE (env NEUTRON_D2D_STROKE_DEGEN, default on; =0 restores the old behavior
++ * for a one-run A/B).
++ *
++ * A line segment whose length is at the level of its coordinates' float rounding has no direction of
++ * its own. UI toolkits produce them where a computed arc start misses the end of the straight edge by
++ * an ulp: Lightroom (cloud) 10 strokes its pill buttons as "... AddLine(0, 8), AddLine(0, 8.00000095),
++ * AddBezier(...)" -- the left edge runs UP to y = 8, then a 9.5e-7 segment runs DOWN. Normalising that
++ * segment gives a direction exactly opposite the edge, so both of its ends became 180 degree turns and
++ * the miter join extended the stroke limit * width / 2 past the corner: a square spike at the pill's
++ * top-left. Windows draws these buttons as clean pills. Such a segment is skipped for the outline
++ * (no band, no join at its start), and the join at its end is taken from the segment before it, as if
++ * the two vertices were one. Real reversals (any length above float noise) still get the miter
++ * extension Wine's tests expect. The fill is untouched. */
++static BOOL neutron_stroke_degen(void)
++{
++    static int v = -1;
++
++    if (v < 0)
++    {
++        char buf[8];
++
++        v = !(GetEnvironmentVariableA("NEUTRON_D2D_STROKE_DEGEN", buf, sizeof(buf)) && buf[0] == '0');
++        if (!v)
++            ERR("neutron-stroke-degen: gate NEUTRON_D2D_STROKE_DEGEN resolved to 0 (old behavior)\n");
++    }
++    return v;
++}
++
++/* TRUE when a and b are the same point up to float rounding: within 8 ulps of the larger coordinate
++ * (at least 8 * FLT_EPSILON in absolute terms, for coordinates near 0). */
++static BOOL neutron_points_coincide(const D2D1_POINT_2F *a, const D2D1_POINT_2F *b)
++{
++    float m = max(max(fabsf(a->x), fabsf(a->y)), max(fabsf(b->x), fabsf(b->y)));
++    float eps = 8.0f * FLT_EPSILON * max(m, 1.0f);
++
++    return fabsf(b->x - a->x) <= eps && fabsf(b->y - a->y) <= eps;
++}
++
+ static BOOL d2d_geometry_add_figure_outline(struct d2d_geometry *geometry,
+         struct d2d_figure *figure, D2D1_FIGURE_END figure_end)
+ {
+     const D2D1_POINT_2F *prev, *p0, *p1, *next, *next_prev;
+-    size_t bezier_idx, i, vertex_count;
++    size_t bezier_idx, i, vertex_count, first_i = 0;
++    BOOL degen = neutron_stroke_degen();
+     enum d2d_vertex_type type;
+ 
+     if (!(vertex_count = figure->vertex_count))
+@@ -3778,7 +3817,12 @@
+     p0 = &figure->vertices[0];
+     if (figure_end == D2D1_FIGURE_END_CLOSED)
+     {
+-        if (figure->vertex_types[vertex_count - 1] == D2D_VERTEX_TYPE_END && !--vertex_count)
++        /* NEUTRON STROKE DEGENERATE: a closing point an ulp off the start is the start; the implicit
++         * closing segment it would leave is float noise (see neutron_stroke_degen()). */
++        if ((figure->vertex_types[vertex_count - 1] == D2D_VERTEX_TYPE_END
++                || (degen && vertex_count > 2 && figure->vertex_types[vertex_count - 1] == D2D_VERTEX_TYPE_LINE
++                && neutron_points_coincide(&figure->vertices[vertex_count - 1], &figure->vertices[0])))
++                && !--vertex_count)
+             return TRUE;
+ 
+         /* In case of a CLOSED path, a join between first and last vertex is
+@@ -3825,6 +3869,16 @@
+                 next = p1 = &figure->vertices[i + 1];
+             next_prev = p0;
+ 
++            /* NEUTRON STROKE DEGENERATE: no band and no join for a segment of float-noise length;
++             * prev stays the direction source for the join at its end. */
++            if (degen && neutron_points_coincide(p0, p1))
++            {
++                if (i == first_i)
++                    first_i = i + 1;
++                p0 = p1;
++                continue;
++            }
++
+             if (!d2d_geometry_outline_add_line_segment(geometry, p0, p1))
+             {
+                 ERR("Failed to add line segment.\n");
+@@ -3832,7 +3886,7 @@
+             }
+         }
+ 
+-        if (i || figure_end == D2D1_FIGURE_END_CLOSED)
++        if (i > first_i || figure_end == D2D1_FIGURE_END_CLOSED)
+         {
+             D2D1_POINT_2F q_next, q_prev;
+ 

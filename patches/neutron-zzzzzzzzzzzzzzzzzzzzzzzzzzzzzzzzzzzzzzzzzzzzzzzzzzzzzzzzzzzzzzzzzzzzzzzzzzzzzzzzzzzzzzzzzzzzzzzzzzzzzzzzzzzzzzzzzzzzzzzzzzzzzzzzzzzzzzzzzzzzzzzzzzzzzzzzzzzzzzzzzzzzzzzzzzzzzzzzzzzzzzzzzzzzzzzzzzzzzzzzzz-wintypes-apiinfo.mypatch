@@ -1,0 +1,206 @@
+From: Neutron lab (a27l) <lab@neutron>
+Subject: [PATCH] wintypes: Answer ApiInformation Is*Present queries with S_OK, as Windows does (NEUTRON_APIINFO).
+
+What he saw (2027 suite check, 11-14): "You need to test all of the 2027 suite NOW". Lightroom (cloud) 10.0.202610291525
+stops at startup on the splash with "(unknown C++ exception)", then "can only init the Organize Module once"; the main
+window never comes up. Lightroom 9.6 in a reflink of the same signed-in prefix, same runtime 11.10-200, starts normally.
+
+Mechanism (lab, +seh,+loaddll and fixme+all,+combase traces): while starting its Organize module, Lightroom 10's ui.dll
+calls Windows.Foundation.Metadata.ApiInformation.IsTypePresent("Windows.Devices.Haptics.InputHapticsManager"). Wine's
+wintypes stub returns E_NOTIMPL; C++/WinRT turns the failed HRESULT into a thrown winrt::hresult_not_implemented
+(decoded from the throw's ThrowInfo in ui.dll: .?AUhresult_not_implemented@winrt@@ <- .?AUhresult_error@winrt@@, the
+only throw type 10.0 has that 9.6 does not), the app's catch(...) shows "(unknown C++ exception)" and the module stays
+half-initialized. The trace line right before the throw: "api_information_statics_IsTypePresent ... InputHapticsManager
+stub!" followed by "RoOriginateLanguageException 0x80004001".
+
+Windows behavior: every ApiInformation Is*Present query answers S_OK with TRUE or FALSE for a well-formed name; Wine's
+own tests (dlls/wintypes/tests/wintypes.c, run on Windows) show S_OK for IsTypePresent, IsMethodPresentWithArity,
+IsEventPresent, ... and TRUE for "Windows.Foundation.FoundationContract".
+
+Fix: the Is*Present methods that returned E_NOTIMPL now return S_OK. IsTypePresent answers TRUE when Wine registers the
+type as a runtime class (HKLM\Software\Microsoft\WindowsRuntime\ActivatableClassId\<name>, what RoGetActivationFactory
+resolves through) or it is an API contract Wine reports present; IsApiContractPresentByMajorAndMinor uses the existing
+contract table (minor ignored, as ByMajor). No per-app logic.
+
+Not covered: types Wine implements without an activatable class (enums, structs, interfaces) answer FALSE; member
+queries (method/event/property/enum value) answer FALSE, where Windows answers TRUE for members that exist (Wine has no
+metadata to look them up). InputHapticsManager answers FALSE (Wine has no such class), so Lightroom takes its
+no-haptics path. tests/wintypes.c still carries todo_wine on the IsTypePresent / IsMethodPresentWithArity(NULL) /
+IsEventPresent(NULL) ... S_OK lines that now pass; they need their todo_wine dropped (not done here, tests not run).
+
+Lab evidence (runtime 11.10-200al = 200 + this x86_64 wintypes.dll; Lr-a27l-new = reflink of the signed-in Lr-db1-a
+with Lightroom 10.0 installed by Mud Hut; desk 1.75; 75 s per start):
+  stock 200:                     error dialog 5/5 (r1, seh, sehld, rt, stock2), main window 0/5
+  200al, NEUTRON_APIINFO=0:      error dialog 3/3 (kill1, kill2, kill3)
+  200al, fix on:                 main window ("Personalize Your Lightroom" / Get started), no error 4/4 (fix1-fix4;
+                                 fix3, fix4 on this final version of the patch)
+  Gate line "neutron-apiinfo: gate NEUTRON_APIINFO resolved to 1|0" in every 200al log. Stock wintypes.dll built from
+  the same tree == runtime 200's except 4 header bytes (timestamp/checksum).
+
+Kill switch: NEUTRON_APIINFO=0 restores the E_NOTIMPL answers exactly.
+
+--- a/dlls/wintypes/Makefile.in
++++ b/dlls/wintypes/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = wintypes.dll
+ IMPORTLIB = wintypes
+-IMPORTS   = combase
++IMPORTS   = combase advapi32
+ 
+ SOURCES = \
+ 	buffer.c \
+--- a/dlls/wintypes/main.c
++++ b/dlls/wintypes/main.c
+@@ -42,6 +42,48 @@
+     return FALSE;
+ }
+ 
++/* NEUTRON_APIINFO (default on). Windows answers every ApiInformation Is*Present query with S_OK and TRUE or FALSE;
++ * it never fails a well-formed query. Wine returned E_NOTIMPL from most of them, and C++/WinRT turns that HRESULT into a
++ * thrown winrt::hresult_not_implemented: Lightroom 10.0 asks IsTypePresent("Windows.Devices.Haptics.InputHapticsManager")
++ * while starting its Organize module and stops at "(unknown C++ exception)" / "can only init the Organize Module once".
++ * A type counts as present when Wine registers it as a runtime class (HKLM\Software\Microsoft\WindowsRuntime\
++ * ActivatableClassId\<name>, the key RoGetActivationFactory resolves through) or it is one of the API contracts Wine
++ * reports present (Windows answers TRUE for "Windows.Foundation.FoundationContract", tests/wintypes.c), so the answer
++ * matches what activation can deliver. Not covered: types Wine implements without an activatable class (enums, structs,
++ * interfaces) answer FALSE, and member queries (method/event/property/enum value) answer FALSE because Wine has no
++ * metadata to look them up in; Windows answers TRUE for members that exist.
++ * KILL SWITCH: NEUTRON_APIINFO=0 restores the E_NOTIMPL answers exactly. */
++static BOOL neutron_apiinfo_enabled(void)
++{
++    static LONG cached = -1;
++
++    if (cached == -1)
++    {
++        WCHAR buf[8];
++        DWORD len = GetEnvironmentVariableW( L"NEUTRON_APIINFO", buf, ARRAY_SIZE(buf) );
++        LONG on = !(len && len < ARRAY_SIZE(buf) && buf[0] == '0');
++        ERR( "neutron-apiinfo: gate NEUTRON_APIINFO resolved to %ld\n", on );
++        InterlockedCompareExchange( &cached, on, -1 );
++    }
++    return cached;
++}
++
++static BOOLEAN is_type_registered( HSTRING type_name )
++{
++    static const WCHAR prefix[] = L"Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\";
++    const WCHAR *name = WindowsGetStringRawBuffer( type_name, NULL );
++    WCHAR path[ARRAY_SIZE(prefix) + 256];
++    HKEY key;
++
++    if (!name || !*name || wcslen( name ) >= 256) return FALSE;
++    if (is_api_contract_present( type_name, 0 )) return TRUE;
++    wcscpy( path, prefix );
++    wcscat( path, name );
++    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return FALSE;
++    RegCloseKey( key );
++    return TRUE;
++}
++
+ struct api_information_statics
+ {
+     IActivationFactory IActivationFactory_iface;
+@@ -150,7 +192,11 @@
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = is_type_registered( type_name );
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsMethodPresent(
+@@ -177,7 +223,11 @@
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEventPresent(
+@@ -189,7 +239,11 @@
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsPropertyPresent(
+@@ -201,7 +255,11 @@
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsReadOnlyPropertyPresent(
+@@ -214,7 +272,11 @@
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsWriteablePropertyPresent(
+@@ -226,7 +288,11 @@
+     if (!type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsEnumNamedValuePresent(
+@@ -238,7 +304,11 @@
+     if (!enum_type_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = FALSE;
++    return S_OK;
+ }
+ 
+ static HRESULT STDMETHODCALLTYPE api_information_statics_IsApiContractPresentByMajor(
+@@ -264,7 +334,11 @@
+     if (!contract_name)
+         return E_INVALIDARG;
+ 
+-    return E_NOTIMPL;
++    if (!neutron_apiinfo_enabled())
++        return E_NOTIMPL;
++
++    *value = is_api_contract_present( contract_name, major_version );
++    return S_OK;
+ }
+ 
+ static const struct IApiInformationStaticsVtbl api_information_statics_vtbl =

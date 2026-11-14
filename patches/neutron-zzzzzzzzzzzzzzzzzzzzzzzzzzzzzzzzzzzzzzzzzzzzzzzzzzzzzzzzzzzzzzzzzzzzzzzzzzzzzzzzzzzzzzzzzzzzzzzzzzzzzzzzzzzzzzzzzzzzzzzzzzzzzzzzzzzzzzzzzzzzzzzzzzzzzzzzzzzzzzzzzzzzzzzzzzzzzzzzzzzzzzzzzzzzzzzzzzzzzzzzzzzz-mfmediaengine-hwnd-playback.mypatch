@@ -1,0 +1,479 @@
+mfmediaengine: render video into MF_MEDIA_ENGINE_PLAYBACK_HWND (rendering mode)
+
+His words: "tip videos don't play on 2027 as you can see generate image's has a grey box where there should be
+content playing" (Photoshop 2027 28.0.0.20, runtime 11.10-203, fresh prefix Adobe2027). On Windows the tip's video plays.
+
+Mechanism (SOLID, lab trace +mfplat on 203):
+  Photoshop's feature cards / coach marks are the UXP plugin Required/UXP/com.adobe.photoshop.inAppMessaging; the
+  Generate Image card plays assets/gen_image.mp4 (H.264 High 512x288) through a UXP <video>. UXP's runtime
+  (dynamic-torqnative.dll, same in PS 2026/2027, InDesign, Animate, AE, Premiere) plays <video> with IMFMediaEngine in
+  RENDERING MODE: MFCreateAttributes; SetUINT64(MF_MEDIA_ENGINE_PLAYBACK_HWND, <its child OS_ViewContainer window>);
+  SetUnknown(MF_MEDIA_ENGINE_CALLBACK); CreateInstance(MF_MEDIA_ENGINE_WAITFORSTABLE_STATE) -- no
+  MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, no DXGI manager; then SetSource(<mp4>), UpdateVideoStream(NULL, dst, border).
+  Wine recorded MEDIA_ENGINE_RENDERING_MODE but nothing used it: media_engine_create_video_renderer() demanded
+  VIDEO_OUTPUT_FORMAT ("Output format was not specified."), create_topology() failed ("Failed to create simple video
+  render node, hr 0x80004005"), nothing played, and UpdateVideoStream() was a stub. UXP's gray placeholder stayed.
+  PS 2026 shows the same gray box on Neutron (same plugin, byte-identical mp4): old gap, not a 2027 regression.
+
+Windows behavior:
+  - IMFMediaEngineClassFactory::CreateInstance, Remarks: in rendering mode "the Media Engine renders both audio and
+    video", to the window (MF_MEDIA_ENGINE_PLAYBACK_HWND) or DirectComposition visual the application provides;
+    MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT is Required in frame-server mode but Optional in rendering mode.
+    https://learn.microsoft.com/en-us/windows/win32/api/mfmediaengine/nf-mfmediaengine-imfmediaengineclassfactory-createinstance
+  - IMFMediaEngineEx::UpdateVideoStream: pSrc = area of the frame shown (NULL = the entire frame), pDst = area of the
+    window where the video is drawn, pBorderClr = border color; in rendering mode it repositions/repaints, all NULL
+    repaints the most recent frame; in frame-server mode it has no effect.
+    https://learn.microsoft.com/en-us/windows/win32/api/mfmediaengine/nf-mfmediaengine-imfmediaengineex-updatevideostream
+
+Fix (mfmediaengine only, no per-app logic):
+  - Rendering mode with a valid PLAYBACK_HWND and no VIDEO_OUTPUT_FORMAT builds the existing frame sink with
+    DXGI_FORMAT_B8G8R8X8_UNORM (system-memory RGB32 samples; the topology loader adds decoder + converter as for
+    frame-server WIC transfers).
+  - A presenter thread per rendering-mode engine shows each frame when the presentation clock reaches its time
+    (video_frame_sink_get_pts, the same selection OnVideoStreamTick uses), and the current frame again on
+    UpdateVideoStream. It draws with GDI (GetDC + StretchDIBits HALFTONE) into pDst (default: the client area), the
+    source rect scaled with its aspect ratio kept, the rest of pDst filled with the border color when one was given.
+  - UpdateVideoStream stores src/dst/border (src NULL = whole frame) and repaints; in frame-server mode returns S_OK
+    (no effect) instead of E_NOTIMPL. Thread stopped on Shutdown and on final Release (5 s capped join).
+  Logs: ERR "neutron-mfengine-hwnd: engine %p renders into hwnd %p." once per rendering-mode engine;
+  "neutron-gateresolved: NEUTRON_MFENGINE_HWND = n" once per process.
+
+Not covered / differs from Windows:
+  - Windows presents through DXGI/DirectComposition; this draws with GDI into the window. The app's own WM_PAINT of
+    that window can overwrite a frame until the next one (<= 1 frame period while playing; a paused frame comes back
+    on the app's UpdateVideoStream). Under a layered (LWA_COLORKEY) parent -- UXP's tip popup uses key 0 -- pure-black
+    video pixels would be keyed out by GDI; not seen with these clips (INFERRED risk, not measured).
+  - MF_MEDIA_ENGINE_PLAYBACK_VISUAL (DirectComposition target) is still unimplemented (FIXME kept).
+  - Rendering mode WITH a DXGI manager or an explicit VIDEO_OUTPUT_FORMAT takes the same GDI path (system-memory
+    transfer); not exercised (UXP sets neither).
+  - PS rich tool tooltips (also UXP <video>, e.g. crop-tool.mp4 with an AAC track) not reached in the lab (PS 2027
+    toolbar hover opens the tool flyout instead); audio-track playback through this path not measured.
+
+Lab evidence (runtime 11.10-203pv = 203 + this mfmediaengine 64+32, prefix copies of the lab PS 2026+2027 prefix,
+nested desk 175%, tip forced by deleting the PS Prefs.psp before each start; video area sampled in 3 captures ~1 s
+apart: pixel std and frame-to-frame difference):
+  - Base 203 (t2): gray 32,32,32, std 0, diff 0.
+  - Kill switch NEUTRON_MFENGINE_HWND=0, same build: PS 2027 t6, t7, t10 + PS 2026 u2 -> 4/4 gray (std 0, diff 0).
+  - Fix on: PS 2027 t4, t5, t8, t9 + PS 2026 u1, u3 -> 6/6 PLAYS (std 56-74, diff 39-82 between captures; the
+    Generate Image clip visibly advancing, upright, filling the box). "Got it" dismisses; quits CLEAN; 0 page
+    faults / Unhandled; no "did not stop".
+  - Regression: Premiere 2026 (project si-pr-smoke2) on 203pv: opens, timeline plays (playhead 3:09 -> 7:09),
+    quits CLEAN, 0 faults; it created no rendering-mode engine (no neutron-mfengine line). Static: among the
+    installed Adobe binaries only UXP's dynamic-torqnative.dll references PLAYBACK_HWND in code; libcef/msedge
+    (WebView2) and LrC's video_toolkit (frame-server help videos) do not contain the GUID at all.
+
+Kill switch: NEUTRON_MFENGINE_HWND=0 (restores the old behavior: rendering mode fails topology creation).
+---
+--- a/dlls/mfmediaengine/Makefile.in
++++ b/dlls/mfmediaengine/Makefile.in
+@@ -1,5 +1,5 @@
+ MODULE    = mfmediaengine.dll
+-IMPORTS = oleaut32 ole32 mfplat mf mfuuid uuid
++IMPORTS = oleaut32 ole32 mfplat mf mfuuid uuid user32 gdi32
+ 
+ EXTRADLLFLAGS = -Wb,--prefer-native
+ 
+--- a/dlls/mfmediaengine/main.c
++++ b/dlls/mfmediaengine/main.c
+@@ -23,6 +23,8 @@
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
+ 
+ #include "mfapi.h"
+ #include "mfmediaengine.h"
+@@ -205,6 +207,20 @@
+             } cb;
+         } d3d11;
+     } video_frame;
++    /* Neutron: rendering mode (MF_MEDIA_ENGINE_PLAYBACK_HWND) presenter. */
++    struct
++    {
++        HWND hwnd;
++        HANDLE thread;
++        HANDLE wake;
++        BOOL stop;
++        BOOL repaint;
++        LONGLONG last_pts;
++        BOOL has_src, has_dst, has_border;
++        MFVideoNormalizedRect src;
++        RECT dst;
++        MFARGB border;
++    } render;
+     CRITICAL_SECTION cs;
+ };
+ 
+@@ -1268,8 +1284,13 @@
+ 
+     if (FAILED(IMFAttributes_GetUINT32(engine->attributes, &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, &output_format)))
+     {
+-        WARN("Output format was not specified.\n");
+-        return E_FAIL;
++        if (!engine->render.hwnd)
++        {
++            WARN("Output format was not specified.\n");
++            return E_FAIL;
++        }
++        /* Rendering mode: the engine presents the frames itself, from system memory RGB32 samples. */
++        output_format = DXGI_FORMAT_B8G8R8X8_UNORM;
+     }
+ 
+     memcpy(&subtype, &MFVideoFormat_Base, sizeof(subtype));
+@@ -1624,8 +1645,12 @@
+     return refcount;
+ }
+ 
++static void media_engine_render_stop(struct media_engine *engine);
++static BOOL neutron_mfengine_hwnd_enabled(void);
++
+ static void free_media_engine(struct media_engine *engine)
+ {
++    media_engine_render_stop(engine);
+     if (engine->callback)
+         IMFMediaEngineNotify_Release(engine->callback);
+     if (engine->clock)
+@@ -1648,6 +1673,8 @@
+         IMFDXGIDeviceManager_Release(engine->device_manager);
+     }
+     SysFreeString(engine->current_source);
++    if (engine->render.wake)
++        CloseHandle(engine->render.wake);
+     DeleteCriticalSection(&engine->cs);
+     free(engine->video_frame.buffer);
+     free(engine);
+@@ -2472,6 +2499,9 @@
+     else
+     {
+         media_engine_set_flag(engine, FLAGS_ENGINE_SHUT_DOWN, TRUE);
++        LeaveCriticalSection(&engine->cs);
++        media_engine_render_stop(engine);
++        EnterCriticalSection(&engine->cs);
+         media_engine_clear_presentation(engine);
+         /* critical section can not be held during shutdown, as shut down requires all pending
+          * callbacks to complete, and some callbacks require this cs */
+@@ -3013,9 +3043,50 @@
+ static HRESULT WINAPI media_engine_UpdateVideoStream(IMFMediaEngineEx *iface, const MFVideoNormalizedRect *src,
+         const RECT *dst, const MFARGB *border_color)
+ {
+-    FIXME("%p, %p, %p, %p stub.\n", iface, src, dst, border_color);
++    struct media_engine *engine = impl_from_IMFMediaEngineEx(iface);
++    HRESULT hr = S_OK;
+ 
+-    return E_NOTIMPL;
++    TRACE("%p, %p, %s, %p.\n", iface, src, wine_dbgstr_rect(dst), border_color);
++
++    if (!engine->render.hwnd)
++    {
++        /* In frame-server mode this method has no effect. */
++        if (engine->mode == MEDIA_ENGINE_FRAME_SERVER_MODE && neutron_mfengine_hwnd_enabled())
++            return S_OK;
++        FIXME("%p, %p, %p, %p stub.\n", iface, src, dst, border_color);
++        return E_NOTIMPL;
++    }
++
++    /* Rendering mode: update the source rectangle (NULL = the whole frame), destination rectangle and border
++     * color, then repaint the current frame; all NULL means repaint the most recent frame only. */
++    EnterCriticalSection(&engine->cs);
++    if (engine->flags & FLAGS_ENGINE_SHUT_DOWN)
++        hr = MF_E_SHUTDOWN;
++    else
++    {
++        if (src || dst || border_color)
++            engine->render.has_src = FALSE;
++        if (src)
++        {
++            engine->render.src = *src;
++            engine->render.has_src = TRUE;
++        }
++        if (dst)
++        {
++            engine->render.dst = *dst;
++            engine->render.has_dst = TRUE;
++        }
++        if (border_color)
++        {
++            engine->render.border = *border_color;
++            engine->render.has_border = TRUE;
++        }
++        engine->render.repaint = TRUE;
++        SetEvent(engine->render.wake);
++    }
++    LeaveCriticalSection(&engine->cs);
++
++    return hr;
+ }
+ 
+ static double WINAPI media_engine_GetBalance(IMFMediaEngineEx *iface)
+@@ -3596,6 +3667,247 @@
+     return 1;
+ }
+ 
++/* Neutron: kill switch NEUTRON_MFENGINE_HWND=0 restores the old behavior (rendering mode fails topology creation). */
++static BOOL neutron_mfengine_hwnd_enabled(void)
++{
++    static LONG cached = -1;
++    char buf[8];
++    DWORD len;
++    LONG value = cached;
++
++    if (value < 0)
++    {
++        len = GetEnvironmentVariableA("NEUTRON_MFENGINE_HWND", buf, sizeof(buf));
++        value = !(len && len < sizeof(buf) && buf[0] == '0');
++        if (InterlockedCompareExchange(&cached, value, -1) == -1)
++            ERR("neutron-gateresolved: NEUTRON_MFENGINE_HWND = %ld\n", value);
++    }
++    return value;
++}
++
++struct render_params
++{
++    SIZE size;
++    BOOL has_src, has_dst, has_border;
++    MFVideoNormalizedRect src;
++    RECT dst;
++    MFARGB border;
++};
++
++/* Paints one RGB32 frame into the playback window: the source rectangle is scaled into the destination
++ * rectangle (default: the whole client area) keeping its aspect ratio; with a border color the rest of
++ * the destination rectangle is filled with it. */
++static void media_engine_render_paint(HWND hwnd, IMFSample *sample, const struct render_params *params)
++{
++    LONG pitch = 0, width = params->size.cx, height = params->size.cy, rows;
++    RECT client, dst, src, image;
++    IMFMediaBuffer *buffer;
++    IMF2DBuffer *buffer2d = NULL;
++    DWORD max_length, length = 0;
++    BYTE *data = NULL, *bits;
++    BITMAPINFO bmi;
++    double scale_x, scale_y, scale;
++    LONG src_w, src_h, img_w, img_h;
++    HDC dc;
++
++    if (width <= 0 || height <= 0)
++        return;
++    if (FAILED(IMFSample_ConvertToContiguousBuffer(sample, &buffer)))
++        return;
++
++    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&buffer2d)))
++    {
++        if (FAILED(IMF2DBuffer_Lock2D(buffer2d, &data, &pitch)))
++        {
++            IMF2DBuffer_Release(buffer2d);
++            buffer2d = NULL;
++            data = NULL;
++        }
++    }
++    if (!buffer2d)
++    {
++        if (FAILED(IMFMediaBuffer_Lock(buffer, &data, &max_length, &length)))
++        {
++            IMFMediaBuffer_Release(buffer);
++            return;
++        }
++        pitch = width * 4;
++        if (length < (DWORD)(width * height * 4))
++        {
++            WARN("Unexpected buffer length %lu for %ldx%ld.\n", length, width, height);
++            goto done;
++        }
++    }
++    if (!pitch || (pitch > 0 ? pitch : -pitch) < width * 4)
++        goto done;
++
++    src.left = 0;
++    src.top = 0;
++    src.right = width;
++    src.bottom = height;
++    if (params->has_src)
++    {
++        src.left = max(0, min(width, (LONG)(params->src.left * width + 0.5f)));
++        src.top = max(0, min(height, (LONG)(params->src.top * height + 0.5f)));
++        src.right = max(src.left, min(width, (LONG)(params->src.right * width + 0.5f)));
++        src.bottom = max(src.top, min(height, (LONG)(params->src.bottom * height + 0.5f)));
++    }
++    src_w = src.right - src.left;
++    src_h = src.bottom - src.top;
++    rows = src_h;
++
++    if (!GetClientRect(hwnd, &client))
++        goto done;
++    dst = params->has_dst ? params->dst : client;
++    if (dst.right <= dst.left || dst.bottom <= dst.top || !src_w || !src_h)
++        goto done;
++
++    /* Letterbox: fit the source into the destination, keeping the frame's aspect ratio. */
++    scale_x = (double)(dst.right - dst.left) / src_w;
++    scale_y = (double)(dst.bottom - dst.top) / src_h;
++    scale = min(scale_x, scale_y);
++    img_w = max(1, (LONG)(src_w * scale + 0.5));
++    img_h = max(1, (LONG)(src_h * scale + 0.5));
++    image.left = dst.left + (dst.right - dst.left - img_w) / 2;
++    image.top = dst.top + (dst.bottom - dst.top - img_h) / 2;
++    image.right = image.left + img_w;
++    image.bottom = image.top + img_h;
++
++    /* Rows run top-down for a positive pitch; Lock2D returns scanline 0 with a negative pitch for bottom-up. */
++    memset(&bmi, 0, sizeof(bmi));
++    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
++    bmi.bmiHeader.biPlanes = 1;
++    bmi.bmiHeader.biBitCount = 32;
++    bmi.bmiHeader.biCompression = BI_RGB;
++    if (pitch > 0)
++    {
++        bits = data + src.top * pitch;
++        bmi.bmiHeader.biWidth = pitch / 4;
++        bmi.bmiHeader.biHeight = -rows;
++    }
++    else
++    {
++        bits = data + (src.top + rows - 1) * pitch;
++        bmi.bmiHeader.biWidth = -pitch / 4;
++        bmi.bmiHeader.biHeight = rows;
++    }
++
++    if (!(dc = GetDC(hwnd)))
++        goto done;
++    if (params->has_border)
++    {
++        HBRUSH brush = CreateSolidBrush(RGB(params->border.rgbRed, params->border.rgbGreen, params->border.rgbBlue));
++        HRGN rgn = CreateRectRgnIndirect(&dst), img_rgn = CreateRectRgnIndirect(&image);
++
++        CombineRgn(rgn, rgn, img_rgn, RGN_DIFF);
++        FillRgn(dc, rgn, brush);
++        DeleteObject(img_rgn);
++        DeleteObject(rgn);
++        DeleteObject(brush);
++    }
++    SetStretchBltMode(dc, HALFTONE);
++    SetBrushOrgEx(dc, 0, 0, NULL);
++    StretchDIBits(dc, image.left, image.top, img_w, img_h, src.left, 0, src_w, rows,
++            bits, &bmi, DIB_RGB_COLORS, SRCCOPY);
++    ReleaseDC(hwnd, dc);
++
++done:
++    if (buffer2d)
++    {
++        IMF2DBuffer_Unlock2D(buffer2d);
++        IMF2DBuffer_Release(buffer2d);
++    }
++    else
++        IMFMediaBuffer_Unlock(buffer);
++    IMFMediaBuffer_Release(buffer);
++}
++
++/* Rendering mode presenter: shows each frame when the presentation clock reaches its time, and the current
++ * frame again on UpdateVideoStream(). */
++static DWORD CALLBACK media_engine_render_thread(void *arg)
++{
++    struct media_engine *engine = arg;
++    struct render_params params;
++    IMFSample *sample;
++    MFTIME clocktime;
++    LONGLONG pts;
++    BOOL playing;
++    HWND hwnd;
++
++    SetThreadDescription(GetCurrentThread(), L"wine_mfmediaengine_render");
++
++    for (;;)
++    {
++        EnterCriticalSection(&engine->cs);
++        playing = !(engine->flags & (FLAGS_ENGINE_PAUSED | FLAGS_ENGINE_SHUT_DOWN));
++        LeaveCriticalSection(&engine->cs);
++
++        WaitForSingleObject(engine->render.wake, playing ? 5 : 100);
++
++        sample = NULL;
++        EnterCriticalSection(&engine->cs);
++        if (engine->render.stop)
++        {
++            LeaveCriticalSection(&engine->cs);
++            break;
++        }
++        if (!(engine->flags & FLAGS_ENGINE_SHUT_DOWN) && (engine->flags & FLAGS_ENGINE_HAS_VIDEO)
++                && engine->presentation.frame_sink)
++        {
++            BOOL present = engine->render.repaint;
++
++            if (SUCCEEDED(IMFPresentationClock_GetTime(engine->clock, &clocktime))
++                    && video_frame_sink_get_pts(engine->presentation.frame_sink, clocktime, &pts) == S_OK
++                    && pts != engine->render.last_pts)
++            {
++                engine->render.last_pts = pts;
++                present = TRUE;
++            }
++            if (present && video_frame_sink_get_sample(engine->presentation.frame_sink, &sample))
++            {
++                engine->render.repaint = FALSE;
++                params.size = engine->video_frame.size;
++                params.has_src = engine->render.has_src;
++                params.has_dst = engine->render.has_dst;
++                params.has_border = engine->render.has_border;
++                params.src = engine->render.src;
++                params.dst = engine->render.dst;
++                params.border = engine->render.border;
++            }
++        }
++        hwnd = engine->render.hwnd;
++        LeaveCriticalSection(&engine->cs);
++
++        if (sample)
++        {
++            media_engine_render_paint(hwnd, sample, &params);
++            IMFSample_Release(sample);
++        }
++    }
++
++    return 0;
++}
++
++static void media_engine_render_stop(struct media_engine *engine)
++{
++    HANDLE thread;
++
++    EnterCriticalSection(&engine->cs);
++    thread = engine->render.thread;
++    engine->render.thread = NULL;
++    engine->render.stop = TRUE;
++    if (engine->render.wake)
++        SetEvent(engine->render.wake);
++    LeaveCriticalSection(&engine->cs);
++
++    if (thread)
++    {
++        if (WaitForSingleObject(thread, 5000))
++            ERR("neutron-mfengine-hwnd: presenter thread did not stop.\n");
++        CloseHandle(thread);
++    }
++}
++
+ static HRESULT init_media_engine(DWORD flags, IMFAttributes *attributes, struct media_engine *engine)
+ {
+     UINT32 output_format;
+@@ -3663,7 +3975,22 @@
+     IMFAttributes_GetUINT64(attributes, &MF_MEDIA_ENGINE_PLAYBACK_HWND, &playback_hwnd);
+     hr = IMFAttributes_GetUINT32(attributes, &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, &output_format);
+     if (playback_hwnd) /* FIXME: handle MF_MEDIA_ENGINE_PLAYBACK_VISUAL */
++    {
+         engine->mode = MEDIA_ENGINE_RENDERING_MODE;
++        if (neutron_mfengine_hwnd_enabled() && IsWindow((HWND)(ULONG_PTR)playback_hwnd))
++        {
++            engine->render.last_pts = MINLONGLONG;
++            if (!(engine->render.wake = CreateEventW(NULL, FALSE, FALSE, NULL)))
++                return HRESULT_FROM_WIN32(GetLastError());
++            engine->render.hwnd = (HWND)(ULONG_PTR)playback_hwnd;
++            if (!(engine->render.thread = CreateThread(NULL, 0, media_engine_render_thread, engine, 0, NULL)))
++            {
++                engine->render.hwnd = NULL;
++                return HRESULT_FROM_WIN32(GetLastError());
++            }
++            ERR("neutron-mfengine-hwnd: engine %p renders into hwnd %p.\n", engine, engine->render.hwnd);
++        }
++    }
+     else
+     {
+         if (SUCCEEDED(hr))
