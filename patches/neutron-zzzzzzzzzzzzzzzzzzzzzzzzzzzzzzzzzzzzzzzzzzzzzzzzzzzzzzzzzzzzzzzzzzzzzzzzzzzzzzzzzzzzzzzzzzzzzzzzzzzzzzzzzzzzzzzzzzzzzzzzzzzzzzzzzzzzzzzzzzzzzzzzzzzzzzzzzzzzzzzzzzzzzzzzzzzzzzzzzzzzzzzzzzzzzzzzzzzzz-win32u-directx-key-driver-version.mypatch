@@ -1,0 +1,60 @@
+Neutron#53 (@atsuenn): Premiere Pro 2026 on an Intel Arc B390 shows a "System Compatibility report" --
+"No graphics processor suitable for GPU-accelerated render" -- as soon as it opens, on a GPU Windows accepts.
+
+Mechanism (SOLID on the host side, where it can be read directly; the Intel-GPU half is INFERRED, see below):
+Adobe's GPU detector (GPUSniffer.exe, run by Premiere / After Effects / Media Encoder) reads the adapter's driver
+version from HKLM\Software\Microsoft\DirectX\{adapter-guid}\DriverVersion -- a QWORD, one 16-bit field per
+component -- and matches it against its bundled SystemCompatibilityReport blocklist. For an Intel Arc the blocklist
+flags driver builds below 0.0.101.6314 ("jira:DVASE-6630").
+
+Wine's win32u writes two driver versions for every GPU: the class key's DriverVersion STRING is the host/vendor
+version (e.g. Intel's "35.0.101.6314"), but the DirectX key's DriverVersion QWORD was left at a single fixed value,
+0x230000000f1ff4 = 35.0.15.8180, for every adapter. On Windows these two are always the same number. GPUSniffer
+reads the DirectX key, sees build 15.8180 (far below 101.6314) and flags the Arc.
+
+Windows behavior: the DirectX key DriverVersion QWORD equals the class key DriverVersion string. This patch encodes
+the same driver_version string into the QWORD (the encoder, driver_version_to_qword, already existed and was already
+used whenever the host supplied a mapped version). The fixed 0x230000000f1ff4 now only remains as the fallback when
+the version string does not parse.
+
+Not covered / INFERRED: this is the input GPUSniffer reads to reach the per-device checks, confirmed by reading the
+blocklist and GPUSniffer's registry reads (lab trace: GPUSniffer reads this exact key by AdapterLuid right after it
+pairs the D3D11 device, before the device-info/counter step). A SECOND, separate gate also blocks the Arc in the lab
+(GPUSniffer's Intel path wants the D3D11 "Intel Device Information" counter, which DXVK does not expose -- see the
+companion prototype dxvk-intel-device-info-counter.patch and reporter-ask.md). This patch removes the blocklist
+false-positive; whether it is sufficient on real Intel hardware needs the reporter to confirm (reporter-ask.md).
+
+Lab evidence (runtime 11.10-196i5 = 196 + lab opencl.dll presenting NVIDIA's OpenCL as an Intel Arc B390, CUDA hidden,
+DXVK customVendorId 8086; prefix reflink of a Premiere 2026 prefix; desk i53b; all runs n>=2):
+- The DirectX key A/B on the disguised rig: with the fix the QWORD decodes 35.0.101.6314, without it 35.0.15.8180
+  (arms dxon1/dxoff1, each confirmed in the log). GPUSniffer's result did not change on THIS rig (14 both ways) because
+  the disguised NVIDIA GPU also fails the Intel D3D11-counter gate -- the lab cannot make a non-Intel GPU pass Intel's
+  own device-info step. So the registry value is proven; the end-to-end effect is for the reporter to confirm.
+- Regression: for an NVIDIA GPU the host driver version is already mapped (patch 193), so driver_version differs from
+  the vendor default and the QWORD was ALREADY the real version; this patch does not change that path (derived from the
+  diff; the guard it removes was true for NVIDIA already).
+
+Kill switch: NEUTRON_DXKEY_DRIVER_VERSION=0 restores the old fixed QWORD.
+
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -1649,10 +1649,16 @@
+     hkey = reg_create_ascii_key( NULL, buffer, REG_OPTION_VOLATILE, NULL );
+     if (hkey)
+     {
+-        UINT64 ver = 0x230000000f1ff4; /* Some version in the future. */
++        /* NEUTRON (#53): the DirectX key's DriverVersion QWORD must be the SAME driver version as the class key's
++         * DriverVersion string, exactly as Windows writes it. Wine left the fixed 35.0.15.8180 here for every GPU;
++         * Intel's GPU-detect code (Adobe's GPUSniffer, run by Premiere/After Effects/Media Encoder) reads this key,
++         * sees a driver build far below the current one and flags the GPU in its System Compatibility report
++         * ("No graphics processor suitable for GPU-accelerated render" on an Intel Arc that Windows accepts).
++         * NEUTRON_DXKEY_DRIVER_VERSION=0 restores the old fixed value. */
++        UINT64 ver = 0x230000000f1ff4; /* Fallback when the version string does not parse. */
++        const char *dxkey_env = getenv( "NEUTRON_DXKEY_DRIVER_VERSION" );
+ 
+-        /* NEUTRON: the same version as the class key when it is the host's */
+-        if (driver_version != driver_vendor_to_version( pci->vendor ) && driver_version_to_qword( driver_version ))
++        if (!(dxkey_env && dxkey_env[0] == '0') && driver_version_to_qword( driver_version ))
+             ver = driver_version_to_qword( driver_version );
+ 
+         asciiz_to_unicode( bufferW, "AdapterLuid" );

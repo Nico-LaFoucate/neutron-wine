@@ -1,0 +1,193 @@
+From: Neutron <neutron@localhost>
+Subject: [PATCH] win32u: Report the host NVIDIA driver's version in Windows' format (NEUTRON_GPU_DRIVER_VERSION).
+
+What he saw: Filmora 16's "Graphics Card Detection Results -- GPU acceleration disabled ... NVIDIA GeForce RTX 5070 --
+Graphics card mismatches with driver": "it recognizes the gpu but claims the driver is mismatched?"
+
+Mechanism: Wine writes one fixed driver version per vendor (NVIDIA "35.0.15.6094" = public driver 560.94, older than
+any driver an RTX 50 card runs on Windows) into the display class key's DriverVersion (WMI Win32_VideoController
+.DriverVersion, which Filmora's gpu_check reads), DEVPKEY_Device_DriverVersion (SetupAPI), and a different constant
+(35.0.15.8180) into the DirectX key. The version never changes when the host driver is updated.
+NOT the cause of the box (SOLID, see lab evidence): the box is OpenCL (separate patch, opencl). What this patch does
+for Filmora: Filmora keeps its GPU check's result per driver version and re-runs the check only when the version
+changes; an install that already turned the GPU off (the box's Close) turns it back on only through a new version.
+With the fixed string that never happens; with the host's version it happens on this update and on every host driver
+update after it, as a Windows driver update does.
+
+Windows behavior (cited, not measured on his PC): NVIDIA's Windows version ends in the public driver number -- the last
+digit of the third field and the fourth field (32.0.15.7628 = 576.28, DXVK dxgi_adapter.cpp; Filmora's own downloaded
+blocklist lists real ones as 31.0.15.5161, 31.0.15.2879 and derives "3.6451" = 364.51 from 2x.x.13.6451). The first
+field is the WDDM generation (31, 32); upstream Wine b48f03501bf deliberately moved it to 35 ("a future version") and
+this patch keeps Wine's 35.0. Probe for his Windows PC: team/fgpu2/probe/drvver.exe (prints SetupAPI, class key, WMI,
+DXGI UMD and DirectX key versions plus the registered OpenCL drivers; read-only, exits by itself).
+
+Fix: get_vulkan_gpus() chains VkPhysicalDeviceDriverProperties (when the host device has VK_KHR_driver_properties);
+for driverID NVIDIA_PROPRIETARY the Windows string is "35.0.<10 + major/100>.<major%100><minor:02>" from
+VkPhysicalDeviceProperties::driverVersion (host 620.70.06 -> 35.0.16.2070). It goes to the class key, the DEVPKEY and
+(as a QWORD) the DirectX key. No per-app logic.
+
+Not covered: Mesa (RADV, ANV, NVK) and AMD's own Vulkan driver number releases unrelated to the Windows Adrenalin/Intel
+builds, so there is no faithful mapping and they keep Wine's fixed strings. A Linux minor above 99 (535.104) shows as
+.99 of the same branch. The Linux and Windows minors of one NVIDIA branch differ (Linux 580.65 vs Windows 580.88); the
+branch is exact, the minor is the host's. DXVK's dxgi CheckInterfaceSupport UMD version stays DXVK's own constant
+(35.0.19.9999 for NVIDIA). The driver date stays "today" (Wine's).
+
+Lab evidence (runtime 11.10-194fv = 194fg + this win32u + the opencl fix; desk fgpu2; team/fgpu2/NOTES.md):
+  Probe drvver.exe under Wine: 194fg 35.0.15.6094 (DirectX key 35.0.15.8180); 194fv 35.0.16.2070 in SetupAPI, class
+  key, WMI and DirectX key (2/2); NEUTRON_GPU_DRIVER_VERSION=0: 6094/8180 again (1/1).
+  Filmora 16 fresh installs (programs install, installer-started copy): Filmora read 35.0.16.2070 (fix, 2/2) vs
+  35.0.15.6094 (kill, 2/2); without working OpenCL the box showed in all 4 (result 3), with it in none of 4 (result 0):
+  the version does not decide the box.
+  Recovery (an install whose box was Closed, GPU off, then a menu launch with working OpenCL): checked version
+  6094 -> now 2070: Filmora re-ran its check, result 0, GPU acceleration back on (2/2); same version 2070 -> 2070: no
+  re-check, GPU stays off (2/2).
+  Kill switch: NEUTRON_GPU_DRIVER_VERSION=0 -> Wine's fixed strings for every vendor.
+
+---
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -244,6 +244,9 @@
+     char *name;
+     GUID uuid;
+     ULONGLONG memory;
++    /* NEUTRON: the host driver's version in Windows' display driver format ("35.0.16.2070"), or empty when
++     * there is no faithful mapping (see d3dkmt.c, gpu_driver_version_from_host). */
++    char driver_version[32];
+ };
+ 
+ extern BOOL get_vulkan_gpus( struct list *gpus );
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -954,8 +954,48 @@
+     VkPhysicalDeviceProperties2 properties2;
+     VkPhysicalDeviceIDProperties id;
+     VkPhysicalDeviceMemoryProperties mem_properties;
++    VkPhysicalDeviceDriverProperties driver; /* NEUTRON: valid when has_driver is set */
++    BOOL has_driver;
+ };
+ 
++/* NEUTRON: the host driver's version in the format Windows' display driver reports it (the DriverVersion of the
++ * display class key, read by WMI's Win32_VideoController and SetupAPI's DEVPKEY_Device_DriverVersion, and of the
++ * DirectX key). Wine wrote one fixed version per vendor; for NVIDIA that is "35.0.15.6094", i.e. public driver 560.94,
++ * which no RTX 50 card can run on Windows (they need 572 or later) and which never changes when the host driver is
++ * updated. Programs that keep a GPU check's result until the driver changes never saw an update: Filmora 16 re-runs
++ * its check only for a new driver version, so a GPU it had turned off stayed off.
++ *
++ * NVIDIA's Windows version ends in the public driver number: the last digit of the third field and the four
++ * digits of the fourth field are the public major.minor (32.0.15.7628 = 576.28, 32.0.15.6094 = 560.94). The
++ * proprietary Linux driver reports the same public numbering in VkPhysicalDeviceProperties::driverVersion
++ * (major 10 bits, minor 8 bits), so the branch maps exactly; a Linux minor above 99 (535.104) has no Windows
++ * equivalent and is shown as .99 of the same branch. The first two fields stay Wine's ("35.0").
++ * Mesa (RADV, ANV, NVK) and AMD's own Vulkan driver number their releases unrelated to the Windows drivers, so
++ * there is no faithful mapping: those keep Wine's fixed string (empty here).
++ * NEUTRON_GPU_DRIVER_VERSION=0 keeps Wine's fixed strings for every vendor. */
++static void gpu_driver_version_from_host( const struct vk_physdev_info *info, char *buffer, size_t size )
++{
++    static int enabled = -1;
++    UINT32 version, major, minor;
++
++    buffer[0] = 0;
++    if (enabled < 0)
++    {
++        const char *e = getenv( "NEUTRON_GPU_DRIVER_VERSION" );
++        enabled = !(e && e[0] == '0');
++    }
++    if (!enabled || !info->has_driver) return;
++    if (info->driver.driverID != VK_DRIVER_ID_NVIDIA_PROPRIETARY) return;
++
++    version = info->properties2.properties.driverVersion;
++    major = version >> 22;
++    minor = (version >> 14) & 0xff;
++    if (major < 100 || major > 999) return;
++    if (minor > 99) minor = 99;
++    snprintf( buffer, size, "35.0.%u.%u%02u", 10 + major / 100, major % 100, minor );
++    TRACE( "host driver %s (%#x) -> %s\n", debugstr_a(info->driver.driverInfo), version, buffer );
++}
++
+ static int compare_vulkan_physical_devices( const void *v1, const void *v2 )
+ {
+     static const int device_type_rank[6] = { 100, 1, 0, 2, 3, 200 };
+@@ -985,6 +1025,12 @@
+         devinfo[i].id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+         devinfo[i].properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+         devinfo[i].properties2.pNext = &devinfo[i].id;
++        if (physical_device->extensions.has_VK_KHR_driver_properties)
++        {
++            devinfo[i].driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
++            devinfo[i].id.pNext = &devinfo[i].driver;
++            devinfo[i].has_driver = TRUE;
++        }
+ 
+         instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device, &devinfo[i].properties2 );
+         instance->p_vkGetPhysicalDeviceMemoryProperties( physical_device->host.physical_device, &devinfo[i].mem_properties );
+@@ -1000,6 +1046,7 @@
+         gpu->name = strdup( devinfo[i].properties2.properties.deviceName );
+         gpu->pci_id.vendor = devinfo[i].properties2.properties.vendorID;
+         gpu->pci_id.device = devinfo[i].properties2.properties.deviceID;
++        gpu_driver_version_from_host( &devinfo[i], gpu->driver_version, sizeof(gpu->driver_version) );
+ 
+         for (j = 0; j < devinfo[i].mem_properties.memoryHeapCount; j++)
+         {
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -1469,9 +1469,21 @@
+     return default_name;
+ };
+ 
++/* NEUTRON: the DirectX key's DriverVersion (a QWORD, one WORD per field) for the same version string. */
++static UINT64 driver_version_to_qword( const char *version )
++{
++    unsigned int f[4];
++
++    if (sscanf( version, "%u.%u.%u.%u", &f[0], &f[1], &f[2], &f[3] ) != 4) return 0;
++    return ((UINT64)(f[0] & 0xffff) << 48) | ((UINT64)(f[1] & 0xffff) << 32) | ((f[2] & 0xffff) << 16) | (f[3] & 0xffff);
++}
++
+ static BOOL write_gpu_to_registry( const struct gpu *gpu, const struct pci_id *pci,
+-                                   ULONGLONG memory_size )
++                                   ULONGLONG memory_size, const char *host_driver_version )
+ {
++    /* NEUTRON: the host driver's version when it maps onto the vendor's Windows numbering, else Wine's fixed one */
++    const char *driver_version = host_driver_version && host_driver_version[0]
++                                 ? host_driver_version : driver_vendor_to_version( pci->vendor );
+     unsigned int size, name_size = (wcslen( gpu->name ) + 1) * sizeof(WCHAR);
+     char buffer[4096], *tmp;
+     WCHAR bufferW[512];
+@@ -1540,7 +1552,7 @@
+     if ((subkey = reg_create_ascii_key( hkey, devpkey_device_driver_version, 0, NULL )))
+     {
+         set_reg_value( subkey, NULL, 0xffff0000 | DEVPROP_TYPE_STRING, bufferW,
+-                       asciiz_to_unicode( bufferW, driver_vendor_to_version( pci->vendor ) ));
++                       asciiz_to_unicode( bufferW, driver_version ));
+         NtClose( subkey );
+     }
+ 
+@@ -1626,7 +1638,7 @@
+     value = (ULONG)min( memory_size, (ULONGLONG)MAXDWORD );
+     set_reg_value( hkey, memory_sizeW, REG_DWORD, &value, sizeof(value) );
+ 
+-    set_reg_ascii_value( hkey, "DriverVersion", driver_vendor_to_version( pci->vendor ) );
++    set_reg_ascii_value( hkey, "DriverVersion", driver_version );
+     NtClose( hkey );
+ 
+ 
+@@ -1639,6 +1651,10 @@
+     {
+         UINT64 ver = 0x230000000f1ff4; /* Some version in the future. */
+ 
++        /* NEUTRON: the same version as the class key when it is the host's */
++        if (driver_version != driver_vendor_to_version( pci->vendor ) && driver_version_to_qword( driver_version ))
++            ver = driver_version_to_qword( driver_version );
++
+         asciiz_to_unicode( bufferW, "AdapterLuid" );
+         set_reg_value( hkey, bufferW, REG_QWORD, &gpu->luid, sizeof(gpu->luid) );
+         asciiz_to_unicode( bufferW, "DriverVersion" );
+@@ -1798,7 +1814,7 @@
+     if (!memory && opengl_gpu) memory = opengl_gpu->memory;
+     if (!memory) memory = 1024 * 1024 * 1024;
+ 
+-    if (!write_gpu_to_registry( gpu, pci_id, memory ))
++    if (!write_gpu_to_registry( gpu, pci_id, memory, vulkan_gpu ? vulkan_gpu->driver_version : NULL ))
+     {
+         WARN( "Failed to write gpu %p to registry\n", gpu );
+         gpu_release( gpu );
