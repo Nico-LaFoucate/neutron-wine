@@ -1,0 +1,862 @@
+Neutron#53 (@atsuenn): Premiere Pro 2026 on an Intel Arc B390 (Panther Lake, Framework Laptop 13 Pro, xe, Mesa 26.2.6,
+intel-compute-runtime) -- "as SOON as i open it, i get a System Compatibility report" ("No graphics processor suitable
+for GPU-accelerated render"). On Windows the Arc is used.
+
+d3d11: answer Intel's "Intel Device Information" counter on Intel adapters (kill switch NEUTRON_DXVK_INTEL_DEVINFO=0)
+
+Mechanism (SOLID, lab + static reading of GPUSniffer.exe 26.5.2.5): Premiere's GPU check (GPUSniffer, also run by After
+Effects and Media Encoder) lists Intel's OpenCL device ("No capability restrictions detected - adding device to list") but
+only initializes it after Intel's own device query succeeds -- a D3D11 device-dependent counter that Intel's Windows driver
+exposes. On an AMD device the equivalent is cl_amd_device_attribute_query (lab control from i53b: with it 545, without it
+14, the same "isn't initialized"). DXVK reported no device-dependent counters (CheckCounterInfo LastDeviceDependentCounter
+0, CheckCounter/CreateCounter E_INVALIDARG), so the device stayed "* Not chosen because it isn't initialized." and
+GPUSniffer returned 14 -- the reporter's result, before and after 187.1's driver-version fix.
+
+What GPUSniffer does (static reading, located for this fix; same protocol as Intel's public GPU Detect sample,
+github.com/GameTechDev/gpudetect GPUDetect.cpp GetIntelDeviceInfo):
+- only when the DirectX-key driver build is 5103..65535 (Intel's numbering; 187.1 made that key real);
+- CheckCounterInfo, then CheckCounter twice per device-dependent counter (lengths, then strings); the counter whose name is
+  "Intel Device Information" (exactly 24 characters) is Intel's;
+- version = sscanf(description, "Version %d"); no match -> version 1, 8 bytes. Then sscanf(units, "Size %d"): no match ->
+  24 bytes if version >= 2; a number -> that size; EMPTY units -> size 0 -> counter rejected (lab-confirmed below);
+- CreateCounter, Begin, End, GetData(8 bytes) must return exactly S_OK; the 8 bytes are the ADDRESS of the driver's block,
+  which it copies; the version must be 2 ("invalid intel device info header version, expect: 2");
+- block = IntelDeviceInfoV2 { GPUMaxFreq, GPUMinFreq, GTGeneration, EUCount, PackageTDP, MaxFillRate } (DWORDs, 24
+  bytes); it reports "Hardware Family" = GTGeneration and keeps GTGeneration and EUCount (its compute-unit gate drops from 20
+  to 16 for GTGeneration >= 0x21, Tiger Lake).
+Our first prototype (i53b) returned an empty description: GPUSniffer read version 1 and rejected it.
+
+Windows/Intel behavior this mirrors: Intel's D3D11 driver exposes one device-dependent counter "Intel Device Information",
+description "Version 2", whose GetData returns a pointer to driver-owned IntelDeviceInfoV2 (gpudetect GPUDetect.cpp, the
+struct and the "Version %d" parse; DeviceId.h INTEL_GPU_ARCHITECTURE = the values GTGeneration carries, asserted against
+the device-id table in GPUDetect.cpp InitCounterInfo). This patch exposes exactly that counter, ONLY when the Vulkan
+adapter's vendor is Intel (0x8086), and fills it from the real hardware:
+- GTGeneration: Intel's PRODUCT_FAMILY for the PCI device id the app sees through DXGI. Up to Alchemist: Intel's GPU
+  Detect table (gpudetect DeviceId.cpp GetIntelGPUArchitecture; Tiger Lake 0x21, Rocket Lake 0x23, Alder Lake 0x24, DG1
+  1210, Alchemist 1270). Newer: ids from the Linux kernel's include/drm/intel/pciids.h (INTEL_PTL/LNL/BMG/ARL/MTL_IDS),
+  values from Intel's igfxfmid.h (gmmlib Source/inc/common/igfxfmid.h, intel-graphics-compiler inc/common/igfxfmid.h):
+  Meteor Lake 1272, Arrow Lake 1273, Battlemage 1274, Lunar Lake 1275, Panther Lake 1300 (the reporter's B390 is 0xB082).
+  igfxfmid.h and gpudetect agree on DG1 1210 and Alchemist 1270; their low numbers differ, and gpudetect's (Windows) win.
+- EUCount: CL_DEVICE_MAX_COMPUTE_UNITS of Intel's own OpenCL runtime (compute-runtime/NEO, platform vendor "Intel(R)
+  Corporation", device vendor 0x8086) for the same PCI address (cl_khr_pci_bus_info vs VK_EXT_pci_bus_info; the only Intel
+  OpenCL GPU when one side has no PCI info). NEO sets that value to GT_SYSTEM_INFO.EUCount, the fused EU count from the
+  kernel driver (compute-runtime shared/source/device/device_caps.cpp). Vulkan and sysfs do not report EUs and a PE DLL
+  cannot issue the xe/i915 topology ioctl, so Intel's runtime is the source DXVK can reach -- and Premiere needs that
+  runtime installed anyway (it refuses Mesa's OpenCL by vendor). Read on the first CreateCounter, not at device creation.
+- GPUMaxFreq/GPUMinFreq: the GPU's hardware RP0/RPn from sysfs, found by PCI slot (/sys/class/drm/cardN/device/uevent):
+  xe device/tile0/gt0/freq0/rp0_freq + rpn_freq, i915 gt_RP0_freq_mhz + gt_RPn_freq_mhz; max falls back to NEO's
+  CL_DEVICE_MAX_CLOCK_FREQUENCY.
+- units "Size 24" (GPUSniffer needs non-empty units; with "Size 24" or any other non-"Size" text it reads 24 bytes).
+One info line per adapter goes to the DXVK log: "D3D11: Intel Device Information v2 for device 0x...: GTGeneration ...,
+EUCount ... (source), GPUMaxFreq ... (source)".
+
+Not covered / INFERRED:
+- Never run on real Intel hardware. The exact units text and counter type Intel's driver reports are not public; GPUSniffer
+  and Intel's sample behave the same for any non-empty units. Whether Intel's Windows driver reports Panther Lake as 1300
+  is INFERRED (igfxfmid.h; the high block agrees with the Windows-read values for DG1/Alchemist).
+- PackageTDP and MaxFillRate are 0 (no user-space source; GPUSniffer prints them and keeps neither).
+- EUCount is 0 without Intel's OpenCL runtime (then Premiere has no Intel OpenCL device to initialize anyway).
+- Wildcat Lake (0xFD80/FD81), Nova Lake and Raptor Lake ids have no table entry (GTGeneration 0 = IGFX_UNKNOWN).
+- x64 d3d11 only (the x86 DLLs are dxvk-stock); D3D10's counter calls stay unimplemented as upstream.
+- After init GPUSniffer still checks driver blocklist, compute units and memory on the real Arc; the lab passes them
+  with an NVIDIA GPU underneath.
+
+Lab evidence (runtime 11.10-205 + this d3d11 built from DXVK 3c6f5083 + patches/dxvk 0001-0008 as in 205, NVIDIA RTX 5070,
+prefix reflink of a Premiere 2026 lab prefix, desk i53c; rig = the NVIDIA GPU presented as an Arc B390: DXVK
+customVendorId 8086 / customDeviceId b082, NVIDIA's OpenCL renamed to Intel's runtime by an LD_PRELOAD shim, CUDA hidden,
+NEUTRON_DXKEY_DRIVER_VERSION=0; NEUTRON_DXVK_INTEL_DEVINFO_ANY_GPU=1 lets the code run on it):
+- GPUSniffer kill-switch A/B on the same DLL, n=3 each: counter on -> device initialized ("Vendor: Intel", "Hardware Family:
+  1300"), clCreateContext, DirectX test passes, result 545(0x221) (s-on1..3); NEUTRON_DXVK_INTEL_DEVINFO=0 -> "* Not
+  chosen because it isn't initialized.", no context, 14(0xE) (s-off1..3). 545 is also i53b's AMD positive control.
+  Shipped 205 d3d11 on the same rig: 14 (s-205a). Without ANY_GPU (real vendor NVIDIA, DXGI still saying Intel): 14, no
+  counter (s-noany1) -- the gate reads the real adapter.
+- Empty-units variant (lab build): GPUSniffer 14, harness parses size 0 (s-nounits1, h-nounits1).
+- Mingw harness doing Intel's sample + GPUSniffer's parse: name "Intel Device Information" (25), units "Size 24", desc
+  "Version 2", header 24/2, GetDataSize 8, GetData(NULL,0) S_OK, block GTGeneration 0x514 (1300), EUCount 48 (the NVIDIA
+  device's compute units through the shim, matched by PCI 0:1:0.0), GPUMaxFreq 2512 from OpenCL; sysfs card found by PCI
+  slot (/sys/class/drm/card1, no xe/i915 files on NVIDIA). Lab-only fake sysfs roots: xe 2500/400, i915 2100/300 read.
+- Plain NVIDIA adapter: CheckCounterInfo 0, "no device dependent counters" (settle-nv).
+- Regression on NVIDIA (no rig): Premiere 2026 home screen identical with this DLL (n=3) and 205's (n=1); Photoshop 2026
+  home + sign-in dialog identical with this DLL (n=2) and 205's (n=1); no "Intel Device Information" line in any app log.
+
+Kill switch: NEUTRON_DXVK_INTEL_DEVINFO=0 (no counters, upstream behavior). Development only:
+NEUTRON_DXVK_INTEL_DEVINFO_ANY_GPU=1 exposes it on any GPU (lab rigs; same idea as NEUTRON_AMF_ANY_GPU).
+build-external.sh: add b"NEUTRON_DXVK_INTEL_DEVINFO" to the d3d11.dll marker list.
+Applies to patches/dxvk 0001-0008 (205) as 0009 and on top of 0009-swap-state-lock (188 line) as 0010; git apply checked on both, and d3d11.dll compiles on both.
+
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -1,5 +1,6 @@
+ #include "d3d11_context_def.h"
+ #include "d3d11_device.h"
++#include "d3d11_intel_device_info.h"
+ 
+ namespace dxvk {
+   
+@@ -45,6 +46,10 @@
+     if (unlikely(!pAsync))
+       return;
+ 
++    // NEUTRON (Neutron#53): Intel's device-information counter has nothing to record
++    if (unlikely(D3D11IntelDeviceInfoCounter::FromAsync(pAsync) != nullptr))
++      return;
++
+     Com<D3D11Query, false> query(static_cast<D3D11Query*>(pAsync));
+ 
+     if (unlikely(!query->IsScoped()))
+@@ -73,6 +78,10 @@
+     if (unlikely(!pAsync))
+       return;
+ 
++    // NEUTRON (Neutron#53): Intel's device-information counter has nothing to record
++    if (unlikely(D3D11IntelDeviceInfoCounter::FromAsync(pAsync) != nullptr))
++      return;
++
+     Com<D3D11Query, false> query(static_cast<D3D11Query*>(pAsync));
+ 
+     if (query->IsScoped()) {
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -2,6 +2,7 @@
+ #include "d3d11_context_imm.h"
+ #include "d3d11_device.h"
+ #include "d3d11_fence.h"
++#include "d3d11_intel_device_info.h"
+ #include "d3d11_texture.h"
+ 
+ #include "../util/util_win32_compat.h"
+@@ -88,6 +89,10 @@
+     // DataSize is 0, but we should ignore that pointer
+     pData = DataSize ? pData : nullptr;
+ 
++    // NEUTRON (Neutron#53): Intel's device-information counter answers at once
++    if (auto counter = D3D11IntelDeviceInfoCounter::FromAsync(pAsync))
++      return counter->GetData(pData, DataSize);
++
+     // Get query status directly from the query object
+     auto query = static_cast<D3D11Query*>(pAsync);
+     HRESULT hr = query->GetData(pData, GetDataFlags);
+@@ -119,6 +124,9 @@
+ 
+     if (unlikely(!pAsync))
+       return;
++
++    if (unlikely(D3D11IntelDeviceInfoCounter::FromAsync(pAsync) != nullptr))
++      return;
+     
+     auto query = static_cast<D3D11Query*>(pAsync);
+ 
+@@ -137,6 +145,9 @@
+ 
+     if (unlikely(!pAsync))
+       return;
++
++    if (unlikely(D3D11IntelDeviceInfoCounter::FromAsync(pAsync) != nullptr))
++      return;
+     
+     auto query = static_cast<D3D11Query*>(pAsync);
+ 
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -19,6 +19,7 @@
+ #include "d3d11_device.h"
+ #include "d3d11_fence.h"
+ #include "d3d11_input_layout.h"
++#include "d3d11_intel_device_info.h"
+ #include "d3d11_interop.h"
+ #include "d3d11_query.h"
+ #include "d3d11_resource.h"
+@@ -1276,7 +1277,29 @@
+     const D3D11_COUNTER_DESC*         pCounterDesc,
+           ID3D11Counter**             ppCounter) {
+     InitReturnPtr(ppCounter);
+-    
++
++    // NEUTRON (Neutron#53): Intel's "Intel Device Information" counter, see d3d11_intel_device_info.h
++    if (pCounterDesc && pCounterDesc->Counter == D3D11_COUNTER_DEVICE_DEPENDENT_0
++     && D3D11IntelDeviceInfo::IsExposed(m_dxvkAdapter)) {
++      if (pCounterDesc->MiscFlags)
++        return E_INVALIDARG;
++
++      if (!ppCounter)
++        return S_FALSE;
++
++      // The PCI device id the app sees through DXGI, which is what it matches the generation against
++      uint32_t deviceId = m_dxvkAdapter->info().deviceId;
++      Com<IDXGIAdapter> adapter;
++      DXGI_ADAPTER_DESC adapterDesc = { };
++
++      if (SUCCEEDED(m_container->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&adapterDesc)))
++        deviceId = adapterDesc.DeviceId;
++
++      *ppCounter = ref(new D3D11IntelDeviceInfoCounter(this, *pCounterDesc,
++        D3D11IntelDeviceInfo::Get(m_dxvkAdapter, deviceId)));
++      return S_OK;
++    }
++
+     Logger::err(str::format("D3D11: Unsupported counter: ", pCounterDesc->Counter));
+     return E_INVALIDARG;
+   }
+@@ -1741,6 +1764,12 @@
+     pCounterInfo->LastDeviceDependentCounter  = D3D11_COUNTER(0);
+     pCounterInfo->NumSimultaneousCounters     = 0;
+     pCounterInfo->NumDetectableParallelUnits  = 0;
++
++    // NEUTRON (Neutron#53): Intel's "Intel Device Information" counter
++    if (D3D11IntelDeviceInfo::IsExposed(m_dxvkAdapter)) {
++      pCounterInfo->LastDeviceDependentCounter  = D3D11_COUNTER_DEVICE_DEPENDENT_0;
++      pCounterInfo->NumSimultaneousCounters     = 1;
++    }
+   }
+   
+   
+@@ -1754,6 +1783,37 @@
+           UINT*               pUnitsLength,
+           LPSTR               szDescription,
+           UINT*               pDescriptionLength) {
++    // NEUTRON (Neutron#53): Intel's "Intel Device Information" counter. Each length gets the
++    // string's size with its terminator; a given buffer that is too short fails the call.
++    if (pDesc && pDesc->Counter == D3D11_COUNTER_DEVICE_DEPENDENT_0
++     && D3D11IntelDeviceInfo::IsExposed(m_dxvkAdapter)) {
++      auto copyString = [] (LPSTR dst, UINT* pLength, const char* src) {
++        UINT size = UINT(std::strlen(src) + 1);
++
++        if (!pLength)
++          return !dst;
++
++        bool fits = !dst || *pLength >= size;
++
++        if (dst && fits)
++          std::memcpy(dst, src, size);
++
++        *pLength = size;
++        return fits;
++      };
++
++      if (pType)
++        *pType = D3D11_COUNTER_TYPE_UINT32;
++
++      if (pActiveCounters)
++        *pActiveCounters = 1;
++
++      bool ok = copyString(szName, pNameLength, D3D11IntelDeviceInfo::Name());
++      ok &= copyString(szUnits, pUnitsLength, D3D11IntelDeviceInfo::Units());
++      ok &= copyString(szDescription, pDescriptionLength, D3D11IntelDeviceInfo::Description());
++      return ok ? S_OK : E_INVALIDARG;
++    }
++
+     Logger::err("D3D11: Counters not supported");
+     return E_INVALIDARG;
+   }
+--- /dev/null
++++ b/src/d3d11/d3d11_intel_device_info.cpp
+@@ -0,0 +1,487 @@
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "../dxvk/dxvk_adapter.h"
++
++#include "../util/util_env.h"
++
++#include "d3d11_device.h"
++#include "d3d11_intel_device_info.h"
++
++namespace dxvk {
++
++  /* NEUTRON (Neutron#53): see d3d11_intel_device_info.h. Where each value comes from:
++   *
++   * GTGeneration: Intel's PRODUCT_FAMILY for the PCI device id. Ids and values up to Alchemist come
++   *   from Intel's own GPU Detect table (gpudetect DeviceId.cpp GetIntelGPUArchitecture + DeviceId.h
++   *   INTEL_GPU_ARCHITECTURE, the values its comment says the counter returns; its assert checks the
++   *   counter's value against that table). Newer families: ids from the Linux kernel's
++   *   include/drm/intel/pciids.h, values from Intel's igfxfmid.h (gmmlib, intel-graphics-compiler):
++   *   MTL 1272, ARL 1273, BMG 1274, LNL 1275, PTL 1300; the same file agrees with gpudetect on DG1 1210
++   *   and DG2/Alchemist 1270.
++   * EUCount: CL_DEVICE_MAX_COMPUTE_UNITS of Intel's own OpenCL runtime (compute-runtime/NEO) for the same
++   *   PCI device: NEO sets it to GT_SYSTEM_INFO.EUCount, the fused EU count the kernel driver reports
++   *   (shared/source/device/device_caps.cpp). Neither Vulkan nor sysfs reports EUs, and a PE DLL cannot
++   *   issue the xe/i915 topology ioctl, so Intel's own runtime is the source DXVK can reach. 0 when Intel's
++   *   OpenCL runtime is not installed.
++   * GPUMaxFreq / GPUMinFreq: the GPU's hardware RP0 / RPn frequencies from sysfs (xe:
++   *   device/tile0/gt0/freq0/rp0_freq, rpn_freq; i915: gt_RP0_freq_mhz, gt_RPn_freq_mhz). Max falls back to
++   *   NEO's CL_DEVICE_MAX_CLOCK_FREQUENCY (its maxRenderFrequency), min to 0.
++   * PackageTDP, MaxFillRate: 0 (no user-space source).
++   */
++
++  // OpenCL, through the prefix's opencl.dll, without the CL headers
++  typedef int32_t (WINAPI *PFN_ClGetPlatformIDs)(uint32_t, void**, uint32_t*);
++  typedef int32_t (WINAPI *PFN_ClGetPlatformInfo)(void*, uint32_t, size_t, void*, size_t*);
++  typedef int32_t (WINAPI *PFN_ClGetDeviceIDs)(void*, uint64_t, uint32_t, void**, uint32_t*);
++  typedef int32_t (WINAPI *PFN_ClGetDeviceInfo)(void*, uint32_t, size_t, void*, size_t*);
++
++  constexpr uint32_t ClPlatformVendor           = 0x0903;
++  constexpr uint64_t ClDeviceTypeGpu            = 1u << 2;
++  constexpr uint32_t ClDeviceVendorId           = 0x1001;
++  constexpr uint32_t ClDeviceMaxComputeUnits    = 0x1002;
++  constexpr uint32_t ClDeviceMaxClockFrequency  = 0x100C;
++  constexpr uint32_t ClDevicePciBusInfoKhr      = 0x410F;
++
++  struct IntelPciAddress {
++    bool     valid = false;
++    uint32_t domain = 0, bus = 0, device = 0, function = 0;
++  };
++
++  struct IntelClInfo {
++    bool        found = false;
++    uint32_t    computeUnits = 0;
++    uint32_t    maxClockMhz = 0;
++    const char* how = "no Intel OpenCL GPU";
++  };
++
++  struct IntelInfoEntry {
++    uint8_t                 uuid[VK_UUID_SIZE];
++    uint32_t                deviceId;
++    D3D11IntelDeviceInfoV2* info;
++  };
++
++  static std::mutex                   g_intelInfoMutex;
++  static std::vector<IntelInfoEntry>  g_intelInfoEntries;
++
++  std::atomic<uint32_t> D3D11IntelDeviceInfoCounter::s_liveCount = { 0u };
++
++
++  static bool IntelDevInfoAnyGpu() {
++    // Development only: lets a lab rig that presents another GPU as Intel run this code.
++    static const bool anyGpu = env::getEnvVar("NEUTRON_DXVK_INTEL_DEVINFO_ANY_GPU") == "1";
++    return anyGpu;
++  }
++
++
++  bool D3D11IntelDeviceInfo::IsExposed(const Rc<DxvkAdapter>& adapter) {
++    static const bool disabled = env::getEnvVar("NEUTRON_DXVK_INTEL_DEVINFO") == "0";
++
++    if (disabled)
++      return false;
++
++    return adapter->info().vendorId == 0x8086u || IntelDevInfoAnyGpu();
++  }
++
++
++  uint32_t D3D11IntelDeviceInfo::GetGTGeneration(uint32_t deviceId) {
++    // Exact ids first: kernel include/drm/intel/pciids.h, values from igfxfmid.h
++    static const struct { uint16_t id; uint16_t family; } exact[] = {
++      // PTL (IGFX_PTL = 1300): INTEL_PTL_IDS
++      { 0xb080, 1300 }, { 0xb081, 1300 }, { 0xb082, 1300 }, { 0xb083, 1300 }, { 0xb084, 1300 },
++      { 0xb085, 1300 }, { 0xb086, 1300 }, { 0xb087, 1300 }, { 0xb08f, 1300 }, { 0xb090, 1300 },
++      { 0xb0a0, 1300 }, { 0xb0a1, 1300 }, { 0xb0b0, 1300 },
++      // LNL (IGFX_LUNARLAKE = 1275): INTEL_LNL_IDS
++      { 0x6420, 1275 }, { 0x64a0, 1275 }, { 0x64b0, 1275 },
++      // BMG (IGFX_BMG = 1274): INTEL_BMG_IDS
++      { 0xe202, 1274 }, { 0xe209, 1274 }, { 0xe20b, 1274 }, { 0xe20c, 1274 }, { 0xe20d, 1274 },
++      { 0xe210, 1274 }, { 0xe211, 1274 }, { 0xe212, 1274 }, { 0xe216, 1274 }, { 0xe220, 1274 },
++      { 0xe221, 1274 }, { 0xe222, 1274 }, { 0xe223, 1274 },
++      // ARL (IGFX_ARROWLAKE = 1273): INTEL_ARL_IDS
++      { 0x7d41, 1273 }, { 0x7d51, 1273 }, { 0x7d67, 1273 }, { 0x7dd1, 1273 }, { 0xb640, 1273 },
++      // MTL (IGFX_METEORLAKE = 1272): INTEL_MTL_IDS + gmmlib's 7D57/7DD7
++      { 0x7d40, 1272 }, { 0x7d45, 1272 }, { 0x7d55, 1272 }, { 0x7d57, 1272 }, { 0x7d60, 1272 },
++      { 0x7dd5, 1272 }, { 0x7dd7, 1272 },
++    };
++
++    for (const auto& e : exact) {
++      if (e.id == deviceId)
++        return e.family;
++    }
++
++    // Intel's GPU Detect table (gpudetect DeviceId.cpp GetIntelGPUArchitecture)
++    const uint32_t idhi = deviceId & 0xff00u;
++    const uint32_t idlo = deviceId & 0x00ffu;
++
++    if (idhi == 0x0100u)
++      return ((idlo & 0xf0u) == 0x50u || (idlo & 0xf0u) == 0x60u) ? 0x0d : 0x0c;   // IVYBRIDGE : SANDYBRIDGE
++    if (idhi == 0x0400u || idhi == 0x0a00u || idhi == 0x0d00u || idhi == 0x0c00u)
++      return 0x0e;                    // HASWELL
++    if (idhi == 0x1600u || idhi == 0x0b00u)
++      return 0x10;                    // BROADWELL
++    if (idhi == 0x1900u || idhi == 0x0900u)
++      return 0x12;                    // SKYLAKE
++    if (idhi == 0x5900u)
++      return 0x13;                    // KABYLAKE
++    if (idhi == 0x3100u)
++      return 0x17;                    // GEMINILAKE
++    if (idhi == 0x5a00u)
++      return 0x1a;                    // CANNONLAKE
++    if (idhi == 0x3e00u || idhi == 0x9b00u)
++      return 0x14;                    // COFFEELAKE (gpudetect's Whiskey/Comet Lake have no value of their own)
++    if (idhi == 0x8a00u)
++      return 0x1d;                    // ICELAKE_LP
++    if (idhi == 0x9a00u)
++      return 0x21;                    // TIGERLAKE_LP
++    if (idhi == 0x4900u)
++      return 0x4ba;                   // DG1 (1210)
++    if (idhi == 0x4c00u)
++      return 0x23;                    // ROCKETLAKE
++    if (idhi == 0x4600u)
++      return 0x24;                    // ADL
++    if (idhi == 0x5600u)
++      return 1270;                    // Alchemist (DG2)
++
++    return 0;                         // IGFX_UNKNOWN
++  }
++
++
++#ifdef _WIN32
++  static bool ReadUnixFile(const std::string& unixPath, std::string& data) {
++    typedef WCHAR* (CDECL *PFN_WineGetDosFileName)(LPCSTR);
++
++    static const auto wineGetDosFileName = reinterpret_cast<PFN_WineGetDosFileName>(
++      ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "wine_get_dos_file_name"));
++
++    if (!wineGetDosFileName)
++      return false;
++
++    WCHAR* dosName = wineGetDosFileName(unixPath.c_str());
++
++    if (!dosName)
++      return false;
++
++    HANDLE file = ::CreateFileW(dosName, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
++      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    ::HeapFree(::GetProcessHeap(), 0, dosName);
++
++    if (file == INVALID_HANDLE_VALUE)
++      return false;
++
++    char buffer[4096];
++    DWORD read = 0;
++    BOOL ok = ::ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
++    ::CloseHandle(file);
++
++    if (!ok || !read)
++      return false;
++
++    data.assign(buffer, read);
++    return true;
++  }
++
++
++  static uint32_t ReadUnixNumber(const std::string& unixPath) {
++    std::string data;
++
++    if (!ReadUnixFile(unixPath, data))
++      return 0;
++
++    return uint32_t(std::strtoul(data.c_str(), nullptr, 10));
++  }
++
++
++  static IntelClInfo QueryIntelOpenCl(const IntelPciAddress& pci) {
++    IntelClInfo result;
++
++    HMODULE cl = ::LoadLibraryW(L"opencl.dll");
++
++    if (!cl) {
++      result.how = "no opencl.dll";
++      return result;
++    }
++
++    // Not freed: OpenCL ICDs do not all survive being unloaded, and the app may use it too
++    auto clGetPlatformIDs  = reinterpret_cast<PFN_ClGetPlatformIDs> (::GetProcAddress(cl, "clGetPlatformIDs"));
++    auto clGetPlatformInfo = reinterpret_cast<PFN_ClGetPlatformInfo>(::GetProcAddress(cl, "clGetPlatformInfo"));
++    auto clGetDeviceIDs    = reinterpret_cast<PFN_ClGetDeviceIDs>   (::GetProcAddress(cl, "clGetDeviceIDs"));
++    auto clGetDeviceInfo   = reinterpret_cast<PFN_ClGetDeviceInfo>  (::GetProcAddress(cl, "clGetDeviceInfo"));
++
++    if (!clGetPlatformIDs || !clGetPlatformInfo || !clGetDeviceIDs || !clGetDeviceInfo)
++      return result;
++
++    uint32_t platformCount = 0;
++
++    if (clGetPlatformIDs(0, nullptr, &platformCount) || !platformCount)
++      return result;
++
++    std::vector<void*> platforms(platformCount);
++
++    if (clGetPlatformIDs(platformCount, platforms.data(), nullptr))
++      return result;
++
++    struct Candidate { void* device; bool hasPci; uint32_t pci[4]; };
++    std::vector<Candidate> candidates;
++
++    for (void* platform : platforms) {
++      char vendor[256] = { };
++
++      if (clGetPlatformInfo(platform, ClPlatformVendor, sizeof(vendor) - 1, vendor, nullptr)
++       || !std::strstr(vendor, "Intel(R) Corporation"))
++        continue;
++
++      uint32_t deviceCount = 0;
++
++      if (clGetDeviceIDs(platform, ClDeviceTypeGpu, 0, nullptr, &deviceCount) || !deviceCount)
++        continue;
++
++      std::vector<void*> devices(deviceCount);
++
++      if (clGetDeviceIDs(platform, ClDeviceTypeGpu, deviceCount, devices.data(), nullptr))
++        continue;
++
++      for (void* device : devices) {
++        uint32_t vendorId = 0;
++
++        if (clGetDeviceInfo(device, ClDeviceVendorId, sizeof(vendorId), &vendorId, nullptr) || vendorId != 0x8086u)
++          continue;
++
++        Candidate c = { device, false, { } };
++        c.hasPci = !clGetDeviceInfo(device, ClDevicePciBusInfoKhr, sizeof(c.pci), c.pci, nullptr);
++        candidates.push_back(c);
++      }
++    }
++
++    const Candidate* chosen = nullptr;
++
++    if (pci.valid) {
++      for (const auto& c : candidates) {
++        if (c.hasPci && c.pci[0] == pci.domain && c.pci[1] == pci.bus
++         && c.pci[2] == pci.device && c.pci[3] == pci.function) {
++          chosen = &c;
++          result.how = "Intel OpenCL, same PCI address";
++        }
++      }
++    }
++
++    if (!chosen && candidates.size() == 1u) {
++      chosen = &candidates[0];
++      result.how = "the only Intel OpenCL GPU";
++    }
++
++    if (!chosen) {
++      if (!candidates.empty())
++        result.how = "no Intel OpenCL GPU at this PCI address";
++      return result;
++    }
++
++    uint32_t computeUnits = 0;
++    uint32_t maxClock = 0;
++    int32_t cuError = clGetDeviceInfo(chosen->device, ClDeviceMaxComputeUnits, sizeof(computeUnits), &computeUnits, nullptr);
++    int32_t clockError = clGetDeviceInfo(chosen->device, ClDeviceMaxClockFrequency, sizeof(maxClock), &maxClock, nullptr);
++
++    if (cuError || clockError)
++      Logger::warn(str::format("D3D11: Intel Device Information: OpenCL compute units error ", cuError, ", clock error ", clockError));
++
++    result.found = true;
++    result.computeUnits = computeUnits;
++    result.maxClockMhz = maxClock;
++    return result;
++  }
++
++
++  static std::string FindDrmCard(const IntelPciAddress& pci) {
++    if (!pci.valid)
++      return std::string();
++
++    char slot[64];
++    std::snprintf(slot, sizeof(slot), "PCI_SLOT_NAME=%04x:%02x:%02x.%x\n",
++      pci.domain, pci.bus, pci.device, pci.function);
++
++    for (uint32_t i = 0; i < 64u; i++) {
++      std::string card = str::format("/sys/class/drm/card", i);
++      std::string uevent;
++
++      if (ReadUnixFile(card + "/device/uevent", uevent) && uevent.find(slot) != std::string::npos)
++        return card;
++    }
++
++    return std::string();
++  }
++#endif
++
++
++  static IntelPciAddress GetPciAddress(const Rc<DxvkAdapter>& adapter) {
++    IntelPciAddress result;
++
++    auto vki = adapter->vki();
++    uint32_t count = 0;
++
++    if (vki->vkEnumerateDeviceExtensionProperties(adapter->handle(), nullptr, &count, nullptr) != VK_SUCCESS)
++      return result;
++
++    std::vector<VkExtensionProperties> extensions(count);
++
++    if (vki->vkEnumerateDeviceExtensionProperties(adapter->handle(), nullptr, &count, extensions.data()) != VK_SUCCESS)
++      return result;
++
++    bool supported = false;
++
++    for (const auto& e : extensions)
++      supported |= !std::strcmp(e.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);
++
++    if (!supported)
++      return result;
++
++    VkPhysicalDevicePCIBusInfoPropertiesEXT pciInfo = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT };
++    VkPhysicalDeviceProperties2 properties = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
++    properties.pNext = &pciInfo;
++    vki->vkGetPhysicalDeviceProperties2(adapter->handle(), &properties);
++
++    result.valid = true;
++    result.domain = pciInfo.pciDomain;
++    result.bus = pciInfo.pciBus;
++    result.device = pciInfo.pciDevice;
++    result.function = pciInfo.pciFunction;
++    return result;
++  }
++
++
++  const D3D11IntelDeviceInfoV2* D3D11IntelDeviceInfo::Get(const Rc<DxvkAdapter>& adapter, uint32_t deviceId) {
++    std::lock_guard lock(g_intelInfoMutex);
++
++    DxvkAdapterInfo adapterInfo = adapter->info();
++
++    for (const auto& e : g_intelInfoEntries) {
++      if (e.deviceId == deviceId && !std::memcmp(e.uuid, adapterInfo.deviceUuid, VK_UUID_SIZE))
++        return e.info;
++    }
++
++    auto info = new D3D11IntelDeviceInfoV2();
++    info->GTGeneration = GetGTGeneration(deviceId);
++
++    IntelPciAddress pci = GetPciAddress(adapter);
++    const char* euSource = "not available";
++    std::string freqSource = "no DRM card at this PCI address";
++
++#ifdef _WIN32
++    IntelClInfo cl = QueryIntelOpenCl(pci);
++    euSource = cl.how;
++
++    if (cl.found)
++      info->EUCount = cl.computeUnits;
++
++    std::string card = FindDrmCard(pci);
++
++    if (!card.empty()) {
++      freqSource = str::format("no xe/i915 frequency files in ", card);
++
++      if ((info->GPUMaxFreq = ReadUnixNumber(card + "/device/tile0/gt0/freq0/rp0_freq"))) {
++        info->GPUMinFreq = ReadUnixNumber(card + "/device/tile0/gt0/freq0/rpn_freq");
++        freqSource = "xe sysfs rp0/rpn";
++      } else if ((info->GPUMaxFreq = ReadUnixNumber(card + "/gt_RP0_freq_mhz"))) {
++        info->GPUMinFreq = ReadUnixNumber(card + "/gt_RPn_freq_mhz");
++        freqSource = "i915 sysfs RP0/RPn";
++      }
++    }
++
++    if (!info->GPUMaxFreq && cl.found && cl.maxClockMhz) {
++      info->GPUMaxFreq = cl.maxClockMhz;
++      freqSource = str::format("max from OpenCL, min unknown; ", freqSource);
++    }
++#endif
++
++    Logger::info(str::format("D3D11: Intel Device Information v2 for device 0x", std::hex, deviceId,
++      ": GTGeneration 0x", info->GTGeneration, std::dec,
++      ", EUCount ", info->EUCount, " (", euSource, ")",
++      ", GPUMaxFreq ", info->GPUMaxFreq, " MHz, GPUMinFreq ", info->GPUMinFreq, " MHz (", freqSource, ")",
++      pci.valid ? str::format(", PCI ", pci.domain, ":", pci.bus, ":", pci.device, ".", pci.function) : std::string()));
++
++    IntelInfoEntry entry;
++    std::memcpy(entry.uuid, adapterInfo.deviceUuid, VK_UUID_SIZE);
++    entry.deviceId = deviceId;
++    entry.info = info;
++    g_intelInfoEntries.push_back(entry);
++    return info;
++  }
++
++
++  D3D11IntelDeviceInfoCounter::D3D11IntelDeviceInfoCounter(
++          D3D11Device*                  pDevice,
++    const D3D11_COUNTER_DESC&           Desc,
++    const D3D11IntelDeviceInfoV2*       pInfo)
++  : D3D11DeviceChild<ID3D11Counter>(pDevice),
++    m_desc(Desc), m_info(pInfo) {
++    s_liveCount++;
++  }
++
++
++  D3D11IntelDeviceInfoCounter::~D3D11IntelDeviceInfoCounter() {
++    s_liveCount--;
++  }
++
++
++  HRESULT STDMETHODCALLTYPE D3D11IntelDeviceInfoCounter::QueryInterface(
++          REFIID                        riid,
++          void**                        ppvObject) {
++    if (ppvObject == nullptr)
++      return E_POINTER;
++
++    *ppvObject = nullptr;
++
++    if (riid == __uuidof(IUnknown)
++     || riid == __uuidof(ID3D11DeviceChild)
++     || riid == __uuidof(ID3D11Asynchronous)
++     || riid == __uuidof(ID3D11Counter)) {
++      *ppvObject = ref(this);
++      return S_OK;
++    }
++
++    return E_NOINTERFACE;
++  }
++
++
++  UINT STDMETHODCALLTYPE D3D11IntelDeviceInfoCounter::GetDataSize() {
++    // The data is the block's address. Intel's sample reads it into a
++    // uintptr_t (and, in its older version, into two DWORDs).
++    return sizeof(uint64_t);
++  }
++
++
++  void STDMETHODCALLTYPE D3D11IntelDeviceInfoCounter::GetDesc(
++          D3D11_COUNTER_DESC*           pDesc) {
++    if (pDesc)
++      *pDesc = m_desc;
++  }
++
++
++  HRESULT D3D11IntelDeviceInfoCounter::GetData(
++          void*                         pData,
++          UINT                          DataSize) {
++    if (pData && DataSize >= sizeof(uint64_t)) {
++      uint64_t address = uint64_t(reinterpret_cast<uintptr_t>(m_info));
++      std::memcpy(pData, &address, sizeof(address));
++    }
++
++    return S_OK;
++  }
++
++
++  D3D11IntelDeviceInfoCounter* D3D11IntelDeviceInfoCounter::FromAsync(
++          ID3D11Asynchronous*           pAsync) {
++    if (likely(!s_liveCount.load(std::memory_order_acquire)) || !pAsync)
++      return nullptr;
++
++    ID3D11Counter* counter = nullptr;
++
++    if (FAILED(pAsync->QueryInterface(__uuidof(ID3D11Counter), reinterpret_cast<void**>(&counter))))
++      return nullptr;
++
++    counter->Release();
++    return static_cast<D3D11IntelDeviceInfoCounter*>(counter);
++  }
++
++}
+--- /dev/null
++++ b/src/d3d11/d3d11_intel_device_info.h
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <atomic>
++
++#include "d3d11_device_child.h"
++
++namespace dxvk {
++
++  class DxvkAdapter;
++
++  /**
++   * \brief Intel's "Intel Device Information" D3D11 counter
++   *
++   * NEUTRON (Neutron#53). Intel's Windows D3D11 driver exposes one device-dependent counter named
++   * "Intel Device Information" (description "Version 2"). Its GetData returns the ADDRESS of a
++   * driver-owned IntelDeviceInfoV2 block, not the data. Intel's GPU Detect sample
++   * (github.com/GameTechDev/gpudetect, GPUDetect.cpp GetIntelDeviceInfo) and apps built on it read
++   * the GPU generation and EU count from it; Premiere Pro's GPUSniffer does not initialize an Intel
++   * OpenCL device without it. Exposed only on Intel adapters (Vulkan vendor 0x8086).
++   * Kill switch NEUTRON_DXVK_INTEL_DEVINFO=0.
++   */
++  struct D3D11IntelDeviceInfoV2 {
++    DWORD GPUMaxFreq;     // MHz
++    DWORD GPUMinFreq;     // MHz
++    DWORD GTGeneration;   // Intel PRODUCT_FAMILY (gpudetect: INTEL_GPU_ARCHITECTURE)
++    DWORD EUCount;
++    DWORD PackageTDP;     // Watts, 0 = not known
++    DWORD MaxFillRate;    // pixels/clock, 0 = not known
++  };
++
++  static_assert(sizeof(D3D11IntelDeviceInfoV2) == 24, "IntelDeviceInfoV2 is 24 bytes");
++
++  class D3D11IntelDeviceInfo {
++
++  public:
++
++    /**
++     * \brief Whether the counter is exposed on this adapter
++     */
++    static bool IsExposed(const Rc<DxvkAdapter>& adapter);
++
++    /**
++     * \brief Counter strings as Intel's driver reports them
++     */
++    static const char* Name()        { return "Intel Device Information"; }
++    static const char* Units()       { return "Size 24"; }
++    static const char* Description() { return "Version 2"; }
++
++    /**
++     * \brief The process-lifetime info block for an adapter
++     *
++     * Gathered once per adapter, never freed: the counter hands out its
++     * address, as Intel's driver hands out driver-owned memory.
++     * \param [in] adapter The adapter
++     * \param [in] deviceId PCI device id the app sees through DXGI
++     */
++    static const D3D11IntelDeviceInfoV2* Get(const Rc<DxvkAdapter>& adapter, uint32_t deviceId);
++
++    /**
++     * \brief Intel PRODUCT_FAMILY value for a PCI device id, 0 if unknown
++     */
++    static uint32_t GetGTGeneration(uint32_t deviceId);
++
++  };
++
++
++  class D3D11IntelDeviceInfoCounter : public D3D11DeviceChild<ID3D11Counter> {
++
++  public:
++
++    D3D11IntelDeviceInfoCounter(
++            D3D11Device*                  pDevice,
++      const D3D11_COUNTER_DESC&           Desc,
++      const D3D11IntelDeviceInfoV2*       pInfo);
++
++    ~D3D11IntelDeviceInfoCounter();
++
++    HRESULT STDMETHODCALLTYPE QueryInterface(
++            REFIID                        riid,
++            void**                        ppvObject) final;
++
++    UINT STDMETHODCALLTYPE GetDataSize() final;
++
++    void STDMETHODCALLTYPE GetDesc(
++            D3D11_COUNTER_DESC*           pDesc) final;
++
++    HRESULT GetData(
++            void*                         pData,
++            UINT                          DataSize);
++
++    /**
++     * \brief Returns the counter if an async object is one
++     *
++     * Costs one atomic load while no counter exists. DXVK has no
++     * other ID3D11Counter, so the QueryInterface identifies ours.
++     */
++    static D3D11IntelDeviceInfoCounter* FromAsync(
++            ID3D11Asynchronous*           pAsync);
++
++  private:
++
++    D3D11_COUNTER_DESC                    m_desc;
++    const D3D11IntelDeviceInfoV2*         m_info;
++
++    static std::atomic<uint32_t>          s_liveCount;
++
++  };
++
++}
+--- a/src/d3d11/meson.build
++++ b/src/d3d11/meson.build
+@@ -40,6 +40,7 @@
+   'd3d11_gdi.cpp',
+   'd3d11_initializer.cpp',
+   'd3d11_input_layout.cpp',
++  'd3d11_intel_device_info.cpp',
+   'd3d11_interop.cpp',
+   'd3d11_main.cpp',
+   'd3d11_winrt.cpp',
