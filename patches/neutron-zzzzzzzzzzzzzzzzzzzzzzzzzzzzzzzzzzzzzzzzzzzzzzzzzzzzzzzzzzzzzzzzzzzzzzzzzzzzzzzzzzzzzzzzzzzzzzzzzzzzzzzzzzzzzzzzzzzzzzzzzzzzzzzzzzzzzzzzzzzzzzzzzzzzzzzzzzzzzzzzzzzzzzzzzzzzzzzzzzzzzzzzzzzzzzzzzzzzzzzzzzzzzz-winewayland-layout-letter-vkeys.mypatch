@@ -1,0 +1,235 @@
+neutron: winewayland: letter keys take the VK of the letter they type (Colemak, Workman, Belgian, Czech, ...)
+
+Neutron#55 (@monkeysk4nk, US Colemak-DH on KDE Plasma 6.8.2 Wayland, runtime 11.10-187), his words:
+  "I noticed an issue with indesign it never seem to have the correct layout, when typing or using ctrl + key.
+   Illustrator on the other end it only has the wrong layout on ctrl + key. if I type some text or use letters for
+   shortcuts without the CTRL all is good it matches my keyboad layout. Lastly Photoshop works perfectly with my
+   layout, ctrl + keys work and all."
+  "In both ctrl V works fine, because V is in the same spot I think. Ctrl S gives me the equivalent of ctrl D (place)
+   which is in line with a qwerty keyboard. Ctrl Z paste in illustrator, and opens "text frame option" in indesign."
+  "ctrl Z seems to paste at the back in illustrator so ctrl b, like qwerty."
+
+Mechanism: add_xkb_layout() builds the scancode->VK table from fixed position tables chosen by the layout's
+language (qwerty / azerty / qwertz, plus "dvorak" by name). KDE's "English (Colemak-DH)" is xkb us(colemak_dh):
+language en-US -> the QWERTY table, so every key got the VK of its US-QWERTY position while its characters came
+from xkb. The Colemak S key (<AC03>, QWERTY D) arrived as VK_D carrying 's'; the Z key (<AB05>, QWERTY B) as VK_B;
+V stays on <AB04> = VK_V. Accelerator tables and apps that match Ctrl+letter by VK (Illustrator, InDesign, Win32
+TranslateAccelerator) therefore ran Ctrl+D (InDesign Place, Illustrator Transform Again) and Ctrl+B (InDesign Text
+Frame Options, Illustrator Paste in Back); typed text (WM_CHAR) was right. VkKeyScanEx('s') returned VK_D.
+
+Windows: "The keyboard device driver receives scan codes from the keyboard, which are sent to the keyboard layout
+where they are translated" and the scan code "identifies the key pressed regardless of the active keyboard layout",
+while VKs are what apps use (learn.microsoft.com/windows/win32/inputdev/about-keyboard-input, "Keyboard Input Model",
+"Scan Codes"). Each layout DLL carries its own scancode->VK table (KBDTABLES.pusVSCtoVK, kbd.h); kbdfr gives the
+AZERTY A key VK_A and kbdgr the QWERTZ Z key VK_Z (Wine's azerty/qwertz tables copy them), and the reporter's own
+Windows experience (Ctrl+S saves with Colemak-DH) shows the Colemak layout gives its S key VK_S - letter keys carry the
+VK of the letter they type. (Colemak's KLID/table not measured on a Windows box: INFERRED from his report + MSKLC.) winex11.drv does the same by matching each key's characters against its layout
+tables (X11DRV_InitKeyboard).
+
+Change: after the position table (and patch zzzzzzzzzzzzzm's control-key keysym remap), a character key (position VK
+A-Z or OEM) whose base keysym is a Latin letter takes that letter's VK (keys at letter positions claim first; a
+second key typing the same letter, e.g. Colemak-DH's <LSGT> z, keeps its own VK). A key left on a letter VK another
+key now holds takes the US OEM VK of its character (';' -> VK_OEM_1, ',' -> VK_OEM_COMMA, ...) when free, else a
+position VK the letters freed. Non-Latin keys (Cyrillic, Greek, ...) keep the position VKs, as Windows' Russian or
+Greek layouts do; digits, keypad, function and control keys are untouched. QWERTY, AZERTY, QWERTZ and Dvorak
+produce the same tables as before. No per-app logic.
+
+Not covered: the HKL still says 0409 (US) for Colemak - Windows would report a custom KLID (e.g. a0000409) for an
+MSKLC layout; apps that special-case "US layout" by HKL see US. OEM keys of non-US Latin layouts keep the existing
+tables' positions (only displaced keys are re-derived). i386-unix winewayland.so (32-bit apps) not rebuilt in the lab.
+A second layout or a layout whose language differs from the user locale needs the companion patch
+(event-thread-hkl): without it events are translated with the event thread's table.
+
+Lab (agent kb55, nested KWin 6.8.2, xkb set per desk via XKB_DEFAULT_LAYOUT/VARIANT, keys sent by evdev code through
+fake_input; probe kbt.exe logs WM_KEYDOWN VK/scan, WM_CHAR, ToUnicodeEx, an accelerator table Ctrl+S/Z/V/D/B,
+MapVirtualKeyEx and VkKeyScanEx; base = 204's tree, pristine winewayland.so byte-identical to runtime 204's):
+- us(colemak_dh): 204 n=3 and kill switch n=2 on the patched build: S key -> VK_D, accel Ctrl+D; Z key -> VK_B,
+  accel Ctrl+B. Patched (11.10-204kb n=3, 204kc n=2): S key -> VK_S accel Ctrl+S, Z key -> VK_Z accel Ctrl+Z, V ->
+  VK_V, ';' (QWERTY P key) -> VK_OEM_1, VkKeyScanEx a-z identity; typed text identical in every arm.
+- us (QWERTY), fr, de (en_US locale), ru,us (Alt+Shift toggle, both groups): event streams hash-identical across
+  204, patched and kill switch, n=2 each.
+- Apps on us(colemak_dh), runtime 11.10-204kc (this + event-thread-hkl), kill = both switches =0 on the SAME build
+  (this patch alone decides these results: the event-thread change is a no-op for a single en-US layout under en_US):
+  Illustrator 2026: Colemak Ctrl+S -> Save As dialog 1/1 measured (2nd run's Ctrl+S step blocked by a stray Rectangle
+  dialog), Ctrl+Shift+S -> Save As 2/2; Colemak Ctrl+Z undid a drawn rectangle 1/1 (rect pixels 1075 -> 0). Kill 2/2 and
+  plain 204 1/1: no Save As on Ctrl+S or Ctrl+Shift+S (Transform Again / transparency grid), rectangle stays after
+  Ctrl+Z (1090 -> 1090, Paste in Back).
+  InDesign 2026: patched 2/2: Ctrl+S -> "Save As", Ctrl+Z -> no dialog; kill 2/2: Ctrl+S -> "Place", Ctrl+Z -> "Text
+  Frame Options" 1/2 (2nd: the new document was not yet frontmost). Ctrl+V: no dialog in every arm.
+  Photoshop 2026 (control): Colemak Ctrl+N (Colemak N key) opened New Document on patched AND kill 1/1 each (Photoshop
+  matches Ctrl+letter by character); Ctrl+S showed no save window within 15 s in EITHER arm (lab limit, same both).
+  Premiere 2026 J/K/L, Ctrl+Z on QWERTY: NOT run; QWERTY event streams are hash-identical across 204/patched/kill (n=2).
+Kill switch: NEUTRON_LAYOUT_VKEYS=0 (position tables only, = 204).
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -442,6 +442,120 @@
+     return vkey;
+ }
+ 
++/* NEUTRON layout-letter-vkeys (Neutron#55): with US Colemak-DH, Ctrl+S opened Illustrator's/InDesign's Place
++ * dialog (Ctrl+D) and Ctrl+Z ran InDesign's Text Frame Options (Ctrl+B), while typed text was right. The tables
++ * above pick a VK by physical position and only know azerty/qwertz/dvorak, so every other layout that moves
++ * letters (Colemak, Workman, Belgian, Czech/Slovak/Hungarian QWERTZ, Turkish F, ...) got US-QWERTY position VKs:
++ * the Colemak "s" key arrived as VK_D carrying an "s" character. On Windows the layout DLL's scancode->VK table
++ * gives a letter key the VK of the letter it types (Colemak's S key is VK_S), and winex11.drv does the same by
++ * matching each key's characters. So a character key whose base keysym is a Latin letter takes that letter's VK;
++ * a key displaced from its letter VK takes the US OEM VK of its character (';' -> VK_OEM_1, ...) or a VK the
++ * letters freed. Non-Latin keys (Cyrillic, Greek, ...) keep the position VKs, as on Windows. Digits, keypad,
++ * function and control keys are untouched. NEUTRON_LAYOUT_VKEYS=0 restores the position-only tables. */
++static BOOL layout_letter_vkeys_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *e = getenv("NEUTRON_LAYOUT_VKEYS");
++        enabled = !(e && e[0] == '0' && !e[1]);
++    }
++    return enabled;
++}
++
++static BOOL is_char_vkey(WORD vkey)
++{
++    vkey &= 0xff;
++    return (vkey >= 'A' && vkey <= 'Z') || (vkey >= VK_OEM_1 && vkey <= VK_OEM_3) ||
++           (vkey >= VK_OEM_4 && vkey <= VK_OEM_8) || vkey == VK_OEM_102;
++}
++
++static WORD keysym_letter_vkey(xkb_keysym_t keysym)
++{
++    if (keysym >= XKB_KEY_a && keysym <= XKB_KEY_z) return keysym - XKB_KEY_a + 'A';
++    if (keysym >= XKB_KEY_A && keysym <= XKB_KEY_Z) return keysym - XKB_KEY_A + 'A';
++    return 0;
++}
++
++static WORD keysym_oem_vkey(xkb_keysym_t keysym)
++{
++    switch (keysym)
++    {
++    case XKB_KEY_semicolon:    return VK_OEM_1;
++    case XKB_KEY_slash:        return VK_OEM_2;
++    case XKB_KEY_grave:        return VK_OEM_3;
++    case XKB_KEY_bracketleft:  return VK_OEM_4;
++    case XKB_KEY_backslash:    return VK_OEM_5;
++    case XKB_KEY_bracketright: return VK_OEM_6;
++    case XKB_KEY_apostrophe:   return VK_OEM_7;
++    case XKB_KEY_comma:        return VK_OEM_COMMA;
++    case XKB_KEY_period:       return VK_OEM_PERIOD;
++    case XKB_KEY_minus:        return VK_OEM_MINUS;
++    case XKB_KEY_equal:        return VK_OEM_PLUS;
++    case XKB_KEY_plus:         return VK_OEM_PLUS;
++    }
++    return 0;
++}
++
++/* Fills vkeys[keyc] for min_keycode..max_keycode: key_vkey(), then the letter pass described above. */
++static void layout_vkeys(struct xkb_keymap *xkb_keymap, xkb_layout_index_t xkb_group, const USHORT *scan2vk,
++                         unsigned int min_keycode, unsigned int max_keycode, WORD *vkeys)
++{
++    unsigned int keyc, pass;
++    unsigned int claimed[256] = {0}, used[256] = {0};
++    BOOL lettered[0x300] = {0};
++
++    for (keyc = min_keycode; keyc <= max_keycode; keyc++)
++        vkeys[keyc] = key_vkey(xkb_keymap, keyc, xkb_group, scan2vk, key2scan(keyc - 8));
++
++    if (!layout_letter_vkeys_enabled()) return;
++
++    /* pass 0: keys whose position VK is a letter claim first, then OEM-position keys (e.g. <LSGT>) */
++    for (pass = 0; pass < 2; pass++)
++    {
++        for (keyc = min_keycode; keyc <= max_keycode && keyc < ARRAY_SIZE(lettered); keyc++)
++        {
++            const xkb_keysym_t *keysym;
++            WORD vkey = vkeys[keyc] & 0xff, letter;
++
++            if (!is_char_vkey(vkey) || (vkey >= 'A' && vkey <= 'Z') != !pass) continue;
++            if (xkb_keymap_key_get_syms_by_level(xkb_keymap, keyc, xkb_group, 0, &keysym) < 1) continue;
++            if (!(letter = keysym_letter_vkey(keysym[0])) || claimed[letter]) continue;
++            claimed[letter] = keyc;
++            lettered[keyc] = TRUE;
++            if (letter != vkey)
++                TRACE("keyc %#04x: keysym %#x takes vkey %#04x (position vkey %#04x)\n", keyc, keysym[0], letter, vkey);
++            vkeys[keyc] = letter;
++        }
++    }
++
++    for (keyc = min_keycode; keyc <= max_keycode; keyc++) used[vkeys[keyc] & 0xff]++;
++
++    /* keys left on a letter VK another key now holds */
++    for (keyc = min_keycode; keyc <= max_keycode && keyc < ARRAY_SIZE(lettered); keyc++)
++    {
++        WORD vkey = vkeys[keyc] & 0xff, repl = 0;
++        const xkb_keysym_t *keysym;
++        unsigned int other;
++
++        if (lettered[keyc] || !(vkey >= 'A' && vkey <= 'Z') || !claimed[vkey] || claimed[vkey] == keyc) continue;
++        if (xkb_keymap_key_get_syms_by_level(xkb_keymap, keyc, xkb_group, 0, &keysym) >= 1)
++            repl = keysym_oem_vkey(keysym[0]);
++        if (repl && used[repl]) repl = 0;
++        for (other = min_keycode; !repl && other <= max_keycode && other < ARRAY_SIZE(lettered); other++)
++        {
++            /* a position VK given up by a key that took its letter */
++            WORD freed = key_vkey(xkb_keymap, other, xkb_group, scan2vk, key2scan(other - 8)) & 0xff;
++            if (lettered[other] && is_char_vkey(freed) && !used[freed]) repl = freed;
++        }
++        if (!repl) continue;
++        TRACE("keyc %#04x: displaced from vkey %#04x -> %#04x\n", keyc, vkey, repl);
++        used[vkey]--;
++        used[repl]++;
++        vkeys[keyc] = repl;
++    }
++}
++
+ static void add_xkb_layout(const char *xkb_layout, struct xkb_keymap *xkb_keymap,
+                             xkb_layout_index_t xkb_group, LANGID lang)
+ {
+@@ -455,6 +569,7 @@
+     VK_TO_WCHARS8 *vk2wchars_entry;
+     struct layout *layout;
+     const USHORT *scan2vk;
++    WORD *vkeys;
+     WCHAR *names_str;
+     WORD index = 0;
+     char *ptr;
+@@ -502,6 +617,15 @@
+     }
+     if (strstr(xkb_layout, "dvorak")) scan2vk = scan2vk_dvorak;
+ 
++    if (!(vkeys = calloc(max_keycode + 1, sizeof(*vkeys))))
++    {
++        ERR("Failed to allocate memory for Xkb layout vkeys\n");
++        free(layout);
++        xkb_state_unref(xkb_state);
++        return;
++    }
++    layout_vkeys(xkb_keymap, xkb_group, scan2vk, min_keycode, max_keycode, vkeys);
++
+     layout->tables.pKeyNames = layout->key_names;
+     layout->tables.pKeyNamesExt = layout->key_names_ext;
+     layout->tables.bMaxVSCtoVK = 0xff;
+@@ -563,7 +687,7 @@
+ 
+     for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+     {
+-        WORD scan = key2scan(keyc - 8), vkey = key_vkey(xkb_keymap, keyc, xkb_group, scan2vk, scan);
++        WORD scan = key2scan(keyc - 8), vkey = vkeys[keyc];
+         VSC_VK *entry = NULL;
+ 
+         if (!(scan & 0xff) || !vkey) continue;
+@@ -588,7 +712,7 @@
+ 
+     for (keyc = min_keycode; keyc <= max_keycode; keyc++)
+     {
+-        WORD scan = key2scan(keyc - 8), vkey = key_vkey(xkb_keymap, keyc, xkb_group, scan2vk, scan);
++        WORD vkey = vkeys[keyc];
+         VK_TO_WCHARS8 vkey2wch = {.VirtualKey = vkey}, caps_vkey2wch = vkey2wch;
+         BOOL found = FALSE, caps_found = FALSE;
+         uint32_t caps_ret, shift_ret;
+@@ -657,6 +781,7 @@
+     }
+ 
+     xkb_state_unref(xkb_state);
++    free(vkeys);
+ 
+     TRACE("Created layout entry=%p index=%04x lang=%04x id=%04x\n", layout, layout->index, layout->lang, layout->layout_id);
+     list_add_tail(&xkb_layouts, &layout->entry);

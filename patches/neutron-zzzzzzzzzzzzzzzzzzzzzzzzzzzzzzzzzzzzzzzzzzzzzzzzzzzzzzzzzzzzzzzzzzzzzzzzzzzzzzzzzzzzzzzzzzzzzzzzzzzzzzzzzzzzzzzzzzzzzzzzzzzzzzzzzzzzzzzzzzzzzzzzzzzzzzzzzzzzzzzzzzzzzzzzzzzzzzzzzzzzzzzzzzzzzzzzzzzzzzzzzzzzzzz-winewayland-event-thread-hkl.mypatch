@@ -1,0 +1,65 @@
+neutron: winewayland: translate key events with the active layout (event thread follows the compositor's group)
+
+Found while working Neutron#55 (@monkeysk4nk, Colemak-DH): his words "I noticed an issue with indesign it never seem to
+have the correct layout, when typing or using ctrl + key." His single Colemak layout does not need this patch (the
+letter-VK patch fixes his case); this one covers the same symptom family in the setups next to his.
+
+Mechanism: winewayland sends keys as KEYEVENTF_SCANCODE and win32u's send_hardware_message() maps the scancode to a
+VK with NtUserGetKeyboardLayout(0) of the CALLING thread (its own TODO: "Use the keyboard layout of the target hwnd").
+That thread is winewayland's event thread; set_current_xkb_group() only posts WM_INPUTLANGCHANGEREQUEST to the focused
+window, so the event thread keeps the locale's default HKL. When the active xkb group's HKL differs from it - a layout
+whose language is not the user locale's (fr under en_US: 040C0409 vs 04090409) or the second of two layouts
+(us + us(colemak_dh): F0010409) - KbdLayerDescriptor finds another layout's table or none (built-in US), while
+TranslateMessage/ToUnicodeEx in the app use the active one. Result: AZERTY under en_US TYPED QWERTY letters (scan 0x1e
+-> VK_A -> 'a', 0x2c -> 'z', 0x27 -> '$'), QWERTZ typed z for y and u-umlaut for o-umlaut, and in a US + Colemak
+setup the Colemak group typed QWERTY text and kept QWERTY shortcuts. With LANG=fr_FR (HKL 040C040C) AZERTY was right.
+
+Windows: "The system provides language-independent keyboard support by using the language-specific keyboard layout
+currently selected by the user or the application. The keyboard device driver receives scan codes ... which are sent to
+the keyboard layout where they are translated" (learn.microsoft.com/windows/win32/inputdev/about-keyboard-input,
+"Keyboard Input Model"); the VK comes from the active layout, not from a fixed one.
+
+Change: when the active group's HKL changes, set_current_xkb_group() (event thread) also calls
+NtUserActivateKeyboardLayout(hkl, 0) for its own thread, so scancodes are translated with the layout the compositor
+has active. A no-op when the HKL equals the event thread's (one layout matching the locale: every QWERTY en_US user).
+
+Not covered: an app that refuses WM_INPUTLANGCHANGEREQUEST keeps its old layout for WM_CHAR while events follow the
+compositor (Windows would follow the app's thread); the win32u TODO itself (per-target-thread layout) is unchanged.
+i386-unix winewayland.so not rebuilt in the lab.
+
+Lab (agent kb55, probe kbt.exe, nested KWin 6.8.2, same build 11.10-204kc, kill = NEUTRON_EVENT_THREAD_HKL=0, n=2 each):
+- fr under en_US: on: scan 0x1e -> VK_Q 'q', 0x2c -> VK_W 'w', 0x27 -> VK_M 'm' (AZERTY right; Ctrl on the 0x2c key no
+  longer fires Ctrl+Z); off: QWERTY letters (= plain 204, hash-identical).
+- de under en_US: on: y/o-umlaut right; off: z/u-umlaut (= 204).
+- us,us(colemak_dh) Alt+Shift toggle: on: US group QWERTY VKs, Colemak group VK_S/VK_Z + Ctrl+S/Ctrl+Z accelerators and
+  's'/'z' typed; off: Colemak group QWERTY in both VKs and text.
+- us, us(colemak_dh) single, ru,us toggle: hash-identical on/off.
+Kill switch: NEUTRON_EVENT_THREAD_HKL=0.
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -813,6 +813,25 @@
+     if (hkl == keyboard_hkl) return;
+     keyboard_hkl = hkl;
+ 
++    /* NEUTRON event-thread-hkl (Neutron#55): win32u turns our KEYEVENTF_SCANCODE input into a VK with the
++     * keyboard layout of the CALLING thread (send_hardware_message's TODO: "Use the keyboard layout of the
++     * target hwnd"), and this is the event thread, which kept the locale's default HKL. Whenever the active
++     * layout's HKL differed from it (a layout whose language is not the user locale's, e.g. AZERTY under
++     * en_US, or the second of two layouts, e.g. US + Colemak), keys were turned into VKs with another
++     * layout's table (or the built-in US one) while WM_CHAR used the active one: AZERTY typed QWERTY letters.
++     * On Windows the scancode is translated with the active layout of the foreground thread. Make the event
++     * thread's layout follow the compositor's active group. NEUTRON_EVENT_THREAD_HKL=0 turns it off. */
++    {
++        static int enabled = -1;
++        if (enabled < 0)
++        {
++            const char *e = getenv("NEUTRON_EVENT_THREAD_HKL");
++            enabled = !(e && e[0] == '0' && !e[1]);
++        }
++        if (enabled && !NtUserActivateKeyboardLayout(hkl, 0))
++            WARN("Failed to activate %p on the event thread\n", hkl);
++    }
++
+     pthread_mutex_lock(&text_input->mutex);
+     ime = text_input->focused_hwnd == keyboard->focused_hwnd;
+     pthread_mutex_unlock(&text_input->mutex);
