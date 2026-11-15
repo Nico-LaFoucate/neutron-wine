@@ -1,0 +1,128 @@
+neutron: winewayland: take a key's VK from the active xkb layout, not from the sending thread's layout (206 regression) [opt-in]
+
+OPT-IN (his C353, 11-15): OFF unless NEUTRON_EVENT_VKEY=1, until the reporter confirms; meant to be enabled
+together with NEUTRON_LAYOUT_VKEYS=1 (layout-letter-vkeys-optin). Applies after event-thread-hkl (207, unchanged).
+
+Neutron#55 (@monkeysk4nk, US Colemak-DH, KDE Plasma 6.8.2 Wayland), on 11.10-206: "It now is acting as qwerty all the
+time (ctrl or not) for me after the update, and photoshop is now behaving in qwerty too which it did not before. I tried
+to relaunch neutron and the programs but no luck." On 187: typing followed Colemak-DH, only Ctrl shortcuts were QWERTY.
+
+Mechanism: winewayland sends keys as KEYEVENTF_SCANCODE; win32u maps the scancode to a VK with the keyboard layout of
+the SENDING thread (send_hardware_message: "TODO: Use the keyboard layout of the target hwnd"), while TranslateMessage
+looks the character up in the app thread's layout. When the two tables differ, the VK comes from one table and the
+character from the other. Before patch 206 every table used position VKs, so a mismatch only broke Ctrl (his 187
+report). Patch 206 made the Colemak table map VK_D to 'd' (the D key), so a mismatch now also breaks text: the S key
+gets VK_D from the other table and types 'd'. Patch 207 was meant to remove the mismatch by activating the active
+layout on the event thread; on his desktop it evidently does not take effect (why: not determined, INFERRED). Lab
+reproduction of his exact symptom: two xkb groups us,us(colemak_dh), Colemak group active, 206 with only
+NEUTRON_EVENT_THREAD_HKL=0: S key -> VK_D + 'd', Z key -> VK_B + 'b', Ctrl+S -> Ctrl+D (= "qwerty all the time");
+with NEUTRON_LAYOUT_VKEYS=0 as well: 's'/'z' typed, Ctrl+D/Ctrl+B (= his 187).
+
+Windows: the VK comes from the active keyboard layout's table ("The keyboard device driver receives scan codes ...
+which are sent to the keyboard layout where they are translated", learn.microsoft.com/windows/win32/inputdev/
+about-keyboard-input, "Keyboard Input Model"), not from whichever thread happens to deliver the input.
+
+Change: keyboard_handle_key() looks the scancode up in the ACTIVE xkb layout's own table (the layout whose HKL is
+keyboard_hkl; base, E0 and E1 tables, with the KBD* flags) and sends wVk + wScan & 0xff (+ KEYEVENTF_EXTENDEDKEY), the
+same request win32u builds from that table for KEYEVENTF_SCANCODE, as this file's lock-state and release paths already
+do. No table entry -> the old scancode path. The VK no longer depends on the sending thread's layout; even if an app
+thread keeps another table, letters stay right (any Latin table maps VK_S to 's'). Patch 207's activation stays.
+
+Not covered: why 207's activation does not take effect on his desktop (single layout per his words; locale, KDE
+keymap details and input methods not known); numpad keys not exercised (same table values incl. KBDNUMPAD, by code).
+
+Lab (agent kb55, probe kbt.exe on nested KWin 6.8.2, runtime 11.10-206kb = 206 + this, x86_64 + i386 winewayland.so
+built from 206's tree, pristine build byte-identical to 206's):
+- us,us(colemak_dh), app started in the Colemak group: 206kb 2/2 's','z', VK_S/VK_Z, Ctrl+S/Ctrl+Z; 206kb with
+  NEUTRON_EVENT_THREAD_HKL=0 (207's activation off) 2/2 still right; 206kb with also NEUTRON_EVENT_VKEY=0 1/1 and 206
+  with NEUTRON_EVENT_THREAD_HKL=0 1/1: 'd','b', Ctrl+D/Ctrl+B (his symptom).
+- fr under en_US with NEUTRON_EVENT_THREAD_HKL=0: AZERTY right (w, m) with this change.
+- us, us(colemak_dh), fr: every WM_KEYDOWN/WM_CHAR/accelerator line identical between 206 and 206kb, including
+  arrows, Home/End, Delete, PageUp (extended keys) and Alt+F; ru,us identical.
+Switch: NEUTRON_EVENT_VKEY=1 enables it (opt-in); unset = the scancode-only path (= 206).
+--- a/dlls/winewayland.drv/wayland_keyboard.c
++++ b/dlls/winewayland.drv/wayland_keyboard.c
+@@ -1195,6 +1195,54 @@
+     NtUserSendHardwareInput(hwnd, 0, &input, 0);
+ }
+ 
++/* NEUTRON event-vkey (Neutron#55, regression in 11.10-206): "It now is acting as qwerty all the time (ctrl or not)".
++ * We sent keys as KEYEVENTF_SCANCODE and win32u turned the scancode into a VK with the keyboard layout of the
++ * SENDING thread (send_hardware_message's TODO), while WM_CHAR is looked up in the app thread's layout. Whenever
++ * those two differ (a second xkb group, e.g. US + Colemak-DH, or a layout whose HKL is not the sending thread's),
++ * the VK came from another table: harmless while every table used position VKs, but since layout-letter-vkeys the
++ * Colemak table maps VK_D to 'd', so the S key (VK_D from the US table) typed 'd'. event-thread-hkl made the sending
++ * thread follow the active group, which covers the cases measured in the lab but evidently not every desktop.
++ * On Windows the VK comes from the active layout's table, whatever thread raw input runs on; so take it from the
++ * active xkb layout's own table here (with its KBD flags, exactly what win32u's scancode path would produce from
++ * that table) and send VK + scancode, as the lock-state and release paths in this file already do.
++ * OPT-IN: only with NEUTRON_EVENT_VKEY=1; unset = the scancode-only path. */
++static BOOL event_vkey_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char *e = getenv("NEUTRON_EVENT_VKEY");
++        enabled = e && e[0] == '1' && !e[1];  /* opt-in until the reporter confirms (C353) */
++    }
++    return enabled;
++}
++
++/* The VK (with KBD* flags) the active xkb layout's table gives this scancode; 0 if none. Event thread only. */
++static WORD active_layout_vkey(UINT scan)
++{
++    struct layout *layout;
++    WORD vkey = 0;
++
++    if (!keyboard_hkl) return 0;
++    pthread_mutex_lock(&xkb_layouts_mutex);
++    LIST_FOR_EACH_ENTRY(layout, &xkb_layouts, struct layout, entry)
++    {
++        const VSC_VK *entry;
++
++        if (keyboard_hkl != get_layout_hkl(layout, LOWORD(keyboard_hkl))) continue;
++        if (!(scan & 0x300)) vkey = layout->tables.pusVSCtoVK[scan & 0xff];
++        else
++        {
++            for (entry = (scan & 0x100) ? layout->tables.pVSCtoVK_E0 : layout->tables.pVSCtoVK_E1;
++                 entry && entry->Vsc; entry++)
++                if (entry->Vsc == (scan & 0xff)) { vkey = entry->Vk; break; }
++        }
++        break;
++    }
++    pthread_mutex_unlock(&xkb_layouts_mutex);
++    return (vkey & 0xff) == VK__none_ ? 0 : vkey;
++}
++
+ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
+                                 uint32_t serial, uint32_t time, uint32_t key,
+                                 uint32_t state)
+@@ -1202,6 +1250,7 @@
+     UINT scan = key2scan(key);
+     INPUT input = {0};
+     HWND hwnd;
++    WORD vkey;
+ 
+     InterlockedExchange(&process_wayland.input_serial, serial);
+ 
+@@ -1213,8 +1262,18 @@
+     if (key == KEY_RIGHTALT) send_right_control(hwnd, state);
+ 
+     input.type = INPUT_KEYBOARD;
+-    input.ki.wScan = (scan & 0x300) ? scan + 0xdf00 : scan;
+-    input.ki.dwFlags = KEYEVENTF_SCANCODE;
++    if (event_vkey_enabled() && (vkey = active_layout_vkey(scan)))
++    {
++        /* same request win32u builds for KEYEVENTF_SCANCODE: vkey from the table, scan & 0xff */
++        input.ki.wVk = vkey;
++        input.ki.wScan = scan & 0xff;
++        input.ki.dwFlags = 0;
++    }
++    else
++    {
++        input.ki.wScan = (scan & 0x300) ? scan + 0xdf00 : scan;
++        input.ki.dwFlags = KEYEVENTF_SCANCODE;
++    }
+     if (scan & ~0xff) input.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+ 
+     if (state == WL_KEYBOARD_KEY_STATE_RELEASED) input.ki.dwFlags |= KEYEVENTF_KEYUP;
