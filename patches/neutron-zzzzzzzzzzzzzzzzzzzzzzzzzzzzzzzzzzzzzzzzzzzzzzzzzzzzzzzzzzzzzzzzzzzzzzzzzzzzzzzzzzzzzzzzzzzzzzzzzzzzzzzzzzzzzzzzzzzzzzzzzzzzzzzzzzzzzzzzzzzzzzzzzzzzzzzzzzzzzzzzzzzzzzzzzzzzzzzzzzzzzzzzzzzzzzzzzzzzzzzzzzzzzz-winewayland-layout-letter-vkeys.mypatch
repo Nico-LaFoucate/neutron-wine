@@ -1,9 +1,4 @@
-neutron: winewayland: letter keys take the VK of the letter they type (Colemak, Workman, Belgian, Czech, ...) [opt-in]
-
-OPT-IN (his C353, 11-15): a fix built by emulating one reporter's environment ships to that reporter first. This
-change is OFF unless NEUTRON_LAYOUT_VKEYS=1; unset (or any other value) = exactly the position tables of 187. On 206 it
-was default-on and, combined with a VK/character table mismatch on his desktop, made typing QWERTY too (see
-event-vkey-active-layout); enable it only together with NEUTRON_EVENT_VKEY=1.
+neutron: winewayland: letter keys take the VK of the letter they type (Colemak, Workman, Belgian, Czech, ...)
 
 Neutron#55 (@monkeysk4nk, US Colemak-DH on KDE Plasma 6.8.2 Wayland, runtime 11.10-187), his words:
   "I noticed an issue with indesign it never seem to have the correct layout, when typing or using ctrl + key.
@@ -64,7 +59,7 @@ MapVirtualKeyEx and VkKeyScanEx; base = 204's tree, pristine winewayland.so byte
   Photoshop 2026 (control): Colemak Ctrl+N (Colemak N key) opened New Document on patched AND kill 1/1 each (Photoshop
   matches Ctrl+letter by character); Ctrl+S showed no save window within 15 s in EITHER arm (lab limit, same both).
   Premiere 2026 J/K/L, Ctrl+Z on QWERTY: NOT run; QWERTY event streams are hash-identical across 204/patched/kill (n=2).
-Switch: NEUTRON_LAYOUT_VKEYS=1 enables it (opt-in); unset = position tables (= 187).
+Kill switch: NEUTRON_LAYOUT_VKEYS=0 (position tables only, = 204).
 --- a/dlls/winewayland.drv/wayland_keyboard.c
 +++ b/dlls/winewayland.drv/wayland_keyboard.c
 @@ -442,6 +442,120 @@
@@ -80,14 +75,14 @@ Switch: NEUTRON_LAYOUT_VKEYS=1 enables it (opt-in); unset = position tables (= 1
 + * matching each key's characters. So a character key whose base keysym is a Latin letter takes that letter's VK;
 + * a key displaced from its letter VK takes the US OEM VK of its character (';' -> VK_OEM_1, ...) or a VK the
 + * letters freed. Non-Latin keys (Cyrillic, Greek, ...) keep the position VKs, as on Windows. Digits, keypad,
-+ * function and control keys are untouched. OPT-IN: only with NEUTRON_LAYOUT_VKEYS=1; unset = position tables. */
++ * function and control keys are untouched. NEUTRON_LAYOUT_VKEYS=0 restores the position-only tables. */
 +static BOOL layout_letter_vkeys_enabled(void)
 +{
 +    static int enabled = -1;
 +    if (enabled < 0)
 +    {
 +        const char *e = getenv("NEUTRON_LAYOUT_VKEYS");
-+        enabled = e && e[0] == '1' && !e[1];  /* opt-in until the reporter confirms (C353) */
++        enabled = !(e && e[0] == '0' && !e[1]);
 +    }
 +    return enabled;
 +}

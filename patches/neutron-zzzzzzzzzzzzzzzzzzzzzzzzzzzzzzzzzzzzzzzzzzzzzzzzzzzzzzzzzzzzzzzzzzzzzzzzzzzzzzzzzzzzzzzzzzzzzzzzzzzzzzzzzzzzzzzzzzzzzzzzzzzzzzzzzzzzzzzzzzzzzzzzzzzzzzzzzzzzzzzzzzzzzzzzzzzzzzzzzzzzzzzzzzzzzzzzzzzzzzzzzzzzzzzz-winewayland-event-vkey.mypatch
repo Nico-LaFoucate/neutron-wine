@@ -1,7 +1,4 @@
-neutron: winewayland: take a key's VK from the active xkb layout, not from the sending thread's layout (206 regression) [opt-in]
-
-OPT-IN (his C353, 11-15): OFF unless NEUTRON_EVENT_VKEY=1, until the reporter confirms; meant to be enabled
-together with NEUTRON_LAYOUT_VKEYS=1 (layout-letter-vkeys-optin). Applies after event-thread-hkl (207, unchanged).
+neutron: winewayland: take a key's VK from the active xkb layout, not from the sending thread's layout (206 regression)
 
 Neutron#55 (@monkeysk4nk, US Colemak-DH, KDE Plasma 6.8.2 Wayland), on 11.10-206: "It now is acting as qwerty all the
 time (ctrl or not) for me after the update, and photoshop is now behaving in qwerty too which it did not before. I tried
@@ -39,7 +36,7 @@ built from 206's tree, pristine build byte-identical to 206's):
 - fr under en_US with NEUTRON_EVENT_THREAD_HKL=0: AZERTY right (w, m) with this change.
 - us, us(colemak_dh), fr: every WM_KEYDOWN/WM_CHAR/accelerator line identical between 206 and 206kb, including
   arrows, Home/End, Delete, PageUp (extended keys) and Alt+F; ru,us identical.
-Switch: NEUTRON_EVENT_VKEY=1 enables it (opt-in); unset = the scancode-only path (= 206).
+Kill switch: NEUTRON_EVENT_VKEY=0.
 --- a/dlls/winewayland.drv/wayland_keyboard.c
 +++ b/dlls/winewayland.drv/wayland_keyboard.c
 @@ -1195,6 +1195,54 @@
@@ -56,14 +53,14 @@ Switch: NEUTRON_EVENT_VKEY=1 enables it (opt-in); unset = the scancode-only path
 + * On Windows the VK comes from the active layout's table, whatever thread raw input runs on; so take it from the
 + * active xkb layout's own table here (with its KBD flags, exactly what win32u's scancode path would produce from
 + * that table) and send VK + scancode, as the lock-state and release paths in this file already do.
-+ * OPT-IN: only with NEUTRON_EVENT_VKEY=1; unset = the scancode-only path. */
++ * NEUTRON_EVENT_VKEY=0 restores the scancode-only path. */
 +static BOOL event_vkey_enabled(void)
 +{
 +    static int enabled = -1;
 +    if (enabled < 0)
 +    {
 +        const char *e = getenv("NEUTRON_EVENT_VKEY");
-+        enabled = e && e[0] == '1' && !e[1];  /* opt-in until the reporter confirms (C353) */
++        enabled = !(e && e[0] == '0' && !e[1]);
 +    }
 +    return enabled;
 +}
