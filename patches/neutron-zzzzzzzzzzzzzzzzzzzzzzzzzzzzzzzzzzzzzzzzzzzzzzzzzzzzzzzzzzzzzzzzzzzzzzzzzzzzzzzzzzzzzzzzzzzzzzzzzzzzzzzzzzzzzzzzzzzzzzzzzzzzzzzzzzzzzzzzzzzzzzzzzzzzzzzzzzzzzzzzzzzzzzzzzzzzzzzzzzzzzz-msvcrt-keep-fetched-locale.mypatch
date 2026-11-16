@@ -1,0 +1,214 @@
+msvcrt: Keep the fetched locale for nested calls, so another thread's setlocale cannot free it mid-call.
+
+After Effects 2027 crashed at most starts in ucrtbase fpnum_parse_bnum (string.c, *locinfo->lconv->decimal_point
+on NULL), called from LUTEngine.dll's strtod/sscanf. AE changes the global locale thousands of times from several
+threads while it starts. strtod_helper, the scanf family, _strlwr_s_l, _strupr_s_l, _strnicmp_l, _mblen_l and
+_mbtowc_l fetched locinfo = get_locinfo() and then called _isspace_l(c, NULL), isspace() or _tolower_l(c, NULL).
+Each nested call runs get_locinfo() -> update_thread_locale() again, which frees the thread's old locinfo once
+another thread has called setlocale, so the outer function kept using freed memory.
+
+When the caller passes no locale, these functions now wrap the fetched locinfo in a local _locale_tstruct and pass
+it to the nested calls, so the thread's locale is updated once per call. wcstod is not affected (_iswspace_l does
+not look at the locale).
+
+Test: tests/locale/localerace.c (one thread flips setlocale between German_Germany.1252 and C; two threads parse
+"   7" with sscanf " %lf" and strtod): before, page fault in fpnum_parse_bnum; after, PASS 3/3. After Effects 2027
+started cleanly 5/5 (before: most starts crashed).
+
+
+From le-birnes/LinDobe 0146 (LGPL-2.1-or-later; DCO sign-off on the commit). Applies with patch -F0 on wine-11.10
+plus neutron-wine's three msvcrt patches (adobe-msvcrt-findframe-null, msvcrt-stream-table-cap, 181
+cxx-processing-throw-register); wine-staging does not touch these files.
+
+MEASURED on the shipped neutron-wine v11.10-187 runtime (Xvfb, fresh prefix, LinDobe's wine/tests/locale/localerace.c):
+  187 as shipped:                                         page fault, WineDbg attached, 3 of 3 runs
+  control: ucrtbase/msvcrt built from 11.10 + those three: page fault, 3 of 3
+  control + this patch (only ucrtbase.dll/msvcrt.dll swapped): PASS 3 of 3 ("0 wrong results", 27-34 ms)
+After Effects 2027 checked under LinDobe (Wine 11.20), not yet under Neutron.
+
+--- a/dlls/msvcrt/mbcs.c
++++ b/dlls/msvcrt/mbcs.c
+@@ -3068,14 +3068,18 @@ unsigned char* CDECL _mbspbrk(const unsigned char *str, const unsigned char *acc
+ int CDECL _mblen_l(const char* str, size_t size, _locale_t locale)
+ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+ 
+     if (!str || !*str || !size)
+         return 0;
+ 
+     if (locale)
+         locinfo = locale->locinfo;
+-    else
++    else {
+         locinfo = get_locinfo();
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* see _isctype_l callers */
++        locale = &cur_locale;
++    }
+ 
+     if (locinfo->mb_cur_max == 1)
+         return 1; /* ASCII CP */
+@@ -3162,11 +3166,14 @@ size_t CDECL _mbstrlen(const char* str)
+ int CDECL _mbtowc_l(wchar_t *dst, const char* str, size_t n, _locale_t locale)
+ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     wchar_t tmpdst;
+ 
+-    if(!locale)
++    if(!locale) {
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* nested _l calls use this locinfo: */
++        locale = &cur_locale;                                   /* a second get_locinfo() could free it */
++    } else
+         locinfo = locale->locinfo;
+ 
+     if(n <= 0 || !str)
+--- a/dlls/msvcrt/scanf.h
++++ b/dlls/msvcrt/scanf.h
+@@ -38,7 +38,7 @@
+ #define _UCHAR_ unsigned char
+ #define _EOF_ EOF
+ #define _EOF_RET EOF
+-#define _ISSPACE_(c) isspace(c)
++#define _ISSPACE_(c) _isspace_l((c), locale)   /* the locale fetched below, not a fresh get_locinfo() */
+ #define _WIDE2SUPPORTED_(c) c /* FIXME: convert wide char to char */
+ #define _CHAR2SUPPORTED_(c) c /* No conversion needed (char to char) */
+ #define _CHAR2DIGIT_(c, base) char2digit((c), (base))
+@@ -199,6 +199,7 @@ static void _STRTOD_NAME_(strtod_scanf_unget)(void *ctx)
+ 
+ _FUNCTION_ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     int rd = 0, consumed = 0;
+     int nch;
+     if (!*format) return 0;
+@@ -221,9 +222,14 @@ _FUNCTION_ {
+         return _EOF_RET;
+     }
+ 
+-    if(!locale)
++    if(!locale) {
++        /* nested calls (_ISSPACE_) get this locinfo: a second get_locinfo() after another thread changed the
++         * global locale would free the one this function is still parsing with */
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo;
++        cur_locale.mbcinfo = NULL;
++        locale = &cur_locale;
++    } else
+         locinfo = locale->locinfo;
+ 
+     while (*format) {
+--- a/dlls/msvcrt/string.c
++++ b/dlls/msvcrt/string.c
+@@ -63,6 +63,7 @@ char* CDECL _strdup(const char* str)
+ int CDECL _strlwr_s_l(char *str, size_t len, _locale_t locale)
+ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     char *ptr = str;
+ 
+     if (!str || !len)
+@@ -84,9 +85,11 @@ int CDECL _strlwr_s_l(char *str, size_t len, _locale_t locale)
+         return EINVAL;
+     }
+ 
+-    if(!locale)
++    if(!locale) {
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* nested _l calls use this locinfo: */
++        locale = &cur_locale;                                   /* a second get_locinfo() could free it */
++    } else
+         locinfo = locale->locinfo;
+ 
+     if(!locinfo->lc_handle[LC_CTYPE])
+@@ -142,6 +145,7 @@ char* CDECL _strlwr(char *str)
+ int CDECL _strupr_s_l(char *str, size_t len, _locale_t locale)
+ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     char *ptr = str;
+ 
+     if (!str || !len)
+@@ -163,9 +167,11 @@ int CDECL _strupr_s_l(char *str, size_t len, _locale_t locale)
+         return EINVAL;
+     }
+ 
+-    if(!locale)
++    if(!locale) {
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* nested _l calls use this locinfo: */
++        locale = &cur_locale;                                   /* a second get_locinfo() could free it */
++    } else
+         locinfo = locale->locinfo;
+ 
+     if(!locinfo->lc_handle[LC_CTYPE])
+@@ -1006,6 +1012,7 @@ static void strtod_str_unget(void *ctx)
+ static inline double strtod_helper(const char *str, char **end, _locale_t locale, int *perr)
+ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     const char *beg, *p;
+     struct fpnum fp;
+     double ret;
+@@ -1021,9 +1028,11 @@ static inline double strtod_helper(const char *str, char **end, _locale_t locale
+         return 0;
+     }
+ 
+-    if (!locale)
++    if (!locale) {
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* nested _l calls use this locinfo: */
++        locale = &cur_locale;                                   /* a second get_locinfo() could free it */
++    } else
+         locinfo = locale->locinfo;
+ 
+     p = str;
+@@ -1504,15 +1513,18 @@ int CDECL __STRINGTOLD_L( _LDOUBLE *value, char **endptr,
+ {
+     struct MSVCRT__LDOUBLE *d = (struct MSVCRT__LDOUBLE *)value;
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     const char *beg, *p;
+     int err, ret = 0;
+     struct fpnum fp;
+ 
+     if (flags) FIXME("flags not supported: %x\n", flags);
+ 
+-    if (!locale)
++    if (!locale) {
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* nested _l calls use this locinfo: */
++        locale = &cur_locale;                                   /* a second get_locinfo() could free it */
++    } else
+         locinfo = locale->locinfo;
+ 
+     p = str;
+@@ -3312,6 +3324,7 @@ int __cdecl _strnicmp_l(const char *s1, const char *s2,
+         size_t count, _locale_t locale)
+ {
+     pthreadlocinfo locinfo;
++    _locale_tstruct cur_locale;
+     int c1, c2;
+ 
+     if(!count)
+@@ -3324,9 +3337,11 @@ int __cdecl _strnicmp_l(const char *s1, const char *s2,
+ #endif /* _MSVCR_VER>=140 */
+         return _NLSCMPERROR;
+ 
+-    if(!locale)
++    if(!locale) {
+         locinfo = get_locinfo();
+-    else
++        cur_locale.locinfo = locinfo; cur_locale.mbcinfo = NULL;   /* nested _l calls use this locinfo: */
++        locale = &cur_locale;                                   /* a second get_locinfo() could free it */
++    } else
+         locinfo = locale->locinfo;
+ 
+     if(!locinfo->lc_handle[LC_CTYPE])
