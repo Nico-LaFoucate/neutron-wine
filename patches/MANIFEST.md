@@ -1593,12 +1593,6 @@ in UXP\Plugins\External, Plugins > Auto Photoshop Stable Diffusion Plugin > Auto
 `neutron plugins install` (CLI `2ff3ec8`).
 SHIPPED in 11.10-155 (release-155 = 154 + `5657db3` + `029dd61` + `b14660a`; package real diffs vs 154 = win32u.so, rtworkq.dll, dwrite.dll x86_64 + i386; lab on the package; fresh HOME `setup --runtime-version 11.10-155` rc 0, tree == tarball; Latest).
 
-### patch 183 — `…z×183-wineinf-native-common-files-dir` (Adobe's plugin installer (UPIA) fails with -1 installing a Premiere UXP plugin: CommonW6432Dir missing) — from LinDobe 0149 (le-birnes/LinDobe PR #52), LGPL-2.1+
-wine.inf adds HKLM\Software\Microsoft\Windows\CurrentVersion CommonW6432Dir in the AMD64 and ARM64 sections (from the common-files
-dirid, no-clobber). UPIA reads it to build its UXP plugin path. MEASURED on the shipped 11.10-187 runtime: native-common-files.c
-FAIL (value missing) as shipped, PASS with the two lines in share/wine/wine.inf. Real app (Product Manager installing Animation
-Composer for Premiere 2.2.3, plugin opened under Extensions) checked under LinDobe, not yet under Neutron.
-
 ### patch 182 — `…z×182-msvcrt-keep-fetched-locale` (After Effects 2027 crashed at most starts in ucrtbase strtod/sscanf while other threads call setlocale) — from LinDobe 0146 (le-birnes/LinDobe), LGPL-2.1+
 strtod, the scanf family and a few _l functions fetched the thread locale and then called _isspace_l(c, NULL) and friends, whose
 own get_locinfo() frees that locale once another thread has called setlocale: use after free in fpnum_parse_bnum. Nested calls
