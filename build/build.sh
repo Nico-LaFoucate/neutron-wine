@@ -102,6 +102,41 @@ for _cfg in "$TKGDIR/customization.cfg" "$TKGDIR/wine-tkg-profiles/advanced-cust
     sed -i 's/^_user_patches_no_confirm=.*/_user_patches_no_confirm="true"/' "$_cfg"
 done
 
+# 3c. NEUTRON (2026-11-17, Mud-Hut#3): no GLIBC_ABI_GNU_TLS tag on the 32-bit unix modules.
+# binutils 2.45+ ld adds a GLIBC_ABI_GNU_TLS version dependency to every i386 .so that calls
+# ___tls_get_addr when the build machine's libc.so defines that tag (glibc 2.42+). Every runtime from
+# at least 11.10-120 to 212 shipped i386 win32u.so with it (212: winewayland.so too). glibc 2.39
+# (Ubuntu 24.04, Linux Mint 22, our README's floor) does not define it, so there the dynamic loader
+# refuses i386 win32u.so: every 32-bit process runs with no win32u unix side, its NtUser* calls
+# return STATUS_INVALID_SYSTEM_SERVICE, and it crashes on its first window call (Mud Hut's 32-bit
+# HDPIM host: "exit status: 84"; winedbg crashes the same way; the 32-bit vc_redist bootstrappers
+# exit 84). Linked without the tag, the same objects load on glibc 2.39 (lab: Mint 22.3 container).
+# The flag can't simply go into the 32-bit LDFLAGS: configure's first compiler test links a 64-bit
+# program (it adds -m32 only later) and the x86_64 linker rejects --no-gnu-tls-tag (first try,
+# 11.10-208.1: "C compiler cannot create executables"); and replacing LDFLAGS would drop tkg's own
+# -O1/--sort-common/--as-needed (v2081: DT_NEEDED changed in 4 modules). So the 32-bit build gets a CC
+# wrapper that only adds -B<dir>, where <dir> holds an `ld` wrapper: i386 links (-m elf_i386) get
+# --no-gnu-tls-tag, every other link runs the system ld unchanged. LDFLAGS and the PE cross compilers
+# (CROSSCC, mingw) are untouched. package.sh's GLIBC-FLOOR GATE checks the result.
+_LDWRAP="$WORK/ldwrap"
+mkdir -p "$_LDWRAP"
+cat > "$_LDWRAP/ld" <<'LDW'
+#!/bin/bash
+# Neutron build.sh 3c: i386 links get --no-gnu-tls-tag; every other link runs the system ld unchanged.
+for a in "$@"; do [ "$a" = "elf_i386" ] && exec /usr/bin/ld --no-gnu-tls-tag "$@"; done
+exec /usr/bin/ld "$@"
+LDW
+cat > "$_LDWRAP/gcc32" <<LDW
+#!/bin/bash
+# Neutron build.sh 3c: the 32-bit build's CC; finds the ld wrapper next to it first.
+exec gcc -B$_LDWRAP/ "\$@"
+LDW
+chmod 755 "$_LDWRAP/ld" "$_LDWRAP/gcc32"
+for _cfg in "$TKGDIR/customization.cfg" "$TKGDIR/wine-tkg-profiles/advanced-customization.cfg"; do
+    [ -f "$_cfg" ] || continue
+    sed -i "s|^_configure_userargs32=.*|_configure_userargs32=\"CC=$_LDWRAP/gcc32\"|" "$_cfg"
+done
+
 # 4. Build (non-makepkg flow). Output lands in src/<flavor>-build/.
 #
 # 🚨 PIN THE COLLATION. wine-tkg applies userpatches in whatever order the shell globs them, which

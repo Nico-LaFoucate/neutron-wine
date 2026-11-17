@@ -174,6 +174,42 @@ PY
         echo "   Matching the majority is the healthy case; the ones that differ are the suspect builds." >&2
     fi
 fi
+# ---------------------------------------------------------------------------
+# GLIBC-FLOOR GATE (2026-11-17, Mud-Hut#3). The README promises glibc 2.39 (Ubuntu 24.04, Linux Mint
+# 22). A unix module that needs a newer glibc version node does not load there, and nothing says so:
+# every runtime up to 11.10-212 shipped i386 win32u.so needing GLIBC_ABI_GNU_TLS (glibc 2.42+, added
+# by binutils 2.45+ ld), so on Mint 22.3 every 32-bit process crashed on its first window call. Check
+# every ELF file we ship against the floor; build.sh 3c links the 32-bit side with --no-gnu-tls-tag.
+# ---------------------------------------------------------------------------
+_glibc_bad="$(python3 - "$TREE" <<'PY'
+import os, re, subprocess, sys
+FLOOR = (2, 39)          # README: glibc 2.39 or newer
+OK_TAGS = {"GLIBC_ABI_DT_RELR"}   # defined since glibc 2.36
+bad = []
+for root, _, files in os.walk(sys.argv[1]):
+    for n in files:
+        p = os.path.join(root, n)
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        with open(p, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                continue
+        out = subprocess.run(["readelf", "-V", "-W", p], capture_output=True, text=True).stdout
+        for v in sorted(set(re.findall(r"Name: (GLIBC_[A-Z0-9_.]+)", out))):
+            m = re.fullmatch(r"GLIBC_(\d+)\.(\d+)(?:\.\d+)?", v)
+            if (m and (int(m[1]), int(m[2])) > FLOOR) or (not m and v not in OK_TAGS):
+                bad.append("%s needs %s" % (os.path.relpath(p, sys.argv[1]), v))
+print("\n".join(bad))
+PY
+)"
+if [ -n "$_glibc_bad" ]; then
+    echo "package.sh: ⛔ GLIBC FLOOR — these files will not load on glibc 2.39 (Ubuntu 24.04 / Mint 22):" >&2
+    printf '    %s\n' "$_glibc_bad" >&2
+    echo "  A GLIBC_ABI_GNU_TLS hit on an i386 module means build.sh step 3c (--no-gnu-tls-tag) did not reach" >&2
+    echo "  the 32-bit configure: check last_build_config.log and the 32-build Makefile's LDFLAGS." >&2
+    exit 10
+fi
+
 echo "packaging Wine tree: $TREE"
 echo "release:             $NAME  (base: $WINE_BASE)"
 
