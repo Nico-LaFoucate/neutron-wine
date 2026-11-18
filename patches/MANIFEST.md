@@ -20,6 +20,9 @@ userpatches are silently skipped on a non-interactive build.
 
 ## Production (`patches/`)
 
+### patch 227a38 — `…z×227-a38-tabcur` (Neutron#56: "When pen tablet are used the cursor suddenly changed to cross shaped made it hard to use for drawing purposes.") — 11.10-213.1 test build (hotfix line, 11-18)
+Main's 227a38 (lab penc + his Cintiq check), regenerated with `diff -u` on 11.10-213's tree for the hotfix line: hunk bodies identical, offsets only (waylanddrv.h -5/-66, wayland_pointer.c -24); applies on 213 with 0 offset/fuzz. The only patch 11.10-213.1 adds to 213. winewayland never set a cursor for a tablet tool (no zwp_tablet_tool_v2.set_cursor, no cursor-shape get_tablet_tool_v2), so KWin showed its fallback crosshair for the pen while the mouse got the Win32 cursor. Each tool now gets its own cursor surface + shape device, set at proximity_in, at every SetCursor for the window under the tool and over another process's child (published shape), with the tool's proximity serial. NEUTRON_TABLET_CURSOR=0 (diag NEUTRON_TABLET_CURSOR_DIAG=1). Not covered: over another process's child the pen shows the last published shape (same limitation as the pointer).
+
 ### `neutron-wgl-nv-dx-interop.mypatch`  🔑 NEW 2026-08-03
 **`WGL_NV_DX_interop` / `_interop2`** — the OpenGL↔DirectX sharing extension. `dlls/win32u/opengl.c`
 advertises it and implements the 8 entry points; `dlls/opengl32/wgl.c` adds the D3D-object

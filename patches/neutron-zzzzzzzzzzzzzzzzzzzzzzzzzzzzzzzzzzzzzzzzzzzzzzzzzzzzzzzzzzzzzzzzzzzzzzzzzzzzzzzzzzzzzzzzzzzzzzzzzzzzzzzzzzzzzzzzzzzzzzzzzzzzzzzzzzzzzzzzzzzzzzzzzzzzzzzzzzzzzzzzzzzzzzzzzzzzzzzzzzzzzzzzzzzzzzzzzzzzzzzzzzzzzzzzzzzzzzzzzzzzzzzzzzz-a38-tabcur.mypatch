@@ -1,0 +1,462 @@
+winewayland: give each tablet tool the window's Win32 cursor (zwp_tablet_tool_v2.set_cursor / cursor-shape get_tablet_tool_v2)
+
+What a user sees (Neutron#56, Photoshop 2025, runtime 11.10-213, AMD, KDE Plasma 6.8.2): "When pen tablet are used the cursor
+suddenly changed to cross shaped made it hard to use for drawing purposes. While using mouse on the other hand the cursor
+follow brush shape as it should be." The owner sees the same crosshair with his Cintiq.
+
+Mechanism: the Win32 side was already right. wintab.c injects the pen's mouse input with NtUserSendHardwareInput(hwnd), the
+window answers WM_SETCURSOR, and win32u hands the HCURSOR to WAYLAND_SetCursor -- which gave it to wl_pointer only, and only
+while the POINTER was over that window. On Wayland every tablet tool has its own cursor; winewayland binds the tablet seat in
+every process but never called zwp_tablet_tool_v2.set_cursor or cursor-shape-v1's get_tablet_tool_v2, so KWin drew its
+fallback crosshair for the pen over every Wine window (KWin's fallback for a client that never sets a tool cursor: KDE bug
+477570, the same bug Qt had before 6.8).
+
+Windows: the tablet driver moves the one system cursor; the pen shows exactly what the mouse shows (Photoshop's brush outline,
+its Caps Lock precise cross, arrows over panels).
+Fix: each tool (pen, eraser: its own wl_surface, as a surface may only ever be one tool's cursor, and its own shape device)
+shows the Win32 cursor of the window it is in proximity over, resolved by the pointer's own code (cursor-shape for system
+cursors, else the bitmap with hotspot and viewport at the window's scale, the retained last cursor for an unresolvable
+handle, hidden for NULL / ShowCursor(FALSE)): at every proximity_in (the cursor is undefined there, as at wl_pointer.enter),
+at every WAYLAND_SetCursor for that window, and over another process's child window as pointer_motion_to_hwnd does. Every
+request carries the tool's latest proximity_in serial. The pointer's buffer/surface helpers now take the cursor to fill;
+the pointer path is unchanged (its request stream is identical with and without this patch, and on 214).
+
+Not covered: over a child window of ANOTHER process the pen, like the pointer, shows the shape last published to the shared
+slot / the last resolved cursor, not that process's own cursor (lab: a SIZEALL child showed the parent's last shape, same for
+the pointer) -- pre-existing pointer behavior. Pads (zwp_tablet_pad_v2) have no cursor. Not proven on hardware in the lab: KWin
+drawing the tool cursor (protocol-standard; the owner's hand test decides).
+
+Lab evidence (no tablet in a nested desk, no uinput: a Wayland wire proxy in front of the nested KWin 6.8.3 injected a fake
+tablet + pen + eraser into Wine's connection and logged every request Wine sent on them; probe curprobe.exe cycles arrow /
+64 px color ring / hand / SetCursor(NULL) / 32 px mono X / I-beam / ShowCursor(FALSE), 175% output, 168 dpi):
+  fix (11.10-214pc) 5/5 runs: pen and eraser get exactly the probe's cursor in every phase (shape 1/4/9, ring 64x64 hotspot
+  18,18 dest 37x37, X 32x32 hotspot 9,9 dest 18x18, hidden), each with its own latest proximity serial (5001/5002/5003), and the
+  same requests and byte-identical cursor images as wl_pointer for the same phases (4/4 runs with a held fake pointer);
+  kill switch 3/3 and 214 4/4: zero tool requests (= the crosshair); wl_pointer's requests identical in all arms.
+  Photoshop 2026 lab copy (UseSystemStylus 0, WinTab), fake pen, 2 fix runs + 1 kill run: brush tool hover -> the pen gets
+  Photoshop's brush outline bitmap (13x13, hotspot centered), ] x3 -> 21x21 centered, Caps Lock on -> Photoshop's precise
+  cursor (64x64), off -> outline again, over the right-hand panels -> arrow (shape 1), back on the canvas -> outline, eraser
+  end with the Eraser tool -> 15x15 outline; eyedropper run: the eyedropper bitmap, its precise cursor on Caps Lock;
+  kill switch: zero tool requests (pointer requests unchanged).
+Kill switch: NEUTRON_TABLET_CURSOR=0. Diag: NEUTRON_TABLET_CURSOR_DIAG=1 (err+waylanddrv: one neutron-tabletcursor line per
+tool cursor update).
+11.10-213.1 (hotfix line): regenerated with diff -u on 11.10-213's tree; hunk bodies identical to main's 227a38, offsets
+only (waylanddrv.h -5/-66, wayland_pointer.c -24, wayland_tablet.c 0).
+
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -210,6 +210,17 @@
+                                    * channel can be motion-gated like the real Wacom driver
+                                    * (which emits nothing when the pen hasn't moved) */
+     BOOL  pending_move;
++    /* NEUTRON tablet cursor (NEUTRON_TABLET_CURSOR): the tool's own cursor. On Windows the pen
++     * drives the one system cursor; on Wayland every tablet tool has its own, set with
++     * zwp_tablet_tool_v2.set_cursor (or cursor-shape-v1's get_tablet_tool_v2) against the
++     * tool's proximity_in serial. A wl_surface may only ever be the cursor of ONE tool, so each
++     * tool owns its surface. Guarded by process_wayland.pointer.mutex. */
++    HWND cursor_hwnd;             /* window the tool is in proximity over, NULL when out */
++    uint32_t proximity_serial;    /* serial of the latest proximity_in */
++    struct wayland_cursor cursor;
++    struct wp_cursor_shape_device_v1 *wp_cursor_shape_device_v1;
++    BOOL cursor_xproc;            /* last motion was over another process's child window */
++    UINT cursor_xproc_shape;      /* the shape shown there (0 = hidden) */
+ };
+ 
+ struct wayland_tablet_pad
+@@ -759,6 +770,11 @@
+ LRESULT wayland_drag_source_message(HWND hwnd, WPARAM op, LPARAM params);
+ BOOL wayland_drag_out_enabled(void);
+ void wayland_pointer_dnd_motion(HWND hwnd, wl_fixed_t sx, wl_fixed_t sy);
++/* NEUTRON tablet cursor (wayland_pointer.c): the tool shows the window's Win32 cursor */
++void wayland_tablet_tool_cursor_enter(struct wayland_tablet_tool *tool, uint32_t serial, HWND hwnd);
++void wayland_tablet_tool_cursor_leave(struct wayland_tablet_tool *tool);
++void wayland_tablet_tool_cursor_motion(struct wayland_tablet_tool *tool, HWND hwnd, POINT screen);
++void wayland_tablet_tool_cursor_destroy(struct wayland_tablet_tool *tool);
+ BOOL wayland_pointer_drag_origin(HWND *hwnd, uint32_t *serial);
+ void wayland_pointer_release_drag_buttons(HWND hwnd, const char *where);
+ 
+--- a/dlls/winewayland.drv/wayland_pointer.c
++++ b/dlls/winewayland.drv/wayland_pointer.c
+@@ -974,9 +974,9 @@
+ 
+ /* NEUTRON: returns FALSE only when a non-NULL handle could not be resolved (get_icon_info or buffer
+  * creation failed). A NULL handle and a fully transparent cursor are resolved hides: TRUE. */
+-static BOOL wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
++/* NEUTRON tablet cursor: takes the cursor to fill (the pointer's, or a tablet tool's own). */
++static BOOL wayland_cursor_update_buffer(struct wayland_cursor *cursor, HCURSOR hcursor, double scale)
+ {
+-    struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
+     ICONINFOEXW info = {0};
+     BOOL resolved = TRUE;
+ 
+@@ -1049,10 +1049,13 @@
+     return resolved;
+ }
+ 
+-static void wayland_pointer_clear_cursor_surface(void)
++static BOOL wayland_pointer_update_cursor_buffer(HCURSOR hcursor, double scale)
+ {
+-    struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
++    return wayland_cursor_update_buffer(&process_wayland.pointer.cursor, hcursor, scale);
++}
+ 
++static void wayland_cursor_clear_surface(struct wayland_cursor *cursor)
++{
+     if (cursor->wp_viewport)
+     {
+         wp_viewport_destroy(cursor->wp_viewport);
+@@ -1070,10 +1073,13 @@
+     }
+ }
+ 
+-static void wayland_pointer_update_cursor_surface(double scale)
++static void wayland_pointer_clear_cursor_surface(void)
+ {
+-    struct wayland_cursor *cursor = &process_wayland.pointer.cursor;
++    wayland_cursor_clear_surface(&process_wayland.pointer.cursor);
++}
+ 
++static void wayland_cursor_update_surface(struct wayland_cursor *cursor, double scale)
++{
+     if (!cursor->shm_buffer) goto clear_cursor;
+ 
+     if (!cursor->wl_surface)
+@@ -1118,7 +1124,12 @@
+     return;
+ 
+ clear_cursor:
+-    wayland_pointer_clear_cursor_surface();
++    wayland_cursor_clear_surface(cursor);
++}
++
++static void wayland_pointer_update_cursor_surface(double scale)
++{
++    wayland_cursor_update_surface(&process_wayland.pointer.cursor, scale);
+ }
+ 
+ static void reapply_cursor_clipping(void)
+@@ -1344,6 +1355,278 @@
+     return TRUE;
+ }
+ 
++/* NEUTRON tablet cursor (Neutron#56: "When pen tablet are used the cursor suddenly changed to cross
++ * shaped made it hard to use for drawing purposes. While using mouse on the other hand the cursor
++ * follow brush shape as it should be.")
++ *
++ * On Windows the pen drives the one system cursor: the tablet driver injects mouse input, the window
++ * under it answers WM_SETCURSOR, and the pen shows exactly what the mouse would (Photoshop's brush
++ * outline). The Win32 half already works the same here -- wintab.c injects the pen's mouse input
++ * through NtUserSendHardwareInput, so the window gets WM_SETCURSOR and win32u hands the resulting
++ * HCURSOR to WAYLAND_SetCursor -- but the driver only ever gave that cursor to wl_pointer. On Wayland
++ * every tablet tool has its OWN cursor (zwp_tablet_tool_v2.set_cursor, or cursor-shape-v1's
++ * get_tablet_tool_v2) and we never set one, so KWin showed its fallback crosshair for the pen over
++ * every Wine window (KDE bug 477570, the same for Qt before 6.8).
++ *
++ * Fix: each tool in proximity over one of our windows shows that window's current Win32 cursor,
++ * resolved by the same code as the pointer (cursor-shape for system cursors, else the bitmap with its
++ * hotspot at the window's scale, the retained last cursor for an unresolvable handle, NULL = hidden):
++ * at every proximity_in (the tool's cursor is undefined there, as the pointer's is at enter), at every
++ * WAYLAND_SetCursor for that window, and over another process's child window as the pointer does.
++ * Each tool (pen, eraser) has its own surface and shape device: a wl_surface may only ever be the
++ * cursor of one tool. Requests carry the tool's latest proximity_in serial.
++ * Kill switch NEUTRON_TABLET_CURSOR=0 (no tool cursor requests at all = 214's behavior);
++ * NEUTRON_TABLET_CURSOR_DIAG=1 prints one neutron-tabletcursor line per tool cursor update.
++ * Everything below runs with pointer->mutex held unless it says otherwise. */
++static BOOL neutron_tablet_cursor_enabled(void)
++{
++    static int v = -1;
++    if (v < 0) v = neutron_gate("NEUTRON_TABLET_CURSOR", TRUE);
++    return v;
++}
++
++static BOOL neutron_tablet_cursor_diag(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv("NEUTRON_TABLET_CURSOR_DIAG"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
++
++static enum wp_cursor_shape_device_v1_shape neutron_cursor_shape_of(HCURSOR hcursor)
++{
++    ICONINFOEXW info = {0};
++    enum wp_cursor_shape_device_v1_shape shape;
++
++    if (!process_wayland.wp_cursor_shape_manager_v1 || !hcursor) return 0;
++    if (!get_icon_info(hcursor, &info)) return 0;
++    shape = cursor_shape_from_info(&info, wp_cursor_shape_manager_v1_get_version(
++                                              process_wayland.wp_cursor_shape_manager_v1));
++    if (info.hbmColor) NtGdiDeleteObjectApp(info.hbmColor);
++    if (info.hbmMask) NtGdiDeleteObjectApp(info.hbmMask);
++    return shape;
++}
++
++static BOOL tablet_tool_set_shape(struct wayland_tablet_tool *tool, enum wp_cursor_shape_device_v1_shape shape)
++{
++    if (!process_wayland.wp_cursor_shape_manager_v1) return FALSE;
++    if (!tool->wp_cursor_shape_device_v1)
++        tool->wp_cursor_shape_device_v1 =
++            wp_cursor_shape_manager_v1_get_tablet_tool_v2(process_wayland.wp_cursor_shape_manager_v1,
++                                                          tool->zwp_tablet_tool_v2);
++    if (!tool->wp_cursor_shape_device_v1) return FALSE;
++    wp_cursor_shape_device_v1_set_shape(tool->wp_cursor_shape_device_v1, tool->proximity_serial, shape);
++    wayland_cursor_clear_surface(&tool->cursor);
++    return TRUE;
++}
++
++static void tablet_tool_apply_cursor(struct wayland_tablet_tool *tool, HCURSOR hcursor, double scale,
++                                     const char *why)
++{
++    struct wayland_cursor *cursor = &tool->cursor;
++    enum wp_cursor_shape_device_v1_shape shape;
++    const char *what;
++    BOOL resolved;
++
++    tool->cursor_xproc_shape = ~0u;   /* over another process's panel, the next motion shows its shape again */
++    if ((shape = neutron_cursor_shape_of(hcursor)) && tablet_tool_set_shape(tool, shape))
++    {
++        neutron_cursor_remember_shape(hcursor, shape);
++        what = "shape";
++        goto done;
++    }
++
++    resolved = wayland_cursor_update_buffer(cursor, hcursor, scale);
++    what = cursor->shm_buffer ? "bitmap" : "hidden";
++    /* an unresolvable handle shows the last resolved cursor, as on the pointer (NEUTRON_CURSOR_KEEP) */
++    if (!resolved && hcursor && neutron_cursor_keep_enabled())
++    {
++        if (neutron_cursor_last.shape || !neutron_cursor_last.shm_buffer)
++        {
++            shape = neutron_cursor_last.shape ? neutron_cursor_last.shape : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
++            if (tablet_tool_set_shape(tool, shape))
++            {
++                what = "kept shape";
++                goto done;
++            }
++        }
++        else
++        {
++            if (cursor->shm_buffer) wayland_shm_buffer_unref(cursor->shm_buffer);
++            wayland_shm_buffer_ref(neutron_cursor_last.shm_buffer);
++            cursor->shm_buffer = neutron_cursor_last.shm_buffer;
++            cursor->hotspot_x = round(neutron_cursor_last.hotspot_x / scale);
++            cursor->hotspot_y = round(neutron_cursor_last.hotspot_y / scale);
++            what = "kept bitmap";
++        }
++    }
++
++    wayland_cursor_update_surface(cursor, scale);
++    zwp_tablet_tool_v2_set_cursor(tool->zwp_tablet_tool_v2, tool->proximity_serial,
++                                  cursor->wl_surface, cursor->hotspot_x, cursor->hotspot_y);
++    if (tool->wp_cursor_shape_device_v1)
++    {
++        wp_cursor_shape_device_v1_destroy(tool->wp_cursor_shape_device_v1);
++        tool->wp_cursor_shape_device_v1 = NULL;
++    }
++    if (!cursor->wl_surface) what = "hidden";
++
++done:
++    if (neutron_tablet_cursor_diag())
++        ERR("neutron-tabletcursor: %s tool=%p type=%#x hwnd=%p hcursor=%p -> %s shape=%u size=%dx%d "
++            "hotspot=%d,%d scale=%.3f serial=%u\n",
++            why, tool, tool->type, tool->cursor_hwnd, hcursor, what, (unsigned)shape,
++            cursor->shm_buffer ? cursor->shm_buffer->width : 0,
++            cursor->shm_buffer ? cursor->shm_buffer->height : 0,
++            cursor->hotspot_x, cursor->hotspot_y, scale, tool->proximity_serial);
++}
++
++/* WAYLAND_SetCursor for hwnd: every tool in proximity over it shows the same cursor. */
++static BOOL tablet_tools_set_cursor(HWND hwnd, HCURSOR hcursor, double scale)
++{
++    struct wayland_tablet *tablet = &process_wayland.tablet;
++    struct wayland_tablet_tool *tool;
++    BOOL any = FALSE;
++
++    if (!neutron_tablet_cursor_enabled()) return FALSE;
++    pthread_mutex_lock(&tablet->mutex);
++    if (tablet->zwp_tablet_seat_v2)   /* the tool list exists only once the seat does */
++    {
++        LIST_FOR_EACH_ENTRY(tool, &tablet->tools, struct wayland_tablet_tool, entry)
++        {
++            if (!tool->cursor_hwnd || tool->cursor_hwnd != hwnd) continue;
++            tablet_tool_apply_cursor(tool, hcursor, scale, "setcursor");
++            any = TRUE;
++        }
++    }
++    pthread_mutex_unlock(&tablet->mutex);
++    return any;
++}
++
++/* The window's current cursor, as wayland_set_cursor resolves it for the pointer. FALSE: not ours. */
++static BOOL tablet_window_cursor(HWND hwnd, HCURSOR *hcursor, double *scale)
++{
++    struct wayland_win_data *data;
++    BOOL ret = FALSE;
++
++    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
++    if (data->wayland_surface)
++    {
++        *hcursor = data->wayland_surface->hcursor;
++        *scale = data->wayland_surface->window.scale;
++        ret = TRUE;
++    }
++    wayland_win_data_release(data);
++    return ret;
++}
++
++/* Event thread, proximity_in: the tool's cursor is undefined at every proximity_in (KWin shows its
++ * fallback crosshair), so set it again with the latest information we have, as pointer_handle_enter
++ * does for the pointer. */
++void wayland_tablet_tool_cursor_enter(struct wayland_tablet_tool *tool, uint32_t serial, HWND hwnd)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    HCURSOR hcursor = NULL;
++    double scale = 1.0;
++    BOOL ours;
++
++    if (!neutron_tablet_cursor_enabled()) return;
++    ours = hwnd && tablet_window_cursor(hwnd, &hcursor, &scale);
++
++    pthread_mutex_lock(&pointer->mutex);
++    tool->cursor_hwnd = hwnd;
++    tool->proximity_serial = serial;
++    tool->cursor_xproc = FALSE;
++    if (ours) tablet_tool_apply_cursor(tool, hcursor, scale, "proximity_in");
++    else if (neutron_tablet_cursor_diag())
++        ERR("neutron-tabletcursor: proximity_in tool=%p hwnd=%p has no surface, cursor left to the compositor\n",
++            tool, hwnd);
++    pthread_mutex_unlock(&pointer->mutex);
++    wl_display_flush(process_wayland.wl_display);
++}
++
++/* Event thread, proximity_out: the compositor drops the tool's cursor; keep the objects for the next
++ * proximity_in (the surface may only ever serve this tool). */
++void wayland_tablet_tool_cursor_leave(struct wayland_tablet_tool *tool)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++
++    pthread_mutex_lock(&pointer->mutex);
++    tool->cursor_hwnd = NULL;
++    tool->cursor_xproc = FALSE;
++    pthread_mutex_unlock(&pointer->mutex);
++}
++
++/* Event thread, tool motion at screen (the pen's injected mouse position): over a child window of
++ * another process (a CEF panel host) that process's SetCursor cannot reach us, so mirror what
++ * pointer_motion_to_hwnd does for the mouse -- the published shape, or hidden. Leaving such a
++ * window, show our own window's cursor again. */
++void wayland_tablet_tool_cursor_motion(struct wayland_tablet_tool *tool, HWND hwnd, POINT screen)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++    HWND under;
++    DWORD under_pid = 0;
++    CURSORINFO ci = {0};
++    HCURSOR hcursor = NULL;
++    double scale = 1.0;
++    BOOL xproc;
++
++    if (!neutron_tablet_cursor_enabled() || !hwnd) return;
++    under = NtUserWindowFromPoint(screen.x, screen.y);
++    if (under) NtUserGetWindowThread(under, &under_pid);
++    xproc = under && under_pid && under_pid != GetCurrentProcessId();
++    if (!xproc && !tool->cursor_xproc) return;   /* the common case: our own window, SetCursor drives it */
++
++    ci.cbSize = sizeof(ci);
++    if (xproc) NtUserGetCursorInfo(&ci);
++    else if (!tablet_window_cursor(hwnd, &hcursor, &scale)) return;
++
++    pthread_mutex_lock(&pointer->mutex);
++    if (tool->cursor_hwnd == hwnd)
++    {
++        if (!xproc) tablet_tool_apply_cursor(tool, hcursor, scale, "left other process");
++        else if (!(ci.flags & CURSOR_SHOWING))
++        {
++            if (!tool->cursor_xproc || tool->cursor_xproc_shape)
++                tablet_tool_apply_cursor(tool, NULL, scale, "other process hidden");
++            tool->cursor_xproc_shape = 0;
++        }
++        else
++        {
++            volatile LONG *shm = neutron_cursor_shm();
++            LONG s = shm ? *shm : 0;
++            enum wp_cursor_shape_device_v1_shape shape = s > 0 ? (enum wp_cursor_shape_device_v1_shape)s
++                                                               : WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
++            /* one request per change, not one per pen sample */
++            if ((!tool->cursor_xproc || shape != tool->cursor_xproc_shape) && tablet_tool_set_shape(tool, shape))
++            {
++                tool->cursor_xproc_shape = shape;
++                if (neutron_tablet_cursor_diag())
++                    ERR("neutron-tabletcursor: other process tool=%p hwnd=%p under=%p -> shape=%d serial=%u\n",
++                        tool, hwnd, under, (int)s, tool->proximity_serial);
++            }
++        }
++        tool->cursor_xproc = xproc;
++    }
++    pthread_mutex_unlock(&pointer->mutex);
++    wl_display_flush(process_wayland.wl_display);
++}
++
++/* Event thread, tool removed: before the tool is freed. */
++void wayland_tablet_tool_cursor_destroy(struct wayland_tablet_tool *tool)
++{
++    struct wayland_pointer *pointer = &process_wayland.pointer;
++
++    pthread_mutex_lock(&pointer->mutex);
++    tool->cursor_hwnd = NULL;
++    if (tool->wp_cursor_shape_device_v1)
++    {
++        wp_cursor_shape_device_v1_destroy(tool->wp_cursor_shape_device_v1);
++        tool->wp_cursor_shape_device_v1 = NULL;
++    }
++    wayland_cursor_clear_surface(&tool->cursor);
++    pthread_mutex_unlock(&pointer->mutex);
++}
++
+ static void wayland_set_cursor(HWND hwnd, HCURSOR hcursor, BOOL use_hcursor)
+ {
+     struct wayland_pointer *pointer = &process_wayland.pointer;
+@@ -1403,6 +1686,9 @@
+         wl_display_flush(process_wayland.wl_display);
+         reapply_clip = TRUE;
+     }
++    /* NEUTRON tablet cursor: the pen in proximity over this window shows the same cursor. */
++    if (use_hcursor && tablet_tools_set_cursor(hwnd, hcursor, scale))
++        wl_display_flush(process_wayland.wl_display);
+     pthread_mutex_unlock(&pointer->mutex);
+ 
+     /* Reapply cursor clip since cursor visibility affects pointer constraint
+--- a/dlls/winewayland.drv/wayland_tablet.c
++++ b/dlls/winewayland.drv/wayland_tablet.c
+@@ -164,6 +164,7 @@
+ 
+     TRACE("tablet tool removed: serial=%llx\n", tool->serial);
+ 
++    wayland_tablet_tool_cursor_destroy(tool);   /* NEUTRON tablet cursor: its surface + shape device */
+     zwp_tablet_tool_v2_destroy(zwp_tablet_tool_v2);
+     free(tool);
+ }
+@@ -177,6 +178,8 @@
+     struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
+     tool->surface = surface;
+     wayland_wintab_proximity_in(tool, serial, tablet, surface);
++    /* NEUTRON tablet cursor: show the window's Win32 cursor, not the compositor's fallback */
++    if (surface) wayland_tablet_tool_cursor_enter(tool, serial, wl_surface_get_user_data(surface));
+ }
+ 
+ static void wayland_tablet_tool_proximity_out(void *data,
+@@ -184,6 +187,7 @@
+ {
+     struct wayland_tablet_tool *tool = (struct wayland_tablet_tool *)data;
+     wayland_wintab_proximity_out(tool);
++    wayland_tablet_tool_cursor_leave(tool);   /* NEUTRON tablet cursor */
+     tool->surface = NULL;
+ }
+ 
+@@ -276,6 +280,8 @@
+          * the packet, so per-sample mouse+packet stay paired and ordered. */
+         tool->pending_pos = screen;
+         tool->pending_move = TRUE;
++        /* NEUTRON tablet cursor: over another process's child window, as the pointer does */
++        wayland_tablet_tool_cursor_motion(tool, hwnd, screen);
+     }
+     wayland_wintab_motion(tool, x, y);
+ }
