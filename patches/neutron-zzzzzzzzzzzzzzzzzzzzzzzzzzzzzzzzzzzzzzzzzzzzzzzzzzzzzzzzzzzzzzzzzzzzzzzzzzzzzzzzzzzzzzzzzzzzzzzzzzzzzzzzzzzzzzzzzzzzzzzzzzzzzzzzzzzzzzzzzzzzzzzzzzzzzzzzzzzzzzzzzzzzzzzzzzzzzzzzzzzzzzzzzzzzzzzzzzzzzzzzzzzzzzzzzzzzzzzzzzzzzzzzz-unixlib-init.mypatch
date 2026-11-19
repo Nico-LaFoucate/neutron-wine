@@ -1,0 +1,101 @@
+From: Neutron lab (mudhut4)
+Subject: [PATCH] ntdll: call a Unix library's OWN __wine_unix_lib_init (backport of main's patch 225 to 11.10-213: Mud-Hut#4)
+
+What the reporter saw (Mud-Hut#4, Fedora 45 + MangoWM): "Tried installing an adobe app but after waiting a long time for wine
+to initialize it prints that error" -- wineboot --init failed (exit status: 53): wine: could not load kernel32.dll, status c0000135.
+
+This is main's patch 225 (...z-unixlib-init.mypatch, in test builds 211+), unchanged except offsets, regenerated with diff -u on
+213's tree (release-213 = 208 content), so the Latest line gets it without the beta-2 commits.
+
+Mechanism (SOLID): on 213, winewayland.so has no __wine_unix_lib_init of its own (winex11.so does), so loading the
+Wayland driver's PE side re-ran win32u's init through dlsym's dependency search and every thread lost its win32u state.
+On a brand-new prefix, the 32-bit `rundll32 setupapi,InstallHinfSection Wow64Install` is the first process to load uxtheme:
+right after loading winewayland.drv it writes the theme config, broadcasts WM_SYSCOLORCHANGE and calls
+RedrawWindow(NULL, RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW), and its main thread never returns (futex_wait).
+syswow64 stays empty. The first process's bootstrap wait (ntdll run_wineboot) gives up after 5 minutes (the "long wait"),
+then loads syswow64\kernel32.dll with bootstrap mode off: STATUS_DLL_NOT_FOUND c0000135, exit code 0x35 = 53.
+With x11 (own init) the reset never happens: that is why "forcing the x11 driver" worked for the reporter.
+INFERRED: which lock the reset thread waits on, and why it needs a wlroots compositor (lab KWin/Muffin runs on 208 passed;
+sway offers zwlr_data_control, so the 32-bit process starts no clipboard thread and its main thread does the first theme load).
+
+Windows behavior: loading a DLL never resets a thread's window state, and a fresh Windows install never hangs creating its
+first window.
+
+Lab evidence (Fedora 45 container, setup's own 32-bit package command, headless sway 1.12/wlroots 0.20 without Xwayland,
+pixman, no GPU, CPUs 16-23; Mud Hut 0.3.12's exact wineboot command on a new empty prefix):
+  213 (Latest):                 rc 53 after 300 s, 5/5 (a4, a5, a6, a7; ntsync off b1)
+  210 rc 53 1/1; 211, 212, 214, 216 rc 0 (4 s) 1/1 each (bisect: the fix is in 211's patches 213-226)
+  216 + NEUTRON_UNIXLIB_OWN_INIT=0: rc 53 1/1; 211 + kill: rc 53 1/1
+  213mh4 (= 213 + this patch, ntdll.so x86_64 + i386): rc 0, 4 s, syswow64 857 files, 2/2 (f1, f2)
+  213mh4 + NEUTRON_UNIXLIB_OWN_INIT=0 (same build): rc 53 after 300 s, 2/2 (k1f, k2f)
+  sway with Xwayland (x11 picked): 213 rc 0 1/1; no compositor: 213 rc 0 1/1
+
+Not covered: regressions on the host KWin desk and Mint are parked (need the GPU / a desk); glibc-only (dlinfo), as in 225.
+Kill switch: NEUTRON_UNIXLIB_OWN_INIT=0.
+---
+--- a/dlls/ntdll/unix/virtual.c	2026-11-18 22:57:40.821738086 -0500
++++ b/dlls/ntdll/unix/virtual.c	2026-11-18 22:57:40.823738150 -0500
+@@ -60,6 +60,9 @@
+ #endif
+ #include <unistd.h>
+ #include <dlfcn.h>
++#ifdef HAVE_LINK_H
++# include <link.h>
++#endif
+ #ifdef HAVE_VALGRIND_VALGRIND_H
+ # include <valgrind/valgrind.h>
+ #endif
+@@ -849,10 +852,53 @@
+ /***********************************************************************
+  *           get_unixlib_funcs
+  */
++/* NEUTRON: a Unix library's init entry point is its OWN __wine_unix_lib_init, never one of its dependencies'.
++ *
++ * dlsym() on a dlopen() handle searches the library AND its dependencies. winevulkan.so, opengl32.so, winewayland.so and
++ * wineps.so link win32u.so and define no __wine_unix_lib_init of their own, so every load of their PE side ran win32u's
++ * init again. Since 11.10 (win32u: "Use pthread instead of the TEB to access internal per-thread data") that init creates
++ * the pthread key holding each thread's win32u state: a second run replaces the key and every thread silently starts over
++ * with an empty user_thread_info (a new default input context, no default IME window, hook/message recursion counters
++ * reset), while the old per-thread IME record stays registered. On Windows loading a DLL never resets a thread's window
++ * state; ImmGetDefaultIMEWnd() names one default IME window per thread for the life of its windows.
++ * Seen in Media Composer (neutron 2026-11-15): each Direct3D 9 start loads winevulkan, the main thread lost its state 3
++ * times, ended up with two default IME windows, and the IME UI window's WM_IME_SETCONTEXT bounced between them inside
++ * every modal loop -- window after window, then a stack overflow. Probe probe/tinfo.c: one vkCreateInstance is enough.
++ * NEUTRON_UNIXLIB_OWN_INIT=0: take whatever dlsym() finds, as before. */
++static BOOL neutron_unixlib_own_init(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_UNIXLIB_OWN_INIT" );
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
++static BOOL symbol_is_own( void *so_handle, const void *ptr )
++{
++#if defined(HAVE_DLINFO) && defined(HAVE_LINK_H) && defined(__GLIBC__)
++    struct link_map *map = NULL;
++    Dl_info info;
++
++    if (dlinfo( so_handle, RTLD_DI_LINKMAP, &map ) || !map || !map->l_name) return TRUE;
++    if (!dladdr( ptr, &info ) || !info.dli_fname) return TRUE;
++    return !strcmp( info.dli_fname, map->l_name );
++#else
++    return TRUE;
++#endif
++}
++
+ static NTSTATUS get_unixlib_funcs( void *so_handle, BOOL wow, const void **funcs, NTSTATUS (**entry)(void) )
+ {
+     *funcs = dlsym( so_handle, wow ? "__wine_unix_call_wow64_funcs" : "__wine_unix_call_funcs" );
+     *entry = dlsym( so_handle, "__wine_unix_lib_init" );
++    if (*entry && neutron_unixlib_own_init() && !symbol_is_own( so_handle, *entry ))
++    {
++        TRACE( "ignoring a dependency's __wine_unix_lib_init %p\n", *entry );
++        *entry = NULL;
++    }
+     return *funcs || *entry ? STATUS_SUCCESS : STATUS_ENTRYPOINT_NOT_FOUND;
+ }
+ 
