@@ -1,0 +1,91 @@
+opengl32: the legacy ChoosePixelFormat no longer returns floating-point formats (Neutron#57)
+
+What the reporter saw: "After Effects 2026 freezes permanently when OCIO color management (built-in or custom ACES config) is
+enabled while footage is in the project."
+
+Mechanism (ae57f, lab): After Effects' hidden OpenColorIO window ("OpenColorIO_Win_Class", 113x18) calls the legacy
+ChoosePixelFormat with DRAW_TO_WINDOW|SUPPORT_OPENGL|DOUBLEBUFFER, RGBA, cColorBits 128, depth 32, stencil 32. Our legacy list
+holds every EGL config that can draw to a window, so NVIDIA's RGBA16F configs appear as "RGBA, 64 color bits" and win (format
+135 of 138). SetPixelFormat then needs a float16 Wayland EGL window surface. The reporter's log shows that drawable never
+arriving for that one window; when the lab makes that creation fail or block (LD_PRELOAD shim), After Effects freezes at the
+first import under OCIO exactly as reported (4/4; 0/3 without the shim). Why it does not arrive on his RTX 3060 / 620.70.06 /
+Fedora 45 is not known.
+
+Windows behavior (measured, probe round 51, owner's box, RTX 5070): the legacy list ALSO holds the eight float formats (89-92 and
+their twins, "RGBA, 64 color bits", WGL type 0x21a0), but ChoosePixelFormat with the After Effects request returns format 11, an
+8-bit format (RGB a0, depth 24, stencil 8). Windows never hands the legacy caller a float format.
+
+Fix: wglChoosePixelFormat skips formats whose WGL pixel type is float (RGBA_FLOAT_ARB / RGBA_UNSIGNED_FLOAT_EXT). The OCIO
+window then gets format 70 (RGBA8, depth 24, stencil 8) like every other After Effects GL window. Format numbering,
+DescribePixelFormat and wglChoosePixelFormatARB are untouched (the list stays as it is, as on Windows). On NVIDIA the only legacy
+formats above 32 bits are the float ones, so "skip float" and "never exceed the screen depth" pick the same format there. Windows
+also picked an a0 format where Wine picks RGBA8; that stays as is. Kill switch: NEUTRON_GL_LEGACY_NO_FLOAT=0.
+
+Not covered: an app that walks DescribePixelFormat itself can still pick a float format (Windows lists them too). Non-float
+formats above 32 bits (Mesa's RGBA16 UNORM, seen in 32-bit llvmpipe) stay selectable.
+
+Lab evidence (11.10-224pf = 224 + this opengl32.dll x86_64 + i386; glfloat/NOTES.md): probe 224 -> 135 float n=2, 224pf -> 70
+n=2, kill switch -> 135 n=2 (64-bit; the 32-bit process runs on llvmpipe here, no float configs, 154 in every arm).
+After Effects 168 dpi OCIO + import + comp + preview: 224 and 224pf both work; only change: the OCIO window's format 135 -> 70.
+Photoshop (zoom/rotate), Illustrator GPU Preview, Lightroom Classic Develop, FL Studio call the legacy chooser too and already got
+8-bit formats: unchanged, 0 px.
+---
+--- a/dlls/opengl32/wgl.c
++++ b/dlls/opengl32/wgl.c
+@@ -541,12 +541,35 @@
+ /***********************************************************************
+  *		wglChoosePixelFormat (OPENGL32.@)
+  */
++/* NEUTRON: the legacy chooser never offers a floating-point format. A PIXELFORMATDESCRIPTOR cannot describe one (its
++ * iPixelType is RGBA or COLORINDEX only); on Windows float formats are reached through wglChoosePixelFormatARB with
++ * WGL_TYPE_RGBA_FLOAT_ARB. Here every EGL config that can draw to a window is in the list, so NVIDIA's RGBA16F configs
++ * showed up as "RGBA, 64 color bits" and won any request for more than 32 color bits. After Effects' hidden OpenColorIO
++ * window asks for cColorBits 128 and got one, i.e. a float16 Wayland window surface that not every driver/compositor
++ * pair delivers; when that drawable does not come back After Effects freezes at the first footage under OCIO (Neutron#57).
++ * Kill switch NEUTRON_GL_LEGACY_NO_FLOAT=0. */
++static BOOL neutron_legacy_no_float(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_GL_LEGACY_NO_FLOAT" );
++        on = e ? (e[0] != '0') : 1;
++        ERR( "neutron-gateresolved: NEUTRON_GL_LEGACY_NO_FLOAT = %d (%s)\n", on, e ? "environment" : "default" );
++    }
++    return on;
++}
++
++static struct wgl_pixel_format *get_pixel_formats( HDC hdc, UINT *num_formats, UINT *num_onscreen_formats );
++
+ INT WINAPI wglChoosePixelFormat(HDC hdc, const PIXELFORMATDESCRIPTOR* ppfd)
+ {
+     PIXELFORMATDESCRIPTOR format, best;
+     int i, count, best_format;
+     int bestDBuffer = -1, bestStereo = -1;
+     DWORD is_memdc;
++    struct wgl_pixel_format *wgl_formats;
++    UINT num_wgl_formats = 0, num_wgl_onscreen = 0;
+ 
+     TRACE( "%p %p: size %u version %u flags %lu type %u color %u %u,%u,%u,%u "
+            "accum %u depth %u stencil %u aux %u\n",
+@@ -568,10 +591,20 @@
+     best.cAuxBuffers = -1;
+     best.cAccumBits = -1;
+ 
++    wgl_formats = neutron_legacy_no_float() ? get_pixel_formats( hdc, &num_wgl_formats, &num_wgl_onscreen ) : NULL;
++
+     for (i = 1; i <= count; i++)
+     {
+         if (!wglDescribePixelFormat( hdc, i, sizeof(format), &format )) continue;
+ 
++        if (wgl_formats && i <= num_wgl_formats &&
++            (wgl_formats[i - 1].pixel_type == WGL_TYPE_RGBA_FLOAT_ARB ||
++             wgl_formats[i - 1].pixel_type == WGL_TYPE_RGBA_UNSIGNED_FLOAT_EXT))
++        {
++            TRACE( "float format skipped for iPixelFormat=%d\n", i );
++            continue;
++        }
++
+         if ((ppfd->iPixelType == PFD_TYPE_COLORINDEX) != (format.iPixelType == PFD_TYPE_COLORINDEX))
+         {
+             TRACE( "pixel type mismatch for iPixelFormat=%d\n", i );
