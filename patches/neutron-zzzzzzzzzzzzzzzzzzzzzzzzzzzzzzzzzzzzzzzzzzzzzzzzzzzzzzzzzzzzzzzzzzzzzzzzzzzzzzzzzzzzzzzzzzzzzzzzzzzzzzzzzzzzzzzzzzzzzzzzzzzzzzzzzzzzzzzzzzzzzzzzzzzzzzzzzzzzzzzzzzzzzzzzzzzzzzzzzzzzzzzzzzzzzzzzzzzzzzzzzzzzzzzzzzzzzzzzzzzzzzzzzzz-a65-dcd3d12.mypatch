@@ -1,0 +1,402 @@
+From: Neutron lab (ai58)
+Subject: [PATCH] dcomp, winewayland.drv: copy a D3D12 swap chain when children sit over it; never put a chain the bridge cannot read below the window surface
+
+What he saw (Neutron#58, reporter's words): "Illustrator Type Tool causes editing area to return to welcome screen."
+Illustrator 2027 (31.0.0.84), GPU Performance on, New Document, Type tool, click the artboard and type: the document
+area shows Illustrator's Home screen (white with "Show The Home Screen When No Documents Are Open" off); clicking
+brings the canvas back for a moment. CPU view (Ctrl+E) does not do it.
+
+Mechanism (SOLID, lab):
+- The canvas is a DroverLord "OS_ViewContainer" child (WS_CLIPCHILDREN) presenting a vkd3d-proton D3D12 swap chain
+  for its own window; DXVK's dxgi registers it with the dcomp bridge (dcomp-hook PresentBase is_d3d12=1), so the
+  window gets the __wine_dcomp_blit mark ("the bridge can copy its frames").
+- The Type tool shows the on-canvas type bar; its font-size field is a real Edit child (OS_EditTextContainer > Edit,
+  81x31) over the canvas. children-over-chain then puts the chain's client surface BELOW the window surface and
+  leaves the canvas to the bridge's copy through the window's DC.
+- The bridge reads a chain as an ID3D11Texture2D. A D3D12 chain's buffers are ID3D12Resource: GetBuffer answers
+  E_NOINTERFACE ("diag: GetBuffer failed hr 0x80004002") and nothing is copied, so the window surface's old pixels
+  show: the Home page drawn into that area earlier (CEF frames blitted into the top-level), or the white fill.
+  When the field hides (click elsewhere), the client surface goes back above and the canvas returns.
+Windows: DWM composes every swap chain itself and child windows above it (the field shows over the canvas).
+
+Fix:
+1. dcomp: read back a D3D12 chain (8-bit BGRA/RGBA, single-sampled): the buffer it presented last (the one before
+   its current back buffer), copied with CopyTextureRegion into a readback buffer on a direct queue the bridge owns
+   on the chain's device, waited on a fence (250 ms cap); the same-process GDI path then draws it, clipped by the
+   children. The bridge cannot reach the app's queue (vkd3d-proton's IDXGISwapChain::GetDevice answers with the
+   device), so the copy has no GPU ordering against the app's rendering; it runs one blit tick (16 ms) after the
+   Present that marked it. The presented buffer is in PRESENT (= COMMON), which promotes to COPY_SOURCE implicitly.
+2. dcomp: mark a window __wine_dcomp_blit only while its chain can be read the way the bridge reads it (D3D11
+   texture, or a D3D12 chain that (1) handles); otherwise take the mark back. An unreadable chain stays on its own
+   client surface, as patch 150 leaves every direct chain.
+3. winewayland: children-over-chain keys on the LIVE mark, not the sticky latch, so a taken-back mark is honored.
+
+Not covered: D3D12 chains in 10-bit/FP16 formats (unmarked: their children stay hidden under the chain, the
+pre-children-copy behavior); the D3D12 copy is not GPU-ordered with the app's queue (a frame the app has not
+finished rendering 16 ms after its Present is read as it stands; not seen in the lab); the copy costs a readback per
+present while children cover the chain (2410x1880 here); GNOME (the reporter's desktop) not run, KDE nested only;
+hybrid Intel+NVIDIA not run (lab GPU = one NVIDIA).
+
+Lab (desk: one 3840x2160 output at scale 2.0 = 192 dpi like the reporter; prefix copy of a signed-in Ai 2026 + 2027
+lab prefix provisioned per runtime with CLI beta.43; steps: Ctrl+N, Create, T, click artboard, type ffff, Escape,
+click; shots after each step):
+  Illustrator 2027 31.0.0.84 (signed-in lab copy), GPU Performance on:
+    217 plain r1 r2                                   Home screen in the document area 2/2 (2 % white), canvas back after
+                                                      Escape + click; "GetBuffer failed hr 0x80004002"
+    217, CPU view (Ctrl+E) c1                         canvas fine 1/1 (the reporter's workaround), 0 children-copy switches
+    225 plain b1 b2                                   Home screen 2/2 (225 does not fix it)
+    225aj (225 + this patch) j2 j3                    canvas, text and the type bar's "12 pt" field drawn 2/2, same as the
+                                                      CPU view; "neutron-d3d12-copy: 2410x1880 format 87 -> read back"
+    225aj NEUTRON_DCOMP_D3D12_COPY=0 k1 k3            canvas and text fine, the "12 pt" field EMPTY 2/2 (the Edit child
+                                                      under the chain; 0 below switches)
+    225aj D3D12_COPY=0 + NEUTRON_DCOMP_MARK_READABLE=0 k2 k4   Home screen 2/2 (== 225)
+  Illustrator 2026 30.8.2 (same prefix, 2027 folder moved aside):
+    217 a9 a10 a11                                    artboard gone, flat gray document area with the "12 pt / 1 pt"
+                                                      chip on it 3/3, back after Escape + click
+    225aj a7 a8                                       artboard and type bar with "12 pt" 2/2; D3D12 copy 3226x1880
+  Every run quit clean (td CLEAN). Lab runtimes: 11.10-225ai (parts 2+3 only), 11.10-225aj (whole patch).
+Not run: regression on other apps (no other lab app is known to present a D3D12 chain with children over it; the
+change is limited to windows with a D3D12 chain: 8-bit ones now copied while children cover them, others no longer
+marked); GNOME; NVIDIA+Intel hybrid.
+Kill switches: NEUTRON_DCOMP_D3D12_COPY=0 (no D3D12 readback: the chain stays on its own client surface, children
+hidden under it), NEUTRON_DCOMP_MARK_READABLE=0 (mark every same-process chain, as 225; with both off == 225).
+
+Regression, lab rel58 (11-23; desk = the owner's layout: 3840x2160 at 175 % (168 dpi) + 1920x1080 at 100 %; one prefix copy per
+pair provisioned on 225 with CLI 3f9a1af, fresh reflink per run; matched screenshots pixel-diffed, every non-zero diff viewed),
+225 (A) vs 225aj (B):
+  Illustrator 2027 + 2026, GPU and CPU view, Type tool, Character panel, font menu: only the typing shots differ (225: Home screen /
+    gray area; 225aj: artboard, text and type bar), every other step 0 px.
+  Photoshop (text layer, contextual task bar, brush, Camera Raw, Open/Save As, prefs), After Effects (OCIO ACES 1.2, import, comp,
+    layer selected, Effects & Presets, Render Queue), Lightroom Classic (Develop on a real file, Masking brush, filmstrip),
+    Premiere (timeline, Effect Controls, program monitor playing), Animate (stage): every difference also occurs between two runs of
+    the same runtime (promo video frame, Tip of the Day, sample carousel, thumbnails, LrC panel gutter, playback position) or is a
+    slower app start; n=2 pairs where anything differed. Photoshop, Lightroom Classic and Animate present D3D12 chains too; no
+    children-over-chain switch fired for them in either arm.
+  Cost (Illustrator 2027, 40-character bursts with the type bar over the canvas): +0.75 s CPU per 4.7 s burst and +1 s per 10 s idle
+    vs 225 (which copies nothing); at or below the CPU view (the reporter's workaround); no visible typing lag; equal without the type bar.
+Also applies to 11.10-217.1's dlls/dcomp/device.c and dlls/winewayland.drv/wayland_surface.c with offsets only (patch -F0); the
+patched text equals 225's patched text up to the files' existing 217/225 differences (11.10-217.2 pre-release).
+---
+--- a/dlls/dcomp/device.c
++++ b/dlls/dcomp/device.c
+@@ -32,6 +32,8 @@
+ #include "objbase.h"
+ #include "dxgi.h"
+ #include "d3d11.h"
++#include "dxgi1_4.h"
++#include "d3d12.h"
+ #include "dcomp.h"
+ #include "wine/list.h"
+ #include "wine/debug.h"
+@@ -603,6 +605,273 @@
+ };
+ struct INeutronBoundedAcquire { const struct INeutronBoundedAcquireVtbl *lpVtbl; };
+ 
++/* NEUTRON 2026-11-23 (Neutron#58): read back a D3D12 swap chain, so children-over-chain can copy it like a D3D11
++ * one. Illustrator 2027's (and 2026's DirectXRenderer) canvas is a vkd3d-proton D3D12 chain made for its own
++ * window; the Type tool puts an Edit child (the font-size field of the on-canvas type bar) over it. Windows
++ * composes that child above the chain. Here the child is GDI content of the top-level's window surface, so the
++ * chain goes below that surface and must reach it through the window's DC -- which needs its pixels.
++ * The copy reads the buffer the chain presented last (the one before its current back buffer) on a direct queue
++ * of the chain's device that the bridge owns: the app's own queue is not reachable (vkd3d-proton's
++ * IDXGISwapChain::GetDevice answers with the device). The buffer is in the PRESENT (= COMMON) state, which
++ * promotes to COPY_SOURCE implicitly and decays back at the end of the submission. The bridge reads it one blit
++ * tick (16 ms) after its Present, without a GPU wait on the app's queue: a frame the app has not finished
++ * rendering by then is read as it stands. 8-bit BGRA/RGBA chains only.
++ * Kill switch NEUTRON_DCOMP_D3D12_COPY=0 (no D3D12 readback: such a chain is not copyable and stays on its own
++ * client surface). */
++static int neutron_d3d12_copy(void)
++{
++    static int gate = -1;
++
++    if (gate < 0)
++    {
++        char b[8];
++        gate = (GetEnvironmentVariableA("NEUTRON_DCOMP_D3D12_COPY", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_D3D12_COPY = %d\n", gate);
++    }
++    return gate;
++}
++
++static BOOL neutron_d3d12_format_ok(DXGI_FORMAT format, BOOL *swap_rb)
++{
++    switch (format)
++    {
++    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
++    case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
++        *swap_rb = FALSE;
++        return TRUE;
++    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
++        *swap_rb = TRUE;
++        return TRUE;
++    default:
++        return FALSE;
++    }
++}
++
++/* The buffer a D3D12 (flip-model) chain presented last, with its description. */
++static ID3D12Resource *neutron_d3d12_presented(IDXGISwapChain *swapchain, D3D12_RESOURCE_DESC *rd)
++{
++    DXGI_SWAP_CHAIN_DESC scd;
++    IDXGISwapChain3 *sc3 = NULL;
++    ID3D12Resource *res = NULL;
++    UINT index = 0;
++
++    if (FAILED(IDXGISwapChain_GetDesc(swapchain, &scd))) return NULL;
++    if (scd.BufferCount > 1 && SUCCEEDED(IDXGISwapChain_QueryInterface(swapchain, &IID_IDXGISwapChain3, (void **)&sc3)))
++    {
++        index = (IDXGISwapChain3_GetCurrentBackBufferIndex(sc3) + scd.BufferCount - 1) % scd.BufferCount;
++        IDXGISwapChain3_Release(sc3);
++    }
++    if (FAILED(IDXGISwapChain_GetBuffer(swapchain, index, &IID_ID3D12Resource, (void **)&res)) || !res) return NULL;
++    res->lpVtbl->GetDesc(res, rd);
++    return res;
++}
++
++static struct
++{
++    CRITICAL_SECTION cs;
++    ID3D12Device *device;
++    ID3D12CommandQueue *queue;
++    ID3D12CommandAllocator *allocator;
++    ID3D12GraphicsCommandList *list;
++    ID3D12Resource *buffer;
++    UINT64 buffer_size;
++    ID3D12Fence *fence;
++    UINT64 value;
++    HANDLE event;
++    BOOL busy; /* a copy that did not finish in time still owns the allocator */
++} d3d12_rb;
++static INIT_ONCE d3d12_rb_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL CALLBACK d3d12_rb_init(INIT_ONCE *once, void *param, void **context)
++{
++    InitializeCriticalSection(&d3d12_rb.cs);
++    d3d12_rb.event = CreateEventW(NULL, FALSE, FALSE, NULL);
++    return TRUE;
++}
++
++static void d3d12_rb_release(void)
++{
++    if (d3d12_rb.list) ID3D12GraphicsCommandList_Release(d3d12_rb.list);
++    if (d3d12_rb.allocator) ID3D12CommandAllocator_Release(d3d12_rb.allocator);
++    if (d3d12_rb.buffer) ID3D12Resource_Release(d3d12_rb.buffer);
++    if (d3d12_rb.fence) ID3D12Fence_Release(d3d12_rb.fence);
++    if (d3d12_rb.queue) ID3D12CommandQueue_Release(d3d12_rb.queue);
++    if (d3d12_rb.device) ID3D12Device_Release(d3d12_rb.device);
++    d3d12_rb.queue = NULL; d3d12_rb.list = NULL; d3d12_rb.allocator = NULL; d3d12_rb.buffer = NULL; d3d12_rb.fence = NULL;
++    d3d12_rb.device = NULL; d3d12_rb.buffer_size = 0; d3d12_rb.value = 0; d3d12_rb.busy = FALSE;
++}
++
++/* Returns the presented frame as packed BGRA rows (malloc'd, caller frees) and its size, or NULL. */
++static void *neutron_d3d12_readback(IDXGISwapChain *swapchain, UINT *width, UINT *height)
++{
++    static unsigned int nlog;
++    D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_READBACK};
++    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
++    D3D12_TEXTURE_COPY_LOCATION dst, src;
++    D3D12_COMMAND_QUEUE_DESC qd = {D3D12_COMMAND_LIST_TYPE_DIRECT};
++    D3D12_RESOURCE_DESC rd, bd;
++    D3D12_RANGE range;
++    ID3D12Device *device = NULL;
++    ID3D12Resource *res;
++    UINT64 row_size, total;
++    BYTE *mapped = NULL, *packed = NULL;
++    UINT rows, x, y;
++    BOOL swap_rb;
++    HRESULT hr = E_FAIL;
++
++    if (!(res = neutron_d3d12_presented(swapchain, &rd))) return NULL;
++    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || rd.SampleDesc.Count != 1
++            || !neutron_d3d12_format_ok(rd.Format, &swap_rb) || !rd.Width || !rd.Height)
++        goto out;
++    if (FAILED(hr = ID3D12Resource_GetDevice(res, &IID_ID3D12Device, (void **)&device))) goto out;
++    ID3D12Device_GetCopyableFootprints(device, &rd, 0, 1, 0, &fp, &rows, &row_size, &total);
++
++    InitOnceExecuteOnce(&d3d12_rb_once, d3d12_rb_init, NULL, NULL);
++    EnterCriticalSection(&d3d12_rb.cs);
++    if (d3d12_rb.busy)
++    {
++        if (ID3D12Fence_GetCompletedValue(d3d12_rb.fence) < d3d12_rb.value) { hr = E_PENDING; goto unlock; }
++        d3d12_rb.busy = FALSE;
++    }
++    if (d3d12_rb.device != device)
++    {
++        d3d12_rb_release();
++        if (FAILED(hr = ID3D12Device_CreateCommandQueue(device, &qd, &IID_ID3D12CommandQueue, (void **)&d3d12_rb.queue))
++                || FAILED(hr = ID3D12Device_CreateCommandAllocator(device, qd.Type, &IID_ID3D12CommandAllocator,
++                (void **)&d3d12_rb.allocator))
++                || FAILED(hr = ID3D12Device_CreateCommandList(device, 0, qd.Type, d3d12_rb.allocator, NULL,
++                &IID_ID3D12GraphicsCommandList, (void **)&d3d12_rb.list))
++                || FAILED(hr = ID3D12GraphicsCommandList_Close(d3d12_rb.list))
++                || FAILED(hr = ID3D12Device_CreateFence(device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence,
++                (void **)&d3d12_rb.fence)))
++        {
++            d3d12_rb_release();
++            goto unlock;
++        }
++        ID3D12Device_AddRef(device);
++        d3d12_rb.device = device;
++    }
++    if (d3d12_rb.buffer_size < total)
++    {
++        if (d3d12_rb.buffer) ID3D12Resource_Release(d3d12_rb.buffer);
++        d3d12_rb.buffer = NULL; d3d12_rb.buffer_size = 0;
++        memset(&bd, 0, sizeof(bd));
++        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++        bd.Width = total;
++        bd.Height = 1;
++        bd.DepthOrArraySize = 1;
++        bd.MipLevels = 1;
++        bd.SampleDesc.Count = 1;
++        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++        if (FAILED(hr = ID3D12Device_CreateCommittedResource(device, &heap, D3D12_HEAP_FLAG_NONE, &bd,
++                D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&d3d12_rb.buffer)))
++            goto unlock;
++        d3d12_rb.buffer_size = total;
++    }
++    if (FAILED(hr = ID3D12CommandAllocator_Reset(d3d12_rb.allocator))
++            || FAILED(hr = ID3D12GraphicsCommandList_Reset(d3d12_rb.list, d3d12_rb.allocator, NULL)))
++        goto unlock;
++    dst.pResource = d3d12_rb.buffer;
++    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    dst.PlacedFootprint = fp;
++    src.pResource = res;
++    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    src.SubresourceIndex = 0;
++    ID3D12GraphicsCommandList_CopyTextureRegion(d3d12_rb.list, &dst, 0, 0, 0, &src, NULL);
++    if (FAILED(hr = ID3D12GraphicsCommandList_Close(d3d12_rb.list))) goto unlock;
++    ID3D12CommandQueue_ExecuteCommandLists(d3d12_rb.queue, 1, (ID3D12CommandList **)&d3d12_rb.list);
++    if (FAILED(hr = ID3D12CommandQueue_Signal(d3d12_rb.queue, d3d12_rb.fence, ++d3d12_rb.value))) goto unlock;
++    if (ID3D12Fence_GetCompletedValue(d3d12_rb.fence) < d3d12_rb.value)
++    {
++        ID3D12Fence_SetEventOnCompletion(d3d12_rb.fence, d3d12_rb.value, d3d12_rb.event);
++        if (WaitForSingleObject(d3d12_rb.event, 250) != WAIT_OBJECT_0)
++        {
++            d3d12_rb.busy = TRUE; /* dropped; the next readback waits for it first */
++            hr = E_PENDING;
++            goto unlock;
++        }
++    }
++    range.Begin = 0;
++    range.End = total;
++    if (FAILED(hr = ID3D12Resource_Map(d3d12_rb.buffer, 0, &range, (void **)&mapped))) goto unlock;
++    if ((packed = malloc((SIZE_T)rd.Width * 4 * rd.Height)))
++    {
++        for (y = 0; y < rd.Height; y++)
++        {
++            const BYTE *row = mapped + fp.Offset + (SIZE_T)y * fp.Footprint.RowPitch;
++            DWORD *out = (DWORD *)(packed + (SIZE_T)y * rd.Width * 4);
++
++            memcpy(out, row, (SIZE_T)rd.Width * 4);
++            if (swap_rb)
++                for (x = 0; x < rd.Width; x++)
++                    out[x] = (out[x] & 0xff00ff00) | ((out[x] & 0xff) << 16) | ((out[x] >> 16) & 0xff);
++        }
++        *width = rd.Width;
++        *height = rd.Height;
++    }
++    range.End = 0;
++    ID3D12Resource_Unmap(d3d12_rb.buffer, 0, &range);
++unlock:
++    LeaveCriticalSection(&d3d12_rb.cs);
++out:
++    if (nlog < 8 && (!packed || !nlog))
++    {
++        nlog++;
++        ERR("neutron-d3d12-copy: swapchain=%p %ux%u format %u -> %s (hr %#lx)\n", swapchain, (UINT)rd.Width,
++            rd.Height, rd.Format, packed ? "read back" : "not read", hr);
++    }
++    if (device) ID3D12Device_Release(device);
++    ID3D12Resource_Release(res);
++    return packed;
++}
++
++/* NEUTRON 2026-11-23 (Neutron#58, Illustrator 2027 Type tool): the bridge copies a chain by asking it for an
++ * ID3D11Texture2D (blit_swapchain_to_hwnd). A D3D12 chain -- vkd3d-proton's, which DXVK's dxgi registers here
++ * (dcomp-hook PresentBase is_d3d12=1) -- has ID3D12Resource buffers: GetBuffer answers E_NOINTERFACE and the
++ * bridge copies nothing. The __wine_dcomp_blit mark tells winewayland that the bridge CAN copy a window's chain;
++ * children-over-chain puts a marked chain's client surface below the window surface once a child sits over it,
++ * which for a D3D12 chain bared whatever the window surface held (Illustrator's Home page drawn there earlier,
++ * or white). Mark a window only while its chain can be read the way the bridge reads it; an unreadable chain
++ * stays on its own client surface, as patch 150 leaves every direct chain. Windows: DWM composes every chain,
++ * nothing copies it. Kill switch NEUTRON_DCOMP_MARK_READABLE=0 (mark every same-process chain, as before). */
++static BOOL neutron_chain_readable(IDXGISwapChain *swapchain, HWND hwnd)
++{
++    static int gate = -1;
++    ID3D11Texture2D *tex = NULL;
++    HRESULT hr;
++
++    if (gate < 0)
++    {
++        char b[8];
++        gate = (GetEnvironmentVariableA("NEUTRON_DCOMP_MARK_READABLE", b, sizeof(b)) && b[0] == '0') ? 0 : 1;
++        ERR("neutron-gateresolved: NEUTRON_DCOMP_MARK_READABLE = %d\n", gate);
++    }
++    if (!gate) return TRUE;
++    hr = IDXGISwapChain_GetBuffer(swapchain, 0, &IID_ID3D11Texture2D, (void **)&tex);
++    if (SUCCEEDED(hr) && tex)
++    {
++        ID3D11Texture2D_Release(tex);
++        return TRUE;
++    }
++    if (hr == E_NOINTERFACE && neutron_d3d12_copy())
++    {
++        D3D12_RESOURCE_DESC rd;
++        ID3D12Resource *res = neutron_d3d12_presented(swapchain, &rd);
++        BOOL swap_rb, ok = res && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && rd.SampleDesc.Count == 1
++                && neutron_d3d12_format_ok(rd.Format, &swap_rb);
++
++        if (res) ID3D12Resource_Release(res);
++        if (ok) return TRUE;
++    }
++    {
++        static unsigned int nlog;
++        if (nlog++ < 16)
++            ERR("neutron-unreadable: hwnd=%p swapchain=%p GetBuffer(ID3D11Texture2D) hr %#lx -> not marked, the bridge "
++                "cannot copy it (its own client surface shows it)\n", hwnd, swapchain, hr);
++    }
++    return FALSE;
++}
++
+ /* Stamp a swapchain as bridge-managed. Returns 1 if DXVK acknowledged. */
+ static int neutron_stamp_bounded_acquire(IDXGISwapChain *swapchain)
+ {
+@@ -865,7 +1134,11 @@
+             }
+             if (FAILED(hr))
+             {
+-                if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
++                /* Neutron#58: a D3D12 chain has ID3D12Resource buffers (see neutron_d3d12_readback) */
++                if (hr == E_NOINTERFACE && !p->cross_proc && neutron_d3d12_copy()
++                        && (packed = neutron_d3d12_readback(swapchain, &desc.Width, &desc.Height)))
++                    have_pixels = TRUE;
++                else if (diag) ERR("diag: GetBuffer failed hr %#lx\n", hr);
+             }
+             else
+             {
+@@ -1724,7 +1997,10 @@
+      * the whole UI). The bridge already delivers content via GetDC+StretchDIBits, so
+      * the client subsurface is redundant AND harmful; the mark lets winewayland drop
+      * it (env NEUTRON_DCOMP_SUPPRESS_CLIENT=1) so the GDI content shows. */
+-    if (!target_cross_proc && hwnd && !neutron_dcomp_native()) /* round-35: native mode never marks/suppresses same-proc windows */
++    if (!target_cross_proc && hwnd && !neutron_dcomp_native() /* round-35: native mode never marks/suppresses same-proc windows */
++            && !neutron_chain_readable(swapchain, hwnd))
++        RemovePropW(hwnd, L"__wine_dcomp_blit"); /* Neutron#58: an earlier, readable chain's mark */
++    else if (!target_cross_proc && hwnd && !neutron_dcomp_native())
+     {
+         SetPropW(hwnd, L"__wine_dcomp_blit", (HANDLE)(ULONG_PTR)1);
+         /* NEUTRON diag: log every window we MARK for suppression, once per hwnd, so a
+--- a/dlls/winewayland.drv/wayland_surface.c
++++ b/dlls/winewayland.drv/wayland_surface.c
+@@ -5231,7 +5231,9 @@
+              * chain to this client surface (patch 150). Kill switch NEUTRON_DCOMP_CHILDREN_COPY=0. */
+             static const WCHAR dcomp_below_prop[] =
+                 {'_','_','w','i','n','e','_','d','c','o','m','p','_','b','e','l','o','w',0};
+-            BOOL below = (marked || sticky) && visible && neutron_children_over_chain(hwnd);
++            /* Neutron#58: the LIVE mark, not the sticky latch -- dcomp takes the mark back when the window's chain
++             * becomes one it cannot copy (a D3D12 chain), and a latched mark would still put that chain below. */
++            BOOL below = marked && visible && neutron_children_over_chain(hwnd);
+             BOOL was_below = !!NtUserGetProp(hwnd, dcomp_below_prop);
+ 
+             if (below != was_below)
