@@ -1,0 +1,64 @@
+win32u: GetClipBox returns an all-zero box for an empty clip region (Neutron#59).
+
+What he saw (reporter, Neutron#59): "Lightroom CC Camera Matching Profile does not stay
+selected" -- "I can hover over the selection and see the change in the image but clicking it
+and moving my mouse off the field causes it to revert to adobe standard." Reproduced in the lab
+at the reporter's 3440x1440: Camera Matching / B&W tiles get the selection border but are not
+applied; at 3840x2160 they apply.
+
+Mechanism: on mouse-up Lightroom's Profile Browser (AgGridView, one child window per profile
+group) reads the "visibleRect" of every group window: GetDC(child) + GetClipBox. When a group
+window lies wholly below its toplevel (a tall group such as Camera Matching or B&W pushes the
+following collapsed groups below the window), Wine returned NULLREGION with the leftover of the
+failed device-rect intersection as the box, e.g. (0,0)-(0,-26). Lightroom turns that inverted
+rect into an invalid range and the click handler stops before the profile is applied.
+NtGdiGetAppClipBox used intersect_rect(), which leaves max/min values in the rect when the
+intersection is empty.
+
+Windows (MEASURED, probe clipbox.exe round 52 on the owner's Windows box, 11-24): a child
+window wholly below its parent gives GetClipBox ret=1 (NULLREGION) box=(0,0)-(0,0); a child
+inside gives ret=2 (SIMPLEREGION) (0,0)-(100,100) and a half-covered one ret=2 (0,0)-(100,61).
+Wine 227 gave NULLREGION (0,0)-(0,-1646) for the child below its parent; with this patch it
+gives (0,0)-(0,0) like Windows, and the inside and half rows do not change.
+
+Not covered: a mapped DC (non-identity window/viewport) or RTL layout with an empty clip also
+gets (0,0)-(0,0) now; Windows behavior there is not measured.
+
+Lab evidence (runtime 11.10-227cz = 227 + this win32u.so x2; unedited build == 227's win32u.so):
+- 3440x1440, Camera Matching NT+IN, B&W 01+04: fix on 4/4 + 4/4 applied (two sessions);
+  kill switch NEUTRON_CLIPBOX_EMPTY_ZERO=0 on the same build 0/4. 3840x2160 fix on: 2/2 applied.
+- Sanity (fix on): Develop slider drag, filmstrip thumb click, Masking "Add New Mask" panel OK.
+
+Kill switch: NEUTRON_CLIPBOX_EMPTY_ZERO=0.
+--- a/dlls/win32u/clipping.c	2026-11-24 19:49:16.889400919 -0500
++++ b/dlls/win32u/clipping.c	2026-11-24 19:49:16.890400952 -0500
+@@ -428,6 +428,20 @@
+ }
+ 
+ 
++/* NEUTRON #59: on Windows a clip box that comes out empty (NULLREGION) is
++ * all zeros, like GetRgnBox of an empty region.  Wine left the leftover of
++ * the failed intersection with the device rect in it, e.g. (0,0)-(0,-26)
++ * for a child window that lies wholly below its toplevel's visible rect,
++ * and Lightroom's Profile Browser turned that inverted rect into an invalid
++ * range, which aborted the click (Neutron#59).
++ * Kill switch: NEUTRON_CLIPBOX_EMPTY_ZERO=0. */
++static BOOL neutron_clipbox_empty_zero(void)
++{
++    static int v = -1;
++    if (v < 0) { const char *e = getenv( "NEUTRON_CLIPBOX_EMPTY_ZERO" ); v = !(e && e[0] == '0'); }
++    return v;
++}
++
+ /***********************************************************************
+  *           NtGdiGetAppClipBox    (win32u.@)
+  */
+@@ -458,6 +472,8 @@
+         rect->right = tmp - 1;
+     }
+     dp_to_lp( dc, (LPPOINT)rect, 2 );
++    if (ret == NULLREGION && neutron_clipbox_empty_zero())
++        rect->left = rect->top = rect->right = rect->bottom = 0;
+     /* NEUTRON READ-TRACE */
+     if (neutron_read_band_hit( rect ))
+         ERR( "neutron-read: GetAppClipBox dc=%p hwnd=%p ret=%d box=(%d,%d)-(%d,%d)\n",
