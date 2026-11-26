@@ -1,0 +1,743 @@
+winewayland: take each output's work area from KWin (every panel on its own edge) (Neutron#61)
+
+Neutron#61, the reporter: "trying to interact with anything in the LRC window, including the title-bar, moves the
+window". Lightroom Classic restored its saved place below the screen; Win32 and KWin then disagreed about where the
+window was, every click landed on the bottom row of Wine's rect = the caption, and the caption started a compositor move.
+227a72 (placement-bounds) and 227a71 (placement-workspace) follow Windows' rules; this patch gives those rules the
+work area Windows would have.
+
+Windows reference. rcWork = the monitor minus the taskbar on the edge the taskbar actually is on. Round 54 (winpl.exe)
+and round 55 (dlg.exe) on the owner's PC, 3840x2160 at 225 %, taskbar at the bottom: work area 0,0-3840,2070 (bottom
+90 px excluded, top 0); WINDOWPLACEMENT's workspace offset is then 0.
+
+Mechanism (before). Wayland has no work-area protocol: display.c measured only how much the panels take (a maximized
+configure's height) and always took it off the TOP. With KDE's default BOTTOM panel (38 logical px at 150 %) rcWork was
+(0,57)-(3840,2160) where Windows has (0,0)-(3840,2103): the reporter's saved rect was moved only thanks to the wrong +57
+offset, and Lightroom's own saved place (30,86)-(3810,2130) came back 57 px lower, 27 px past the bottom of the screen.
+
+Fix (KDE Plasma only; new dlls/winewayland.drv/wayland_workarea.c, hooks in display.c, dllmain.c, unixlib.h,
+waylanddrv_main.c, waylanddrv.h, Makefile.in). The exact answer is KWin's workspace.clientArea(MaximizeArea, output,
+desktop). When XDG_CURRENT_DESKTOP names KDE, the desktop process (explorer.exe /desktop) loads a KWin script once
+(org.kde.KWin /Scripting, the interface KWin's own scripting tools use); the script reports every output's geometry and
+maximize area with callDBus back to that desktop process's own bus name, and again when outputs, the current desktop or
+a panel is added, removed, moved, resized, shown or hidden, read after KWin's rearrange and only when the result changed
+(a panel = a dock, or a window outside the normal layer that cannot be moved: a layer-shell surface). Only calls from the
+owner of org.kde.KWin are taken. The first answer is waited for in DllMain (bounded 500 ms; measured 1-3 ms), before the
+first monitor list is built; a later change rebuilds the monitor list as an output change does. rc_work = rc_monitor
+minus KWin's four insets (logical -> device px); a maximized height measured under the CURRENT area and smaller than it
+(a compositor-drawn title bar) is still reserved at the top, as before, so a maximized window keeps matching its
+configure; a height measured before the area last changed is ignored. Each script is named after its process and
+unloads itself once that process's bus name is gone (checked at every ordinary window add/remove and every panel/output
+event): two desktop processes can start for one session (explorer loads the driver before it creates the desktop
+window; the loser exits), so no process ever touches another one's script. KWin's script id is the count of loaded
+scripts; when that id's object path is still taken (a script unloaded in the middle), the script is loaded again (up to
+8 tries) and the copy that owns its path runs; the others never ran and are unloaded. libdbus is dlopen'ed (as
+wayland_sni.c does): 231.1 has none of the 229 line's KWin/libdbus code.
+
+Kill switch: NEUTRON_WORKAREA_EDGES=0 (no script, no D-Bus: the measured top inset as before).
+
+What stays imperfect / not covered:
+- Non-KDE compositors (GNOME/Mutter, Hyprland, Sway, ...), no session bus or libdbus, KWin refusing the script, or an
+  output KWin does not name: the measured TOP inset as before. Right for GNOME's top bar; a bottom bar on Hyprland/Sway
+  still comes out at the top (wrong), and a side bar is not seen at all.
+- A panel change that keeps every panel window's geometry and visibility (e.g. a switch to "windows can cover") is seen
+  at the next reported event; the script of a desktop process killed without exit stays loaded in KWin until the next
+  window opens or closes on that desktop; only the current virtual desktop's area is reported; no
+  WM_SETTINGCHANGE(SPI_SETWORKAREA) is sent on a change (Wine never sent one; maximized windows follow KWin's own
+  reconfigure).
+
+Line: public pre-release 11.10-231.1 (release-231.1 = Latest 231 + a70 tpidle + a71 wplws + a72 plbound + this a73);
+applies after a72 on its source as built (b3, -F0, no offset/fuzz). Main has NOT got this patch (main only gets what is
+folded for 230; lab copy for the 229 line: lr61i workarea-edges-229.mypatch).
+
+Lab evidence (lr61i, 11-26; nested KWin 6.8.3, his kwinrc copied, desk 3840x2160 @150 % unless noted; lab runtime
+11.10-231.1b = the earlier 231.1 dist + these winewayland.so/.drv x2; n per arm):
+- winpl (round-54 probe) bottom 38 px panel: rcWork (0,0)-(3840,2103), 0/32 lines off Windows' rule, n=2; top 38:
+  (0,57)-(3840,2160) 0/32; left 48: (72,0)-(3840,2160) 0/32 (an earlier build took the old panel's maximized height for
+  a title bar there: fixed by the "measured under the current area" rule). Kill switch: (0,57)-(3840,2160) = before.
+- Lightroom Classic 16.0.1, bottom panel: the reporter's saved rect (2480,2137)-(4400,3189) now lies entirely below the
+  work area and LrC itself opens at its own default (30,30) 3780x2043 (inside (0,0)-(3840,2103)); photo clicks reach the
+  loupe, 0 compositor moves, n=2 + maximized->restore n=1. LrC's own place (30,86)-(3810,2130) stays (30,86) (was shifted
+  to (30,143)), n=2.
+- Panel moved while an app runs (bottom -> top -> left -> bottom): rcWork followed within ~1 s each time, n=1.
+- His layout (3840x2160 @175 % + 1920x1080 @100 %, top 32 px panel, no-strut bottom dock): DISPLAY1 (0,56)-(3840,2160),
+  a panel-less DISPLAY2 = its whole monitor (kill switch: the 32 px estimate), n=1. Photoshop / Illustrator maximized =
+  KWin's area exactly (0,32 2194x1202 logical), Open/Save As identical to 231, n=1.
+- Start-up: the script answers in 1-3 ms (>30 starts); cold `wine` start 231.1 vs 231.1b alternating n=4: median 1335 vs
+  1322 ms.
+Untested: his real Plasma session (real plasmashell panels are docks: covered by the filter), a real second-monitor
+panel (the lab's panels all land on output 0), GNOME/Hyprland/Sway runs (the code path is off there).
+
+--- a/dlls/winewayland.drv/Makefile.in
++++ b/dlls/winewayland.drv/Makefile.in
+@@ -29,6 +29,7 @@
+ 	wayland_surface.c \
+ 	wayland_tablet.c \
+ 	wayland_text_input.c \
++	wayland_workarea.c \
+ 	waylanddrv_main.c \
+ 	window.c \
+ 	window_surface.c \
+--- a/dlls/winewayland.drv/display.c
++++ b/dlls/winewayland.drv/display.c
+@@ -658,6 +658,7 @@
+     int i;
+ 
+     if (!name || !*name || logical_h <= 0 || !neutron_workarea_per_output()) return FALSE;
++    neutron_workarea_edges_measured(name, logical_h);   /* NEUTRON workarea-edges: measured under KWin's current area */
+     pthread_mutex_lock(&neutron_workarea_mutex);
+     neutron_workarea_load_locked();
+     for (i = 0; i < neutron_workarea_output_count; i++)
+@@ -770,6 +771,18 @@
+ 
+         TRACE("neutron-workarea: logical_h=%d measured=%ld logical_inset=%d device_inset=%d\n",
+               logical_h, (long)measured, logical_inset, inset);
++
++        /* NEUTRON workarea-edges: KWin's own work area for this output, every panel on its own edge, replaces the
++         * top inset above (wayland_workarea.c); without an answer for this output the top inset stays */
++        {
++            RECT work = monitor.rc_monitor;
++            int mode_w = output_info->output->current_mode ? output_info_width(output_info) : 0;
++
++            if (neutron_workarea_edges(output_info->output->name, output_info->output->logical_x,
++                                       output_info->output->logical_y, output_info->output->logical_w, logical_h,
++                                       mode_w, mode_h, &work))
++                monitor.rc_work = work;
++        }
+     }
+ 
+     TRACE("name=%s rc_monitor=%s rc_work=%s\n",
+--- a/dlls/winewayland.drv/dllmain.c
++++ b/dlls/winewayland.drv/dllmain.c
+@@ -54,6 +54,19 @@
+     return len >= ARRAY_SIZE(name) - 1 && !wcsicmp(path + len - (ARRAY_SIZE(name) - 1), name);
+ }
+ 
++/* NEUTRON workarea-edges: the desktop process (win32u starts it as "explorer.exe /desktop") reads each output's real
++ * work area from KWin; this thread takes KWin's later answers (wayland_workarea.c) */
++static DWORD WINAPI workarea_thread(void *arg)
++{
++    WAYLANDDRV_UNIX_CALL(workarea_run, NULL);
++    return 0;
++}
++
++static BOOL is_desktop_process(void)
++{
++    return is_explorer_process() && wcsstr(GetCommandLineW(), L" /desktop");
++}
++
+ static LRESULT CALLBACK clipboard_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg)
+@@ -350,6 +363,8 @@
+     /* NEUTRON: owner-side consumer for cross-process dcomp CEP panels (shared-memory pixel transport). */
+     CloseHandle(CreateThread(NULL, 0, neutron_present_consumer_thread, NULL, 0, &tid));
+     if (is_explorer_process()) CloseHandle(CreateThread(NULL, 0, sni_thread, NULL, 0, &tid));
++    if (is_desktop_process() && !WAYLANDDRV_UNIX_CALL(workarea_start, NULL))
++        CloseHandle(CreateThread(NULL, 0, workarea_thread, NULL, 0, &tid));
+ 
+     /* NEUTRON round-43 RPC: create/open the epoch control section (DXVK writes it
+      * on each GDI present) and hand its mapped VA to the unix side (same address
+--- a/dlls/winewayland.drv/unixlib.h
++++ b/dlls/winewayland.drv/unixlib.h
+@@ -35,6 +35,9 @@
+     waylanddrv_unix_func_sni_run,
+     /* NEUTRON wv2-overlay: show a cross-process DComp target's frame as its own subsurface (see dllmain.c) */
+     waylanddrv_unix_func_px_overlay,
++    /* NEUTRON workarea-edges: the desktop process loads KWin's work-area script (DllMain), then serves it */
++    waylanddrv_unix_func_workarea_start,
++    waylanddrv_unix_func_workarea_run,
+     waylanddrv_unix_func_count,
+ };
+ 
+--- a/dlls/winewayland.drv/waylanddrv.h
++++ b/dlls/winewayland.drv/waylanddrv.h
+@@ -858,6 +858,12 @@
+ void wayland_keyboard_release_destroyed_focus(void);
+ BOOL wayland_pointer_release_destroyed_on(void);
+ NTSTATUS waylanddrv_unix_sni_run(void *arg);
++/* NEUTRON workarea-edges (wayland_workarea.c) */
++BOOL neutron_workarea_edges_on(void);
++BOOL neutron_workarea_edges(const char *name, int lx, int ly, int lw, int lh, int mode_w, int mode_h, RECT *work);
++void neutron_workarea_edges_measured(const char *name, int logical_h);
++NTSTATUS waylanddrv_unix_workarea_start(void *arg);
++NTSTATUS waylanddrv_unix_workarea_run(void *arg);
+ NTSTATUS waylanddrv_unix_px_overlay(void *arg);
+ NTSTATUS waylanddrv_unix_px_overlay_wow64(void *arg);
+ void WAYLAND_SetLayeredWindowAttributes(HWND hwnd, COLORREF key, BYTE alpha, DWORD flags);
+--- a/dlls/winewayland.drv/waylanddrv_main.c
++++ b/dlls/winewayland.drv/waylanddrv_main.c
+@@ -189,6 +189,8 @@
+     waylanddrv_unix_rpc_epoch,
+     waylanddrv_unix_sni_run,
+     waylanddrv_unix_px_overlay,
++    waylanddrv_unix_workarea_start,
++    waylanddrv_unix_workarea_run,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == waylanddrv_unix_func_count);
+@@ -203,6 +205,8 @@
+     waylanddrv_unix_rpc_epoch,
+     waylanddrv_unix_sni_run,
+     waylanddrv_unix_px_overlay_wow64,
++    waylanddrv_unix_workarea_start,
++    waylanddrv_unix_workarea_run,
+ };
+ 
+ C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == waylanddrv_unix_func_count);
+--- /dev/null
++++ b/dlls/winewayland.drv/wayland_workarea.c
+@@ -0,0 +1,553 @@
++/*
++ * Wayland driver: the work area of each output, from the compositor (KDE Plasma)
++ *
++ * Copyright 2026 the Neutron project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/* NEUTRON workarea-edges (2026-11-26, Neutron#61: "trying to interact with anything in the LRC window, including the
++ * title-bar, moves the window").
++ *
++ * Windows' work area is the monitor minus the taskbar, on whichever edge the taskbar is (GetMonitorInfo rcWork,
++ * SPI_GETWORKAREA). SetWindowPlacement's off-screen rule and the workspace coordinates of WINDOWPLACEMENT are both
++ * defined against it. Wayland has no work-area protocol, so display.c measured only HOW MUCH the panels take (the
++ * height of a maximized configure) and always took it off the TOP. On a Plasma desktop with the default BOTTOM panel
++ * that gave rcWork (0,57)-(3840,2160) where Windows has (0,0)-(3840,2103): Lightroom Classic's own saved place
++ * (30,86)-(3810,2130) came back 57 px lower, 27 px past the bottom of the screen, and a saved place below the screen was
++ * kept only because of that wrong offset.
++ *
++ * On KDE Plasma the exact answer is KWin's own: workspace.clientArea(MaximizeArea, output, desktop), the area KWin
++ * maximizes windows into, with every panel's strut on its own edge. It is read with a KWin script (org.kde.KWin
++ * /Scripting on the session bus, the interface KWin's own scripting tools use), loaded once by the DESKTOP process (the
++ * only process that builds the monitor list):
++ *  - the script reports every output's geometry and maximize area with callDBus to this process's own bus name
++ *    (method Update on /org/neutron/wine/WorkArea); only calls from the owner of org.kde.KWin are taken;
++ *  - it reports again when the outputs change, the current desktop changes, or a panel (a dock, or a window that
++ *    cannot be moved outside the normal layer: a layer-shell surface) is added, removed, moved, resized, shown or hidden -- computed after KWin's rearrange, and
++ *    only when the result changed; the desktop process then rebuilds the monitor list, as for an output change;
++ *  - the first answer is waited for (bounded, 500 ms) before the first monitor list is built, so the first window of
++ *    the session already gets the real work area;
++ *  - the script is named after this process and unloads itself (unloadScript) once this process's bus name is gone:
++ *    checked whenever an ordinary window is added or removed anywhere, and at every panel or output event. Two
++ *    desktop processes can start for one session (explorer loads the driver before it creates the desktop window;
++ *    the one that loses that race exits), so a script never touches another process's script.
++ * A maximized height measured under the current area and smaller than it (a window with a compositor-drawn title bar
++ * was maximized) is still reserved at the top, as before, so a maximized window keeps matching its configure; a height
++ * measured before the area last changed is ignored (it is the old panel, not a title bar).
++ *
++ * Other compositors (GNOME/Mutter, Hyprland, Sway, ...), no session bus or libdbus, KWin's scripting refusing the
++ * script, or an output the answer does not name: the measured top inset as before (right for GNOME's top bar; a
++ * bottom bar on Sway/Hyprland still comes out at the top).
++ * Not covered: a panel change that keeps every panel window's geometry and visibility (e.g. switching a panel to
++ * "windows can cover") is seen at the next reported event; the script of a desktop process that is gone stays loaded
++ * until the next window is opened or closed on the desktop; the maximize area is per virtual desktop and only the current one is
++ * reported; Windows' auto-hide taskbar has no counterpart here (an auto-hide panel has no strut in KWin either).
++ * Kill switch NEUTRON_WORKAREA_EDGES=0 (no script, no D-Bus: the measured top inset as before). */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <math.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "waylanddrv.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(waylanddrv);
++
++#define NEUTRON_KWA_OUTPUTS 16
++
++struct neutron_kwa_output
++{
++    char name[64];
++    int g[4];   /* KWin logical: the output's geometry x, y, w, h */
++    int a[4];   /* KWin logical: its maximize area x, y, w, h */
++    int fresh_h; /* a maximized height measured on it since KWin last reported this area (0 = none) */
++};
++
++static pthread_mutex_t kwa_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct neutron_kwa_output kwa_outputs[NEUTRON_KWA_OUTPUTS];
++static int kwa_count = -1;    /* -1: no answer (yet) */
++static BOOL kwa_changed;
++
++BOOL neutron_workarea_edges_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *d = getenv("XDG_CURRENT_DESKTOP");
++        on = neutron_gate("NEUTRON_WORKAREA_EDGES", TRUE);
++        if (on && (!d || !strstr(d, "KDE"))) on = 0;   /* KWin's scripting interface: Plasma sessions only */
++    }
++    return on;
++}
++
++/* "name gx gy gw gh ax ay aw ah;..." -> kwa_outputs; TRUE if it differs from what was stored */
++static BOOL kwa_store(const char *payload)
++{
++    struct neutron_kwa_output out[NEUTRON_KWA_OUTPUTS];
++    const char *p = payload;
++    int n = 0, used, i, j;
++    BOOL changed;
++
++    while (*p && n < NEUTRON_KWA_OUTPUTS)
++    {
++        struct neutron_kwa_output *o = &out[n];
++        memset(o, 0, sizeof(*o));
++        if (sscanf(p, "%63s %d %d %d %d %d %d %d %d%n", o->name, &o->g[0], &o->g[1], &o->g[2], &o->g[3],
++                   &o->a[0], &o->a[1], &o->a[2], &o->a[3], &used) != 9) break;
++        if (o->g[2] > 0 && o->g[3] > 0) n++;
++        p += used;
++        while (*p == ';' || *p == ' ') p++;
++    }
++    pthread_mutex_lock(&kwa_mutex);
++    changed = n != kwa_count;
++    for (i = 0; i < n; i++)
++    {
++        for (j = 0; j < kwa_count; j++)
++            if (!strcmp(out[i].name, kwa_outputs[j].name) && !memcmp(out[i].g, kwa_outputs[j].g, sizeof(out[i].g)) &&
++                !memcmp(out[i].a, kwa_outputs[j].a, sizeof(out[i].a))) break;
++        if (j < kwa_count) out[i].fresh_h = kwa_outputs[j].fresh_h;   /* unchanged: its measurement stays valid */
++        else changed = TRUE;
++    }
++    if (changed)
++    {
++        memcpy(kwa_outputs, out, n * sizeof(out[0]));
++        kwa_count = n;
++        kwa_changed = TRUE;
++    }
++    pthread_mutex_unlock(&kwa_mutex);
++    if (changed) ERR("neutron-workarea-edges: KWin's maximize areas: %s\n", debugstr_a(payload));
++    return changed;
++}
++
++/* display.c (neutron_workarea_save_output, desktop process): a maximized height was measured on this output */
++void neutron_workarea_edges_measured(const char *name, int logical_h)
++{
++    int i;
++
++    pthread_mutex_lock(&kwa_mutex);
++    for (i = 0; i < kwa_count; i++) if (!strcmp(kwa_outputs[i].name, name)) kwa_outputs[i].fresh_h = logical_h;
++    pthread_mutex_unlock(&kwa_mutex);
++}
++
++/* display.c: shrink work (= the output's rc_monitor, device px) to the output's real work area. lx..lh: the output's
++ * logical geometry as Wine knows it; mode_w/h: its device size. FALSE: no answer for this output (the caller keeps the measured top inset). */
++BOOL neutron_workarea_edges(const char *name, int lx, int ly, int lw, int lh, int mode_w, int mode_h, RECT *work)
++{
++    struct neutron_kwa_output o = {{0}};
++    BOOL found = FALSE;
++    int i, l, t, r, b, area_h, extra = 0;
++    double sx, sy;
++    RECT mon = *work;
++
++    if (!name || !*name || lw <= 0 || lh <= 0 || mode_w <= 0 || mode_h <= 0 || !neutron_workarea_edges_on())
++        return FALSE;
++    pthread_mutex_lock(&kwa_mutex);
++    for (i = 0; i < kwa_count && !found; i++)
++        if (!strcmp(kwa_outputs[i].name, name)) { o = kwa_outputs[i]; found = TRUE; }
++    pthread_mutex_unlock(&kwa_mutex);
++    if (!found) return FALSE;
++
++    /* the same output in both views (a mode change Wine has not seen yet, or the other way round: keep the old way) */
++    if (abs(o.g[2] - lw) > 1 || abs(o.g[3] - lh) > 1)
++    {
++        ERR("neutron-workarea-edges: %s is %dx%d to KWin but %dx%d here: not used\n", name, o.g[2], o.g[3], lw, lh);
++        return FALSE;
++    }
++    l = max(0, o.a[0] - o.g[0]);
++    t = max(0, o.a[1] - o.g[1]);
++    r = max(0, o.g[0] + o.g[2] - (o.a[0] + o.a[2]));
++    b = max(0, o.g[1] + o.g[3] - (o.a[1] + o.a[3]));
++    if (l + r >= o.g[2] || t + b >= o.g[3]) return FALSE;
++    /* a maximized window with a compositor-drawn title bar is configured shorter than the area: reserve the
++     * difference at the top, as the measured inset did, so the maximized window keeps matching its configure. Only a
++     * height measured under THIS area counts: an older one (taken before the panel moved or changed) is not a title bar. */
++    area_h = o.g[3] - t - b;
++    if (o.fresh_h > 0 && o.fresh_h < area_h && area_h - o.fresh_h < lh / 4) extra = area_h - o.fresh_h;
++
++    sx = (double)mode_w / lw;
++    sy = (double)mode_h / lh;
++    work->left += (int)floor(l * sx + 0.5);
++    work->top += (int)floor((t + extra) * sy + 0.5);
++    work->right -= (int)floor(r * sx + 0.5);
++    work->bottom -= (int)floor(b * sy + 0.5);
++    if (work->right <= work->left || work->bottom <= work->top)
++    {
++        *work = mon;
++        return FALSE;
++    }
++    ERR("neutron-workarea-edges: %s insets left %d top %d right %d bottom %d logical (+%d at the top: a shorter maximize measured since) "
++        "-> rc_work %s of %s\n", name, l, t, r, b, extra, wine_dbgstr_rect(work), wine_dbgstr_rect(&mon));
++    return TRUE;
++}
++
++#ifdef SONAME_LIBDBUS_1
++
++#include <dbus/dbus.h>
++
++#define KWA_PATH  "/org/neutron/wine/WorkArea"
++#define KWA_IFACE "org.neutron.wine.WorkArea"
++
++#define KWA_DBUS_FUNCS \
++    DO_FUNC(dbus_bus_get_private); \
++    DO_FUNC(dbus_bus_get_unique_name); \
++    DO_FUNC(dbus_connection_add_filter); \
++    DO_FUNC(dbus_connection_flush); \
++    DO_FUNC(dbus_connection_read_write_dispatch); \
++    DO_FUNC(dbus_connection_send); \
++    DO_FUNC(dbus_connection_send_with_reply_and_block); \
++    DO_FUNC(dbus_connection_set_exit_on_disconnect); \
++    DO_FUNC(dbus_error_free); \
++    DO_FUNC(dbus_error_init); \
++    DO_FUNC(dbus_error_is_set); \
++    DO_FUNC(dbus_message_append_args); \
++    DO_FUNC(dbus_message_get_args); \
++    DO_FUNC(dbus_message_get_path); \
++    DO_FUNC(dbus_message_get_sender); \
++    DO_FUNC(dbus_message_is_method_call); \
++    DO_FUNC(dbus_message_new_method_call); \
++    DO_FUNC(dbus_message_new_method_return); \
++    DO_FUNC(dbus_message_unref); \
++    DO_FUNC(dbus_threads_init_default)
++#define DO_FUNC(f) static __typeof__(f) *pa_##f
++KWA_DBUS_FUNCS;
++#undef DO_FUNC
++
++static DBusConnection *kwa_conn;
++static int kwa_state;            /* 0 = not started, 1 = running, -1 = unavailable */
++static char kwa_kwin_owner[128]; /* KWin's unique bus name: the only sender taken */
++
++static ULONGLONG kwa_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (ULONGLONG)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++/* one method call; a1/a2: string arguments or NULL; out_type: the one value of the answer (DBUS_TYPE_INT32 into int,
++ * DBUS_TYPE_BOOLEAN into BOOL, DBUS_TYPE_STRING into a char buffer of out_size) or DBUS_TYPE_INVALID */
++static BOOL kwa_call(const char *dest, const char *path, const char *iface, const char *method, const char *a1,
++                     const char *a2, int out_type, void *out, size_t out_size)
++{
++    DBusMessage *msg, *reply;
++    DBusError err;
++    BOOL ok = TRUE;
++
++    if (!(msg = pa_dbus_message_new_method_call(dest, path, iface, method))) return FALSE;
++    if (a1 && a2) pa_dbus_message_append_args(msg, DBUS_TYPE_STRING, &a1, DBUS_TYPE_STRING, &a2, DBUS_TYPE_INVALID);
++    else if (a1) pa_dbus_message_append_args(msg, DBUS_TYPE_STRING, &a1, DBUS_TYPE_INVALID);
++    pa_dbus_error_init(&err);
++    reply = pa_dbus_connection_send_with_reply_and_block(kwa_conn, msg, 1000, &err);
++    pa_dbus_message_unref(msg);
++    if (!reply)
++    {
++        ERR("neutron-workarea-edges: %s %s.%s refused: %s\n", dest, path, method, err.message ? err.message : "?");
++        pa_dbus_error_free(&err);
++        return FALSE;
++    }
++    if (out_type == DBUS_TYPE_INT32)
++    {
++        dbus_int32_t v = -1;
++        ok = pa_dbus_message_get_args(reply, &err, DBUS_TYPE_INT32, &v, DBUS_TYPE_INVALID);
++        *(int *)out = ok ? v : -1;
++    }
++    else if (out_type == DBUS_TYPE_BOOLEAN)
++    {
++        dbus_bool_t v = FALSE;
++        ok = pa_dbus_message_get_args(reply, &err, DBUS_TYPE_BOOLEAN, &v, DBUS_TYPE_INVALID);
++        *(BOOL *)out = ok && v;
++    }
++    else if (out_type == DBUS_TYPE_STRING)
++    {
++        const char *v = NULL;
++        ok = pa_dbus_message_get_args(reply, &err, DBUS_TYPE_STRING, &v, DBUS_TYPE_INVALID) && v;
++        if (ok) snprintf(out, out_size, "%s", v);
++    }
++    if (pa_dbus_error_is_set(&err)) pa_dbus_error_free(&err);
++    pa_dbus_message_unref(reply);
++    return ok;
++}
++
++static BOOL kwa_kwin(const char *path, const char *iface, const char *method, const char *a1, const char *a2,
++                     int out_type, void *out, size_t out_size)
++{
++    return kwa_call("org.kde.KWin", path, iface, method, a1, a2, out_type, out, out_size);
++}
++
++static DBusHandlerResult kwa_filter(DBusConnection *conn, DBusMessage *msg, void *user)
++{
++    const char *sender, *path, *payload = NULL;
++    DBusMessage *reply;
++    DBusError err;
++
++    if (!pa_dbus_message_is_method_call(msg, KWA_IFACE, "Update")) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
++    if (!(path = pa_dbus_message_get_path(msg)) || strcmp(path, KWA_PATH)) return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
++    sender = pa_dbus_message_get_sender(msg);
++    if (!sender || strcmp(sender, kwa_kwin_owner))
++    {
++        WARN("ignoring an Update from %s\n", debugstr_a(sender));
++        return DBUS_HANDLER_RESULT_HANDLED;
++    }
++    pa_dbus_error_init(&err);
++    if (pa_dbus_message_get_args(msg, &err, DBUS_TYPE_STRING, &payload, DBUS_TYPE_INVALID) && payload)
++        kwa_store(payload);
++    if (pa_dbus_error_is_set(&err)) pa_dbus_error_free(&err);
++    if ((reply = pa_dbus_message_new_method_return(msg)))
++    {
++        pa_dbus_connection_send(conn, reply, NULL);
++        pa_dbus_message_unref(reply);
++    }
++    return DBUS_HANDLER_RESULT_HANDLED;
++}
++
++/* the KWin script: %1$s our bus name, %2$s the script's own name */
++static const char kwa_script[] =
++    "(function () {\n"
++    "  var PEER = \"%1$s\", NAME = \"%2$s\", last = null, dead = false, pending = false;\n"
++    "  function area() {\n"
++    "    var s = workspace.screens, d = workspace.currentDesktop, out = [];\n"
++    "    for (var i = 0; i < s.length; i++) {\n"
++    "      var g = s[i].geometry, a = workspace.clientArea(KWin.MaximizeArea, s[i], d);\n"
++    "      out.push([s[i].name, Math.round(g.x), Math.round(g.y), Math.round(g.width), Math.round(g.height),\n"
++    "                Math.round(a.x), Math.round(a.y), Math.round(a.width), Math.round(a.height)].join(\" \"));\n"
++    "    }\n"
++    "    return out.join(\";\");\n"
++    "  }\n"
++    /* the area is read in the answer to NameHasOwner: after KWin's rearrange, which runs from a zero timer */
++    "  function bye() { callDBus(\"org.kde.KWin\", \"/Scripting\", \"org.kde.kwin.Scripting\", \"unloadScript\", NAME); }\n"
++    "  function check() {\n"
++    "    if (dead || pending) return;\n"
++    "    pending = true;\n"
++    "    callDBus(\"org.freedesktop.DBus\", \"/org/freedesktop/DBus\", \"org.freedesktop.DBus\", \"NameHasOwner\", PEER,\n"
++    "      function (has) {\n"
++    "        pending = false;\n"
++    "        if (!has) { if (!dead) { dead = true; bye(); } return; }\n"
++    "        var p = area();\n"
++    "        if (p === last) return;\n"
++    "        last = p;\n"
++    "        callDBus(PEER, \"" KWA_PATH "\", \"" KWA_IFACE "\", \"Update\", p);\n"
++    "      });\n"
++    "  }\n"
++    "  function alive() {\n"
++    "    if (dead) return;\n"
++    "    callDBus(\"org.freedesktop.DBus\", \"/org/freedesktop/DBus\", \"org.freedesktop.DBus\", \"NameHasOwner\", PEER,\n"
++    "      function (has) { if (!has && !dead) { dead = true; bye(); } });\n"
++    "  }\n"
++    /* a panel: a dock (Plasma's panels), or a window outside the normal layer that cannot be moved (a layer-shell
++     * surface: KWin 6.8 lists those as managed normal windows in its above layer) */
++    "  function panel(w) { return !w.popupWindow && (w.dock || (!w.moveable && w.layer !== 2)); }\n"
++    "  function watch(w) {\n"
++    "    if (!panel(w)) return;\n"
++    "    w.frameGeometryChanged.connect(check);\n"
++    "    w.hiddenChanged.connect(check);\n"
++    "  }\n"
++    "  var ws = workspace.windowList();\n"
++    "  for (var i = 0; i < ws.length; i++) watch(ws[i]);\n"
++    "  workspace.windowAdded.connect(function (w) { if (panel(w)) { watch(w); check(); } else if (w.managed) alive(); });\n"
++    "  workspace.windowRemoved.connect(function (w) { if (panel(w)) check(); else if (w.managed) alive(); });\n"
++    "  workspace.screensChanged.connect(check);\n"
++    "  workspace.virtualScreenGeometryChanged.connect(check);\n"
++    "  workspace.currentDesktopChanged.connect(check);\n"
++    "  check();\n"
++    "})();\n";
++
++static BOOL kwa_has_node(const char *xml, int id)
++{
++    char node[48];
++    snprintf(node, sizeof(node), "<node name=\"Script%d\"/>", id);
++    return strstr(xml, node) != NULL;
++}
++
++/* DllMain of the desktop process (dllmain.c): load and run the script, wait for its first answer. STATUS_SUCCESS: the
++ * script runs, call waylanddrv_unix_workarea_run on a thread of its own. */
++NTSTATUS waylanddrv_unix_workarea_start(void *arg)
++{
++    static char before[65536], after[65536];
++    const char *rt = getenv("XDG_RUNTIME_DIR"), *prefix = getenv("WINEPREFIX"), *unique, *why = "no session bus";
++    char dir[256], path[300], name[64], obj[64], script[sizeof(kwa_script) + 256];
++    unsigned int hash = 2166136261u;
++    ULONGLONG start = kwa_ms(), deadline;
++    BOOL ran = FALSE, still = FALSE;
++    void *module;
++    DBusError err;
++    int fd, id = -1, len, tries, i;
++
++    WCHAR station[64] = {0}, desk[64] = {0};
++
++    if (kwa_state || !neutron_workarea_edges_on()) return STATUS_NOT_SUPPORTED;
++    kwa_state = -1;
++    NtUserGetObjectInformation(NtUserGetProcessWindowStation(), UOI_NAME, station, sizeof(station) - sizeof(WCHAR), NULL);
++    NtUserGetObjectInformation(NtUserGetThreadDesktop(GetCurrentThreadId()), UOI_NAME, desk, sizeof(desk) - sizeof(WCHAR), NULL);
++    ERR("neutron-workarea-edges: desktop process %d station %s desktop %s\n", (int)getpid(), debugstr_w(station), debugstr_w(desk));
++    if (!rt || !*rt || strlen(rt) > 200) return STATUS_NOT_SUPPORTED;
++    if (!(module = dlopen(SONAME_LIBDBUS_1, RTLD_NOW)))
++    {
++        ERR("neutron-workarea-edges: no %s: %s\n", SONAME_LIBDBUS_1, dlerror());
++        return STATUS_NOT_SUPPORTED;
++    }
++#define DO_FUNC(f) if (!(pa_##f = dlsym(module, #f))) { ERR("neutron-workarea-edges: libdbus lacks %s\n", #f); return STATUS_NOT_SUPPORTED; }
++    KWA_DBUS_FUNCS;
++#undef DO_FUNC
++    pa_dbus_threads_init_default();
++    pa_dbus_error_init(&err);
++    if (!(kwa_conn = pa_dbus_bus_get_private(DBUS_BUS_SESSION, &err)))
++    {
++        ERR("neutron-workarea-edges: no session bus: %s\n", err.message ? err.message : "?");
++        pa_dbus_error_free(&err);
++        return STATUS_NOT_SUPPORTED;
++    }
++    pa_dbus_connection_set_exit_on_disconnect(kwa_conn, FALSE);
++    if (!(unique = pa_dbus_bus_get_unique_name(kwa_conn)) ||
++        !kwa_call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner",
++                  "org.kde.KWin", NULL, DBUS_TYPE_STRING, kwa_kwin_owner, sizeof(kwa_kwin_owner)))
++    {
++        ERR("neutron-workarea-edges: KWin is not on the session bus\n");
++        return STATUS_NOT_SUPPORTED;
++    }
++    pa_dbus_connection_add_filter(kwa_conn, kwa_filter, NULL, NULL);
++
++    /* named after this process (the prefix only to read the logs): never another process's script */
++    for (len = 0; prefix && prefix[len]; len++) hash = (hash ^ (unsigned char)prefix[len]) * 16777619u;
++
++    snprintf(dir, sizeof(dir), "%s/neutron-wine-workarea-XXXXXX", rt);
++    if (!mkdtemp(dir)) return STATUS_NOT_SUPPORTED;   /* mode 0700, ours */
++
++    /* KWin 6.8 (scripting.cpp): loadScript only loads; the new script's id is the COUNT of loaded scripts and its
++     * object /Scripting/Script<id> is registered only if that path is free -- after an unload in the middle (a leftover
++     * script unloading itself, another client's) the path still belongs to a script with that id, and running it would
++     * run THAT script. So: load, and if the id's path was taken before, load again (the id grows by one per try) and
++     * run the copy whose path is its own; the copies that never got a path never ran and are unloaded. */
++    why = "KWin's scripting interface refused it";
++    for (tries = 0; tries < 8 && !ran; tries++)
++    {
++        snprintf(name, sizeof(name), "neutron-wine-workarea-%d-%08x-%d", (int)getpid(), hash, tries);
++        snprintf(path, sizeof(path), "%s/area%d.js", dir, tries);
++        len = snprintf(script, sizeof(script), kwa_script, unique, name);
++        if (len <= 0 || len >= sizeof(script) || (fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600)) < 0)
++            break;
++        if (write(fd, script, len) != len) { close(fd); unlink(path); break; }
++        close(fd);
++        id = -1;
++        if (!kwa_kwin("/Scripting", "org.freedesktop.DBus.Introspectable", "Introspect", NULL, NULL, DBUS_TYPE_STRING,
++                      before, sizeof(before)) ||
++            !kwa_kwin("/Scripting", "org.kde.kwin.Scripting", "loadScript", path, name, DBUS_TYPE_INT32, &id, 0) ||
++            id < 0)
++        {
++            unlink(path);
++            break;
++        }
++        snprintf(obj, sizeof(obj), "/Scripting/Script%d", id);
++        if (kwa_has_node(before, id) ||
++            !kwa_kwin("/Scripting", "org.freedesktop.DBus.Introspectable", "Introspect", NULL, NULL, DBUS_TYPE_STRING,
++                      after, sizeof(after)) || !kwa_has_node(after, id))
++        {
++            why = "every script id named another loaded script";
++            unlink(path);
++            continue;
++        }
++        if (!kwa_kwin(obj, "org.kde.kwin.Script", "run", NULL, NULL, DBUS_TYPE_INVALID, NULL, 0))
++            why = "the script did not run";
++        else if (!kwa_kwin("/Scripting", "org.kde.kwin.Scripting", "isScriptLoaded", name, NULL, DBUS_TYPE_BOOLEAN,
++                           &ran, 0) || !ran)
++            why = "the script stopped (KWin dropped it)";
++        unlink(path);
++        if (!ran) { tries++; break; }
++    }
++    /* the copies that did not get their own path (and a copy that failed), by name; never the one that runs */
++    for (i = 0; i < tries; i++)
++    {
++        char other[64];
++        snprintf(other, sizeof(other), "neutron-wine-workarea-%d-%08x-%d", (int)getpid(), hash, i);
++        if (ran && !strcmp(other, name)) continue;
++        kwa_kwin("/Scripting", "org.kde.kwin.Scripting", "unloadScript", other, NULL, DBUS_TYPE_BOOLEAN, &still, 0);
++    }
++    if (ran && tries > 1) ERR("neutron-workarea-edges: %d script id(s) were taken, ran copy %d\n", tries - 1, tries - 1);
++    rmdir(dir);
++
++    /* its first answer (callDBus is asynchronous) */
++    deadline = kwa_ms() + 500;
++    while (ran && kwa_ms() < deadline)
++    {
++        pthread_mutex_lock(&kwa_mutex);
++        len = kwa_count;
++        pthread_mutex_unlock(&kwa_mutex);
++        if (len >= 0) break;
++        if (!pa_dbus_connection_read_write_dispatch(kwa_conn, (int)(deadline - kwa_ms()) + 1)) break;
++    }
++    pthread_mutex_lock(&kwa_mutex);
++    len = kwa_count;
++    kwa_changed = FALSE;   /* the first monitor list is still to be built */
++    pthread_mutex_unlock(&kwa_mutex);
++    if (ran && len < 0) why = "no answer within 500 ms";
++    if (!ran || len < 0)
++    {
++        if (ran) kwa_kwin("/Scripting", "org.kde.kwin.Scripting", "unloadScript", name, NULL, DBUS_TYPE_BOOLEAN,
++                          &still, 0);
++        ERR("neutron-workarea-edges: %s (%u ms): the measured top inset stays\n", why,
++            (unsigned)(kwa_ms() - start));
++        return STATUS_NOT_SUPPORTED;
++    }
++    kwa_state = 1;
++    ERR("neutron-workarea-edges: script %s for %s answered in %u ms\n", name, unique, (unsigned)(kwa_ms() - start));
++    return STATUS_SUCCESS;
++}
++
++/* its own thread of the desktop process: KWin's later answers; a change rebuilds the monitor list */
++NTSTATUS waylanddrv_unix_workarea_run(void *arg)
++{
++    BOOL changed;
++    HWND desktop;
++
++    if (kwa_state <= 0) return STATUS_NOT_SUPPORTED;
++    while (pa_dbus_connection_read_write_dispatch(kwa_conn, -1))
++    {
++        pthread_mutex_lock(&kwa_mutex);
++        changed = kwa_changed;
++        kwa_changed = FALSE;
++        pthread_mutex_unlock(&kwa_mutex);
++        if (changed && (desktop = NtUserGetDesktopWindow()))
++            NtUserPostMessage(desktop, WM_WAYLAND_INIT_DISPLAY_DEVICES, 0, 0);
++    }
++    ERR("neutron-workarea-edges: the session bus connection closed\n");
++    return STATUS_SUCCESS;
++}
++
++#else  /* SONAME_LIBDBUS_1 */
++
++NTSTATUS waylanddrv_unix_workarea_start(void *arg)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++NTSTATUS waylanddrv_unix_workarea_run(void *arg)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++#endif /* SONAME_LIBDBUS_1 */
