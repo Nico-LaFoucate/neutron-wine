@@ -1,0 +1,221 @@
+win32u: GetWindowPlacement/SetWindowPlacement use workspace coordinates for top-level windows, as on Windows (NEUTRON_PLACEMENT_WORKSPACE)
+
+His words for this family: "When I used meta shift left to move it to the main monitor it appeared off screen and the wrong scale."
+Seen (lab mcb3/wplace, Media Composer 2025 in his signed-in copy, his layout: 175% screen with a 32 px top panel + 100% screen):
+after New Project MC opens its main window maximized; restored with MC's own title-bar button, its normal rect came back 56 px
+lower than before it was maximized, (1,56)-(3840,2160) -> (1,112)-(3840,2216): 56 px past the bottom of the 175% monitor,
+whose work area starts 56 px (32 logical) down.
+
+Mechanism (SOLID for Wine's side, probe wpl.exe): Wine's NtUserGetWindowPlacement returned rcNormalPosition in SCREEN
+coordinates and NtUserSetWindowPlacement took it as screen coordinates, for every window. Windows (WINDOWPLACEMENT): "If the
+window is a top-level window that does not have the WS_EX_TOOLWINDOW window style, then the coordinates represented by the
+following members are in workspace coordinates: ptMinPosition, ptMaxPosition, and rcNormalPosition. Otherwise, these members
+are in screen coordinates." Workspace coordinates are screen coordinates less the offset of the monitor's work area from the
+monitor's corner -- the offset Qt applies (qwindowswindow.cpp windowPlacementOffset = availableGeometry().topLeft() -
+geometry().topLeft()) when it reads a minimized window's rect and when it gives SetWindowPlacement the normal rect of a
+maximized or minimized window. An application that converts as on Windows moves the window by the work-area offset on each
+round trip under Wine; with the panel at the bottom (Windows' default) the offset is 0, so it never shows there, and Wine's own
+test_window_placement (rcNormalPosition compared with the screen rect) passes on Windows test machines without testing this.
+
+Fix: at the API boundary only, NtUserGetWindowPlacement maps rcNormalPosition from screen to workspace coordinates and
+NtUserSetWindowPlacement maps it back, for a top-level (desktop child), non-WS_CHILD window without WS_EX_TOOLWINDOW, by the
+work-area offset of the monitor the rect is on, in the caller's dpi. Win32u's own callers (GetInternalWindowPos, the
+minimize/maximize/restore path, MonitorFromWindow for a minimized window) keep screen coordinates through the new
+get_window_placement(). The first 64 mappings per process are logged ("neutron-wplace: ..."), in both arms.
+
+Not covered: ptMinPosition and ptMaxPosition stay in screen coordinates (Windows documents them as workspace too; no application
+seen that depends on it, and leaving both Get and Set alone keeps a round trip exact). Get/SetInternalWindowPos (undocumented)
+stay screen. The monitor is chosen from the rect as given (screen rect for Get, workspace rect for Set); a rect that straddles a
+monitor edge within the work-area offset may pick the neighbour's offset. No Windows probe: his Windows box has one monitor with
+the taskbar at the bottom (work area at its corner), where both rules give the same numbers.
+Applies after hdpi-pm-move-mfw (its sysparams.c hunk is the context of this patch's MonitorFromWindow change).
+
+Kill switch: NEUTRON_PLACEMENT_WORKSPACE=0.
+
+Lab evidence (lab wplace, desk mirroring his layout: V0 3840x2160@1.75 + 32 px top panel, V1 1920x1080@1 at 2195,94 + 32 px top panel;
+runtime 11.10-214wp5 = 214 + hdpi-pm-move-mfw + hdpi-fs-client + ncbutton-appframe v3 + frame-fit v2 + this):
+- probe wpl.exe on the 100% monitor (work area 32 px down): fix pwf1,pwf2 = documented rule at every step (Get = screen - 32,
+  Set(x,y) -> window at y+32, Set while maximized + restore -> +32), WS_EX_TOOLWINDOW unchanged; kill pwk1,pwk2 = 214 (screen).
+- Media Composer (his signed-in copy, main's OK, unpinned): MC reads GetWindowPlacement and calls SetWindowPlacement with that
+  rect + 56 (the work-area offset Qt knows): kill x3 Get (1,56) -> Set (1,112); fix d1/f4/f5 Get (1,0) -> Set (1,56) -> (1,112).
+  So this patch does NOT change MC's restored rect (both arms (1,112)); MC's drift is its own arithmetic (INFERRED: the same on
+  Windows with a work area 56 px down). Not a non-client height: Wine's WS_OVERLAPPEDWINDOW top inset at 168 dpi is 50.
+- Every MC arm's Select Project dialog: select:ok (check3), both arms.
+Rebased onto 227.1 (b3) by lab lr61e on 11-25 for the 227.1pc lab runtime: the published patch applies to the 227.1 tree with
+offsets and fuzz 1 in sysparams.c (MonitorFromWindow's iconic line, checked by hand); this diff (diff -u of the 227.1 files)
+applies cleanly. Code unchanged from a29.
+
+In 11.10-231.1 (hotfix line): carried as 227a71 = main's 227a29 (wplwork) rebased onto the 227.1/227.2 tree by lab lr61e
+(+/- lines identical to a29). It is in 231.1 because the placement-bounds patch (227a72) works in workspace coordinates.
+Round 54 (owner's Windows box, taskbar at the bottom: work area at the monitor's corner, offset 0) cannot tell screen from
+workspace coordinates; the rule here is the documented one. Known gap (lr61e, SOLID from the numbers): our work area puts a
+BOTTOM panel's inset at the TOP ((0,57)-(3840,2160) on a 150 % monitor with a 38 px bottom panel), so on such a desktop the
+offset is 57 where Windows has 0: a normal rect that Lightroom saved under 227/227.2/231 (screen coordinates) comes back 57 px
+lower once, e.g. LrC's own (30,86)-(3810,2130) -> (30,143)-(3810,2187), 27 px past the bottom. Top-panel desktops (KDE/GNOME
+with the panel at the top) get the right offset. Kill switch NEUTRON_PLACEMENT_WORKSPACE=0.
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -3945,10 +3945,88 @@
+     return pt.x == -1 && pt.y == -1;
+ }
+ 
++/* NEUTRON placement-workspace: kill switch NEUTRON_PLACEMENT_WORKSPACE=0 (see placement_map_workspace). */
++static BOOL neutron_placement_workspace(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_PLACEMENT_WORKSPACE" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_PLACEMENT_WORKSPACE = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/* NEUTRON placement-workspace (11-17, lab wplace; his words for the family: "When I used meta shift left to move it to the
++ * main monitor it appeared off screen and the wrong scale"). Media Composer's main window, maximized after New Project and
++ * restored with its own title-bar button, came back 56 px lower than before it was maximized: (1,56)-(3840,2160) became
++ * (1,112)-(3840,2216) on the 175% screen, whose work area starts 56 px down (a 32 px top panel), so the restored window ran
++ * 56 px past the bottom of its monitor. Windows (WINDOWPLACEMENT): "If the window is a top-level window that does not have
++ * the WS_EX_TOOLWINDOW window style, then the coordinates represented by ptMinPosition, ptMaxPosition and rcNormalPosition
++ * are in workspace coordinates" -- relative to the work area, i.e. a screen rect less the offset of its monitor's work area
++ * from the monitor's corner (Qt: windowPlacementOffset = availableGeometry().topLeft() - geometry().topLeft(), which it
++ * adds to what GetWindowPlacement returns and takes off what it gives SetWindowPlacement). Wine's GetWindowPlacement and
++ * SetWindowPlacement used SCREEN coordinates for every window, so an application that converts as on Windows moved the
++ * window down (or up) by the work-area offset on every round trip; with a panel at the bottom only, both are equal, which is
++ * why Wine's own tests (test_window_placement compares rcNormalPosition with the screen rect) pass on Windows test machines.
++ * Here, at the API boundary only (NtUserGetWindowPlacement / NtUserSetWindowPlacement), rcNormalPosition of a top-level,
++ * non-tool window is mapped between screen and workspace coordinates by the work-area offset of the monitor the rect is on,
++ * in the caller's dpi. Win32u's own callers keep screen coordinates (get_window_placement). Not mapped: ptMinPosition and
++ * ptMaxPosition (no application seen that depends on them; left as Wine had them, so a Get/Set round trip stays exact),
++ * NtUserGetInternalWindowPos / NtUserSetInternalWindowPos (undocumented; screen as before). */
++static BOOL placement_uses_workspace( HWND hwnd )
++{
++    if (get_window_long( hwnd, GWL_STYLE ) & WS_CHILD) return FALSE;
++    if (get_window_long( hwnd, GWL_EXSTYLE ) & WS_EX_TOOLWINDOW) return FALSE;
++    return NtUserGetAncestor( hwnd, GA_PARENT ) == get_desktop_window();
++}
++
++/* to_workspace TRUE: screen -> workspace (GetWindowPlacement); FALSE: workspace -> screen (SetWindowPlacement) */
++static void placement_map_workspace( HWND hwnd, RECT *rect, BOOL to_workspace )
++{
++    static LONG logged;
++    static HWND last_hwnd;
++    static RECT last_rect;
++    MONITORINFO info;
++    RECT before = *rect;
++    int dx, dy;
++    BOOL on;
++
++    if (!placement_uses_workspace( hwnd )) return;
++    info = monitor_info_from_rect( *rect, get_thread_dpi() );
++    dx = info.rcWork.left - info.rcMonitor.left;
++    dy = info.rcWork.top - info.rcMonitor.top;
++    if (!dx && !dy) return;
++    on = neutron_placement_workspace();
++    if (on)
++    {
++        if (to_workspace) OffsetRect( rect, -dx, -dy );
++        else OffsetRect( rect, dx, dy );
++    }
++    /* a GetWindowPlacement is logged when its answer changed (applications poll it), every SetWindowPlacement */
++    if (!to_workspace || hwnd != last_hwnd || !EqualRect( &before, &last_rect ))
++    {
++        if (to_workspace)
++        {
++            last_hwnd = hwnd;
++            last_rect = before;
++        }
++        if (InterlockedIncrement( &logged ) <= 400)
++        ERR( "neutron-wplace: %s hwnd=%p normal %s %s %s (work area of monitor %s starts %d,%d in)\n",
++             to_workspace ? "GetWindowPlacement" : "SetWindowPlacement", hwnd, wine_dbgstr_rect(&before),
++             on ? (to_workspace ? "-> workspace" : "-> screen") : "KILL SWITCH: left as", wine_dbgstr_rect(rect),
++             wine_dbgstr_rect(&info.rcMonitor), dx, dy );
++    }
++}
++
+ /***********************************************************************
+- *           NtUserGetWindowPlacement (win32u.@)
++ *           get_window_placement
++ *
++ * NEUTRON placement-workspace: NtUserGetWindowPlacement's former body; rcNormalPosition in SCREEN coordinates (win32u's
++ * own callers). The exported call maps it to workspace coordinates.
+  */
+-BOOL WINAPI NtUserGetWindowPlacement( HWND hwnd, WINDOWPLACEMENT *placement )
++BOOL get_window_placement( HWND hwnd, WINDOWPLACEMENT *placement )
+ {
+     WND *win = get_win_ptr( hwnd );
+     UINT win_dpi;
+@@ -4034,6 +4112,17 @@
+     return TRUE;
+ }
+ 
++/***********************************************************************
++ *           NtUserGetWindowPlacement (win32u.@)
++ */
++BOOL WINAPI NtUserGetWindowPlacement( HWND hwnd, WINDOWPLACEMENT *placement )
++{
++    if (!get_window_placement( hwnd, placement )) return FALSE;
++    /* NEUTRON placement-workspace: rcNormalPosition in workspace coordinates, as on Windows */
++    if (hwnd && !is_desktop_window( hwnd )) placement_map_workspace( hwnd, &placement->rcNormalPosition, TRUE );
++    return TRUE;
++}
++
+ /* make sure the specified rect is visible on screen */
+ static void make_rect_onscreen( RECT *rect )
+ {
+@@ -4070,7 +4159,7 @@
+     WINDOWPLACEMENT placement;
+ 
+     placement.length = sizeof(placement);
+-    if (!NtUserGetWindowPlacement( hwnd, &placement )) return 0;
++    if (!get_window_placement( hwnd, &placement )) return 0;
+     if (rect) *rect = placement.rcNormalPosition;
+     if (pt) *pt = placement.ptMinPosition;
+     return placement.showCmd;
+@@ -4179,6 +4268,14 @@
+         return FALSE;
+     }
+     if (wpl->flags & WPF_SETMINPOSITION) flags |= PLACE_MIN;
++    /* NEUTRON placement-workspace: the application gives rcNormalPosition in workspace coordinates, as on Windows */
++    if (hwnd && !is_desktop_window( hwnd ))
++    {
++        WINDOWPLACEMENT wp = *wpl;
++
++        placement_map_workspace( hwnd, &wp.rcNormalPosition, FALSE );
++        return set_window_placement( hwnd, &wp, flags );
++    }
+     return set_window_placement( hwnd, wpl, flags );
+ }
+ 
+@@ -5962,7 +6059,7 @@
+     TRACE( "%p %u\n", hwnd, cmd );
+ 
+     wpl.length = sizeof(wpl);
+-    NtUserGetWindowPlacement( hwnd, &wpl );
++    get_window_placement( hwnd, &wpl );
+ 
+     if (call_hooks( WH_CBT, HCBT_MINMAX, (WPARAM)hwnd, cmd, 0 ))
+         return SWP_NOSIZE | SWP_NOMOVE;
+--- a/dlls/win32u/win32u_private.h
++++ b/dlls/win32u/win32u_private.h
+@@ -343,6 +343,7 @@
+ extern LONG_PTR set_window_long( HWND hwnd, INT offset, UINT size, LONG_PTR newval,
+                                  BOOL ansi );
+ extern void set_window_normal_placement( HWND hwnd, RECT rect );
++extern BOOL get_window_placement( HWND hwnd, WINDOWPLACEMENT *placement ); /* NEUTRON placement-workspace: screen coords */
+ extern BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y );
+ extern UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits );
+ extern void update_window_state( HWND hwnd );
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -5047,7 +5047,7 @@
+     if ((override = get_window_monitor_override( hwnd ))) return override;
+ 
+     wp.length = sizeof(wp);
+-    if (is_iconic( hwnd ) && NtUserGetWindowPlacement( hwnd, &wp ))
++    if (is_iconic( hwnd ) && get_window_placement( hwnd, &wp ))
+         return monitor_from_rect( &wp.rcNormalPosition, flags, dpi );
+ 
+     if (get_window_rect( hwnd, &rect, dpi ))

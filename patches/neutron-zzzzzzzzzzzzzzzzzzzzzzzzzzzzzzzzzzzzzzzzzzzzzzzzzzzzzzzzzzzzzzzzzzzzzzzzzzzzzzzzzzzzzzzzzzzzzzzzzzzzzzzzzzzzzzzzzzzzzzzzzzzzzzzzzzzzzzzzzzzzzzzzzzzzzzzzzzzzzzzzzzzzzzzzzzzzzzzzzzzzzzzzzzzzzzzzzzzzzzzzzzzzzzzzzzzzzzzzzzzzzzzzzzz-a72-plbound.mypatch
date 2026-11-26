@@ -1,0 +1,154 @@
+win32u: SetWindowPlacement bounds the normal rect as Windows does (placement-bounds, Neutron#61)
+
+What the reporter saw (CachyOS, KDE Plasma 6.8.3 Wayland, one 3840x2160 monitor at 150 %, 38 px bottom panel, Lightroom
+Classic 16.0.1 on runtime 227): "trying to interact with anything in the LRC window, including the title-bar, moves the
+window (you get a hand icon when you down-click and can drag the window). LRC seems to work correctly when full-screen."
+
+Mechanism (lr61c, SOLID). Lightroom restores its saved normal placement with SetWindowPlacement: (2480,2137)-(4400,3189).
+Wine's make_rect_onscreen moves a normal rect only per axis and only when that axis is entirely outside the work area; our
+work area puts the maximized inset at the TOP even for a bottom panel ((0,57)-(3840,2160)), so the rect was kept, caption
+and all below the bottom of the screen (227: taken as screen coordinates; 229: the workspace mapping (a29) adds 57 and the
+y axis is pulled to 1108 while x keeps running 560 px past the right edge). KWin shows the whole window on screen; clicks map
+as Win32 origin + surface-local position, wineserver clamps the cursor to the virtual screen, and every click landed on the
+last row = the caption: HTCAPTION, SC_MOVE, xdg_toplevel.move (227), or at x=3839 in the wrong view (229).
+
+Windows (round 54, winpl.exe on the owner's PC: Windows 10.0.26200, 3840x2160 at 225 % = 216 dpi, taskbar at the bottom,
+work area 0,0-3840,2070; the dpi-unaware context shows the same pattern at 1707x960, work area 0,0-1707,920):
+- SetWindowPlacement keeps the normal rect unless it lies ENTIRELY outside the work area; an edge that merely touches it
+  counts as inside. Kept: caption half below the work area (100,2038), caption entirely above it (100,-67), 5 px inside at
+  the right (3835,100) or at the left (-1915,100), both (3740,2038); sweeps on every edge with k = 0, 1, 4, 8, 32, 65, 79,
+  64, 100, 200 px and h-8/w-8 inside: all kept. Moved: 2 px below the work area (100,2072) -> (100,1018).
+- When it moves, the WHOLE rect goes inside the work area on BOTH axes, size kept: Lightroom's (2480,2137) 1920x1052 ->
+  (1920,1018) (right edge at 3840, bottom at 2070, although x alone overlapped); off-below (100,2210) -> (100,1018);
+  off-both (3890,2210) -> (1920,1018).
+- The same for a hidden or a visible window, and for a maximized one: SetWindowPlacement(SW_SHOWMAXIMIZED) stores the
+  moved normal rect (GetWindowPlacement reads it back moved while still maximized) and SW_RESTORE restores to it, visible (M)
+  or hidden (H).
+- CreateWindowEx and SetWindowPos never move a rect; only the max-track-size clamp applies (oversize width 3940 -> 3872 on
+  every path). Not changed here.
+
+Fix: make_normal_rect_onscreen replaces make_rect_onscreen for SetWindowPlacement's normal rect only: kept unless entirely
+outside the work area of the monitor nearest the rect (touching = inside), else moved inside it on both axes with its size
+kept. Screen coordinates of the caller's dpi, after the placement-workspace mapping. Unchanged: ptMinPosition/ptMaxPosition,
+the driver's restore placement (set_window_normal_placement), CreateWindowEx, SetWindowPos, child windows.
+
+Applies on top of placement-workspace (a29): 229 has it; on the 227.1 line apply placement-workspace-227.mypatch first.
+
+Not covered / not measured on Windows: a rect 1 px outside (moved here; Windows measured at 0 kept and 2 moved); which
+monitor's work area on a multi-monitor desktop (his Windows box has one; nearest is Wine's choice); a rect larger than the
+work area that is entirely outside (keeps its left/top edge inside here). Our work area still reserves a bottom panel's
+space at the TOP (winewayland display.c; Wayland gives no work-area edge), so a moved rect ends 57 px lower than on Windows
+with a bottom panel ((1920,1108) where Windows gives (1920,1051)). Rects Windows keeps partly off the screen stay partly
+off here too; on Wayland the compositor shows them whole -- the winewayland keep-reachable rule handles that, separately.
+
+Lab: (lr61e, 11-25; nested KWin 6.8.3-3 + Qt 6.12.1, one output 3840x2160 @150 %, 38 px bottom panel, focus follows mouse;
+lab runtimes 11.10-229pc = 229 + this + keep-reachable, 11.10-227.1pc = 227.1 + placement-workspace + this + keep-reachable)
+- winpl.exe round 54 under Wine, compared with Windows' rule applied to this desk's work area (0,57)-(3840,2160) (e/tools/cmp54.py,
+  checked: Windows' own output 0 of 32 lines differ, stock 229 3, stock 227.1 32): this + NEUTRON_KEEP_REACHABLE=0 -> 0 of 32 lines
+  differ on 229pc (n=2) and on 227.1pc (n=2); kill switch NEUTRON_PLACEMENT_BOUNDS=0 on the same build -> 3 of 32 (the k0 sweeps:
+  touching edges moved), = stock 229. Not judged: the oversize line (max-track size = metrics; 229 also shrinks a hidden oversize
+  window at creation, 3840x2160 / 1657x948, which 227.1 and Windows do not -- not this patch).
+- Lightroom Classic 16.0.1, the reporter's saved rect (2480,2137)-(4400,3189): opens restored n=2 per runtime: one line
+  "normal (2480,2194)-(4400,3246) is entirely outside the work area (0,57)-(3840,2160): moved to (1920,1108)-(3840,2160)",
+  photo clicks 2/2 -> the loupe view, right-panel click -> the right panel ("(Bridge View)"), 0 KWin moves; opens maximized + restore
+  click (SC_RESTORE) -> restored at (1920,1108), same targets. Kill switch (both rules off) on the same build: 229 -> Win32
+  (2480,1108), the right-panel click lands in the loupe (x clamped); 227.1pc (placement-workspace still on) the same: (2480,1108), right panel clamped into
+  the loupe (227.1 without placement-workspace: the caption-click move, lr61d dk1). LrC's own on-screen rect (30,86)-(3810,2130): no
+  line from this patch (it is not entirely outside), n=1 per runtime.
+- No-regression pair at 168 dpi (desk switched to 175 %), 229 vs 229pc, n=1 each: Photoshop 2026 Open, Save As and Preferences, and
+  Illustrator 2026 Open and Save As, open at the same KWin positions and sizes in both arms (Open/Save As 748,346 697x502 logical,
+  PS Preferences 581,269 1030x657); 0 placement-bounds and 0 keep-reachable lines in any log. Illustrator's Preferences (Ctrl+K) did not
+  open in either arm (rig: shortcut not taken) -- untested. The first Illustrator 229pc run reached Save As before its new document
+  existed (slow start, Home screen in the shot); rerun with a longer wait: Save As as on 229.
+
+Kill switch: NEUTRON_PLACEMENT_BOUNDS=0 (Wine's make_rect_onscreen, as before).
+
+In 11.10-231.1 (hotfix line): this patch + placement-workspace (227a71) ONLY. The winewayland keep-reachable rule (lr61c/e)
+and the KWin position sync (lr61f) are NOT in 231.1, so a rect Windows keeps partly off the screen stays partly off here and
+KWin may show it whole (clicks past the right/bottom edge clamp). lr61e's A-only arm on 227.1pc (NEUTRON_KEEP_REACHABLE=0,
+reporter's saved rect): this line fired, (1920,1108), photo and right-panel clicks reached the right targets, 0 KWin moves.
+Windows numbers: round 54 (above). Kill switches: NEUTRON_PLACEMENT_BOUNDS=0 (this), NEUTRON_PLACEMENT_WORKSPACE=0 (227a71).
+
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -4151,6 +4151,71 @@
+     }
+ }
+ 
++/* NEUTRON placement-bounds: kill switch NEUTRON_PLACEMENT_BOUNDS=0 (Wine's make_rect_onscreen, as before). */
++static BOOL neutron_placement_bounds(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *e = getenv( "NEUTRON_PLACEMENT_BOUNDS" );
++        on = !e || e[0] != '0';
++        if (!on) ERR( "neutron-gateresolved: NEUTRON_PLACEMENT_BOUNDS = 0 (environment)\n" );
++    }
++    return on;
++}
++
++/***********************************************************************
++ *           make_normal_rect_onscreen
++ *
++ * NEUTRON placement-bounds (Neutron#61): SetWindowPlacement's normal rect, bounded as Windows bounds it.
++ * What the reporter saw: "trying to interact with anything in the LRC window, including the title-bar, moves the
++ * window". Lightroom Classic restores its saved normal rect (2480,2137)-(4400,3189) with SetWindowPlacement on a
++ * 3840x2160 monitor; Wine's make_rect_onscreen kept it (with our top-inset work area it is not entirely outside), the
++ * compositor showed the whole window, and every click mapped past the bottom of the screen onto the caption.
++ * Windows (round 54, winpl.exe on the owner's PC: 3840x2160 at 216 dpi, work area 0,0-3840,2070; the same pattern in
++ * the dpi-unaware context at 1707x960, work area 0,0-1707,920):
++ * - the rect is kept unless it lies ENTIRELY outside the work area; an edge that merely touches it counts as inside
++ *   (sweeps on all four edges with 0 px inside: kept). Kept: caption half below the work area (100,2038), caption
++ *   entirely above it (100,-67), 5 px inside at the right (3835,100) or the left (-1915,100), both (3740,2038).
++ *   Moved: 2 px below the work area (100,2072) -> (100,1018).
++ * - when it is moved, the WHOLE rect goes inside the work area on BOTH axes, size kept: Lightroom's (2480,2137)
++ *   1920x1052 -> (1920,1018) (right edge at 3840 and bottom at 2070, although x alone overlapped); (100,2210) ->
++ *   (100,1018); (3890,2210) -> (1920,1018).
++ * - the same for a hidden or a visible window, and for a maximized one (the stored normal rect reads back moved, and
++ *   SW_RESTORE restores to it), hidden or visible. CreateWindowEx and SetWindowPos never move a rect (only the
++ *   max-track-size clamp applies there); not changed here.
++ * Wine's make_rect_onscreen moved a rect only per axis (an axis entirely outside is aligned to that edge, the other
++ * axis is left as it is), treated a touching edge as outside, and is kept for everything else (the min/max positions,
++ * the driver's restore placement). The work area is that of the monitor nearest the rect (Windows measured with one
++ * monitor: the nearest-monitor choice and a rect 1 px outside are not measured). A rect larger than the work area
++ * keeps its left/top edge inside (not measured on Windows). Coordinates are screen coordinates of the caller's dpi:
++ * NtUserSetWindowPlacement maps the application's workspace coordinates first (placement-workspace).
++ */
++static void make_normal_rect_onscreen( RECT *rect )
++{
++    static LONG logged;
++    MONITORINFO info;
++    RECT before = *rect;
++
++    if (!neutron_placement_bounds())
++    {
++        make_rect_onscreen( rect );
++        return;
++    }
++    info = monitor_info_from_rect( *rect, get_thread_dpi() );
++    if (IsRectEmpty( &info.rcWork )) return;
++    if (rect->right >= info.rcWork.left && rect->left <= info.rcWork.right &&
++        rect->bottom >= info.rcWork.top && rect->top <= info.rcWork.bottom)
++        return;
++    if (rect->right > info.rcWork.right) OffsetRect( rect, info.rcWork.right - rect->right, 0 );
++    if (rect->left < info.rcWork.left) OffsetRect( rect, info.rcWork.left - rect->left, 0 );
++    if (rect->bottom > info.rcWork.bottom) OffsetRect( rect, 0, info.rcWork.bottom - rect->bottom );
++    if (rect->top < info.rcWork.top) OffsetRect( rect, 0, info.rcWork.top - rect->top );
++    if (InterlockedIncrement( &logged ) <= 64)
++        ERR( "neutron-placement-bounds: normal %s is entirely outside the work area %s: moved to %s\n",
++             wine_dbgstr_rect(&before), wine_dbgstr_rect(&info.rcWork), wine_dbgstr_rect(rect) );
++}
++
+ /***********************************************************************
+  *           NtUserGetInternalWindowPos (win32u.@)
+  */
+@@ -4201,7 +4266,7 @@
+ 
+     if (flags & PLACE_MIN) make_point_onscreen( &wp.ptMinPosition );
+     if (flags & PLACE_MAX) make_point_onscreen( &wp.ptMaxPosition );
+-    if ((flags & PLACE_RECT) && !is_child) make_rect_onscreen( &wp.rcNormalPosition );
++    if ((flags & PLACE_RECT) && !is_child) make_normal_rect_onscreen( &wp.rcNormalPosition ); /* NEUTRON placement-bounds */
+ 
+     TRACE( "%p: setting min %d,%d max %d,%d normal %s flags %x adjusted to min %d,%d max %d,%d normal %s\n",
+            hwnd, wndpl->ptMinPosition.x, wndpl->ptMinPosition.y,

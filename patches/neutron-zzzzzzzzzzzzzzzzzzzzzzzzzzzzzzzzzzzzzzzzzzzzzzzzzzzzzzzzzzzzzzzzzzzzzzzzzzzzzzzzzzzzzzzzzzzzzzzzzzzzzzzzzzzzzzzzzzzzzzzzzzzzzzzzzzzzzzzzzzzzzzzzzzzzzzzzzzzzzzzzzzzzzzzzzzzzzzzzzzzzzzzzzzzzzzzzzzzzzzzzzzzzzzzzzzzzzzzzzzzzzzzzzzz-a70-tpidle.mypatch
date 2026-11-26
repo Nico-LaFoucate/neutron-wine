@@ -1,0 +1,334 @@
+From: Neutron lab (ps60b, v2 ps60d)
+Subject: [PATCH] ntdll: thread pool workers are reused last-in-first-out and retire after 2 minutes of pool idle, as on Windows
+
+What the reporter saw (Neutron#60, reporter's words): "Photoshop 27.8 hangs when switching back after saving a PSD as
+PDF on Wayland" / "Photoshop stops responding when I switch back. Easily reproducible." (runtime 217, ntsync off).
+
+Mechanism (SOLID, lab: Photoshop 27.11 on 217 and 229, ntsync on and off, 96 dpi; live TEB stacks, hang report v2,
+a +threadpool trace, AdobePDFL/Photoshop.exe disassembly):
+- Photoshop runs "Save As > Photoshop PDF" as work items on a PRIVATE thread pool (CreateThreadpool, no minimum).
+- The worker that ran the save holds Adobe PDF Library per-thread state. Its destructor runs at thread exit from
+  Photoshop.exe's TLS callback (MSVC __dyn_tls_dtor), inside LdrShutdownThread with the loader lock held. It shuts
+  down PDFL's own worker threads and waits (INFINITE) for their handles. Those threads block in their own
+  LdrShutdownThread on the loader lock: a permanent deadlock. The main thread's next loader call (dxgi Present on
+  the repaint after the focus change) blocks too, which is what the reporter sees on switching back.
+- Wine retired an idle pool worker after 5 s (THREADPOOL_WORKER_TIMEOUT), and the pool's last worker too when the
+  pool has no objects, so the deadlock started 5-10 s after every PDF save, focus change or not (stock 217/229:
+  16 of 16 runs hung).
+
+Windows (measured on the owner's Windows 11 box, probe tpidle.exe, round 53):
+- LIFO reuse: 20 single work items 0.5 s apart ran on ONE thread, 20 of 20 on the thread that ran the previous item
+  (Wine: 8 threads, 0 of 20). Windows workers wait on the worker factory's I/O completion port, which releases its
+  waiters last-in-first-out.
+- Idle lifetime ~2 minutes: a default pool and a CreateThreadpool pool, 5 workers each, all alive at 0.5 s idle;
+  the first exit at 121.8-122.3 s, all gone by 125.4 s (the 3 s between is the probe's own thread-detach wait under
+  the loader lock). Wine: every worker gone 5-8 s after it went idle.
+- Workers that had been idle ~11 s longer than the rest (the cold default-pool workers LIFO never reused) retired at
+  the same moment as the others: the idle time counts from the POOL's last activity, not per thread.
+- The last worker of a pool with no objects exits too (0 of 5 left): Windows does not keep a last worker forever.
+- A retiring worker's thread-detach callbacks run under the loader lock on Windows as well (the probe's wait timed
+  out). The lock rule is the same; what differs is worker lifetime and reuse.
+
+Fix (dlls/ntdll/threadpool.c):
+1. Idle workers wait on their own condition variable, pushed on a per-pool idle stack; new work wakes the top of
+   the stack (the most recently idle worker). Shutdown wakes all.
+2. The pool records when work was last queued or finished (last_active). An idle worker may retire only once the
+   whole pool has been idle for THREADPOOL_WORKER_TIMEOUT_WINDOWS (120 s); a worker woken by its timeout earlier
+   re-waits for the remainder. The existing retire rule (min_workers, last worker exits when the pool has no
+   objects) is unchanged, now in one helper (tp_worker_may_retire) used by both the wait and the worker loop.
+3. (v2) Retire eligibility is decided BEFORE the wait is chosen. Once the pool has been idle for 120 s, a worker
+   that may retire returns at once and exits; a worker that may not (the pool's minimum, or the last worker of a
+   pool that still has objects) waits a whole 120 s period again, or until new work wakes it. v1 gave such a worker
+   the expired deadline (a 0 ms wait) and it looped at 100 % of a CPU until new work arrived: Illustrator,
+   Lightroom and Premiere idled at 5-7 CPUs on v1 (ps60c).
+Kill switches (read once per process): NEUTRON_TP_LIFO=0 (oldest waiter first, one shared condition variable, as
+before), NEUTRON_TP_WIN_TIMEOUT=0 (5 s per-thread idle timeout, as before).
+
+What stays imperfect / not covered:
+- The constant: Windows' first exit landed at 121.8-122.3 s, ours at 120.1 s. 120 s is the round value; whether
+  Windows uses ~122 s or 120 s plus exit latency is not pinned (optional probe tpidle2.exe pins it, and whether the
+  idle clock is per pool or per thread, from one more Windows run).
+- Thread creation throttling of the Windows worker factory (it delays new threads while workers are busy) is not
+  modeled; Wine still starts a worker per busy submit.
+- If Photoshop leaves that pool idle for more than 2 minutes after a PDF save, the save worker retires and the same
+  deadlock follows (Windows has the same lock rule, so it would too). Photoshop posts work to the pool far more often
+  in the lab (LAB RESULTS).
+- The timer-queue, wait-queue and I/O-queue service threads keep their 5 s timeouts (they run no app callbacks).
+- A kept worker that becomes free to retire while it sleeps (the pool's last object closed after the pool had
+  already been idle 2 minutes) notices at its next wakeup, up to 120 s later; nothing wakes it when objcount drops.
+  Windows' exact behavior for that case is not measured.
+
+Lab (ps60b + ps60d, Photoshop 27.11, 168 dpi desk, base Ps60-b229; lab runtime 11.10-229tq = 229 + this ntdll):
+- #60 flow (open PSD, Save As > Photoshop PDF [High Quality Print], Alt+Tab away and back once, >= 5.3 min watched after
+  the save): away at +10 s ntsync off x2 / on x2, +150 s off x2 / on x2 = 0 of 8 hung, 0 loader_section timeouts, File menu
+  opens after switching back. Same build, NEUTRON_TP_WIN_TIMEOUT=0: HUNG within 35 s (owner wine_threadpool_worker in
+  AdobePDFL's join, from Photoshop.exe's TLS callback). v1 (same idle rule) at 96 dpi: 0 of 8 hung; NEUTRON_TP_LIFO=0 not hung.
+- Stock 217/229 base rate (ps60): 16 of 16 hung (ntsync off/on, switch/no switch).
+- Busy-spin (v1) test, tpspin.exe (pool with an object kept + a pool with minimum 2, 130 s idle, CPU over the next 60 s):
+  229 0 %, v1 277 % of one CPU (3 workers at 91-94 % each), v2 0 % (also with NEUTRON_TP_LIFO=0). New work still reaches
+  the kept workers at once (200 ms item done 200 ms after submit); a kept worker whose pool loses its last object
+  retires 120 s after the pool's last item (229: 5 s).
+- tpidle under v2: LIFO 20 of 20, all alive at 0.5 s, first exit 120.1 s, all gone 123.1 s (Windows 122.3 / 125.4);
+  NEUTRON_TP_LIFO=0 -> 8 threads / 0 of 20; NEUTRON_TP_WIN_TIMEOUT=0 -> all gone at 5 s.
+- Idle CPU 229 vs v2 (n=1 per app unless noted): Lightroom (export + import) main 1.8 vs 1.8 %, Illustrator 3.7/2.9 vs
+  3.4/2.8 %, Premiere (3 exports, 2.18 vs 2.19 s each) scope 13 vs 17-18 %, Photoshop (n=2 v2) main 1.3-1.4 vs 1.5-2.3 %.
+
+Thread plateau (SOLID numbers, INFERRED cause; ps60c/ps60d): with this patch the apps hold more threads at idle than
+stock -- Photoshop about +95 (339-353 vs 256-266), Illustrator +65..70, Lightroom +33..48, Premiere +14 -- flat or
+falling over 5 minutes of idle, never rising. That is the measured Windows rule itself (a worker lives until its POOL
+has been idle 120 s, so a pool that gets an item at least every 2 minutes keeps every worker its bursts created)
+combined with the missing worker-factory throttling above: Windows' factory would have started fewer workers for the
+same bursts. Idle CPU is unchanged within noise (Photoshop n=2 main 1.7 vs 1.9 %, Premiere idle 0.0 % both).
+
+In 11.10-231.1 (hotfix line, release-231.1 = 231 (= 227.2 content) + this + placement): the diff body is ps60d's v2 byte for byte
+(dry-run -F0 clean on the 227.1/227.2 tree, threadpool.c identical to 229's). Kill switches as above.
+
+--- a/dlls/ntdll/threadpool.c
++++ b/dlls/ntdll/threadpool.c
+@@ -98,6 +98,40 @@
+ #define THREADPOOL_WORKER_TIMEOUT 5000
+ #define MAXIMUM_WAITQUEUE_OBJECTS (MAXIMUM_WAIT_OBJECTS - 1)
+ 
++/* Neutron#60: pool workers are reused and retired the way Windows does it.
++ *
++ * Measured on Windows 11 (probe tpidle.exe: a default-pool and a CreateThreadpool pool, 8 short items
++ * each, then idle, every worker's thread handle polled every 0.5 s):
++ *  - new work goes to the most recently idle worker: 20 single items 0.5 s apart all ran on one thread
++ *    (Wine: 8 different threads, 0 of 20 on the previous item's thread). The workers wait on an I/O
++ *    completion port (the worker factory), which releases its waiters last-in-first-out.
++ *  - idle workers live about 2 minutes: all 5 + 5 alive after 0.5 s, the first exit at 121.8-122.3 s, the
++ *    rest right after it (Wine: every worker gone 5-8 s after it went idle). Workers that had been idle
++ *    about 11 s longer than the rest (unused because the LIFO order kept one hot thread) exited at the same
++ *    moment, so the idle time counts from the pool's last activity, not from each thread's own last item.
++ *  - the last worker of a pool with no objects exits too (0 of 5 left), as in Wine.
++ *  - a retiring worker's thread-detach callbacks run under the loader lock on Windows as well.
++ *
++ * A worker that may not retire (the pool's minimum, or the last worker while the pool has objects)
++ * keeps sleeping once the pool's 2 minutes are over; it must not poll the expired deadline.
++ *
++ * Why it matters: Photoshop runs "Save As > Photoshop PDF" on a private pool's worker, and the Adobe PDF
++ * Library state that worker then holds is torn down at thread exit (Photoshop.exe's TLS callback, loader
++ * lock held) by waiting for the library's own threads, which need the loader lock to exit: a deadlock as
++ * soon as that worker retires. Wine retired it 5 s after the save; Photoshop posts work to that pool far
++ * more often than every 2 minutes, so on Windows the worker never retires during a session.
++ *
++ * Kill switches (read once): NEUTRON_TP_LIFO=0 wakes the oldest idle worker again (one shared condition
++ * variable); NEUTRON_TP_WIN_TIMEOUT=0 restores the 5 s per-thread idle timeout. */
++#define THREADPOOL_WORKER_TIMEOUT_WINDOWS 120000
++
++/* an idle worker on its pool's idle stack (most recently idle first), locked via the pool's cs */
++struct threadpool_idle_worker
++{
++    struct list             entry;
++    RTL_CONDITION_VARIABLE  cv;
++};
++
+ /* internal threadpool representation */
+ struct threadpool
+ {
+@@ -108,6 +142,10 @@
+     /* Pools of work items, locked via .cs, order matches TP_CALLBACK_PRIORITY - high, normal, low. */
+     struct list             pools[3];
+     RTL_CONDITION_VARIABLE  update_event;
++    /* idle workers waiting for work, most recently idle first, locked via .cs */
++    struct list             idle_workers;
++    /* when work was last queued or finished (ms, queue_current_time), locked via .cs */
++    ULONGLONG               last_active;
+     /* information about worker threads, locked via .cs */
+     int                     max_workers;
+     int                     min_workers;
+@@ -1751,6 +1789,123 @@
+ }
+ 
+ /***********************************************************************
++ *           tp_env_switch_on    (internal)
++ *
++ * Neutron#60 kill switches: TRUE unless the variable is set to a value starting with '0'.
++ */
++static BOOL tp_env_switch_on( const WCHAR *var )
++{
++    UNICODE_STRING name, value;
++    WCHAR buf[8];
++
++    RtlInitUnicodeString( &name, var );
++    value.Buffer = buf;
++    value.Length = 0;
++    value.MaximumLength = sizeof(buf);
++    return RtlQueryEnvironmentVariable_U( NULL, &name, &value ) || !value.Length || buf[0] != '0';
++}
++
++static BOOL tp_lifo_enabled(void)
++{
++    static LONG state = -1;  /* -1 unknown, 0 off, 1 on */
++    if (state < 0) InterlockedCompareExchange( &state, tp_env_switch_on( L"NEUTRON_TP_LIFO" ), -1 );
++    return state;
++}
++
++static BOOL tp_win_timeout_enabled(void)
++{
++    static LONG state = -1;
++    if (state < 0) InterlockedCompareExchange( &state, tp_env_switch_on( L"NEUTRON_TP_WIN_TIMEOUT" ), -1 );
++    return state;
++}
++
++/***********************************************************************
++ *           tp_wake_idle_workers    (internal)
++ *
++ * Wake the most recently idle worker, or all of them. Called with pool->cs held.
++ */
++static void tp_wake_idle_workers( struct threadpool *pool, BOOL all )
++{
++    struct threadpool_idle_worker *idle;
++    struct list *ptr;
++
++    if (!tp_lifo_enabled())
++    {
++        if (all) RtlWakeAllConditionVariable( &pool->update_event );
++        else RtlWakeConditionVariable( &pool->update_event );
++        return;
++    }
++    while ((ptr = list_head( &pool->idle_workers )))
++    {
++        idle = LIST_ENTRY( ptr, struct threadpool_idle_worker, entry );
++        list_remove( &idle->entry );
++        list_init( &idle->entry );
++        RtlWakeConditionVariable( &idle->cv );
++        if (!all) break;
++    }
++}
++
++/***********************************************************************
++ *           tp_worker_may_retire    (internal)
++ *
++ * Whether an idle worker may exit without violating the pool's limits: the pool keeps
++ * min_workers threads, and at least one while it has objects. Called with pool->cs held.
++ */
++static BOOL tp_worker_may_retire( struct threadpool *pool )
++{
++    return pool->num_workers > max( pool->min_workers, 1 ) ||
++           (!pool->min_workers && !pool->objcount);
++}
++
++/***********************************************************************
++ *           tp_wait_for_work    (internal)
++ *
++ * An idle worker waits for work on top of the pool's idle stack. Called with pool->cs held.
++ * Returns STATUS_TIMEOUT when the worker may retire: with the Windows timeout, only once the
++ * whole pool has had no work for THREADPOOL_WORKER_TIMEOUT_WINDOWS.
++ *
++ * With the Windows timeout a worker waits until the pool has been idle for that long. Once it
++ * has, a worker that may retire returns at once; one that may not (the pool's minimum, or the
++ * last worker of a pool that still has objects) waits a whole period again, or until woken,
++ * instead of polling the expired deadline.
++ */
++static NTSTATUS tp_wait_for_work( struct threadpool *pool )
++{
++    struct threadpool_idle_worker idle;
++    LARGE_INTEGER timeout;
++    ULONGLONG ms = THREADPOOL_WORKER_TIMEOUT, idle_ms;
++    NTSTATUS status;
++
++    if (tp_win_timeout_enabled())
++    {
++        idle_ms = queue_current_time() - pool->last_active;
++        if (idle_ms < THREADPOOL_WORKER_TIMEOUT_WINDOWS)
++            ms = THREADPOOL_WORKER_TIMEOUT_WINDOWS - idle_ms;
++        else if (tp_worker_may_retire( pool ))
++            return STATUS_TIMEOUT;
++        else
++            ms = THREADPOOL_WORKER_TIMEOUT_WINDOWS;
++    }
++    timeout.QuadPart = ms * -10000;
++
++    if (!tp_lifo_enabled())
++        status = RtlSleepConditionVariableCS( &pool->update_event, &pool->cs, &timeout );
++    else
++    {
++        RtlInitializeConditionVariable( &idle.cv );
++        list_add_head( &pool->idle_workers, &idle.entry );
++        status = RtlSleepConditionVariableCS( &idle.cv, &pool->cs, &timeout );
++        list_remove( &idle.entry );  /* no-op when a waker already took it off the stack */
++    }
++
++    /* work reached the pool while this worker slept further down the stack: not idle yet */
++    if (status == STATUS_TIMEOUT && tp_win_timeout_enabled() &&
++        queue_current_time() - pool->last_active < THREADPOOL_WORKER_TIMEOUT_WINDOWS)
++        status = STATUS_SUCCESS;
++    return status;
++}
++
++/***********************************************************************
+  *           tp_threadpool_alloc    (internal)
+  *
+  * Allocates a new threadpool object.
+@@ -1761,6 +1916,8 @@
+     struct threadpool *pool;
+     unsigned int i;
+ 
++    tp_lifo_enabled();  /* resolve the kill switches outside pool->cs */
++    tp_win_timeout_enabled();
+     pool = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*pool) );
+     if (!pool)
+         return STATUS_NO_MEMORY;
+@@ -1775,6 +1932,8 @@
+     for (i = 0; i < ARRAY_SIZE(pool->pools); ++i)
+         list_init( &pool->pools[i] );
+     RtlInitializeConditionVariable( &pool->update_event );
++    list_init( &pool->idle_workers );
++    pool->last_active = queue_current_time();
+ 
+     pool->max_workers             = 500;
+     pool->min_workers             = 0;
+@@ -1801,7 +1960,7 @@
+     assert( pool != default_threadpool );
+ 
+     pool->shutdown = TRUE;
+-    RtlWakeAllConditionVariable( &pool->update_event );
++    tp_wake_idle_workers( pool, TRUE );
+ }
+ 
+ /***********************************************************************
+@@ -2097,12 +2256,13 @@
+     /* Count how often the object was signaled. */
+     if (object->type == TP_OBJECT_TYPE_WAIT && signaled)
+         object->u.wait.signaled++;
++    pool->last_active = queue_current_time();
+ 
+     /* No new thread started - wake up one existing thread. */
+     if (status != STATUS_SUCCESS)
+     {
+         assert( pool->num_workers > 0 );
+-        RtlWakeConditionVariable( &pool->update_event );
++        tp_wake_idle_workers( pool, FALSE );
+     }
+ 
+     RtlLeaveCriticalSection( &pool->cs );
+@@ -2438,7 +2598,6 @@
+ static void CALLBACK threadpool_worker_proc( void *param )
+ {
+     struct threadpool *pool = param;
+-    LARGE_INTEGER timeout;
+     struct list *ptr;
+ 
+     TRACE( "starting worker thread for pool %p\n", pool );
+@@ -2462,6 +2621,7 @@
+ 
+             assert(pool->num_busy_workers);
+             pool->num_busy_workers--;
++            pool->last_active = queue_current_time();
+ 
+             tp_object_release( object );
+         }
+@@ -2475,10 +2635,8 @@
+          * decreased without violating the min_workers limit. An exception is when
+          * min_workers == 0, then objcount is used to detect if the last thread
+          * can be terminated. */
+-        timeout.QuadPart = (ULONGLONG)THREADPOOL_WORKER_TIMEOUT * -10000;
+-        if (RtlSleepConditionVariableCS( &pool->update_event, &pool->cs, &timeout ) == STATUS_TIMEOUT &&
+-            !threadpool_get_next_item( pool ) && (pool->num_workers > max( pool->min_workers, 1 ) ||
+-            (!pool->min_workers && !pool->objcount)))
++        if (tp_wait_for_work( pool ) == STATUS_TIMEOUT &&
++            !threadpool_get_next_item( pool ) && tp_worker_may_retire( pool ))
+         {
+             break;
+         }
