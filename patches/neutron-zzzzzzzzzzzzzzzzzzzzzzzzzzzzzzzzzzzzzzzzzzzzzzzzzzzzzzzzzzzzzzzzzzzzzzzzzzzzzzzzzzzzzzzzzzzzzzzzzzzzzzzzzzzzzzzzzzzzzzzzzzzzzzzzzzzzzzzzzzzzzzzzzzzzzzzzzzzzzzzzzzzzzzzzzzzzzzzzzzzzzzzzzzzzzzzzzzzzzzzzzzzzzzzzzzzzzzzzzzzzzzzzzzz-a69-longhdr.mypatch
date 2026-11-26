@@ -1,0 +1,217 @@
+winhttp: don't cut response header lines at 1459 bytes (Neutron#62).
+
+What the reporter saw (Lightroom Classic 16.0.1.1, runtime 11.10-227): "When using some of
+the AI enhanced presets (mostly ones from cobalt) i get the "Some AI models failed to
+download, please try again later"".
+
+Mechanism. Camera Raw's model downloader (CameraRaw.dll, WinHTTP) asks
+photos.adobe.io/v2/models/<model>/components/<id> for each file of a cloud model. The
+service answers 302 with a Location that is a pre-signed CloudFront/S3 URL longer than
+1449 characters (its X-Amz-Security-Token alone is about 1 KB). read_reply() read every
+response line into a fixed 1460-byte stack buffer, and read_line() silently dropped
+whatever did not fit, so the URL arrived as exactly 1449 characters ("Location: " + 1449 +
+NUL = 1460). The cut removed X-Amz-SignedHeaders/X-Amz-Signature; WinHTTP followed the
+shortened redirect and S3 answered 400 AuthorizationQueryParametersError ("Query-string
+authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature,
+X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters"), which Camera Raw logs as
+"File download http error:'400'" and shows as the red "Some AI models failed to download"
+banner when an AI preset asks for models. Any other header line over 1459 bytes (long
+Set-Cookie, Content-Security-Policy, Link, ...) was shortened the same way, with no error.
+
+Windows. WinHTTP bounds the whole response header block by
+WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE (64 KB by default) and fails a request beyond it
+with ERROR_WINHTTP_HEADER_SIZE_OVERFLOW; it does not shorten single lines, so the same
+redirect is followed intact there. This is documented (Microsoft Learn, WinHTTP "Option
+Flags": WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE, the maximum size of the response header
+portion, default 64 KB; "WinHTTP error codes": ERROR_WINHTTP_HEADER_SIZE_OVERFLOW). There is
+no per-line limit on Windows.
+
+Fix. read_line() grows the caller's heap buffer while a line arrives, up to 64 KB per line
+(the Windows default for the whole block, so every line Windows accepts fits). Status-line
+parsing, header processing and the raw_headers assembly are unchanged.
+
+Not covered: Windows' ERROR_WINHTTP_HEADER_SIZE_OVERFLOW (a line over 64 KB is still cut the
+old way rather than failed; Wine still ignores WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE).
+wininet has the same pattern with a 4096-byte line buffer (dlls/wininet/http.c, MAX_REPLY_LEN
+0x1000); not changed here, nothing seen failing through it.
+
+Lab evidence (LrC 16.0.1.1 signed-in lab copy, model cache CloudDownload emptied, 3440x1440
+@ 96 dpi, Adaptive: Subject > Warm Pop):
+  227:                      banner 2/2 (A1, A2), dereflect + dereflect_fractional_upsampler
+                            400 on every file and retry, cache gets no dereflect files.
+  227 + this patch:         2/2 (F1, F2) no banner, preset applied, 4/4 files http=200,
+                            dereflect.data 234098752 B + upsampler on disk.
+  same build, gate 0:       K1, K2: 8x http=400 each, no dereflect files; banner 1/2
+                            (K2; K1 applied the preset without it). Stock behavior
+                            overall: download fails 4/4 runs, banner 3/4.
+  229 + this patch (G1):    dereflect downloaded, no banner, preset applied.
+  AI masking (Sky) and Denoise still work on 227 + this patch (F3).
+  Lab-only dump build (not shipped): the 400 bodies are S3 AuthorizationQueryParametersError
+  on 4/4 files. Localhost harness (302 to a 2143-char path + a 3000-byte custom header,
+  64- and 32-bit client): stock 227/229 Location 1449, path 1427/2143; patched 2165 and
+  2143/2143, header 3000/3000; patched with gate 0 = stock numbers.
+
+Kill switch NEUTRON_WINHTTP_LONG_HEADERS=0: keeps the 1460-byte buffer (the pre-patch behavior
+exactly); 1 (default) applies the fix. A one-shot ERR line "neutron-winhttp: gate
+NEUTRON_WINHTTP_LONG_HEADERS resolved to N" tells "gate off" from "patch absent".
+
+Patch 227a69 (lab lr62, 11-25). Pre-release 11.10-227.2 (227.1 + this file only, hotfix line);
+also IN TEST 11.10-230 on main. Same file on main and on release-227.2.
+
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -2974,10 +2974,63 @@
+     return ret;
+ }
+ 
+-static DWORD read_line( struct request *request, char *buffer, DWORD *len )
++#define MAX_REPLY_LEN   1460
++#define INITIAL_HEADER_BUFFER_LEN  512
++
++/* ============================================================================================
++ * NEUTRON: response header lines longer than 1459 bytes were silently cut  (Neutron#62)
++ *
++ * WHAT THE USER SAW.  Lightroom Classic 16.0.1: "Some AI models failed to download, please try
++ * again later" when applying AI presets.  Camera Raw's model downloader asks photos.adobe.io for
++ * a model component; the service answers 302 with a Location that is a pre-signed CloudFront/S3
++ * URL longer than 1449 characters (its X-Amz-Security-Token alone is about 1 KB).  read_reply() read every
++ * response line into a fixed 1460-byte stack buffer and read_line() dropped whatever did not
++ * fit, so "Location: <url>" arrived as exactly 1449 characters of URL.  The cut removed
++ * X-Amz-SignedHeaders/X-Amz-Signature; WinHTTP followed the truncated redirect and S3 answered
++ * 400 AuthorizationQueryParametersError ("Query-string authentication version 4 requires the
++ * X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and
++ * X-Amz-Expires parameters").  Camera Raw logs that as "File download http error:'400'".
++ * Every other caller lost the same way on any header line over 1459 bytes (long Set-Cookie,
++ * Content-Security-Policy, Link, ...): no error, just a shorter value.
++ *
++ * WINDOWS.  WinHTTP bounds the WHOLE response header block by
++ * WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE (default 64 KB) and fails the request with
++ * ERROR_WINHTTP_HEADER_SIZE_OVERFLOW beyond it; it never shortens a single line.  So the same
++ * redirect is followed intact on Windows.
++ *
++ * WHAT THIS DOES.  read_line() now grows the caller's heap buffer as a line arrives, up to
++ * 64 KB per line (the Windows default for the whole block, so any line Windows accepts fits).
++ * A line beyond that is still cut the old way rather than failed: this patch only removes the
++ * 1460-byte limit and does not add Windows' overflow error (not implemented, not covered).
++ * Wire parsing, header processing and raw_headers assembly are unchanged.
++ *
++ * KILL SWITCH.  NEUTRON_WINHTTP_LONG_HEADERS=0 keeps the buffer at 1460 bytes, i.e. the
++ * pre-patch behaviour exactly.  1 (default) applies the fix.
++ * ============================================================================================= */
++
++#define NEUTRON_MAX_REPLY_LINE  65536
++
++static DWORD neutron_reply_line_limit(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        WCHAR buf[8];
++        DWORD len = GetEnvironmentVariableW( L"NEUTRON_WINHTTP_LONG_HEADERS", buf, ARRAY_SIZE(buf) );
++        enabled = (len && len < ARRAY_SIZE(buf) && buf[0] == '0') ? 0 : 1;
++        /* One-shot at ERR so a capture can tell "gate off" from "patch absent". */
++        ERR( "neutron-winhttp: gate NEUTRON_WINHTTP_LONG_HEADERS resolved to %d\n", enabled );
++    }
++    return enabled ? NEUTRON_MAX_REPLY_LINE : MAX_REPLY_LEN;
++}
++
++/* Read one CRLF/LF-terminated line into *buffer (heap, *size bytes, grown up to
++ * neutron_reply_line_limit()).  On return *len is the line length including the NUL. */
++static DWORD read_line( struct request *request, char **buffer, DWORD *size, DWORD *len )
+ {
+     int count, bytes_read, pos = 0;
+-    DWORD ret;
++    DWORD ret, limit = neutron_reply_line_limit();
+ 
+     for (;;)
+     {
+@@ -2989,8 +3042,20 @@
+         }
+         else count = bytes_read = request->read.size;
+ 
+-        count = min( count, *len - pos );
+-        memcpy( buffer + pos, request->read.buf + request->read.pos, count );
++        if (pos + count >= *size && *size < limit)
++        {
++            DWORD new_size = *size;
++            char *tmp;
++
++            while (new_size <= pos + count && new_size < limit) new_size *= 2;
++            new_size = min( new_size, limit );
++            if (!(tmp = realloc( *buffer, new_size ))) return ERROR_OUTOFMEMORY;
++            *buffer = tmp;
++            *size = new_size;
++        }
++
++        count = min( count, *size - pos );
++        memcpy( *buffer + pos, request->read.buf + request->read.pos, count );
+         pos += count;
+         remove_data( request, bytes_read );
+         if (eol) break;
+@@ -3003,33 +3068,44 @@
+             return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
+         }
+     }
++    *len = *size;
+     if (pos < *len)
+     {
+-        if (pos && buffer[pos - 1] == '\r') pos--;
++        if (pos && (*buffer)[pos - 1] == '\r') pos--;
+         *len = pos + 1;
+     }
+-    buffer[*len - 1] = 0;
+-    TRACE("returning %s\n", debugstr_a(buffer));
++    else WARN( "header line longer than %lu bytes truncated\n", *size - 1 );
++    (*buffer)[*len - 1] = 0;
++    TRACE("returning %s\n", debugstr_a(*buffer));
+     return ERROR_SUCCESS;
+ }
+ 
+-#define MAX_REPLY_LEN   1460
+-#define INITIAL_HEADER_BUFFER_LEN  512
++static DWORD read_reply_lines( struct request *request, char **line, DWORD *line_size );
+ 
+ static DWORD read_reply( struct request *request )
+ {
+-    char buffer[MAX_REPLY_LEN];
++    DWORD ret, line_size = MAX_REPLY_LEN;
++    char *line;
++
++    if (!request->netconn) return ERROR_WINHTTP_INCORRECT_HANDLE_STATE;
++    if (!(line = malloc( line_size ))) return ERROR_OUTOFMEMORY;
++    ret = read_reply_lines( request, &line, &line_size );
++    free( line );
++    return ret;
++}
++
++static DWORD read_reply_lines( struct request *request, char **line, DWORD *line_size )
++{
++    char *buffer;
+     DWORD ret, buflen, len, offset, crlf_len = 2; /* lstrlenW(crlf) */
+     const char *status_text, *ptr;
+     WCHAR *versionW, *status_textW, *raw_headers;
+     WCHAR status_code[4]; /* sizeof("nnn") */
+ 
+-    if (!request->netconn) return ERROR_WINHTTP_INCORRECT_HANDLE_STATE;
+-
+     do
+     {
+-        buflen = MAX_REPLY_LEN;
+-        if ((ret = read_line( request, buffer, &buflen ))) return ret;
++        if ((ret = read_line( request, line, line_size, &buflen ))) return ret;
++        buffer = *line;
+ 
+         /* first line should look like 'HTTP/1.x nnn OK' where nnn is the status code */
+         if (!(ptr = strchr( buffer, ' ' ))) return ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
+@@ -3081,8 +3157,8 @@
+         struct header *header;
+         int lenW;
+ 
+-        buflen = MAX_REPLY_LEN;
+-        if (read_line( request, buffer, &buflen )) return ERROR_SUCCESS;
++        if (read_line( request, line, line_size, &buflen )) return ERROR_SUCCESS;
++        buffer = *line;
+         if (!*buffer) buflen = 1;
+ 
+         while (len - offset < buflen + crlf_len)
